@@ -42,7 +42,8 @@
 // activation (AH), weight (WH) and read-out (AR) -- are the *same* permutation,
 // verified bit-exactly on device: a matmul chained off another matmul reads the
 // producer's AR array as its activation with no conversion, and the two agree on
-// every element (see docs/hmx/hmx-generality.md and STATE-OF-PLAY section 4).
+// every element (see docs/history/hmx/hmx-generality.md and STATE-OF-PLAY
+// section 4).
 // So compatibility is "same logical shape and element type", and the role is a
 // property of the *use*, not of the type.
 //
@@ -125,6 +126,31 @@ int64_t weightKTiles(ShapedType weightCrouton);
 int64_t weightNTiles(ShapedType weightCrouton);
 
 } // namespace hmx
+} // namespace mlir
+
+//===----------------------------------------------------------------------===//
+// Marker trait: dialect member, but NOT an engine op
+//===----------------------------------------------------------------------===//
+namespace mlir {
+namespace OpTrait {
+
+/// Marks an `hmx` op that lowers to the plain DMA runtime entries and issues no
+/// HMX instruction -- today `hmx.stage` and `hmx.await`, and nothing else.
+///
+/// `HmxToLLVM`'s engine ensure/unlock decision reads this trait instead of a
+/// list of op classes. The polarity is deliberate and was reviewed: every
+/// *unmarked* dialect op counts as an engine op until proven otherwise, so a
+/// future engine op that is marked nowhere still gets its (harmless,
+/// self-released) pair, while a future DMA-only op must set this marker --
+/// omitting it costs one lock round-trip, whereas excluding an engine op would
+/// park the next thread in `HAP_compute_res_hmx_lock` forever. The contract is
+/// pinned by test/Conversion/HmxToLLVM/hmx-to-llvm.mlir @stage_await; do not
+/// replace it with callee-name matching (silent wrong decision on a rename or
+/// a wrapper) or with an engine whitelist (omission hangs the device).
+template <typename ConcreteType>
+struct HmxDmaOnly : public TraitBase<ConcreteType, HmxDmaOnly> {};
+
+} // namespace OpTrait
 } // namespace mlir
 
 //===----------------------------------------------------------------------===//

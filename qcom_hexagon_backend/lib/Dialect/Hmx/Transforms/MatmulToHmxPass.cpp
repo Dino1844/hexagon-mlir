@@ -222,8 +222,13 @@ InFlightDiagnostic &refusalBudget(InFlightDiagnostic &diag,
 /// `enableConvertToHexagonmem` switch.
 void emitSkipSummary(Operation *within, const HmxTarget &target,
                      const AttributionTally &tally) {
-  if (tally.skipped.empty())
+  if (tally.skipped.empty()) {
+    // Full success is silent to diagnostics; the attributed count is the only
+    // number someone debugging "why did/didn't this matmul go to HMX" needs.
+    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE << "] " << tally.attributed
+                            << " matmul(s) attributed, none refused\n");
     return; // Nothing refused: no warning.
+  }
   Operation *module = within->getParentOfType<ModuleOp>();
   if (!module)
     module = within;
@@ -364,14 +369,14 @@ static DenseElementsAttr prepackCrouton(DenseElementsAttr src,
   packed.reserve(crouton.getNumElements());
   for (int64_t t0 = 0; t0 < crouton.getDimSize(0); ++t0)
     for (int64_t t1 = 0; t1 < crouton.getDimSize(1); ++t1)
-      for (int64_t j = 0; j < hmx::crouton::kCroutonPair; ++j)
-        for (int64_t c = 0; c < hmx::crouton::kCroutonCol; ++c)
-          for (int64_t h = 0; h < hmx::crouton::kCroutonHalf; ++h)
+      for (int64_t j = 0; j < hmx::layout::kCroutonPair; ++j)
+        for (int64_t c = 0; c < hmx::layout::kCroutonCol; ++c)
+          for (int64_t h = 0; h < hmx::layout::kCroutonHalf; ++h)
             packed.push_back(
                 isWeight
-                    ? at(t1 * HmxTarget::tileEdge + hmx::crouton::kCroutonHalf * j + h,
+                    ? at(t1 * HmxTarget::tileEdge + hmx::layout::kCroutonHalf * j + h,
                          t0 * HmxTarget::tileEdge + c)
-                    : at(t0 * HmxTarget::tileEdge + hmx::crouton::kCroutonHalf * j + h,
+                    : at(t0 * HmxTarget::tileEdge + hmx::layout::kCroutonHalf * j + h,
                          t1 * HmxTarget::tileEdge + c));
   return DenseElementsAttr::get(crouton, packed);
 }
@@ -541,7 +546,7 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
   // One tile row per call: the crouton grid's first dim is the 32-row tile
   // count, and `count` covers its 16 row-pairs.
   Value tiles = arith::ConstantIndexOp::create(b, loc, arType.getDimSize(0));
-  IntegerAttr count = b.getI64IntegerAttr(hmx::crouton::kCroutonPair);
+  IntegerAttr count = b.getI64IntegerAttr(hmx::layout::kCroutonPair);
 
   auto loop = scf::ForOp::create(b, loc, zero, tiles, one, ValueRange{dst});
   {
@@ -905,7 +910,7 @@ static Value readoutBehind(Value v, scf::ForOp &bridgeLoop,
 //
 // The rules are the narrow version of Triton's RemoveLayoutConversions
 // (docs/hmx/layout-representation-survey.md section 4.3), narrowed further
-// by measurement (docs/hmx/s1-layout-native-plan.md: the 2026-09-18 LWP
+// by measurement (docs/history/hmx/s1-layout-native-plan.md: the 2026-09-18 LWP
 // showed the mask/phi work costs ~10x in crouton order, regressing naive
 // linear attention 2.56x, while the removed round trip is <1%):
 //
@@ -993,7 +998,7 @@ static AffineMap croutonToLogicalMap(MLIRContext *ctx) {
   AffineExpr j = getAffineDimExpr(2, ctx), col = getAffineDimExpr(3, ctx),
              h = getAffineDimExpr(4, ctx);
   return AffineMap::get(5, 0,
-                        {t0 * HmxTarget::tileEdge + j * hmx::crouton::kCroutonHalf + h,
+                        {t0 * HmxTarget::tileEdge + j * hmx::layout::kCroutonHalf + h,
                          t1 * HmxTarget::tileEdge + col},
                         ctx);
 }

@@ -81,28 +81,29 @@ static constexpr const char *kHmxUnlockFn = "hexagon_runtime_hmx_unlock_dsp";
 /// (bin/runtime/src/HexagonAPI.cpp, EnsureHmxLockForThisThread), while a
 /// wrongly-added pair only costs a lock round-trip the function releases itself.
 ///
-/// `hmx.stage` / `hmx.await` are dialect ops but lower to the plain DMA runtime
-/// entries (`hexagon_runtime_dma_*`), execute no HMX instruction and need no
-/// engine (see HmxExternalFnNames.cpp); they are excluded *by name here* rather
-/// than the engine ops being enumerated as a whitelist, so that a future dialect
-/// op counts as engine until proven otherwise: a wrongly-included op adds a
-/// pair the function releases itself, a wrongly-excluded one hangs the device.
+/// The engine/non-engine split is carried structurally by the
+/// `OpTrait::HmxDmaOnly` marker (defined with the dialect in HmxDialect.h):
+/// `hmx.stage` / `hmx.await` carry it because they lower to the plain DMA
+/// runtime entries (`hexagon_runtime_dma_*`), execute no HMX instruction and
+/// need no engine (see HmxExternalFnNames.cpp). The polarity is deliberate and
+/// was reviewed: every *unmarked* dialect op counts as engine until proven
+/// otherwise -- a wrongly-included op adds a pair the function releases itself,
+/// a wrongly-excluded one hangs the device -- so a future engine op needs no
+/// marker, while a future DMA-only op must set one.
 ///
-/// The exclusion was reviewed and ratified: these two ops are excluded **because
-/// they lower to the DMA runtime, not to an engine leaf** -- the contract is
-/// pinned by test/Conversion/HmxToLLVM/hmx-to-llvm.mlir @stage_await ("a
-/// function that only stages and awaits issues no HMX instruction, so it needs
-/// no engine ensure/unlock"). Do not "simplify" this exclusion away: dropping it
-/// would insert a pair where today's `hmx_*`-call test inserts none, and adding
-/// a whitelist of engine ops instead would silently drop the pair of any future
-/// engine op and hang the device.
+/// The contract is pinned by test/Conversion/HmxToLLVM/hmx-to-llvm.mlir
+/// @stage_await ("a function that only stages and awaits issues no HMX
+/// instruction, so it needs no engine ensure/unlock"). Do not "simplify" this
+/// away: deciding by callee-name prefix would go wrong silently on a renamed or
+/// a wrapped leaf, and an engine whitelist would silently drop the pair of any
+/// future engine op and hang the device.
 static bool issuesHmxEngineLeaves(Operation *fn) {
   bool found = false;
   fn->walk([&](Operation *op) {
     Dialect *dialect = op->getDialect();
     if (dialect &&
         dialect->getNamespace() == HmxDialect::getDialectNamespace() &&
-        !isa<StageOp, AwaitOp>(op))
+        !op->hasTrait<OpTrait::HmxDmaOnly>())
       found = true;
   });
   return found;
@@ -265,9 +266,9 @@ static int64_t croutonTileStride(MemRefType type, int64_t dim) {
     return dense;
   int64_t stride = strides[dim];
   if (ShapedType::isDynamic(stride) || stride <= 0 ||
-      stride % crouton::kCroutonElements != 0)
+      stride % layout::kCroutonElements != 0)
     return dense;
-  return stride / crouton::kCroutonElements;
+  return stride / layout::kCroutonElements;
 }
 
 /// The address of crouton `(row, col)` of a crouton array: the array's base plus
@@ -303,7 +304,7 @@ Value croutonAddr(ConversionPatternRewriter &rewriter, Location loc,
   Value bytes = LLVM::MulOp::create(
       rewriter, loc, i32Ty, tile,
       LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                               rewriter.getI32IntegerAttr(crouton::kCroutonBytes)));
+                               rewriter.getI32IntegerAttr(layout::kCroutonBytes)));
   return LLVM::AddOp::create(rewriter, loc, i32Ty, base, bytes);
 }
 

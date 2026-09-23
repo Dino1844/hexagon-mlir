@@ -12,11 +12,16 @@
 //
 // Upstream Triton has the same shape: an `Accelerate*` pass per op class, each
 // asking `TargetInfo` whether the *operation* fits (`getMMAVersionSafe` +
-// `supportMMA`). Keeping the capability here is what lets a second op class join
-// the engine by writing a thin adapter that extracts its extents and element
-// types and asks this table, instead of needing a second pass.
+// `supportMMA`).
 //
-// See docs/hmx/hmx-generality.md for what is and is not general today.
+// Honest status (2026-09-23, review): the *table* is generic, but the only
+// adapter that asks it is `matmul-to-hmx`, and its bridge/epilogue logic is
+// written against `linalg.matmul` directly. A second op class will first need
+// that extraction generalized (an op interface for extents/element types), not
+// just a thin adapter -- update this comment when it happens instead of letting
+// the claim run ahead of the code.
+//
+// See docs/history/hmx/hmx-generality.md for what is and is not general today.
 //===----------------------------------------------------------------------===//
 
 #ifndef HEXAGON_DIALECT_HMX_TRANSFORMS_HMXTARGET_H
@@ -40,7 +45,7 @@ namespace hmx {
 struct HmxTarget {
   /// One crouton is a 32x32 fp16 block; every extent the engine touches is a
   /// multiple of it.
-  static constexpr int64_t tileEdge = crouton::kTileEdge;
+  static constexpr int64_t tileEdge = layout::kTileEdge;
 
   /// The engine needs a few rows before a tile can even be formed. llama.cpp
   /// draws the same line at HTP_MM_HMX_MIN_NROWS = 4.

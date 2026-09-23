@@ -412,7 +412,8 @@ FuncInput<int8_t, 1> *pVtcmScratch = &wrVtcmScratch;
             else:
                 closure_helper_string += f"{indent}closure->vtcmScratch,\n"
         return self.common_strings.multithread_helper.format(
-            func_name=self.func_name, closure_args_string=closure_helper_string.strip()
+            func_name=self.func_name,
+            closure_args_string=closure_helper_string.strip(),
         )
 
     def generate_vtcm_closure_setup(self):
@@ -549,6 +550,13 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         weight_prepack: str | None = None,
         runtime_options: dict | None = None,
     ) -> list[Tensor]:
+        # Crash-triage override (rowmax plan §12, temporary): swap the freshly
+        # compiled kernel .o for a caller-supplied one (binary-bisection of the
+        # device crash without rebuilding the compiler).
+        _ov = os.environ.get("FA_O_OVERRIDE")
+        if _ov:
+            kernel_obj_as_bytes = Path(_ov).read_bytes()
+            print(f"==> FA_O_OVERRIDE active: {_ov} ({len(kernel_obj_as_bytes)} B)")
         # Getting the input metadata for effective wrapper codegen.
         input_profs = profile_triton_inputs(inputs)
         input_tensor_count = sum(

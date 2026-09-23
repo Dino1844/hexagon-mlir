@@ -183,7 +183,31 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "elementwise folding plus an hvx.vror butterfly, instead of letting "
           "ConvertLinalgToLoops scalarize it into a per-lane serial chain that "
           "the Hexagon backend cannot revectorize (only VECREDUCE_ADD gets an "
-          "HVX DAG combine). Off by default.">
+          "HVX DAG combine). Off by default.">,
+    Option<"enableMaxnumLegalize", "enable-maxnum-legalize", "bool",
+          /*default=*/"false",
+          "Rewrite vector f16/f32 arith.maxnumf into arith.maximumf plus an "
+          "explicit NaN correction before the LLVM conversion: the Hexagon "
+          "HVX backend has no lowering for FMAXNUM (only FMAXIMUMNUM is "
+          "Legal), so a vector maxnumf is expanded per lane into a ~130-"
+          "instruction stack/scalar/build-vector chain (or fmaxf libcalls). "
+          "The rewrite preserves strict maxnum semantics. Off by default: the "
+          "R1-ON kernel aborted at launch on the device hexmem path with a "
+          ">= [512,128] maxnum tile; the root cause is three llvm_triton "
+          "Hexagon backend RA bugs (docs/history/hmx/llvm-hexagon-ra-bugs.md; "
+          "the PS_aligna one is cherry-picked under tools/hexmlir, the rest "
+          "await upstream) -- keep OFF until then.">,
+    Option<"emitMaxnumFixup", "emit-maxnum-fixup", "bool",
+          /*default=*/"true",
+          "Emit the NaN fixup selects of the maxnum legalization (debug/"
+          "bisection knob; false changes maxnum semantics to maximum).">,
+    Option<"maxnumSiteLimit", "maxnum-site-limit", "int",
+          /*default=*/"-1",
+          "Bisection knob: >=0 rewrites only the first N walk-ordered "
+          "maxnumf sites instead of all (device crash triage).">,
+    Option<"maxnumSiteSkip", "maxnum-site-skip", "int",
+          /*default=*/"0",
+          "Bisection knob: skip the first N walk-ordered maxnumf sites.">
    ];
 }
 
@@ -345,6 +369,14 @@ def HexagonTiling :
 def HexagonVectorization :
     Pass<"hexagon-vectorization", "mlir::ModuleOp"> {
   let summary = "Pass to vectorize tensor linalg ops.";
+  let options = [
+    Option<"skipVectorRowReduce", "skip-vector-row-reduce", "bool",
+           /*default=*/"false",
+           "Leave row reduces matching the vector-row-reduce pattern "
+           "unvectorized so they reach that pass instead of becoming a "
+           "vector.multi_reduction whose LLVM lowering is a valign tree. "
+           "Driven by the pipeline's enable-vector-row-reduce knob.">
+  ];
   let constructor = "hexagon::createHexagonVectorizationPass()";
 }
 

@@ -83,6 +83,35 @@ def FastInverse :
   let constructor = "hexagon::createFastInversePass()";
 }
 
+def HvxMaxnumLegalize : Pass<"hvx-maxnum-legalize", "func::FuncOp"> {
+  let summary = "Rewrite vector float maxnumf into HVX vmax plus a NaN fixup";
+  let description = [{
+    The Hexagon HVX backend marks only ISD::FMAXIMUMNUM Legal (selected into
+    V6_vmax_sf/hf); FMAXNUM -- what `arith.maxnumf` lowers to -- has no HVX
+    action, so a vector maxnumf is expanded per lane into a ~130-instruction
+    stack round-trip + scalar sfcmp/mux + build-vector chain (or fmaxf
+    libcalls). This pass rewrites every vector f16/f32 maxnumf, before that
+    lowering, into
+
+      %vmax = arith.maximumf %a, %b           // -> V6_vmax
+      %t    = arith.select (oeq %b, %b), %vmax, %a   // %b is NaN -> %a
+      %r    = arith.select (oeq %a, %a), %t,  %b     // %a is NaN -> %b
+
+    which preserves strict maxnum semantics by construction: a NaN operand
+    yields the other operand, both-NaN yields (some) NaN, and for equal
+    operands -- including +0/-0 -- either operand may be returned, which
+    maxnum permits. The fixup compares are not given fastmath flags, so no
+    downstream pass may delete the correction based on the original op's
+    nnan assertion; the flags do stay on the maximumf itself. The oeq/vmux
+    fixup lowers to vector vcmp/vmux -- verified vector-clean for
+    <32xf32> and <64xhf> under -O3.
+
+    Scalars are left alone: a scalar maxnumf lowers to at worst one fmaxf
+    libcall, and the scalar maximumf route is not an unambiguous win.
+  }];
+  let constructor = "hexagon::createHvxMaxnumLegalizePass()";
+}
+
 def HexagonAddFastMath :
     Pass<"hexagon-add-fastmath", "mlir::ModuleOp"> {
   let summary = "Add fast math flag to selected ops.";

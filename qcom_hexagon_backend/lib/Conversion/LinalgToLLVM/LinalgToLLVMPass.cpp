@@ -380,8 +380,14 @@ public:
 
     // ===== STEP 2: VECTORIZATION =====
     // Vectorizer now sees cleaner IR with hoisted scalars
+    // Vectorization pass for HVX. When the row-reduce butterfly is on, its
+    // reduces are left unvectorized here so they reach the butterfly instead
+    // of becoming a vector.multi_reduction (whose LLVM lowering is the
+    // ExpandReductions valign tree).
     if (enableVectorization) {
-      pm.addPass(createHexagonVectorizationPass());
+      HexagonVectorizationOptions vectorizeOpts;
+      vectorizeOpts.skipVectorRowReduce = enableVectorRowReduce;
+      pm.addPass(createHexagonVectorizationPass(vectorizeOpts));
     }
     pm.addPass(createRewriteUBPoisonToZeroPass());
     pm.addPass(createHexagonVectorLoweringPass());
@@ -518,6 +524,16 @@ public:
     // Off by default; the knob is the device A/B switch.
     if (enableVectorRowReduce)
       pm.addNestedPass<func::FuncOp>(createVectorRowReducePass());
+    // Vector float maxnumf has no HVX lowering (only FMAXIMUMNUM is Legal;
+    // FMAXNUM expands per lane into a ~130-instruction scalar chain or
+    // fmaxf libcalls). Rewrite it into vmax + a NaN fixup that restores
+    // strict maxnum semantics. Last of the maxnumf producers: the
+    // vectorizer's elementwise updates and, with the knob above, the
+    // row-reduce butterfly's fold steps. Runs after AddFastMath, so the
+    // fixup ops it emits are never stamped with the nnan assertion.
+    if (enableMaxnumLegalize)
+      pm.addNestedPass<func::FuncOp>(createHvxMaxnumLegalizePass(
+          emitMaxnumFixup, maxnumSiteLimit, maxnumSiteSkip));
     pm.addPass(createConvertLinalgToLoopsPass());
 
     pm.addNestedPass<func::FuncOp>(createFormAsyncThreadsPass());

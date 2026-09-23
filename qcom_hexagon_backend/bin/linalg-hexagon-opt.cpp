@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerCollapseAddressSpacePass();
   mlir::hexagon::registerConvertLayoutPass();
   mlir::hexagon::registerFastInversePass();
+  mlir::hexagon::registerHvxMaxnumLegalizePass();
   mlir::hexagon::registerConvertZeroSizeMemref();
   mlir::hexagon::registerLowerPack();
   mlir::hexagon::registerSplitReduceGenericPass();

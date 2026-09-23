@@ -12,6 +12,11 @@
 // read them from here, and the host prepack contract is built from them -- so a
 // change to the engine's tile can only be made in one place.
 //
+// The namespace is `hmx::layout` (renamed from `hmx::crouton` on 2026-09-23)
+// so it cannot be confused with the repository's `crouton` dialect
+// (mlir::crouton, a 2 KB-chunk descriptor type consumed by hexagonmem), nor
+// with the `#hmx.crouton` encoding attribute -- three different things.
+//
 // The layout contract itself (why one crouton is 16 pairs x 32 columns x 2
 // halves, and why AH/WH/AR are the same permutation) is documented with the
 // dialect: include/hexagon/Dialect/Hmx/IR/HmxDialect.h and HmxAttrs.td.
@@ -24,7 +29,7 @@
 
 namespace mlir {
 namespace hmx {
-namespace crouton {
+namespace layout {
 
 /// The edge of one crouton: a 32x32 fp16 tile. Every extent the engine touches
 /// is a multiple of it.
@@ -40,7 +45,7 @@ constexpr int64_t kCroutonHalf = 2;
 constexpr int64_t kCroutonElements = kCroutonPair * kCroutonCol * kCroutonHalf;
 constexpr int64_t kCroutonBytes = kCroutonElements * 2;
 
-} // namespace crouton
+} // namespace layout
 } // namespace hmx
 } // namespace mlir
 

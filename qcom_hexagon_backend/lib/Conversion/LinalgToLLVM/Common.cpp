@@ -18,10 +18,173 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Utils/StructuredOpsUtils.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir {
 namespace hexagon {
+
+// === Row-reduce matching shared by the vector-row-reduce pass and the ===
+// === vectorizer's skip gate                                          ===
+
+// kHvxVectorBytes (the 128 B row-chunk width) lives in Common.h: it is one
+// contract shared with VectorRowReducePass, not a file-local constant.
+
+std::optional<RowReduceShape> vectorRowReduceShapeOf(Type type) {
+  auto shaped = dyn_cast<ShapedType>(type);
+  // Rank 1 = a single row reduced to a scalar (the form LinalgGeneralize
+  // produces for a one-dimensional row); rank 2 = a batch of rows.
+  if (!shaped || !shaped.hasStaticShape() ||
+      (shaped.getRank() != 1 && shaped.getRank() != 2))
+    return std::nullopt;
+  Type elemTy = shaped.getElementType();
+  int64_t elemBytes;
+  if (elemTy.isF32())
+    elemBytes = 4;
+  else if (elemTy.isF16())
+    elemBytes = 2;
+  else
+    return std::nullopt;
+  // A row must be contiguous (the vector reads walk it with unit stride);
+  // the outer stride may be anything -- each row is addressed on its own.
+  int64_t innerStride;
+  if (auto memref = dyn_cast<MemRefType>(type)) {
+    SmallVector<int64_t> strides;
+    int64_t offset;
+    if (failed(memref.getStridesAndOffset(strides, offset)) || strides.empty())
+      return std::nullopt;
+    innerStride = strides.back();
+  } else if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+    // No encoding = dense row-major. Any encoding (a crouton layout, say)
+    // means the logical row order is not the memory order -- leave it alone.
+    if (tensor.getEncoding())
+      return std::nullopt;
+    innerStride = 1;
+  } else {
+    return std::nullopt;
+  }
+  if (innerStride != 1)
+    return std::nullopt;
+  int64_t cols = shaped.getDimSize(shaped.getRank() - 1);
+  int64_t rows = shaped.getRank() == 2 ? shaped.getDimSize(0) : 1;
+  if (rows == 0 || cols == 0)
+    return std::nullopt;
+  if ((cols * elemBytes) % kHvxVectorBytes != 0)
+    return std::nullopt;
+  return RowReduceShape{rows, cols, elemBytes};
+}
+
+std::optional<RowReduceFold> matchVectorRowReduce(linalg::LinalgOp op) {
+  // Either the bufferized form (no results; the outs are memrefs) or the
+  // tensor form (one result; the init is a tensor).
+  if (op->getNumResults() > 1)
+    return std::nullopt;
+
+  // The op reaches us either still as a `linalg.reduce` or, since
+  // LinalgGeneralize rewrites every reduce to a generic earlier in the
+  // pipeline, as a `linalg.generic` carrying a reduction iterator. Both are
+  // accepted -- same predicate for the vectorizer's skip gate and for this
+  // pass, so the two can never disagree.
+  Value in, init;
+  SmallVector<int64_t, 4> reducePos, parallelPos;
+  if (auto ro = dyn_cast<linalg::ReduceOp>(op.getOperation())) {
+    if (ro.getInputs().size() != 1 || ro.getInits().size() != 1)
+      return std::nullopt;
+    in = ro.getInputs()[0];
+    init = ro.getInits()[0];
+    auto inTy = dyn_cast<ShapedType>(in.getType());
+    if (!inTy || !inTy.hasStaticShape())
+      return std::nullopt;
+    reducePos.assign(ro.getDimensions().begin(), ro.getDimensions().end());
+    for (int64_t i = 0, r = inTy.getRank(); i < r; ++i)
+      if (!llvm::is_contained(reducePos, i))
+        parallelPos.push_back(i);
+  } else if (auto g = dyn_cast<linalg::GenericOp>(op.getOperation())) {
+    if (g.getInputs().size() != 1 || g.getOutputs().size() != 1)
+      return std::nullopt;
+    if (g.getBody()->getArguments().size() != 2)
+      return std::nullopt;
+    in = g.getInputs()[0];
+    init = g.getOutputs()[0];
+    auto iters = g.getIteratorTypesArray();
+    for (auto [i, t] : llvm::enumerate(iters)) {
+      if (t == utils::IteratorType::reduction)
+        reducePos.push_back((int64_t)i);
+      else
+        parallelPos.push_back((int64_t)i);
+    }
+    if (reducePos.size() != 1)
+      return std::nullopt;
+    // The input must read the iteration space in order (minor identity), and
+    // the result may only mention parallel dimensions -- otherwise the value
+    // written per row is not that row's reduction.
+    auto maps = g.getIndexingMapsArray();
+    if (maps.size() != 2 || !maps[0].isMinorIdentity())
+      return std::nullopt;
+    for (auto d : maps[1].getResults()) {
+      auto de = dyn_cast<AffineDimExpr>(d);
+      if (!de || !llvm::is_contained(parallelPos, (int64_t)de.getPosition()))
+        return std::nullopt;
+    }
+  } else {
+    return std::nullopt;
+  }
+
+  auto shape = vectorRowReduceShapeOf(in.getType());
+  if (!shape) // rows == 0 already rejected inside vectorRowReduceShapeOf
+    return std::nullopt;
+  // Exactly one reduction and it must be the innermost dimension: that is what
+  // keeps a row contiguous under unit stride (the mechanical gate).
+  if (reducePos.size() != 1)
+    return std::nullopt;
+  auto inShaped = cast<ShapedType>(in.getType());
+  if (reducePos[0] != inShaped.getRank() - 1)
+    return std::nullopt;
+
+  Type elemTy = inShaped.getElementType();
+  // The init (outs) and, in tensor form, the result carry one value per row
+  // of the same element type. A single-row reduce writes a scalar.
+  auto perRow = [&](Type t) {
+    auto s = dyn_cast<ShapedType>(t);
+    if (!s || !s.hasStaticShape() || s.getElementType() != elemTy)
+      return false;
+    if (shape->rows == 1)
+      return s.getRank() == 0 ||
+             (s.getRank() == 1 && s.getDimSize(0) == 1);
+    return s.getRank() == 1 && s.getDimSize(0) == shape->rows;
+  };
+  if (!perRow(init.getType()))
+    return std::nullopt;
+  if (op->getNumResults() == 1 && !perRow(op->getResult(0).getType()))
+    return std::nullopt;
+
+  // The body contract: exactly one binary fold over the two block args,
+  // yielded directly.
+  Block &block = op->getRegion(0).front();
+  if (block.getOperations().size() != 2)
+    return std::nullopt;
+  auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
+  if (!yield || yield.getNumOperands() != 1)
+    return std::nullopt;
+  Operation *bin = yield->getOperand(0).getDefiningOp();
+  if (!bin)
+    return std::nullopt;
+  Value blockIn = block.getArgument(0), blockInit = block.getArgument(1);
+  auto isArgs = [&](Value v) { return v == blockIn || v == blockInit; };
+
+  if (auto maxnumf = dyn_cast<arith::MaxNumFOp>(bin)) {
+    if (!isArgs(maxnumf.getLhs()) || !isArgs(maxnumf.getRhs()))
+      return std::nullopt;
+    return RowReduceFold{*shape, /*isMaxNum=*/true, maxnumf.getFastmath()};
+  }
+  if (auto addf = dyn_cast<arith::AddFOp>(bin)) {
+    if (!isArgs(addf.getLhs()) || !isArgs(addf.getRhs()))
+      return std::nullopt;
+    return RowReduceFold{*shape, /*isMaxNum=*/false, addf.getFastmath()};
+  }
+  return std::nullopt;
+}
 
 // Does the generic body carry an exp-family transcendental?
 //

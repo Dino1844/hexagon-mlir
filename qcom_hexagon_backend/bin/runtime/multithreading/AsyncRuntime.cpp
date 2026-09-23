@@ -12,6 +12,20 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <cstdio>
+
+// Crash-triage progress marker (fa-rowmax plan §10/§15). This opens, writes
+// and closes rt_trc.txt on every async runtime call, which otherwise dominates
+// small kernels (fa-crash log R24); it is compiled out unless
+// HEXMLIR_RUNTIME_TRACE is defined. Never enable it for measurements.
+#ifdef HEXMLIR_RUNTIME_TRACE
+static void _trc(const char *m) {
+  FILE *_f = fopen("/data/data/com.termux/files/home/csm/op/rt_trc.txt", "a");
+  if (_f) { fputs(m, _f); fputc('\n', _f); fclose(_f); }
+}
+#else
+#define _trc(m) ((void)0)
+#endif
 #include "AsyncRuntime.h"
 
 #include <atomic>
@@ -236,7 +250,7 @@ extern "C" void mlirAsyncRuntimeDropRef(RefCountedObjPtr ptr, int64_t count) {
 }
 
 // Creates a new `async.token` in not-ready state.
-extern "C" AsyncToken *mlirAsyncRuntimeCreateToken() {
+extern "C" AsyncToken *mlirAsyncRuntimeCreateToken() { _trc("T0");
   AsyncToken *token = new AsyncToken(getDefaultAsyncRuntime());
   return token;
 }
@@ -248,13 +262,13 @@ extern "C" AsyncValue *mlirAsyncRuntimeCreateValue(int64_t size) {
 }
 
 // Create a new `async.group` in empty state.
-extern "C" AsyncGroup *mlirAsyncRuntimeCreateGroup(int64_t size) {
+extern "C" AsyncGroup *mlirAsyncRuntimeCreateGroup(int64_t size) { _trc("G0");
   AsyncGroup *group = new AsyncGroup(getDefaultAsyncRuntime(), size);
   return group;
 }
 
 extern "C" int64_t mlirAsyncRuntimeAddTokenToGroup(AsyncToken *token,
-                                                   AsyncGroup *group) {
+                                                   AsyncGroup *group) { _trc("G1");
   std::unique_lock<std::mutex> lockToken(token->mu);
   std::unique_lock<std::mutex> lockGroup(group->mu);
 
@@ -339,7 +353,7 @@ static void setValueState(AsyncValue *value, State state) {
   value->dropRef();
 }
 
-extern "C" void mlirAsyncRuntimeEmplaceToken(AsyncToken *token) {
+extern "C" void mlirAsyncRuntimeEmplaceToken(AsyncToken *token) { _trc("M0");
   setTokenState(token, State::kAvailable);
 }
 
@@ -347,7 +361,7 @@ extern "C" void mlirAsyncRuntimeEmplaceValue(AsyncValue *value) {
   setValueState(value, State::kAvailable);
 }
 
-extern "C" void mlirAsyncRuntimeSetTokenError(AsyncToken *token) {
+extern "C" void mlirAsyncRuntimeSetTokenError(AsyncToken *token) { _trc("SE");
   setTokenState(token, State::kError);
 }
 
@@ -363,7 +377,7 @@ extern "C" bool mlirAsyncRuntimeIsValueError(AsyncValue *value) {
   return State(value->state).isError();
 }
 
-extern "C" bool mlirAsyncRuntimeIsGroupError(AsyncGroup *group) {
+extern "C" bool mlirAsyncRuntimeIsGroupError(AsyncGroup *group) { _trc("E0");
   return group->numErrors.load() > 0;
 }
 
@@ -381,7 +395,7 @@ extern "C" void mlirAsyncRuntimeAwaitValue(AsyncValue *value) {
         lock, [value] { return State(value->state).isAvailableOrError(); });
 }
 
-extern "C" void mlirAsyncRuntimeAwaitAllInGroup(AsyncGroup *group) {
+extern "C" void mlirAsyncRuntimeAwaitAllInGroup(AsyncGroup *group) { _trc("W0");
   std::unique_lock<std::mutex> lock(group->mu);
   if (group->pendingTokens != 0)
     group->cv.wait(lock, [group] { return group->pendingTokens == 0; });
@@ -393,7 +407,7 @@ extern "C" ValueStorage mlirAsyncRuntimeGetValueStorage(AsyncValue *value) {
   return value->storage.data();
 }
 
-extern "C" void mlirAsyncRuntimeExecute(CoroHandle handle, CoroResume resume) {
+extern "C" void mlirAsyncRuntimeExecute(CoroHandle handle, CoroResume resume) { _trc("X0");
   auto *runtime = getDefaultAsyncRuntime();
   runtime->getThreadPool().async([handle, resume]() { (*resume)(handle); });
 }

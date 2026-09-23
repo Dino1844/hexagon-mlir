@@ -151,7 +151,7 @@ std::optional<TileShape> getTileShape(MatmulOp op) {
     return std::nullopt;
   if (lhs.getRank() != 5 || rhs.getRank() != 5 || out.getRank() != 5)
     return std::nullopt;
-  return TileShape{lhs.getDimSize(0), rhs.getDimSize(0), lhs.getDimSize(1)};
+  return TileShape{lhs.getDimSize(0), weightNTiles(rhs), lhs.getDimSize(1)};
 }
 
 /// Bytes already committed to VTCM in this function. After bufferization the
@@ -447,15 +447,15 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   }
 
   int64_t Mt = actType.getDimSize(0), Kt = actType.getDimSize(1);
-  int64_t Nt = wtType.getDimSize(0);
+  int64_t Nt = weightNTiles(wtType);
   int64_t K = srcType.getDimSize(1);
   if (Mt < 1 || Kt < 1) {
     op.emitRemark() << "HMX pipeline not applied: the activation staging "
                        "geometry has an empty crouton grid";
     return false;
   }
-  if (srcType.getDimSize(0) != Mt * crouton::kTileEdge ||
-      K != Kt * crouton::kTileEdge || wtType.getDimSize(1) != Kt) {
+  if (srcType.getDimSize(0) != Mt * layout::kTileEdge ||
+      K != Kt * layout::kTileEdge || weightKTiles(wtType) != Kt) {
     op.emitRemark() << "HMX pipeline not applied: the source, activation and "
                        "weight grids disagree on the staging tile shape";
     return false;
@@ -481,9 +481,9 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   // bytes come back to the room -- not counting them would turn a ring that fits
   // into a spurious fallback.
   int64_t actBytes = actType.getNumElements() * 2;
-  int64_t scratchBytes = Kt * crouton::kCroutonBytes;
+  int64_t scratchBytes = Kt * layout::kCroutonBytes;
   int64_t srcElemBytes = srcType.getElementTypeBitWidth() / 8;
-  int64_t slotBytes = crouton::kTileEdge * K * srcElemBytes;
+  int64_t slotBytes = layout::kTileEdge * K * srcElemBytes;
   int64_t statusBytes = 4;
   int64_t ringBytes = slotBytes + statusBytes;
   int64_t room = vtcmBudget - vtcmBytesCommitted(func) + actBytes;
@@ -547,7 +547,7 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   rewriter.setInsertionPoint(op);
   Location loc = opLoc;
 
-  auto slotType = MemRefType::get({crouton::kTileEdge, K},
+  auto slotType = MemRefType::get({layout::kTileEdge, K},
                                   srcType.getElementType(), AffineMap{},
                                   hexagon::VTCM_ADDRESS_SPACE);
   auto statusType = MemRefType::get({1}, rewriter.getI32Type());
@@ -557,8 +557,8 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   // buffer, so the mma consumes the packed croutons by address -- no copy
   // between pack and mma, and no second row in flight.
   auto scratchType =
-      MemRefType::get({1, Kt, crouton::kCroutonPair, crouton::kCroutonCol,
-                       crouton::kCroutonHalf},
+      MemRefType::get({1, Kt, layout::kCroutonPair, layout::kCroutonCol,
+                       layout::kCroutonHalf},
                       rewriter.getF16Type(), AffineMap{},
                       hexagon::VTCM_ADDRESS_SPACE);
 
@@ -577,7 +577,7 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
 
   auto c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
   auto c1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
-  auto cTileEdge = arith::ConstantIndexOp::create(rewriter, loc, crouton::kTileEdge);
+  auto cTileEdge = arith::ConstantIndexOp::create(rewriter, loc, layout::kTileEdge);
   auto cKt = arith::ConstantIndexOp::create(rewriter, loc, Kt);
   auto cNt = arith::ConstantIndexOp::create(rewriter, loc, Nt);
   auto cMt = arith::ConstantIndexOp::create(rewriter, loc, Mt);

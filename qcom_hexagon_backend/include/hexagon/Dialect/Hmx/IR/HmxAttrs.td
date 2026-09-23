@@ -85,13 +85,13 @@ def Hmx_CroutonLayoutAttr
   let extraClassDeclaration = [{
     /// The edge of one crouton: a 32x32 fp16 tile. The numbers live in
     /// HmxCroutonLayout.h so the passes and the host contract share them.
-    static constexpr int64_t kTile = mlir::hmx::crouton::kTileEdge;
+    static constexpr int64_t kTile = mlir::hmx::layout::kTileEdge;
 
     /// The tail of one crouton in the physical rank-5 type: 16 pairs x 32
     /// columns x 2 halves of a pair.
-    static constexpr int64_t kCroutonPair = mlir::hmx::crouton::kCroutonPair;
-    static constexpr int64_t kCroutonCol = mlir::hmx::crouton::kCroutonCol;
-    static constexpr int64_t kCroutonHalf = mlir::hmx::crouton::kCroutonHalf;
+    static constexpr int64_t kCroutonPair = mlir::hmx::layout::kCroutonPair;
+    static constexpr int64_t kCroutonCol = mlir::hmx::layout::kCroutonCol;
+    static constexpr int64_t kCroutonHalf = mlir::hmx::layout::kCroutonHalf;
 
     /// The logical (row-major) shape this crouton array holds: [M, N].
     int64_t getLogicalM() const { return getLogical()[0]; }
@@ -145,12 +145,12 @@ def Hmx_CroutonMemRefLayoutAttr
 
   let extraClassDeclaration = [{
     /// The edge of one crouton: a 32x32 fp16 tile.
-    static constexpr int64_t kTile = mlir::hmx::crouton::kTileEdge;
+    static constexpr int64_t kTile = mlir::hmx::layout::kTileEdge;
 
     /// The tail of one crouton in the physical rank-5 type.
-    static constexpr int64_t kCroutonPair = mlir::hmx::crouton::kCroutonPair;
-    static constexpr int64_t kCroutonCol = mlir::hmx::crouton::kCroutonCol;
-    static constexpr int64_t kCroutonHalf = mlir::hmx::crouton::kCroutonHalf;
+    static constexpr int64_t kCroutonPair = mlir::hmx::layout::kCroutonPair;
+    static constexpr int64_t kCroutonCol = mlir::hmx::layout::kCroutonCol;
+    static constexpr int64_t kCroutonHalf = mlir::hmx::layout::kCroutonHalf;
 
     /// The logical (row-major) shape this crouton array holds: [M, N].
     int64_t getLogicalM() const { return getLogical()[0]; }

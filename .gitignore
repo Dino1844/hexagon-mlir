@@ -55,3 +55,6 @@ triton-install
 
 # In-tree logs: measured artifacts live in the workspace logs/ dir instead
 /qcom_hexagon_backend/logs/
+
+# Local agent/editor state: neither build output nor ours to track
+/.serena/

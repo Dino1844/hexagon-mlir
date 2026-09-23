@@ -152,6 +152,16 @@ def WeightResident : InterfacePass<"weight-resident", "mlir::FunctionOpInterface
     for the host pre-packer. The option is off by default because dropping the
     pack is only correct when the caller actually pre-packs; the default leaves
     the IR byte-identical to before.
+
+    Process boundary (a real constraint, not an implementation detail): the
+    residency key is the compile-time source address (a constant's
+    `memref.global`) or the argument slot's aligned pointer (a prepacked
+    runtime weight); the runtime copies on the FIRST hit and returns the pinned
+    buffer on later hits without ever revalidating its contents. Within one
+    process, the weight behind such a key must therefore keep its contents --
+    reusing the same kernel with changed weight data in-process reads stale VTCM
+    (the host pre-packer caches by content hash on its side; the device side
+    never rechecks). A changed weight needs a fresh process.
   }];
 
   let options = [

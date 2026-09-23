@@ -524,7 +524,8 @@ def Hmx_AccReadOp
 
 def Hmx_StageOp
   : Hmx_Op<"stage",
-      [MemoryEffects<[MemRead, MemWrite, MemWrite<Hmx_EngineResource>]>]> {
+      [MemoryEffects<[MemRead, MemWrite, MemWrite<Hmx_EngineResource>]>,
+       NativeOpTrait<"HmxDmaOnly">]> {
   let hasVerifier = 1;
 
   let summary = "Start an asynchronous DDR -> VTCM transfer of one tile row";
@@ -576,7 +577,8 @@ def Hmx_StageOp
 def Hmx_AwaitOp
   : Hmx_Op<"await",
       [MemoryEffects<[MemRead, MemWrite, MemRead<Hmx_EngineResource>,
-                      MemWrite<Hmx_EngineResource>]>]> {
+                      MemWrite<Hmx_EngineResource>]>,
+       NativeOpTrait<"HmxDmaOnly">]> {
   let hasVerifier = 1;
 
   let summary = "Wait for a staged transfer and return its ready slot";

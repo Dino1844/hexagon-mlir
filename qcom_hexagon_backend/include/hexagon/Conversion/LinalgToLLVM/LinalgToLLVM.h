@@ -36,7 +36,9 @@ std::unique_ptr<OperationPass<ModuleOp>> createHexagonSlicingPass(
 std::unique_ptr<OperationPass<ModuleOp>> createHexagonTilingPass(
     const HexagonTilingOptions &options = HexagonTilingOptions());
 
-std::unique_ptr<OperationPass<ModuleOp>> createHexagonVectorizationPass();
+std::unique_ptr<OperationPass<ModuleOp>> createHexagonVectorizationPass(
+    const HexagonVectorizationOptions &options =
+        HexagonVectorizationOptions());
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>> createHexmemCpyToDMAPass();
 

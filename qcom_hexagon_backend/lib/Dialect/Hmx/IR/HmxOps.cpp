@@ -41,8 +41,8 @@ namespace {
 /// One crouton as it appears in the IR: 16 pairs x 32 columns x 2 halves of a
 /// pair. It is what `linalg.pack` produces from a 32x32 fp16 tile
 /// (see docs/hmx/hmx-system-design.md §10.1).
-constexpr int64_t kCroutonDims[3] = {crouton::kCroutonPair, crouton::kCroutonCol,
-                                     crouton::kCroutonHalf};
+constexpr int64_t kCroutonDims[3] = {layout::kCroutonPair, layout::kCroutonCol,
+                                     layout::kCroutonHalf};
 
 /// The conversion-state block the bias registers are loaded from: 256 B, which
 /// is also the HMX_BIAS_BYTES the runtime uses.
@@ -87,15 +87,15 @@ LogicalResult verifyCroutonArray(Operation *op, Value v, StringRef name) {
   // carries the logical matrix and must agree with the grid it is attached to
   // (the same cross-check the tensor encoding makes at construction). Without
   // the layout the shape alone is the contract, exactly as before.
-  if (auto layout =
+  if (auto memLayout =
           dyn_cast_or_null<CroutonMemRefLayoutAttr>(memrefType.getLayout())) {
-    if (layout.getLogical()[0] !=
-            memrefType.getDimSize(0) * crouton::kTileEdge ||
-        layout.getLogical()[1] !=
-            memrefType.getDimSize(1) * crouton::kTileEdge)
+    if (memLayout.getLogical()[0] !=
+            memrefType.getDimSize(0) * layout::kTileEdge ||
+        memLayout.getLogical()[1] !=
+            memrefType.getDimSize(1) * layout::kTileEdge)
       return op->emitOpError()
              << name << " carries #hmx.crouton_memref_layout with logical ["
-             << layout.getLogical()[0] << ", " << layout.getLogical()[1]
+             << memLayout.getLogical()[0] << ", " << memLayout.getLogical()[1]
              << "] but the grid is [" << memrefType.getDimSize(0) << ", "
              << memrefType.getDimSize(1) << "]";
   }
@@ -242,11 +242,13 @@ LogicalResult verifyMatmul(Operation *op, Value lhs, Value rhs, Value out) {
            << "expects croutons: [., ., " << kCroutonDims[0] << ", "
            << kCroutonDims[1] << ", " << kCroutonDims[2] << "]";
 
-  // rhs stores Wᵀ, so K is its second grid dim (see weightKTiles).
-  if (lhsType.getDimSize(1) != rhsType.getDimSize(1))
+  // rhs stores Wᵀ, so K is its second grid dim: read the weight grid through
+  // its accessors (the named single source for which grid dim is K and which
+  // is N -- see weightKTiles/weightNTiles in HmxDialect.h).
+  if (lhsType.getDimSize(1) != weightKTiles(rhsType))
     return op->emitOpError("inner tile counts must agree");
   if (outType.getDimSize(0) != lhsType.getDimSize(0) ||
-      outType.getDimSize(1) != rhsType.getDimSize(0))
+      outType.getDimSize(1) != weightNTiles(rhsType))
     return op->emitOpError("output tile count must be [Mt, Nt]");
 
   return success();
@@ -361,7 +363,7 @@ LogicalResult UnpackAccOp::verify() {
                                     "dst")))
     return failure();
   // A tile row holds exactly 16 row-pairs; `col` selects the first.
-  return verifyCount(getOperation(), getCount(), crouton::kCroutonPair,
+  return verifyCount(getOperation(), getCount(), layout::kCroutonPair,
                      "row-pair");
 }
 
@@ -421,7 +423,7 @@ LogicalResult UnpackAccF32Op::verify() {
              << getDst().getType();
 
   // Same 16-row-pair tile row as `hmx.unpack_acc`.
-  if (failed(verifyCount(op, getCount(), crouton::kCroutonPair, "row-pair")))
+  if (failed(verifyCount(op, getCount(), layout::kCroutonPair, "row-pair")))
     return failure();
 
   return success();
@@ -461,9 +463,9 @@ LogicalResult StageOp::verify() {
   if (dstType.getElementType() != srcType.getElementType())
     return op->emitOpError()
            << "dst element type must match the source element type";
-  if (dstType.getDimSize(0) != crouton::kTileEdge)
+  if (dstType.getDimSize(0) != layout::kTileEdge)
     return op->emitOpError()
-           << "dst must be one crouton tile tall (" << crouton::kTileEdge
+           << "dst must be one crouton tile tall (" << layout::kTileEdge
            << " rows), got " << dstType.getDimSize(0);
   if (dstType.getDimSize(1) != srcType.getDimSize(1))
     return op->emitOpError()

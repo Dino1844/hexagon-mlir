@@ -100,8 +100,32 @@ class HexagonOptions:
     # 2-D last-dim linalg.reduce (f16/f32 max/add) lowered to per-vector
     # elementwise folding plus an hvx.vror butterfly (vector-row-reduce pass)
     # instead of the scalarized per-lane chain the Hexagon backend produces for
-    # vector.reduce.fmax. Off by default: the device A/B switch.
+    # vector.reduce.fmax. Off by default: device A/B switch. NOTE 2026-09-23:
+    # the pattern (bufferized 2-D linalg.reduce) does not occur in production
+    # FA/softmax (fused/loopified earlier); S0 micro + lit only. See R19.
     enableVectorRowReduce: bool = False
+
+    # Vector f16/f32 arith.maxnumf rewritten into arith.maximumf + an explicit
+    # NaN correction (hvx-maxnum-legalize pass). The Hexagon HVX backend has
+    # no lowering for FMAXNUM (only FMAXIMUMNUM is Legal), so a vector maxnumf
+    # is expanded per lane into a ~130-instruction stack/scalar/build-vector
+    # chain (or fmaxf libcalls). Host-side the rewrite cuts the FA kernel 55%;
+    # but on device the R1-ON kernel aborted at launch on the hexmem path with
+    # a >=[512,128] maxnum tile. Root cause found (2026-09-23): three
+    # llvm_triton Hexagon backend RA bugs -- docs/history/hmx/llvm-hexagon-ra-bugs.md;
+    # the PS_aligna one is cherry-picked (tools/hexmlir/llvm-hexagon-ps-aligna.patch),
+    # the rest await upstream. Default OFF until then; the knob re-enables it
+    # (FA_MAXNUM in exp/hmx/op_bench/fa_ablate.py -- workspace scaffold, not
+    # in this repo).
+    enableMaxnumLegalize: bool = False
+    # Bisection knob for the pass above: false = bare maximumf (drops the NaN
+    # fixup and with it strict maxnum semantics). Only for device debugging.
+    enableMaxnumLegalizeFixup: bool = True
+    # Bisection knob: >=0 rewrites only the first N walk-ordered maxnumf
+    # sites (-1 = all). Device crash triage only.
+    enableMaxnumLegalizeSel: int = -1
+    # Bisection knob: skip the first N walk-ordered maxnumf sites.
+    enableMaxnumLegalizeSkip: int = 0
 
     # HMX tile-level software-pipeline depth (hmx-partition). 0 = auto (the
     # deepest activation-staging ring the VTCM budget and the tile count allow),

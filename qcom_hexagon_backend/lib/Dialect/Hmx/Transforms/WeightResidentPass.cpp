@@ -116,9 +116,9 @@ constexpr const char *kPrepackLayoutAttr = "hmx.weight_prepack_layout";
 /// so it cannot drift from the layout.
 static std::string prepackLayoutJson() {
   return std::string("{\"ndims\":5,\"results\":[[[1,") +
-         std::to_string(hmx::crouton::kTileEdge) + "],[2," +
-         std::to_string(hmx::crouton::kCroutonHalf) + "],[4,1]],[[0," +
-         std::to_string(hmx::crouton::kTileEdge) + "],[3,1]]]}";
+         std::to_string(hmx::layout::kTileEdge) + "],[2," +
+         std::to_string(hmx::layout::kCroutonHalf) + "],[4,1]],[[0," +
+         std::to_string(hmx::layout::kTileEdge) + "],[3,1]]]}";
 }
 
 /// The prepacked constant a value is loaded from, or null. Only the direct
@@ -401,15 +401,16 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
   // same [K, BN] block, the whole grid has to be whole croutons, and the block
   // has to tile N exactly so every program's slice lies inside the resident.
   // A weight grid is [Nt, Kt, ...]: dim0 is N, dim1 is K.
-  if (crouton.getRank() != 5 || crouton.getDimSize(1) * hmx::crouton::kTileEdge != k ||
-      crouton.getDimSize(0) * hmx::crouton::kTileEdge != bn)
+  if (crouton.getRank() != 5 ||
+      hmx::weightKTiles(crouton) * hmx::layout::kTileEdge != k ||
+      hmx::weightNTiles(crouton) * hmx::layout::kTileEdge != bn)
     return std::nullopt;
   // Strictly narrower than the whole N: the model is "the view is *one* N block
   // of a wider weight", so a view as wide as the whole N is a block of nothing
   // (there are no other blocks for an offset to select) and any offset into it
   // is not an N offset -- it is the K-block case the offset check below rejects.
   // One N block means at least two.
-  if (n % hmx::crouton::kTileEdge != 0 || bn % hmx::crouton::kTileEdge != 0 || n <= bn ||
+  if (n % hmx::layout::kTileEdge != 0 || bn % hmx::layout::kTileEdge != 0 || n <= bn ||
       n % bn != 0)
     return std::nullopt;
   // The offset is the descriptor's element offset (a one-element list), i.e. the
@@ -427,7 +428,7 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
   slice.n = n;
   int64_t staticOffset = reinterpret.getStaticOffsets().front();
   if (staticOffset != ShapedType::kDynamic) {
-    if (staticOffset < 0 || staticOffset % hmx::crouton::kTileEdge != 0 ||
+    if (staticOffset < 0 || staticOffset % hmx::layout::kTileEdge != 0 ||
         staticOffset + bn > n)
       return std::nullopt;
     slice.staticOffset = staticOffset;
@@ -435,7 +436,7 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
     if (reinterpret.getOffsets().size() != 1)
       return std::nullopt;
     Value offset = reinterpret.getOffsets().front();
-    if (!isMultipleOf(offset, hmx::crouton::kTileEdge) || isMultipleOf(offset, n))
+    if (!isMultipleOf(offset, hmx::layout::kTileEdge) || isMultipleOf(offset, n))
       return std::nullopt;
     slice.dynamicOffset = offset;
   }
@@ -557,7 +558,7 @@ struct WeightResidentPass
 
         BlockArgument arg;
         MemRefType residentType;
-        int64_t logicalN = type.getDimSize(0) * hmx::crouton::kTileEdge;
+        int64_t logicalN = hmx::weightNTiles(type) * hmx::layout::kTileEdge;
         std::optional<WeightSlice> slice;
         if (BlockArgument denseArg = underlyingDenseArgument(src)) {
           arg = denseArg;
@@ -569,7 +570,7 @@ struct WeightResidentPass
           logicalN = slice->n;
           SmallVector<int64_t> wholeShape(type.getShape().begin(),
                                           type.getShape().end());
-          wholeShape[0] = slice->n / hmx::crouton::kTileEdge;
+          wholeShape[0] = slice->n / hmx::layout::kTileEdge;
           residentType = MemRefType::get(wholeShape, type.getElementType(),
                                          AffineMap{},
                                          hexagon::VTCM_ADDRESS_SPACE);
@@ -614,9 +615,11 @@ struct WeightResidentPass
           // and the permutation comes from the compiler's own layout map. The
           // logical shape is reconstructed from the crouton grid -- the whole
           // `[K, N]` for an N-slice, the argument exactly for a dense weight.
-          // A weight grid is [Nt, Kt, ...], so K is dim1 and N is `logicalN`.
-          SmallVector<int64_t> logical{residentType.getDimSize(1) * hmx::crouton::kTileEdge,
-                                       logicalN};
+          // A weight grid is [Nt, Kt, ...], so K is `weightKTiles` and N is
+          // `logicalN`.
+          SmallVector<int64_t> logical{
+              hmx::weightKTiles(residentType) * hmx::layout::kTileEdge,
+              logicalN};
           std::string entry =
               "{\"func\":\"" + func.getSymName().str() + "\",\"slot\":" +
               std::to_string(slot) + ",\"shape\":" + jsonArray(logical) +
@@ -643,12 +646,12 @@ struct WeightResidentPass
           Value n0Crouton;
           if (slice->dynamicOffset) {
             Value edge = arith::ConstantIndexOp::create(rewriter, op.getLoc(),
-                                                        hmx::crouton::kTileEdge);
+                                                        hmx::layout::kTileEdge);
             n0Crouton = arith::DivUIOp::create(rewriter, op.getLoc(),
                                                slice->dynamicOffset, edge);
           } else {
             n0Crouton = arith::ConstantIndexOp::create(
-                rewriter, op.getLoc(), *slice->staticOffset / hmx::crouton::kTileEdge);
+                rewriter, op.getLoc(), *slice->staticOffset / hmx::layout::kTileEdge);
           }
           SmallVector<OpFoldResult> offsets{n0Crouton, rewriter.getIndexAttr(0),
                                             rewriter.getIndexAttr(0),

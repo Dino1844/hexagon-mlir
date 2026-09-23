@@ -44,10 +44,24 @@ using namespace hexagon;
 
 namespace {
 
-static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
+static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op,
+                                       bool skipVectorRowReduce) {
   auto fnName = op->getAttrOfType<StringAttr>("library_call");
   if (fnName) {
     DBG("-> skipping vectorization. Op will be replaced with a library call.");
+    return failure();
+  }
+
+  // A row reduce that the vector-row-reduce pass rewrites into a vector fold
+  // + hvx.vror butterfly must not be consumed here into a
+  // vector.multi_reduction: the LLVM lowering of that reduction is the
+  // ExpandReductions valign tree the butterfly exists to replace. Same
+  // predicate as the pass (matchVectorRowReduce) -- it accepts both the
+  // linalg.reduce and its generalized linalg.generic form -- so the two can
+  // never disagree about which reduces are diverted.
+  if (skipVectorRowReduce && matchVectorRowReduce(op)) {
+    DBG("-> skipping vectorization. Row reduce is left for"
+        " vector-row-reduce.");
     return failure();
   }
 
@@ -82,6 +96,10 @@ static LogicalResult vectorizeLinalgOp(linalg::LinalgOp op) {
 struct HexagonVectorizationPass
     : public ::impl::HexagonVectorizationBase<HexagonVectorizationPass> {
 public:
+  HexagonVectorizationPass() = default;
+  HexagonVectorizationPass(const HexagonVectorizationOptions &options)
+      : Base(options) {}
+
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<func::FuncDialect, arith::ArithDialect, math::MathDialect,
@@ -95,7 +113,7 @@ public:
     MLIRContext *context = moduleOp.getContext();
     moduleOp.walk([&](linalg::LinalgOp op) {
       DBG("vectorization candidate: " << op << "\n");
-      if (succeeded(vectorizeLinalgOp(op))) {
+      if (succeeded(vectorizeLinalgOp(op, skipVectorRowReduce))) {
         DBG(" -> vectorization succeeded.\n");
       } else {
         DBG(" -> vectorization failed.\n");
@@ -106,6 +124,7 @@ public:
 };
 } // namespace
 std::unique_ptr<OperationPass<ModuleOp>>
-hexagon::createHexagonVectorizationPass() {
-  return std::make_unique<HexagonVectorizationPass>();
+hexagon::createHexagonVectorizationPass(
+    const HexagonVectorizationOptions &options) {
+  return std::make_unique<HexagonVectorizationPass>(options);
 }

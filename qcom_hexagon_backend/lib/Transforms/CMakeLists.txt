@@ -25,6 +25,7 @@ add_mlir_library(Transforms
   EraseUnusedLinalgOperands.cpp
   CollapseAddressSpace.cpp
   FastInversePass.cpp
+  MaxnumLegalizePass.cpp
   ConvertZeroSizeMemrefPass.cpp
   ConvertToHexagonmem.cpp
   LowerTPtr.cpp

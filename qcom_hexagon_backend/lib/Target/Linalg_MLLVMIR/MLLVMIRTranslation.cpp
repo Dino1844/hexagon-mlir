@@ -33,6 +33,8 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
+#include <cstdlib>
 #include "llvm/IR/Constants.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
@@ -138,6 +140,37 @@ void setLinalgToLLVMOptions(
   options.enableVectorRowReduce =
       vectorRowReduce != arch_kwargs.end() &&
       !vectorRowReduce->second.compare(TRUE);
+  // Vector maxnumf -> vmax + NaN fixup legalization. Tolerant read: absent
+  // keeps the pass default (off); the key overrides it.
+  auto maxnumLegalize = arch_kwargs.find("enableMaxnumLegalize");
+  if (maxnumLegalize != arch_kwargs.end())
+    options.enableMaxnumLegalize = !maxnumLegalize->second.compare(TRUE);
+  // Fixup bisection knob for the same pass; absent = fixup on (semantics
+  // preserved). false = bare maximumf (maxnum semantics dropped).
+  auto maxnumFixup = arch_kwargs.find("enableMaxnumLegalizeFixup");
+  if (maxnumFixup != arch_kwargs.end())
+    options.emitMaxnumFixup = !maxnumFixup->second.compare(TRUE);
+  // Site-selector bisection knobs, parsed tolerantly: plain atoi mapped
+  // garbage to 0, i.e. silently "rewrite/skip zero sites" for a typo'd knob.
+  // Non-integer now warns and keeps the default instead.
+  auto parseIntOr = [&](const char *key, int def) {
+    auto it = arch_kwargs.find(key);
+    if (it == arch_kwargs.end())
+      return def;
+    const std::string &s = it->second;
+    char *end = nullptr;
+    long v = std::strtol(s.c_str(), &end, 10);
+    if (end == s.c_str() || *end != '\0') {
+      llvm::errs() << "hexagon backend: non-integer option " << key << "=\""
+                   << s << "\" ignored (keeping " << def << ")\n";
+      return def;
+    }
+    return static_cast<int>(v);
+  };
+  options.maxnumSiteLimit =
+      parseIntOr("enableMaxnumLegalizeSel", options.maxnumSiteLimit);
+  options.maxnumSiteSkip =
+      parseIntOr("enableMaxnumLegalizeSkip", options.maxnumSiteSkip);
 }
 
 namespace mlir {

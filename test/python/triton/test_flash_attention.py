@@ -21,7 +21,13 @@ Z, H, N_CTX, D_HEAD = 1, 1, 1024, 64
 BLOCK_N = 64
 BLOCK_DMODEL = 64
 STAGE = 1
-NUM_THREADS = 4
+NUM_THREADS = 1  # 2026-09-23: was 4. grid=4/BLOCK_M=256 was 2.2x slower than
+# grid=1/BLOCK_M=1024 at N_CTX=1024 (17.4 ms vs 7.9 ms, same build 08ead6f2,
+# 2 reps each, same options otherwise). Mechanism: every program re-reads the
+# whole K/V, and the per-program penalty (~1.8-5.8 ms per extra program at
+# BN=64) dominates; grid=1 pays it once. BLOCK_N stays 64. NOTE: BLOCK_M =
+# N_CTX / NUM_THREADS, so this does not scale to long sequences -- for large
+# N_CTX keep NUM_THREADS high enough that BLOCK_M fits.
 
 assert N_CTX % NUM_THREADS == 0
 BLOCK_M = N_CTX // NUM_THREADS

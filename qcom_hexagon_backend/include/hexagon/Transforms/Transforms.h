@@ -42,6 +42,10 @@ std::unique_ptr<OperationPass<func::FuncOp>> createExpandMathOpsPass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createFastInversePass();
 
+std::unique_ptr<OperationPass<func::FuncOp>>
+createHvxMaxnumLegalizePass(bool emitFixup = true, int rewriteLimit = -1,
+                            int skipFirst = 0);
+
 std::unique_ptr<OperationPass<ModuleOp>> createHexagonAddFastMathPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>

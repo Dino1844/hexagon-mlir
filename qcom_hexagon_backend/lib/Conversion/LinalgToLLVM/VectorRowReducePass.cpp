@@ -30,6 +30,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 
@@ -43,10 +44,8 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Pass/Pass.h"
 
-#include <functional>
-#include <optional>
-
 using namespace mlir;
+using namespace mlir::hexagon;
 
 // At global scope, like the rest of this family: the generated pass base lands
 // in ::impl.
@@ -55,85 +54,8 @@ using namespace mlir;
 
 namespace {
 
-/// One HVX vector register, in bytes. The kernels this pipeline serves run
-/// with HVX length 128B (v79); a row chunk of this width is what the butterfly
-/// needs.
-static constexpr int kHvxVectorBytes = 128;
-
-/// The row byte width the pass requires: a whole number of HVX vectors.
-struct RowShape {
-  int64_t rows;      // dim 0
-  int64_t cols;      // dim 1
-  int64_t elemBytes; // f16 -> 2, f32 -> 4
-};
-
-static std::optional<RowShape> rowShapeOf(Value memref) {
-  auto type = dyn_cast<MemRefType>(memref.getType());
-  if (!type || !type.hasStaticShape() || type.getRank() != 2)
-    return std::nullopt;
-  Type elemTy = type.getElementType();
-  int64_t elemBytes;
-  if (elemTy.isF32())
-    elemBytes = 4;
-  else if (elemTy.isF16())
-    elemBytes = 2;
-  else
-    return std::nullopt;
-  // A row must be contiguous (the vector reads walk it with unit stride); the
-  // outer stride may be anything -- each row is addressed through its own
-  // subview.
-  SmallVector<int64_t> strides;
-  int64_t offset;
-  if (failed(type.getStridesAndOffset(strides, offset)) || strides.empty() ||
-      strides.back() != 1)
-    return std::nullopt;
-  int64_t cols = type.getDimSize(1);
-  if ((cols * elemBytes) % kHvxVectorBytes != 0)
-    return std::nullopt;
-  return RowShape{type.getDimSize(0), cols, elemBytes};
-}
-
-/// The body contract: exactly one binary maxnumf/addf over the two block
-/// args, yielded directly. Returns the fastmath flags it must be rebuilt
-/// with, or nothing when the body does not match.
-static std::optional<arith::FastMathFlags>
-matchFoldBody(linalg::ReduceOp op,
-              std::function<Value(OpBuilder &, Location, arith::FastMathFlags,
-                                  Value, Value)> &emit) {
-  Block &block = op.getRegion().front();
-  if (block.getOperations().size() != 2)
-    return std::nullopt;
-  auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
-  if (!yield || yield.getNumOperands() != 1)
-    return std::nullopt;
-  auto bin = yield->getOperand(0).getDefiningOp();
-  if (!bin)
-    return std::nullopt;
-  Value blockIn = block.getArgument(0), blockInit = block.getArgument(1);
-  auto isArgs = [&](Value v) {
-    return v == blockIn || v == blockInit;
-  };
-
-  if (auto maxnumf = dyn_cast<arith::MaxNumFOp>(bin)) {
-    if (!isArgs(maxnumf.getLhs()) || !isArgs(maxnumf.getRhs()))
-      return std::nullopt;
-    emit = [](OpBuilder &b, Location loc, arith::FastMathFlags fm, Value l,
-              Value r) {
-      return arith::MaxNumFOp::create(b, loc, l, r, fm).getResult();
-    };
-    return maxnumf.getFastmath();
-  }
-  if (auto addf = dyn_cast<arith::AddFOp>(bin)) {
-    if (!isArgs(addf.getLhs()) || !isArgs(addf.getRhs()))
-      return std::nullopt;
-    emit = [](OpBuilder &b, Location loc, arith::FastMathFlags fm, Value l,
-              Value r) {
-      return arith::AddFOp::create(b, loc, l, r, fm).getResult();
-    };
-    return addf.getFastmath();
-  }
-  return std::nullopt;
-}
+// kHvxVectorBytes (the 128 B row-chunk width) comes from Common.h -- one
+// contract shared with the vectorizer's skip gate.
 
 struct VectorRowReducePass
     : public ::impl::VectorRowReduceBase<VectorRowReducePass> {
@@ -151,56 +73,57 @@ public:
   void runOnOperation() override {
     auto fn = getOperation();
     // Collect first: rewriting invalidates the walk.
-    SmallVector<linalg::ReduceOp> candidates;
-    fn.walk([&](linalg::ReduceOp op) {
-      std::function<Value(OpBuilder &, Location, arith::FastMathFlags, Value,
-                          Value)>
-          emit;
-      if (matches(op, emit))
-        candidates.push_back(op);
+    SmallVector<std::pair<linalg::LinalgOp, RowReduceFold>> candidates;
+    fn.walk([&](linalg::LinalgOp op) {
+      // Bufferized form only: the rewrite walks memrefs.
+      if (op->getNumResults() != 0)
+        return;
+      if (auto fold = matchVectorRowReduce(op))
+        candidates.emplace_back(op, *fold);
     });
-    for (linalg::ReduceOp op : candidates) {
-      if (failed(rewrite(op)))
+    for (auto &[op, fold] : candidates) {
+      if (failed(rewrite(op, fold)))
         return signalPassFailure();
     }
   }
 
 private:
-  static bool matches(linalg::ReduceOp op,
-                      std::function<Value(OpBuilder &, Location,
-                                          arith::FastMathFlags, Value, Value)>
-                          &emit) {
-    // Bufferized form only: the vector rewrite walks memrefs.
-    if (op.getNumResults() != 0)
-      return false;
-    if (op.getInputs().size() != 1 || op.getInits().size() != 1)
-      return false;
-    ArrayRef<int64_t> dims = op.getDimensions();
-    if (dims.size() != 1 || dims[0] != 1)
-      return false;
-    auto src = rowShapeOf(op.getInputs()[0]);
-    if (!src || src->rows == 0)
-      return false;
-    auto dstTy = dyn_cast<MemRefType>(op.getInits()[0].getType());
-    if (!dstTy || !dstTy.hasStaticShape() || dstTy.getRank() != 1 ||
-        dstTy.getDimSize(0) != src->rows ||
-        dstTy.getElementType() !=
-            cast<MemRefType>(op.getInputs()[0].getType()).getElementType())
-      return false;
-    return matchFoldBody(op, emit).has_value();
+  static Value emitFold(OpBuilder &b, Location loc, const RowReduceFold &fold,
+                        Value l, Value r) {
+    if (fold.isMaxNum)
+      return arith::MaxNumFOp::create(b, loc, l, r, fold.fastmath).getResult();
+    return arith::AddFOp::create(b, loc, l, r, fold.fastmath).getResult();
   }
 
-  LogicalResult rewrite(linalg::ReduceOp op) const {
-    Value src = op.getInputs()[0];
-    Value dst = op.getInits()[0];
+  LogicalResult rewrite(linalg::LinalgOp op, const RowReduceFold &fold) const {
+    // A generalized reduce arrives as linalg.generic (LinalgGeneralize runs
+    // earlier), a reduce still as linalg.reduce; the outs carry one value per
+    // row (or a scalar for a single-row reduce).
+    Value src, dst;
+    if (auto ro = dyn_cast<linalg::ReduceOp>(op.getOperation())) {
+      src = ro.getInputs()[0];
+      dst = ro.getInits()[0];
+    } else if (auto g = dyn_cast<linalg::GenericOp>(op.getOperation())) {
+      src = g.getInputs()[0];
+      dst = g.getOutputs()[0];
+    } else {
+      op->emitOpError("row-reduce rewrite: unsupported linalg op kind");
+      return failure();
+    }
+    if (!src || !dst) {
+      op->emitOpError("row-reduce rewrite: missing src/dst");
+      return failure();
+    }
+    if (!isa<MemRefType>(src.getType()) || !isa<MemRefType>(dst.getType())) {
+      op->emitOpError("row-reduce rewrite: not bufferized (src=")
+          .attachNote()
+          << src.getType() << " dst=" << dst.getType();
+      return failure();
+    }
     auto srcTy = cast<MemRefType>(src.getType());
+    auto dstTy = cast<MemRefType>(dst.getType());
     Type elemTy = srcTy.getElementType();
-    RowShape shape = *rowShapeOf(src);
-
-    std::function<Value(OpBuilder &, Location, arith::FastMathFlags, Value,
-                        Value)>
-        emit;
-    arith::FastMathFlags fm = *matchFoldBody(op, emit);
+    RowReduceShape shape = fold.shape;
 
     int64_t lanes = kHvxVectorBytes / shape.elemBytes; // f32: 32, f16: 64
     int64_t chunks = shape.cols / lanes;
@@ -229,17 +152,31 @@ private:
     // rank-reduced verifier check needs the dropped dim to be statically 1.
     // The memory space carries over: the reduce source may live in VTCM
     // (hexagonmem, space 1), and the reads must stay in it.
-    auto rowTy = MemRefType::get(
-        {shape.cols}, elemTy,
-        StridedLayoutAttr::get(b.getContext(), ShapedType::kDynamic, {1}),
-        srcTy.getMemorySpace());
-    SmallVector<OpFoldResult> rowOffsets{r, b.getIndexAttr(0)};
-    SmallVector<OpFoldResult> rowSizes{b.getIndexAttr(1),
-                                       b.getIndexAttr(shape.cols)};
-    SmallVector<OpFoldResult> rowStrides{b.getIndexAttr(1),
-                                         b.getIndexAttr(1)};
-    auto row = memref::SubViewOp::create(b, loc, rowTy, src, rowOffsets,
-                                         rowSizes, rowStrides);
+    Value row;
+    if (srcTy.getRank() == 2) {
+      // Rank-reduced view of the size-1 row dim of the current row; the outer
+      // stride stays in the subview, which is why the offset is dynamic.
+      // Static sizes/strides: the rank-reduced verifier check needs the
+      // dropped dim to be statically 1. The memory space carries over: the
+      // source may live in VTCM (hexagonmem, space 1), and the reads must
+      // stay in it.
+      auto rowTy = MemRefType::get(
+          {shape.cols}, elemTy,
+          StridedLayoutAttr::get(b.getContext(), ShapedType::kDynamic, {1}),
+          srcTy.getMemorySpace());
+      SmallVector<OpFoldResult> rowOffsets{r, b.getIndexAttr(0)};
+      SmallVector<OpFoldResult> rowSizes{b.getIndexAttr(1),
+                                         b.getIndexAttr(shape.cols)};
+      SmallVector<OpFoldResult> rowStrides{b.getIndexAttr(1),
+                                           b.getIndexAttr(1)};
+      row = memref::SubViewOp::create(b, loc, rowTy, src, rowOffsets, rowSizes,
+                                      rowStrides);
+    } else {
+      // Single row (rank-1 source): the source *is* the row. No subview, so
+      // no layout to guess -- a subview here would have to declare an offset
+      // segment that the natural result (static offset 0) does not have.
+      row = src;
+    }
 
     // Cross-chunk elementwise fold: lane i holds the fold over the same lane
     // of every 128-byte chunk of the row.
@@ -250,7 +187,7 @@ private:
       Value chunk = vector::TransferReadOp::create(
           b, loc, vecTy, row, ValueRange{col}, pad,
           llvm::ArrayRef<bool>(kInBounds));
-      acc = k == 0 ? chunk : emit(b, loc, fm, acc, chunk);
+      acc = k == 0 ? chunk : emitFold(b, loc, fold, acc, chunk);
     }
 
     // Butterfly: rotate the register right by half the remaining span and
@@ -259,16 +196,21 @@ private:
          bytes /= 2) {
       Value rotated = hvx::VrorOp::create(b, loc, vecTy, acc,
                                           b.getI32IntegerAttr(bytes));
-      acc = emit(b, loc, fm, rotated, acc);
+      acc = emitFold(b, loc, fold, rotated, acc);
     }
 
     // Fold in the reduce's own init (the outs element) and keep the scalar
     // contract: one reduced value per row, stored where the reduce wrote it.
-    Value init = memref::LoadOp::create(b, loc, dst, ValueRange{r});
+    // A scalar outs (rank 0, single-row reduce) takes no index; a rank-1
+    // outs of one element is addressed by r (= 0).
+    SmallVector<Value> dstIdx;
+    if (dstTy.getRank() > 0)
+      dstIdx.push_back(r);
+    Value init = memref::LoadOp::create(b, loc, dst, dstIdx);
     Value initVec = vector::BroadcastOp::create(b, loc, vecTy, init);
-    acc = emit(b, loc, fm, acc, initVec);
+    acc = emitFold(b, loc, fold, acc, initVec);
     Value scalar = vector::ExtractOp::create(b, loc, acc, 0);
-    memref::StoreOp::create(b, loc, scalar, dst, ValueRange{r});
+    memref::StoreOp::create(b, loc, scalar, dst, dstIdx);
     scf::YieldOp::create(b, loc);
 
     op.erase();
