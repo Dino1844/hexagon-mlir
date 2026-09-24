@@ -31,11 +31,12 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 namespace mlir {
 namespace hmx {
 
-/// The HMX engine as this compiler knows it: the v1 engine on this device.
+/// The HMX engine capabilities known to this compiler.
 ///
 /// The contract is compile-time constants -- one crouton is a 32x32 fp16 block,
 /// the device VTCM is 8 MiB and the engine shares it with the rest of the kernel
@@ -84,6 +85,12 @@ struct HmxTarget {
     return elem.isF16() || elem.isF32();
   }
 
+  /// The shape-level plan selected by the capability query. `HMXTail` is a
+  /// classification, not permission to lower: only the explicit diagnostic
+  /// producer/partition bridge consumes it, and production attribution remains
+  /// closed until kernel-wide workspace accounting is complete.
+  enum class ContractionPlan { FullHMX, HMXTail, HVX };
+
   /// The single capability query behind both attribution and its diagnostics.
   /// Keeping the refusal here prevents the pass from growing a second copy of
   /// the engine contract merely to explain it.
@@ -94,24 +101,60 @@ struct HmxTarget {
     TileAlignment,
   };
 
+  struct ContractionShape {
+    int64_t m = 0, n = 0, k = 0;
+    int64_t mp = 0, np = 0, kp = 0;
+    int64_t mf = 0, nf = 0, kf = 0;
+    int64_t mt = 0, nt = 0, kt = 0;
+  };
+
   struct ContractionDecision {
     ContractionRefusal refusal = ContractionRefusal::None;
+    ContractionPlan plan = ContractionPlan::HVX;
+    ContractionShape shape;
 
+    /// `supported()` remains the executable predicate for the current
+    /// pipeline. A tail candidate deliberately has a TileAlignment refusal
+    /// until the tail lowering contract is implemented.
     bool supported() const { return refusal == ContractionRefusal::None; }
+    bool tailCandidate() const { return plan == ContractionPlan::HMXTail; }
     explicit operator bool() const { return supported(); }
   };
+
+  static bool splitExtent(int64_t value, int64_t &full, int64_t &padded,
+                          int64_t &tail) {
+    if (value <= 0 ||
+        value > std::numeric_limits<int64_t>::max() - (tileEdge - 1))
+      return false;
+    full = (value / tileEdge) * tileEdge;
+    tail = value - full;
+    padded = ((value + tileEdge - 1) / tileEdge) * tileEdge;
+    return true;
+  }
 
   ContractionDecision queryContraction(int64_t m, int64_t n, int64_t k,
                                       Type lhsElem, Type rhsElem,
                                       Type outElem) const {
     if (!isContractionOperand(lhsElem) || !isContractionOperand(rhsElem) ||
         (!outElem.isF16() && !outElem.isF32()))
-      return {ContractionRefusal::UnsupportedDType};
+      return {ContractionRefusal::UnsupportedDType, ContractionPlan::HVX, {}};
     if (m <= minRows)
-      return {ContractionRefusal::MinRows};
-    if (m % tileEdge != 0 || n % tileEdge != 0 || k % tileEdge != 0)
-      return {ContractionRefusal::TileAlignment};
-    return {};
+      return {ContractionRefusal::MinRows, ContractionPlan::HVX, {}};
+
+    ContractionShape shape;
+    shape.m = m;
+    shape.n = n;
+    shape.k = k;
+    if (!splitExtent(m, shape.mf, shape.mp, shape.mt) ||
+        !splitExtent(n, shape.nf, shape.np, shape.nt) ||
+        !splitExtent(k, shape.kf, shape.kp, shape.kt))
+      return {ContractionRefusal::TileAlignment, ContractionPlan::HVX, {}};
+
+    bool aligned = shape.mt == 0 && shape.nt == 0 && shape.kt == 0;
+    return {aligned ? ContractionRefusal::None
+                    : ContractionRefusal::TileAlignment,
+            aligned ? ContractionPlan::FullHMX : ContractionPlan::HMXTail,
+            shape};
   }
 
   bool supportsContraction(int64_t m, int64_t n, int64_t k, Type lhsElem,

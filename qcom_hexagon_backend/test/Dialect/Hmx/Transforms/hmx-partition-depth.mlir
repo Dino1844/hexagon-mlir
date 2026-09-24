@@ -31,32 +31,18 @@
 // bufferization rebuilds the op. The module manifest is updated in place before
 // hmx.matmul is erased.
 // DEPTH1: hmx.kernel_manifest = {
-// DEPTH1-SAME: function = "depth"
-// DEPTH1-SAME: pipeline_depth = 1 : i64
-// DEPTH1-SAME: pipeline_requested = 1 : i64
-// DEPTH1-SAME: pipeline_selected = "staged"
+// DEPTH1: pipeline = {depth = 1 : i64, requested = 1 : i64, selected = "staged"}
 
 // DEPTH2: hmx.kernel_manifest = {
-// DEPTH2-SAME: function = "depth"
-// DEPTH2-SAME: pipeline_depth = 2 : i64
-// DEPTH2-SAME: pipeline_requested = 2 : i64
-// DEPTH2-SAME: pipeline_selected = "staged"
+// DEPTH2: pipeline = {depth = 2 : i64, requested = 2 : i64, selected = "staged"}
 
 // A requested depth-2 ring that the budget cannot pay for remains staged, but
 // the selected depth and canonical reason describe the downgrade.
 // DOWNGRADE: hmx.kernel_manifest = {
-// DOWNGRADE-SAME: function = "depth"
-// DOWNGRADE-SAME: pipeline_depth = 1 : i64
-// DOWNGRADE-SAME: pipeline_reason = "vtcm-budget"
-// DOWNGRADE-SAME: pipeline_requested = 2 : i64
-// DOWNGRADE-SAME: pipeline_selected = "staged"
+// DOWNGRADE: pipeline = {depth = 1 : i64, reason = "vtcm-budget", requested = 2 : i64, selected = "staged"}
 
 // DEPTH3: hmx.kernel_manifest = {
-// DEPTH3-SAME: function = "depth"
-// DEPTH3-SAME: pipeline_depth = 0 : i64
-// DEPTH3-SAME: pipeline_reason = "serial-requested"
-// DEPTH3-SAME: pipeline_requested = 3 : i64
-// DEPTH3-SAME: pipeline_selected = "serial"
+// DEPTH3: pipeline = {depth = 0 : i64, reason = "serial-requested", requested = 3 : i64, selected = "serial"}
 
 // Forced depth 1: one scratch, one slot, one status word, and the serial
 // source loop -- issue, await, compute -- left unpipelined (no iter_args, no
@@ -113,7 +99,7 @@
 // DEPTH3: hmx.acc_read %{{.*}}, %[[ACC]], %[[M]], %[[N]] {bias_set = 0 : i32}
 // DEPTH3-NOT: hmx.matmul
 
-module attributes {hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{blocking = "whole", block_m = 128 : i64, count_semantics = "ir_sites", engine = "hmx", function = "depth", id = 0 : i64, k = 1024 : i64, lhs_elem = "f16", m = 128 : i64, n = 64 : i64, out_elem = "f16", pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, reason = "selected", rhs_elem = "f16", unpack_sites = 1 : i64, vtcm_before = 0 : i64, vtcm_budget = 8388608 : i64, vtcm_peak = 409600 : i64}], pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, schema = "hex.hmx.kernel_manifest/v1", unpack_sites = 1 : i64}} {
+module attributes {hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{dtypes = {crouton = "f16", lhs = "f16", out = "f16", rhs = "f16"}, execution = {block_m = 128 : i64, blocking = "whole", bridge_counts = {count_semantics = "ir_sites", pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, unpack_sites = 1 : i64}}, full = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, function = "depth", id = 0 : i64, layout = "row-major-inner-contiguous", logical = {k = {kind = "static", value = 1024 : i64}, m = {kind = "static", value = 128 : i64}, n = {kind = "static", value = 64 : i64}}, padded = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, plan = "full-hmx", reason = "selected-aligned", shape_state = "static", tail = {k = 0 : i64, m = 0 : i64, n = 0 : i64}, vtcm_accounting = "bridge-only", vtcm_before_bytes = 0 : i64, vtcm_bridge_peak_bytes = 409600 : i64, vtcm_budget_bytes = 8388608 : i64, weight_binding = {kind = "argument-slot", policy_ref = {function = "depth", slot = 1 : i64}}, workspace_class = "runtime-internal"}], pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, schema = "hex.hmx.kernel_manifest/v2", unpack_sites = 1 : i64, weight_policies = []}} {
 func.func @depth(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

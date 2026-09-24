@@ -1,4 +1,4 @@
-//===- hmx-manifest-matmul.mlir - v1 attribution manifest -----------------===//
+//===- hmx-manifest-matmul.mlir - semantic attribution manifest ------------===//
 //
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause.
@@ -31,7 +31,8 @@
 // EMPTY: pack_act_sites = 0 : i64
 // EMPTY: pack_weight_sites = 0 : i64
 // EMPTY: unpack_sites = 0 : i64
-// EMPTY: schema = "hex.hmx.kernel_manifest/v1"
+// EMPTY: schema = "hex.hmx.kernel_manifest/v2"
+// EMPTY: weight_policies = []
 module {
   func.func @empty() {
     return
@@ -42,36 +43,25 @@ module {
 
 // A legal contraction is selected, its generated hmx.matmul carries the stable
 // decision id, and the manifest reports the actual bridge footprint.
-// SELECTED: hmx.kernel_manifest = {
-// SELECTED: count_semantics = "ir_sites"
-// SELECTED: block_m = 64 : i64
-// SELECTED: blocking = "whole"
-// SELECTED: count_semantics = "ir_sites"
-// SELECTED: engine = "hmx"
 // SELECTED: function = "selected"
 // SELECTED: id = 0 : i64
-// SELECTED: k = 64 : i64
-// SELECTED: lhs_elem = "f16"
-// SELECTED: m = 64 : i64
-// SELECTED: n = 64 : i64
-// SELECTED: out_elem = "f16"
-// SELECTED: pack_act_sites = 1 : i64
-// SELECTED: pack_weight_sites = 1 : i64
-// SELECTED: reason = "selected"
-// SELECTED: rhs_elem = "f16"
-// SELECTED: schema = "hex.hmx.kernel_manifest/v1"
-// SELECTED: unpack_sites = 1 : i64
-// SELECTED: vtcm_before = 0 : i64
-// SELECTED: vtcm_budget = 8388608 : i64
-// SELECTED: vtcm_peak = 24576 : i64
+// SELECTED: logical = {{.*}}
+// SELECTED: plan = "full-hmx"
+// SELECTED: reason = "selected-aligned"
+// SELECTED: shape_state = "static"
+// SELECTED: tail = {{.*}}
+// SELECTED: vtcm_before_bytes = 0 : i64
+// SELECTED: vtcm_budget_bytes = 8388608 : i64
+// SELECTED: vtcm_bridge_peak_bytes = 24576 : i64
+// SELECTED: weight_binding = {{.*}}
 // SELECTED: hmx.matmul
 // SELECTED: hmx.decision_id = 0 : i64
 // With the allocator off, even the otherwise legal contraction stays HVX and
 // publishes the environment code rather than a capability/budget code.
-// ALLOC: hmx.kernel_manifest = {
-// ALLOC: engine = "hvx"
 // ALLOC: function = "selected"
+// ALLOC: plan = "hvx"
 // ALLOC: reason = "vtcm-allocator-disabled"
+// ALLOC: shape_state = "static"
 module {
   func.func @selected(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>) -> tensor<64x64xf16> {
     %c = tensor.empty() : tensor<64x64xf16>
@@ -85,13 +75,13 @@ module {
 
 // A too-large whole contraction is still selected; the M-block decision is
 // explicit rather than inferred by the host from the logical shape.
-// BLOCKED: hmx.kernel_manifest = {
 // BLOCKED: block_m = 512 : i64
 // BLOCKED: blocking = "m_blocked"
-// BLOCKED: count_semantics = "ir_sites"
-// BLOCKED: reason = "selected"
-// BLOCKED: vtcm_before = 0 : i64
-// BLOCKED: vtcm_peak = 4784128 : i64
+// BLOCKED: function = "blocked"
+// BLOCKED: plan = "full-hmx"
+// BLOCKED: reason = "selected-aligned"
+// BLOCKED: vtcm_before_bytes = 0 : i64
+// BLOCKED: vtcm_bridge_peak_bytes = 4784128 : i64
 // BLOCKED: hmx.matmul
 // BLOCKED: hmx.decision_id = 0 : i64
 module {
@@ -109,15 +99,19 @@ module {
 // walk order. This is the duplicate-counting guard: the greedy driver may ask
 // the pattern repeatedly, but these ids are created before it starts.
 // REFUSALS: hmx.kernel_manifest = {
-// REFUSALS: matmuls = [{engine = "hvx", function = "refusals", id = 0 : i64
+// REFUSALS: matmuls = [{dtypes = {lhs = "f16", out = "f16", rhs = "f16"}, function = "refusals", id = 0 : i64
+// REFUSALS: logical = {k = {kind = "static", value = 31 : i64}, m = {kind = "static", value = 64 : i64}, n = {kind = "static", value = 64 : i64}}
+// REFUSALS: plan = "hvx"
 // REFUSALS: reason = "tile-alignment"
-// REFUSALS: }, {engine = "hvx", function = "refusals", id = 1 : i64
+// REFUSALS: shape_state = "static"
+// REFUSALS: }, {dtypes = {lhs = "f64", out = "f64", rhs = "f64"}, function = "refusals", id = 1 : i64
 // REFUSALS: reason = "unsupported-dtype"
-// REFUSALS: }, {engine = "hvx", function = "refusals", id = 2 : i64
+// REFUSALS: }, {dtypes = {lhs = "f16", out = "f16", rhs = "f16"}, function = "refusals", id = 2 : i64
 // REFUSALS: reason = "library-call"
-// REFUSALS: }, {engine = "hvx", function = "refusals", id = 3 : i64
+// REFUSALS: }, {dtypes = {lhs = "f16", out = "f16", rhs = "f16"}, function = "refusals", id = 3 : i64
 // REFUSALS: reason = "dynamic-shape"
-// REFUSALS: }, {engine = "hvx", function = "refusals", id = 4 : i64
+// REFUSALS: shape_state = "partially-dynamic"
+// REFUSALS: }, {dtypes = {lhs = "f16", out = "f16", rhs = "f16"}, function = "refusals", id = 4 : i64
 // REFUSALS: reason = "min-rows"
 module {
   func.func @refusals(%a: tensor<64x31xf16>, %b: tensor<31x64xf16>,
@@ -151,12 +145,11 @@ module {
 
 // Capability passed, but the bridge did not fit. The record remains HVX and
 // carries the budget reason; it must not publish selected-only budget fields.
-// BUDGET: hmx.kernel_manifest = {
-// BUDGET: engine = "hvx"
 // BUDGET: function = "over_budget"
 // BUDGET: id = 0 : i64
+// BUDGET: plan = "hvx"
 // BUDGET: reason = "vtcm-budget"
-// BUDGET: schema = "hex.hmx.kernel_manifest/v1"
+// BUDGET: shape_state = "static"
 module {
   func.func @over_budget(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>) -> tensor<64x64xf16> {
     %c = tensor.empty() : tensor<64x64xf16>
@@ -170,11 +163,12 @@ module {
 
 // A module may contain both decisions. The manifest is a list of per-matmul
 // records; it must not collapse the module into an invented "mixed" state.
-// MIXED: matmuls = [{{.*}}engine = "hmx", function = "mixed", id = 0 : i64
-// MIXED-SAME: reason = "selected"
-// MIXED-SAME: }, {engine = "hvx", function = "mixed", id = 1 : i64
-// MIXED-SAME: reason = "tile-alignment"
-// MIXED-NOT: function = "mixed"
+// MIXED: function = "mixed"
+// MIXED: plan = "full-hmx"
+// MIXED: reason = "selected-aligned"
+// MIXED: function = "mixed"
+// MIXED: plan = "hvx"
+// MIXED: reason = "tile-alignment"
 // MIXED: hmx.matmul
 // MIXED: hmx.decision_id = 0 : i64
 module {
@@ -193,15 +187,12 @@ module {
 
 // -----
 
-// f32 source and result values are part of the same v1 contract. The manifest
+// f32 source and result values are part of the same semantic contract. The manifest
 // records the source element types even though the engine croutons are f16.
-// F32: hmx.kernel_manifest = {
-// F32: engine = "hmx"
+// F32: dtypes = {crouton = "f16", lhs = "f32", out = "f32", rhs = "f32"}
 // F32: function = "f32_contract"
-// F32: lhs_elem = "f32"
-// F32: out_elem = "f32"
-// F32: reason = "selected"
-// F32: rhs_elem = "f32"
+// F32: plan = "full-hmx"
+// F32: reason = "selected-aligned"
 // F32: hmx.matmul
 module {
   func.func @f32_contract(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> tensor<64x64xf32> {

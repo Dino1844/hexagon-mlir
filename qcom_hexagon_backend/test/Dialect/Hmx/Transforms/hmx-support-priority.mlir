@@ -8,11 +8,22 @@
 //===----------------------------------------------------------------------===//
 
 // PRIORITY: hmx.kernel_manifest = {
-// PRIORITY-SAME: matmuls = [{{.*}}engine = "hvx", function = "priority", id = 0 : i64, reason = "library-call"
-// PRIORITY-SAME: , {engine = "hvx", function = "priority", id = 1 : i64, {{[^\}]*}}reason = "unsupported-dtype"
-// PRIORITY-SAME: , {engine = "hvx", function = "priority", id = 2 : i64, {{[^\}]*}}reason = "min-rows"
-// PRIORITY-SAME: , {engine = "hvx", function = "priority", id = 3 : i64, {{[^\}]*}}reason = "tile-alignment"
-// PRIORITY-NOT: function = "priority"
+// PRIORITY: function = "priority"
+// PRIORITY-SAME: id = 0 : i64
+// PRIORITY-SAME: plan = "hvx"
+// PRIORITY-SAME: reason = "library-call"
+// PRIORITY-SAME: function = "priority"
+// PRIORITY-SAME: id = 1 : i64
+// PRIORITY-SAME: plan = "hvx"
+// PRIORITY-SAME: reason = "unsupported-dtype"
+// PRIORITY-SAME: function = "priority"
+// PRIORITY-SAME: id = 2 : i64
+// PRIORITY-SAME: plan = "hvx"
+// PRIORITY-SAME: reason = "min-rows"
+// PRIORITY-SAME: function = "priority"
+// PRIORITY-SAME: id = 3 : i64
+// PRIORITY-SAME: plan = "hvx"
+// PRIORITY-SAME: reason = "tile-alignment"
 module {
   func.func @priority(
       %a: tensor<64x31xf16>, %b: tensor<31x64xf16>,
@@ -46,8 +57,8 @@ module {
 // allocator disabled, this dynamic matmul therefore reports the shape reason
 // rather than the environment reason.
 // ALLOC: hmx.kernel_manifest = {
-// ALLOC: engine = "hvx"
 // ALLOC: function = "allocator_priority"
+// ALLOC: plan = "hvx"
 // ALLOC: reason = "dynamic-shape"
 module {
   func.func @allocator_priority(%a: tensor<?x64xf16>, %b: tensor<64x64xf16>,

@@ -574,8 +574,6 @@ struct WeightResidentPass
         // different contract -- leave such a weight on the per-launch bridge,
         // whose pack does quantise (see hmx.pack_weight).
         auto srcMemref = dyn_cast<MemRefType>(src.getType());
-        if (!srcMemref || !srcMemref.getElementType().isF16())
-          continue;
 
         BlockArgument arg;
         MemRefType residentType;
@@ -606,6 +604,18 @@ struct WeightResidentPass
           return signalPassFailure();
         }
         int64_t slot = *tensorSlot;
+        if (module->hasAttr("hmx.kernel_manifest")) {
+          auto decisionId = op->getAttrOfType<IntegerAttr>(kHmxDecisionIdAttr);
+          if (!decisionId ||
+              failed(bindHmxManifestWeightSlot(
+                  module, func.getSymName(), decisionId.getInt(), slot)))
+            return signalPassFailure();
+        }
+        // The manifest records the argument binding even when the source is f32
+        // or otherwise not eligible for resident prepack; the policy pass then
+        // gives that slot the canonical device-pack reason.
+        if (!srcMemref || !srcMemref.getElementType().isF16())
+          continue;
 
         Value resident = residentBySlot.lookup(slot);
         // One resident per slot: if the same argument resolved to a different
@@ -715,6 +725,9 @@ struct WeightResidentPass
 
     if (addedBytes)
       addResidentBytes(module, addedBytes);
+    if (module->hasAttr("hmx.kernel_manifest") &&
+        failed(reconcileHmxManifestWeightPolicies(module, prepackRuntimeWeights)))
+      return signalPassFailure();
   }
 };
 

@@ -336,6 +336,37 @@ Value rowStride(ConversionPatternRewriter &rewriter, Location loc,
   return width;
 }
 
+/// The tail ABI has no descriptor-to-leaf reconstruction. A tail call is
+/// therefore admitted only when every address/stride it needs is statically
+/// known. The full-tile lowering keeps its historical width fallback; silently
+/// applying that fallback to a partial tile would turn an unknown layout into
+/// a wrong address rather than a refusal.
+static LogicalResult verifyStaticTailLayout(Operation *op, MemRefType type,
+                                            StringRef name, bool rowMajor) {
+  if (!type.hasStaticShape() || type.getRank() < 2 ||
+      (rowMajor && type.getRank() != 2))
+    return op->emitError() << name
+                           << " tail leaf requires a static rank>=2 memref";
+
+  SmallVector<int64_t, 8> strides;
+  int64_t offset;
+  if (failed(type.getStridesAndOffset(strides, offset)))
+    return op->emitError() << name << " tail leaf requires static strides";
+  for (int64_t stride : strides)
+    if (ShapedType::isDynamic(stride) || stride <= 0)
+      return op->emitError() << name << " tail leaf requires static strides";
+
+  if (!rowMajor)
+    return success();
+  if (strides.back() != 1)
+    return op->emitError() << name
+                           << " tail leaf requires unit inner stride";
+  if (strides[strides.size() - 2] < type.getDimSize(type.getRank() - 1))
+    return op->emitError() << name
+                           << " tail leaf row stride overlaps logical rows";
+  return success();
+}
+
 /// The element count of a memref as an i32. A static shape is a constant; a
 /// dynamic one is the product of the descriptor's sizes.
 static Value memrefNumElements(ConversionPatternRewriter &rewriter,
@@ -540,6 +571,48 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
     auto srcType = cast<MemRefType>(op.getSrc().getType());
 
     int64_t count = op.getCount().value_or(1);
+    IntegerAttr validRows = op.getValidRowsAttr();
+    IntegerAttr validCols = op.getValidColsAttr();
+    if (validRows || validCols) {
+      if (count != 1 || !validRows || !validCols) {
+        op.emitError("bounds-safe hmx.pack_act requires paired valid "
+                     "extents and count=1");
+        return failure();
+      }
+      if (failed(verifyStaticTailLayout(op.getOperation(), srcType,
+                                        "pack source", /*rowMajor=*/true)) ||
+          failed(verifyStaticTailLayout(op.getOperation(), dstType,
+                                        "crouton destination",
+                                        /*rowMajor=*/false)))
+        return failure();
+      bool srcIsF32 = srcType.getElementType().isF32();
+      auto fn = getVoidLeaf(module,
+                            srcIsF32 ? getPackActTailF32FnName()
+                                     : getPackActTailF16FnName(),
+                            SmallVector<Type>(9, i32Ty), rewriter);
+      if (failed(fn))
+        return failure();
+      Value dst = croutonAddr(rewriter, loc, adaptor.getDst(), dstType,
+                              adaptor.getRow(), adaptor.getCol(),
+                              dstType.getElementTypeBitWidth() / 8);
+      Value src = asAddress(rewriter, loc, adaptor.getSrc(),
+                            srcType.getElementTypeBitWidth() / 8);
+      auto dimCst = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                        rewriter.getI32IntegerAttr(v))
+            .getResult();
+      };
+      Value rows = dimCst(srcType.getDimSize(0));
+      Value cols = dimCst(srcType.getDimSize(1));
+      Value srcStride = rowStride(rewriter, loc, srcType, cols);
+      SmallVector<Value> args{dst, src, rows, cols, srcStride,
+                              toI32(rewriter, loc, adaptor.getRow()),
+                              toI32(rewriter, loc, adaptor.getCol()),
+                              dimCst(validRows.getInt()),
+                              dimCst(validCols.getInt())};
+      replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
+      return success();
+    }
     bool bulk = count > 1;
     SmallVector<Type> argTys(7, i32Ty);
     if (bulk)
@@ -602,6 +675,48 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     auto srcType = cast<MemRefType>(op.getSrc().getType());
 
     int64_t count = op.getCount().value_or(1);
+    IntegerAttr validRows = op.getValidRowsAttr();
+    IntegerAttr validCols = op.getValidColsAttr();
+    if (validRows || validCols) {
+      if (count != 1 || !validRows || !validCols) {
+        op.emitError("bounds-safe hmx.pack_weight requires paired valid "
+                     "extents and count=1");
+        return failure();
+      }
+      if (failed(verifyStaticTailLayout(op.getOperation(), srcType,
+                                        "pack source", /*rowMajor=*/true)) ||
+          failed(verifyStaticTailLayout(op.getOperation(), dstType,
+                                        "crouton destination",
+                                        /*rowMajor=*/false)))
+        return failure();
+      bool srcIsF32 = srcType.getElementType().isF32();
+      auto fn = getVoidLeaf(module,
+                            srcIsF32 ? getPackWeightTailF32FnName()
+                                     : getPackWeightTailF16FnName(),
+                            SmallVector<Type>(9, i32Ty), rewriter);
+      if (failed(fn))
+        return failure();
+      Value dst = croutonAddr(rewriter, loc, adaptor.getDst(), dstType,
+                              adaptor.getNTile(), adaptor.getKTile(),
+                              dstType.getElementTypeBitWidth() / 8);
+      Value src = asAddress(rewriter, loc, adaptor.getSrc(),
+                            srcType.getElementTypeBitWidth() / 8);
+      auto dimCst = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                        rewriter.getI32IntegerAttr(v))
+            .getResult();
+      };
+      Value k = dimCst(srcType.getDimSize(0));
+      Value n = dimCst(srcType.getDimSize(1));
+      Value srcStride = rowStride(rewriter, loc, srcType, n);
+      SmallVector<Value> args{dst, src, k, n, srcStride,
+                              toI32(rewriter, loc, adaptor.getKTile()),
+                              toI32(rewriter, loc, adaptor.getNTile()),
+                              dimCst(validRows.getInt()),
+                              dimCst(validCols.getInt())};
+      replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
+      return success();
+    }
     bool bulk = count > 1;
     SmallVector<Type> argTys(7, i32Ty);
     if (bulk)
@@ -660,6 +775,53 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
     auto i32Ty = rewriter.getI32Type();
 
     int64_t count = op.getCount().value_or(1);
+    IntegerAttr validRows = op.getValidRowsAttr();
+    IntegerAttr validCols = op.getValidColsAttr();
+    if (validRows || validCols) {
+      if (count != 1 || !validRows || !validCols) {
+        op.emitError("bounds-safe hmx.unpack_acc requires paired valid "
+                     "extents and count=1");
+        return failure();
+      }
+      auto srcType = cast<MemRefType>(op.getSrc().getType());
+      auto dstType = cast<MemRefType>(op.getDst().getType());
+      if (failed(verifyStaticTailLayout(op.getOperation(), srcType,
+                                        "crouton source", /*rowMajor=*/false)) ||
+          failed(verifyStaticTailLayout(op.getOperation(), dstType,
+                                        "unpack destination",
+                                        /*rowMajor=*/true)))
+        return failure();
+      auto fn = getVoidLeaf(module, getUnpackAccTailF16FnName(),
+                            SmallVector<Type>(9, i32Ty), rewriter);
+      if (failed(fn))
+        return failure();
+      Value dst = asAddress(rewriter, loc, adaptor.getDst(),
+                            dstType.getElementTypeBitWidth() / 8);
+      Value zeroCol = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(0));
+      Value src = croutonAddr(rewriter, loc, adaptor.getSrc(), srcType,
+                              adaptor.getRow(), zeroCol,
+                              srcType.getElementTypeBitWidth() / 8);
+      auto dimCst = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                        rewriter.getI32IntegerAttr(v))
+            .getResult();
+      };
+      Value rows = dimCst(dstType.getDimSize(0));
+      Value cols = dimCst(dstType.getDimSize(1));
+      Value dstStride = rowStride(rewriter, loc, dstType, cols);
+      SmallVector<Value> args{dst,
+                              src,
+                              rows,
+                              cols,
+                              dstStride,
+                              toI32(rewriter, loc, adaptor.getRow()),
+                              toI32(rewriter, loc, adaptor.getCol()),
+                              dimCst(validRows.getInt()),
+                              dimCst(validCols.getInt())};
+      replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
+      return success();
+    }
     bool bulk = count > 1;
     // The bulk leaf has the same arity as the single one: it replaces the single
     // form's `col` (always 0 here, the leaf walks the crouton row itself) with
@@ -726,6 +888,80 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
     auto i32Ty = rewriter.getI32Type();
 
     int64_t count = op.getCount().value_or(1);
+    IntegerAttr validRows = op.getValidRowsAttr();
+    IntegerAttr validCols = op.getValidColsAttr();
+    if (validRows || validCols) {
+      if (count != 1 || !validRows || !validCols) {
+        op.emitError("bounds-safe hmx.unpack_acc_f32 requires paired valid "
+                     "extents and count=1");
+        return failure();
+      }
+      auto srcType = cast<MemRefType>(op.getSrc().getType());
+      auto dstType = cast<MemRefType>(op.getDst().getType());
+      if (failed(verifyStaticTailLayout(op.getOperation(), srcType,
+                                        "crouton source", /*rowMajor=*/false)) ||
+          failed(verifyStaticTailLayout(op.getOperation(), dstType,
+                                        "unpack destination",
+                                        /*rowMajor=*/true)))
+        return failure();
+      auto fn = getVoidLeaf(module, getUnpackAccTailF32FnName(),
+                            SmallVector<Type>(12, i32Ty), rewriter);
+      if (failed(fn))
+        return failure();
+      Value dst = asAddress(rewriter, loc, adaptor.getDst(),
+                            dstType.getElementTypeBitWidth() / 8);
+      Value res;
+      Value hasRes;
+      Value resStride;
+      if (Value residual = adaptor.getResidual()) {
+        auto resType = cast<MemRefType>(op.getResidual().getType());
+        res = asAddress(rewriter, loc, residual,
+                        resType.getElementTypeBitWidth() / 8);
+        if (failed(verifyStaticTailLayout(op.getOperation(), resType,
+                                          "residual", /*rowMajor=*/true)))
+          return failure();
+        hasRes = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(1));
+        Value resWidth = LLVM::ConstantOp::create(
+            rewriter, loc, i32Ty,
+            rewriter.getI32IntegerAttr(resType.getDimSize(1)));
+        resStride = rowStride(rewriter, loc, resType, resWidth);
+      } else {
+        res = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                       rewriter.getI32IntegerAttr(0));
+        hasRes = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                          rewriter.getI32IntegerAttr(0));
+        resStride = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                             rewriter.getI32IntegerAttr(0));
+      }
+      Value zeroCol = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                               rewriter.getI32IntegerAttr(0));
+      Value src = croutonAddr(rewriter, loc, adaptor.getSrc(), srcType,
+                              adaptor.getRow(), zeroCol,
+                              srcType.getElementTypeBitWidth() / 8);
+      auto dimCst = [&](int64_t v) {
+        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
+                                        rewriter.getI32IntegerAttr(v))
+            .getResult();
+      };
+      Value rows = dimCst(dstType.getDimSize(0));
+      Value cols = dimCst(dstType.getDimSize(1));
+      Value dstStride = rowStride(rewriter, loc, dstType, cols);
+      SmallVector<Value> args{dst,
+                              res,
+                              hasRes,
+                              src,
+                              rows,
+                              cols,
+                              dstStride,
+                              resStride,
+                              toI32(rewriter, loc, adaptor.getRow()),
+                              toI32(rewriter, loc, adaptor.getCol()),
+                              dimCst(validRows.getInt()),
+                              dimCst(validCols.getInt())};
+      replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
+      return success();
+    }
     bool bulk = count > 1;
     // Same arity rule as the fp16 unpack: `n_pairs` replaces `col`, it is not an
     // extra argument.

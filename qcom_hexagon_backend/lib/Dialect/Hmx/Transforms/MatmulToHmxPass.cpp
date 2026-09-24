@@ -43,7 +43,7 @@
 // The engine's read-out is an fp16 crouton. f32 source and result values are
 // admitted as a quantization/widening ABI: the pack leaf materializes f16
 // croutons and the fused tail reads them back as f32. This is not bit-exact
-// fp32 accumulation; callers requiring that semantic belong outside v1.
+// fp32 accumulation; callers requiring that semantic belong on a non-HMX path.
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"
@@ -70,6 +70,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <iterator>
+#include <memory>
 #include <optional>
 
 #define DEBUG_TYPE "matmul-to-hmx"
@@ -114,11 +115,27 @@ struct MatmulContract {
   Type lhsElem, rhsElem, outElem;
 };
 
+std::string typeName(Type type);
+
+enum class ManifestShapeState { Static, PartiallyDynamic, Dynamic, Unavailable };
+enum class ManifestWeightSource { ArgumentSlot, CompileTimeConstant, InternalValue };
+
+struct ManifestFacts {
+  ManifestShapeState shapeState = ManifestShapeState::Unavailable;
+  int64_t dims[3] = {-1, -1, -1};
+  std::string lhsElem;
+  std::string rhsElem;
+  std::string outElem;
+  ManifestWeightSource weightSource = ManifestWeightSource::InternalValue;
+  int64_t argumentSlot = -1;
+};
+
 /// One canonical decision code per original linalg.matmul. The first
 /// successful rewrite of that op is the only point at which the code becomes
-/// `selected`; every later failure updates the same record in place.
+/// `selected-aligned`; every later failure updates the same record in place.
 enum class MatmulReason {
-  Selected,
+  SelectedAligned,
+  SelectedTail,
   LibraryCall,
   VtcmAllocatorDisabled,
   NonRank2,
@@ -126,13 +143,16 @@ enum class MatmulReason {
   UnsupportedDType,
   MinRows,
   TileAlignment,
+  UnsupportedLayout,
   VtcmBudget,
 };
 
 StringRef reasonCode(MatmulReason reason) {
   switch (reason) {
-  case MatmulReason::Selected:
-    return kHmxReasonSelected;
+  case MatmulReason::SelectedAligned:
+    return kHmxReasonSelectedAligned;
+  case MatmulReason::SelectedTail:
+    return kHmxReasonSelectedTail;
   case MatmulReason::LibraryCall:
     return kHmxReasonLibraryCall;
   case MatmulReason::VtcmAllocatorDisabled:
@@ -147,6 +167,8 @@ StringRef reasonCode(MatmulReason reason) {
     return kHmxReasonMinRows;
   case MatmulReason::TileAlignment:
     return kHmxReasonTileAlignment;
+  case MatmulReason::UnsupportedLayout:
+    return kHmxReasonUnsupportedLayout;
   case MatmulReason::VtcmBudget:
     return kHmxReasonVtcmBudget;
   }
@@ -158,11 +180,15 @@ struct MatmulDecision {
   std::string functionName;
   int64_t id = 0;
   std::optional<MatmulContract> contract;
-  MatmulReason reason = MatmulReason::Selected;
+  MatmulReason reason = MatmulReason::SelectedAligned;
   int64_t vtcmBefore = 0;
   int64_t vtcmPeak = 0;
+  HmxTarget::ContractionPlan contractionPlan = HmxTarget::ContractionPlan::HVX;
+  std::shared_ptr<ManifestFacts> facts;
   std::optional<HmxTarget::BridgePlan> plan;
 };
+
+static int64_t vtcmBytesCommitted(Operation *within);
 
 /// Stamp an HMX bridge operation with the function-local decision id. The
 /// bufferization model copies this explicit attribute when it rebuilds the op;
@@ -170,6 +196,63 @@ struct MatmulDecision {
 void setDecisionId(Operation *op, int64_t id) {
   op->setAttr(kHmxDecisionIdAttr,
               IntegerAttr::get(IntegerType::get(op->getContext(), 64), id));
+}
+
+static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
+  auto facts = std::make_shared<ManifestFacts>();
+  auto shaped = [](Value value) -> ShapedType {
+    return dyn_cast<ShapedType>(value.getType());
+  };
+  ShapedType lhs = shaped(op.getDpsInputOperand(0)->get());
+  ShapedType rhs = shaped(op.getDpsInputOperand(1)->get());
+  ShapedType out = shaped(op.getDpsInitOperand(0)->get());
+  auto recordType = [&](ShapedType type, std::string &destination) {
+    if (type)
+      destination = typeName(type.getElementType());
+    else
+      destination = "unavailable";
+  };
+  recordType(lhs, facts->lhsElem);
+  recordType(rhs, facts->rhsElem);
+  recordType(out, facts->outElem);
+
+  if (lhs && rhs && out && lhs.getRank() == 2 && rhs.getRank() == 2 &&
+      out.getRank() == 2) {
+    auto dim = [](ShapedType type, int64_t index) {
+      return type.isDynamicDim(index) ? int64_t(-1) : type.getDimSize(index);
+    };
+    facts->dims[0] = dim(lhs, 0);
+    facts->dims[1] = dim(rhs, 1);
+    facts->dims[2] = dim(lhs, 1);
+    int dynamic = 0;
+    for (int64_t extent : facts->dims)
+      dynamic += extent < 0;
+    facts->shapeState =
+        dynamic == 0 ? ManifestShapeState::Static
+        : dynamic == 3 ? ManifestShapeState::Dynamic
+                       : ManifestShapeState::PartiallyDynamic;
+  }
+
+  Value source = op.getDpsInputOperand(1)->get();
+  if (auto argument = dyn_cast<BlockArgument>(source)) {
+    if (auto function = op->getParentOfType<func::FuncOp>()) {
+      int64_t slot = 0;
+      for (BlockArgument candidate : function.getArguments()) {
+        if (!isa<RankedTensorType, MemRefType, UnrankedMemRefType>(
+                candidate.getType()))
+          continue;
+        if (candidate == argument) {
+          facts->weightSource = ManifestWeightSource::ArgumentSlot;
+          facts->argumentSlot = slot;
+          break;
+        }
+        ++slot;
+      }
+    }
+  } else if (source.getDefiningOp<arith::ConstantOp>()) {
+    facts->weightSource = ManifestWeightSource::CompileTimeConstant;
+  }
+  return facts;
 }
 
 /// The pass-scoped, per-op decision table. It is populated before the greedy
@@ -202,6 +285,7 @@ public:
                     !outType.hasStaticShape());
 
       MatmulDecision decision{op, func.getName().str(), nextId++};
+      decision.facts = makeManifestFacts(op);
       if (rank2 && !dynamic) {
         decision.contract =
             MatmulContract{lhsType.getDimSize(0),    rhsType.getDimSize(1),
@@ -222,22 +306,39 @@ public:
             decision.contract->m, decision.contract->n, decision.contract->k,
             decision.contract->lhsElem, decision.contract->rhsElem,
             decision.contract->outElem);
+        decision.contractionPlan = capability.plan;
         if (!capability.supported()) {
-          switch (capability.refusal) {
-          case HmxTarget::ContractionRefusal::UnsupportedDType:
-            decision.reason = MatmulReason::UnsupportedDType;
-            break;
-          case HmxTarget::ContractionRefusal::MinRows:
-            decision.reason = MatmulReason::MinRows;
-            break;
-          case HmxTarget::ContractionRefusal::TileAlignment:
-            decision.reason = MatmulReason::TileAlignment;
-            break;
-          case HmxTarget::ContractionRefusal::None:
-            llvm_unreachable("supported contraction has a refusal");
+          bool diagnosticTail =
+              isHmxDiagnosticTailMarker(op.getOperation()) &&
+              capability.refusal == HmxTarget::ContractionRefusal::TileAlignment &&
+              capability.tailCandidate();
+          if (diagnosticTail) {
+            const HmxTarget::ContractionShape &shape = capability.shape;
+            auto paddedPlan = target.planBridge(
+                shape.mp, shape.np, shape.kp, vtcmBytesCommitted(op));
+            if (paddedPlan && !paddedPlan.blocked(shape.mp)) {
+              decision.reason = MatmulReason::SelectedTail;
+              decision.plan = paddedPlan;
+            } else {
+              decision.reason = MatmulReason::VtcmBudget;
+            }
+          } else {
+            switch (capability.refusal) {
+            case HmxTarget::ContractionRefusal::UnsupportedDType:
+              decision.reason = MatmulReason::UnsupportedDType;
+              break;
+            case HmxTarget::ContractionRefusal::MinRows:
+              decision.reason = MatmulReason::MinRows;
+              break;
+            case HmxTarget::ContractionRefusal::TileAlignment:
+              decision.reason = MatmulReason::TileAlignment;
+              break;
+            case HmxTarget::ContractionRefusal::None:
+              llvm_unreachable("supported contraction has a refusal");
+            }
           }
         } else {
-          decision.reason = MatmulReason::Selected;
+          decision.reason = MatmulReason::SelectedAligned;
         }
       }
       byOp[op.getOperation()] = decisions.size();
@@ -266,6 +367,7 @@ bool reportsRefusal(MatmulReason reason) {
   return reason == MatmulReason::VtcmAllocatorDisabled ||
          reason == MatmulReason::MinRows ||
          reason == MatmulReason::TileAlignment ||
+         reason == MatmulReason::UnsupportedLayout ||
          reason == MatmulReason::VtcmBudget;
 }
 
@@ -281,6 +383,7 @@ InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
   case MatmulReason::UnsupportedDType:
   case MatmulReason::MinRows:
   case MatmulReason::TileAlignment:
+  case MatmulReason::UnsupportedLayout:
     diag << "needs f16/f32 inputs and an f16/f32 result, 2D static shapes, "
             "M/N/K multiples of "
          << HmxTarget::tileEdge << ", M > " << HmxTarget::minRows;
@@ -298,8 +401,22 @@ InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
   case MatmulReason::LibraryCall:
   case MatmulReason::NonRank2:
   case MatmulReason::DynamicShape:
-  case MatmulReason::Selected:
+  case MatmulReason::SelectedAligned:
+  case MatmulReason::SelectedTail:
     llvm_unreachable("silent or successful decision rendered as refusal");
+  }
+  if (decision.reason == MatmulReason::TileAlignment && decision.contract) {
+    HmxTarget::ContractionDecision capability = target.queryContraction(
+        decision.contract->m, decision.contract->n, decision.contract->k,
+        decision.contract->lhsElem, decision.contract->rhsElem,
+        decision.contract->outElem);
+    if (capability.tailCandidate()) {
+      const HmxTarget::ContractionShape &shape = capability.shape;
+      diag << " [candidate=hmx-tail, padded=(" << shape.mp << ", "
+           << shape.np << ", " << shape.kp << "), full=(" << shape.mf << ", "
+           << shape.nf << ", " << shape.kf << "), tail=(" << shape.mt << ", "
+           << shape.nt << ", " << shape.kt << ")]";
+    }
   }
   return diag << " [reason=" << reasonCode(decision.reason) << "]";
 }
@@ -309,7 +426,8 @@ void emitDecisionDiagnostics(ModuleOp module, const HmxTarget &target,
   int64_t attributed = 0;
   SmallVector<const MatmulDecision *> reportable;
   for (const MatmulDecision &decision : tally.records()) {
-    if (decision.reason == MatmulReason::Selected) {
+    if (decision.reason == MatmulReason::SelectedAligned ||
+        decision.reason == MatmulReason::SelectedTail) {
       ++attributed;
       continue;
     }
@@ -352,44 +470,213 @@ std::string typeName(Type type) {
   return text;
 }
 
+static StringRef shapeStateName(ManifestShapeState state) {
+  switch (state) {
+  case ManifestShapeState::Static:
+    return "static";
+  case ManifestShapeState::PartiallyDynamic:
+    return "partially-dynamic";
+  case ManifestShapeState::Dynamic:
+    return "dynamic";
+  case ManifestShapeState::Unavailable:
+    return "unavailable";
+  }
+  llvm_unreachable("unknown manifest shape state");
+}
+
+static DictionaryAttr makeDimensionAttr(MLIRContext *ctx, int64_t extent,
+                                        StringRef symbol) {
+  NamedAttrList fields;
+  fields.append("kind", StringAttr::get(ctx, extent >= 0 ? "static" : "dynamic"));
+  if (extent >= 0)
+    fields.append("value", IntegerAttr::get(IntegerType::get(ctx, 64), extent));
+  else
+    fields.append("symbol", StringAttr::get(ctx, symbol));
+  return fields.getDictionary(ctx);
+}
+
+static DictionaryAttr makeLogicalAttr(MLIRContext *ctx,
+                                      const ManifestFacts &facts) {
+  if (facts.shapeState == ManifestShapeState::Unavailable)
+    return {};
+  NamedAttrList fields;
+  fields.append("m", makeDimensionAttr(ctx, facts.dims[0], "m"));
+  fields.append("n", makeDimensionAttr(ctx, facts.dims[1], "n"));
+  fields.append("k", makeDimensionAttr(ctx, facts.dims[2], "k"));
+  return fields.getDictionary(ctx);
+}
+
+static DictionaryAttr makeDTypesAttr(MLIRContext *ctx,
+                                     const ManifestFacts &facts, bool hmx) {
+  NamedAttrList fields;
+  fields.append("lhs", StringAttr::get(ctx, facts.lhsElem));
+  fields.append("rhs", StringAttr::get(ctx, facts.rhsElem));
+  fields.append("out", StringAttr::get(ctx, facts.outElem));
+  if (hmx)
+    fields.append("crouton", StringAttr::get(ctx, "f16"));
+  return fields.getDictionary(ctx);
+}
+
+static DictionaryAttr makeExtentAttr(MLIRContext *ctx, int64_t m, int64_t n,
+                                     int64_t k) {
+  auto i64 = IntegerType::get(ctx, 64);
+  NamedAttrList fields;
+  fields.append("m", IntegerAttr::get(i64, m));
+  fields.append("n", IntegerAttr::get(i64, n));
+  fields.append("k", IntegerAttr::get(i64, k));
+  return fields.getDictionary(ctx);
+}
+
+static DictionaryAttr makeExecutionAttr(MLIRContext *ctx,
+                                        const MatmulDecision &decision) {
+  auto i64 = IntegerType::get(ctx, 64);
+  assert(decision.plan && decision.contract &&
+         "selected matmul has no bridge plan");
+  bool tail = decision.reason == MatmulReason::SelectedTail;
+  NamedAttrList fields;
+  fields.append("blocking",
+                StringAttr::get(ctx, !tail && decision.plan->blocked(
+                                              decision.contract->m)
+                                         ? "m_blocked"
+                                         : "whole"));
+  fields.append("block_m", IntegerAttr::get(
+                               i64, tail ? decision.contract->m
+                                         : decision.plan->blockM));
+  NamedAttrList counts;
+  counts.append("pack_act_sites", IntegerAttr::get(i64, 0));
+  counts.append("pack_weight_sites", IntegerAttr::get(i64, 0));
+  counts.append("unpack_sites", IntegerAttr::get(i64, 0));
+  counts.append("count_semantics", StringAttr::get(ctx, "ir_sites"));
+  fields.append("bridge_counts", counts.getDictionary(ctx));
+  return fields.getDictionary(ctx);
+}
+
+static DictionaryAttr makeWeightBindingAttr(MLIRContext *ctx,
+                                            const MatmulDecision &decision) {
+  const ManifestFacts &facts = *decision.facts;
+  NamedAttrList fields;
+  switch (facts.weightSource) {
+  case ManifestWeightSource::ArgumentSlot: {
+    fields.append("kind", StringAttr::get(ctx, "argument-slot"));
+    NamedAttrList reference;
+    reference.append("function", StringAttr::get(ctx, decision.functionName));
+    reference.append("slot", IntegerAttr::get(IntegerType::get(ctx, 64),
+                                               facts.argumentSlot));
+    fields.append("policy_ref", reference.getDictionary(ctx));
+    break;
+  }
+  case ManifestWeightSource::CompileTimeConstant:
+    fields.append("kind", StringAttr::get(ctx, "compile-time-constant"));
+    break;
+  case ManifestWeightSource::InternalValue:
+    fields.append("kind", StringAttr::get(ctx, "internal-value"));
+    break;
+  }
+  return fields.getDictionary(ctx);
+}
+
 DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
                               const HmxTarget &target) {
   auto i64 = IntegerType::get(ctx, 64);
+  assert(decision.facts && "matmul decision has no semantic facts");
+  const ManifestFacts &facts = *decision.facts;
+  bool hmx = decision.reason == MatmulReason::SelectedAligned ||
+             decision.reason == MatmulReason::SelectedTail;
+  bool tail = decision.reason == MatmulReason::SelectedTail;
+  StringRef plan = tail ? kHmxPlanHMXTail
+                        : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
+
   NamedAttrList fields;
   fields.append("function", StringAttr::get(ctx, decision.functionName));
   fields.append("id", IntegerAttr::get(i64, decision.id));
-  fields.append("engine",
-                StringAttr::get(ctx, decision.reason == MatmulReason::Selected
-                                         ? "hmx"
-                                         : "hvx"));
+  fields.append("plan", StringAttr::get(ctx, plan));
   fields.append("reason", StringAttr::get(ctx, reasonCode(decision.reason)));
-  if (decision.contract) {
-    fields.append("m", IntegerAttr::get(i64, decision.contract->m));
-    fields.append("n", IntegerAttr::get(i64, decision.contract->n));
-    fields.append("k", IntegerAttr::get(i64, decision.contract->k));
-    fields.append("lhs_elem",
-                  StringAttr::get(ctx, typeName(decision.contract->lhsElem)));
-    fields.append("rhs_elem",
-                  StringAttr::get(ctx, typeName(decision.contract->rhsElem)));
-    fields.append("out_elem",
-                  StringAttr::get(ctx, typeName(decision.contract->outElem)));
-  }
-  if (decision.reason == MatmulReason::Selected) {
-    assert(decision.plan && "selected matmul has no bridge plan");
-    fields.append("vtcm_budget", IntegerAttr::get(i64, target.vtcmBudget));
-    fields.append("vtcm_before", IntegerAttr::get(i64, decision.vtcmBefore));
-    fields.append("vtcm_peak", IntegerAttr::get(i64, decision.vtcmPeak));
-    fields.append("blocking", StringAttr::get(ctx, decision.plan->blocked(
-                                                       decision.contract->m)
-                                                       ? "m_blocked"
-                                                       : "whole"));
-    fields.append("block_m", IntegerAttr::get(i64, decision.plan->blockM));
-    fields.append("pack_act_sites", IntegerAttr::get(i64, 0));
-    fields.append("pack_weight_sites", IntegerAttr::get(i64, 0));
-    fields.append("unpack_sites", IntegerAttr::get(i64, 0));
-    fields.append("count_semantics", StringAttr::get(ctx, "ir_sites"));
+  fields.append("shape_state", StringAttr::get(ctx, shapeStateName(facts.shapeState)));
+  if (facts.shapeState == ManifestShapeState::Unavailable)
+    fields.append("logical", UnitAttr::get(ctx));
+  else
+    fields.append("logical", makeLogicalAttr(ctx, facts));
+  fields.append("dtypes", makeDTypesAttr(ctx, facts, hmx));
+
+  if (hmx) {
+    assert(decision.contract && decision.plan &&
+           "selected HMX record has no contract or bridge plan");
+    HmxTarget::ContractionDecision capability = target.queryContraction(
+        decision.contract->m, decision.contract->n, decision.contract->k,
+        decision.contract->lhsElem, decision.contract->rhsElem,
+        decision.contract->outElem);
+    assert(((tail && capability.plan == HmxTarget::ContractionPlan::HMXTail) ||
+            (!tail && capability.plan == HmxTarget::ContractionPlan::FullHMX)) &&
+           "selected HMX record has the wrong contraction plan");
+    const HmxTarget::ContractionShape &shape = capability.shape;
+    fields.append("padded",
+                  makeExtentAttr(ctx, shape.mp, shape.np, shape.kp));
+    fields.append("full", makeExtentAttr(ctx, shape.mf, shape.nf, shape.kf));
+    fields.append("tail", makeExtentAttr(ctx, shape.mt, shape.nt, shape.kt));
+    fields.append("layout",
+                  StringAttr::get(ctx, "row-major-inner-contiguous"));
+    fields.append("workspace_class", StringAttr::get(ctx, "runtime-internal"));
+    fields.append("grid_policy",
+                  StringAttr::get(ctx, tail ? "single-instance"
+                                            : "legacy-runtime"));
+    fields.append("vtcm_accounting", StringAttr::get(ctx, "bridge-only"));
+    fields.append("vtcm_budget_bytes", IntegerAttr::get(i64, target.vtcmBudget));
+    fields.append("vtcm_before_bytes", IntegerAttr::get(i64, decision.vtcmBefore));
+    fields.append("vtcm_bridge_peak_bytes",
+                  IntegerAttr::get(i64, decision.vtcmPeak));
+    if (tail) {
+      NamedAttrList tailPolicy;
+      tailPolicy.append("k", StringAttr::get(ctx, "zero-pad-both-operands"));
+      tailPolicy.append("mn", StringAttr::get(ctx, "padded-edge-tile-bounded-store"));
+      fields.append("tail_policy", tailPolicy.getDictionary(ctx));
+    }
+    fields.append("execution", makeExecutionAttr(ctx, decision));
+    fields.append("weight_binding", makeWeightBindingAttr(ctx, decision));
   }
   return fields.getDictionary(ctx);
+}
+
+/// Materialize the zero-padded row-major view consumed by a diagnostic tail
+/// bridge. The tail ABI requires both K operands to own their padded K lanes;
+/// relying on an over-read or on an allocator's incidental bytes is forbidden.
+/// Even an already-aligned operand is routed through an owned tensor
+/// materialization (a generic copy) so the bufferizer gives the diagnostic
+/// bridge a statically row-major buffer instead of a dynamic-stride function
+/// argument.
+static Value padMatrix(RewriterBase &b, Location loc, Value value,
+                       int64_t paddedRows, int64_t paddedCols) {
+  auto type = cast<RankedTensorType>(value.getType());
+  if (!type.hasStaticShape() || type.getDimSize(0) > paddedRows ||
+      type.getDimSize(1) > paddedCols)
+    return {};
+  if (type.getDimSize(0) == paddedRows &&
+      type.getDimSize(1) == paddedCols) {
+    SmallVector<int64_t> paddedShape = {paddedRows, paddedCols};
+    Value empty = tensor::EmptyOp::create(
+        b, loc, paddedShape, type.getElementType());
+    SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(2));
+    SmallVector<utils::IteratorType> iterators(
+        2, utils::IteratorType::parallel);
+    auto copy = linalg::GenericOp::create(
+        b, loc, TypeRange{type}, ValueRange{value}, ValueRange{empty}, maps,
+        iterators, [](OpBuilder &bodyBuilder, Location bodyLoc,
+                      ValueRange args) {
+          linalg::YieldOp::create(bodyBuilder, bodyLoc, args[0]);
+        });
+    return copy.getResult(0);
+  }
+  SmallVector<int64_t> low = {0, 0};
+  SmallVector<int64_t> high = {paddedRows - type.getDimSize(0),
+                               paddedCols - type.getDimSize(1)};
+  auto paddedType = RankedTensorType::get({paddedRows, paddedCols},
+                                          type.getElementType());
+  Value zero = arith::ConstantOp::create(
+      b, loc, b.getZeroAttr(type.getElementType()));
+  return tensor::PadOp::create(
+             b, loc, paddedType, value,
+             getAsIndexOpFoldResult(b.getContext(), low),
+             getAsIndexOpFoldResult(b.getContext(), high), zero, false)
+      .getResult();
 }
 
 /// A destination the engine will read: a crouton array allocated in VTCM.
@@ -558,12 +845,14 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
     Value out;
     if (isWeight) {
       auto pack = hmx::PackWeightOp::create(b, loc, crouton, carried, src,
-                                             zero, i, count);
+                                             zero, i, count, IntegerAttr(),
+                                             IntegerAttr());
       setDecisionId(pack.getOperation(), decisionId);
       out = pack->getResult(0);
     } else {
       auto pack = hmx::PackActOp::create(b, loc, crouton, carried, src, i,
-                                          zero, count);
+                                          zero, count, IntegerAttr(),
+                                          IntegerAttr());
       setDecisionId(pack.getOperation(), decisionId);
       out = pack->getResult(0);
     }
@@ -657,12 +946,14 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
     Value out;
     if (fused) {
       auto unpack = hmx::UnpackAccF32Op::create(
-          b, loc, outType, ar, arg, i, zero, residual, count);
+          b, loc, outType, ar, arg, i, zero, residual, count, IntegerAttr(),
+          IntegerAttr());
       setDecisionId(unpack.getOperation(), decisionId);
       out = unpack->getResult(0);
     } else {
-      auto unpack =
-          hmx::UnpackAccOp::create(b, loc, outType, ar, arg, i, zero, count);
+      auto unpack = hmx::UnpackAccOp::create(
+          b, loc, outType, ar, arg, i, zero, count, IntegerAttr(),
+          IntegerAttr());
       setDecisionId(unpack.getOperation(), decisionId);
       out = unpack->getResult(0);
     }
@@ -796,6 +1087,67 @@ static bool isLoopInvariant(Value v, Operation *op) {
   return inLoop;
 }
 
+static LogicalResult emitDiagnosticTailMatmul(
+    linalg::MatmulOp op, MatmulDecision &decision, const HmxTarget &target,
+    PatternRewriter &rewriter) {
+  assert(decision.reason == MatmulReason::SelectedTail && decision.contract &&
+         decision.plan && "diagnostic tail decision is incomplete");
+  const MatmulContract &contract = *decision.contract;
+  HmxTarget::ContractionDecision capability = target.queryContraction(
+      contract.m, contract.n, contract.k, contract.lhsElem, contract.rhsElem,
+      contract.outElem);
+  assert(capability.plan == HmxTarget::ContractionPlan::HMXTail &&
+         "diagnostic tail decision lost its shape plan");
+  const HmxTarget::ContractionShape &shape = capability.shape;
+  Location loc = op.getLoc();
+  Value lhs = op.getDpsInputOperand(0)->get();
+  Value rhs = op.getDpsInputOperand(1)->get();
+  Value init = op.getDpsInitOperand(0)->get();
+  auto outType = cast<RankedTensorType>(init.getType());
+  auto lhsType = cast<RankedTensorType>(lhs.getType());
+  auto rhsType = cast<RankedTensorType>(rhs.getType());
+
+  Value paddedLhs = padMatrix(rewriter, loc, lhs, shape.mp, shape.kp);
+  Value paddedRhs = padMatrix(rewriter, loc, rhs, shape.kp, shape.np);
+  if (!paddedLhs || !paddedRhs)
+    return rewriter.notifyMatchFailure(op, "diagnostic tail requires static row-major operands");
+
+  auto paddedLhsType = hmx::croutonLayoutType(RankedTensorType::get(
+      {shape.mp, shape.kp}, lhsType.getElementType()));
+  auto paddedRhsType = hmx::weightCroutonType(RankedTensorType::get(
+      {shape.np, shape.kp}, rhsType.getElementType()));
+  auto paddedF16Out = RankedTensorType::get({shape.mp, shape.np},
+                                             rewriter.getF16Type());
+  auto tailPlan = TailPlanAttr::get(
+      rewriter.getContext(),
+      {contract.m, contract.n, contract.k}, {shape.mp, shape.np, shape.kp},
+      {shape.mf, shape.nf, shape.kf}, {shape.mt, shape.nt, shape.kt},
+      "zero-pad-both-operands", "padded-edge-tile-bounded-store");
+
+  Value packedLhs = emitBridgeAbove(rewriter, loc, paddedLhs, paddedLhsType,
+                                    /*isWeight=*/false, op, /*hoist=*/false,
+                                    decision.id);
+  Value packedRhs = emitBridgeAbove(rewriter, loc, paddedRhs, paddedRhsType,
+                                    /*isWeight=*/true, op, /*hoist=*/false,
+                                    decision.id);
+  Value outEmpty = vtcmEmpty(rewriter, loc, hmx::croutonLayoutType(paddedF16Out));
+  auto matmul = hmx::MatmulOp::create(
+      rewriter, loc, hmx::croutonLayoutType(paddedF16Out), packedLhs, packedRhs,
+      outEmpty, tailPlan);
+  matmul->setAttr(kHmxDiagnosticTailAttr, UnitAttr::get(rewriter.getContext()));
+  setDecisionId(matmul.getOperation(), decision.id);
+
+  bool empty = isEmptyInit(init);
+  bool escapes = resultEscapesUnconsumed(op);
+  // The normal epilogue bridge is deliberately left in the canonical loop form;
+  // hmx-partition's marked diagnostic path owns the full/edge rewrite and is the
+  // first consumer that gives its valid M/N extents to the unpack leaf.
+  Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
+                              empty ? Value{} : init, escapes, decision.id);
+  rewriter.replaceOp(op, result);
+  return success();
+}
+
 /// `linalg.matmul` -> `hmx.matmul` on croutons, bridged in and out of row-major.
 struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
   MatmulToHmx(MLIRContext *ctx, HmxTarget target, AttributionTally *tally)
@@ -803,8 +1155,22 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
+    if (op->hasAttr(kHmxDiagnosticTailAttr) &&
+        !isHmxDiagnosticTailMarker(op.getOperation())) {
+      op.emitError("hmx.diagnostic_tail_partition must be a unit attribute");
+      return failure();
+    }
     MatmulDecision &decision = (*tally)[op];
-    if (decision.reason != MatmulReason::Selected &&
+    // A marked tail candidate that does not fit the padded bridge budget is a
+    // diagnostic refusal, never permission to retry the logical shape through
+    // the full-HMX path.
+    if (isHmxDiagnosticTailMarker(op.getOperation()) &&
+        decision.contractionPlan == HmxTarget::ContractionPlan::HMXTail &&
+        decision.reason != MatmulReason::SelectedTail)
+      return rewriter.notifyMatchFailure(
+          op, "diagnostic tail bridge exceeds VTCM budget");
+    if (decision.reason != MatmulReason::SelectedAligned &&
+        decision.reason != MatmulReason::SelectedTail &&
         decision.reason != MatmulReason::VtcmBudget)
       return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
     assert(decision.contract && "attributable matmul has no contract");
@@ -823,6 +1189,16 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // attention pair is weighed with the first dot's arrays resident.
     int64_t vtcmUsed = vtcmBytesCommitted(op);
 
+    if (decision.reason == MatmulReason::SelectedTail) {
+      decision.vtcmBefore = vtcmUsed;
+      if (!decision.plan) {
+        decision.reason = MatmulReason::VtcmBudget;
+        return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
+      }
+      decision.vtcmPeak = vtcmUsed + decision.plan->bytes;
+      return emitDiagnosticTailMatmul(op, decision, target, rewriter);
+    }
+
     // The second question after legality: the crouton bridge must pay for
     // itself. The plan names the M block the bridge allocates for -- the whole
     // M when the contraction fits, a smaller block when only a block does, and
@@ -838,7 +1214,9 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       decision.plan.reset();
       return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
     }
-    decision.reason = MatmulReason::Selected;
+    decision.reason = MatmulReason::SelectedAligned;
+    assert(decision.contractionPlan == HmxTarget::ContractionPlan::FullHMX &&
+           "selected HMX matmul has no full contraction shape plan");
     decision.vtcmPeak = vtcmUsed + plan.bytes;
     decision.plan = plan;
 
@@ -889,7 +1267,7 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       Value outEmpty = vtcmEmpty(rewriter, loc, hmx::croutonLayoutType(f16Out));
       auto matmul = hmx::MatmulOp::create(
           rewriter, loc, hmx::croutonLayoutType(f16Out), packedLhs, packedRhs,
-          outEmpty);
+          outEmpty, /*tail_plan=*/{});
       setDecisionId(matmul.getOperation(), decision.id);
       // The fused tail replaces the unpack+widen[+add] epilogue with one leaf
       // when the result is f32 and the leaf contract holds by construction (see
@@ -970,7 +1348,8 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
 
       Value outEmpty = vtcmEmpty(rewriter, loc, blockCroutonOut);
       auto matmul = hmx::MatmulOp::create(
-          rewriter, loc, blockCroutonOut, packedLhs, packedRhs, outEmpty);
+          rewriter, loc, blockCroutonOut, packedLhs, packedRhs, outEmpty,
+          /*tail_plan=*/{});
       setDecisionId(matmul.getOperation(), decision.id);
       Value blockResult = emitEpilogue(rewriter, loc, matmul->getResult(0),
                                        blockOutType, residual, escapes,
@@ -1607,6 +1986,18 @@ struct MatmulToHmxPass
           "matmul-to-hmx requires a func.func inside a builtin.module");
       return signalPassFailure();
     }
+
+    bool invalidDiagnosticMarker = false;
+    func.walk([&](linalg::MatmulOp matmul) {
+      if (matmul->hasAttr(kHmxDiagnosticTailAttr) &&
+          !isHmxDiagnosticTailMarker(matmul.getOperation())) {
+        matmul.emitError(
+            "hmx.diagnostic_tail_partition must be a unit attribute");
+        invalidDiagnosticMarker = true;
+      }
+    });
+    if (invalidDiagnosticMarker)
+      return signalPassFailure();
 
     // Pass-scoped, exactly as long as the rewrite. It is populated before the
     // greedy driver and keyed by the original op, so repeated pattern attempts

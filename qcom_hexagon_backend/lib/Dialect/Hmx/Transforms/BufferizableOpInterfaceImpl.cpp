@@ -57,13 +57,19 @@ struct MatmulOpInterface
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
                           const BufferizationOptions &options,
                           BufferizationState &state) const {
+    auto matmulOp = cast<MatmulOp>(op);
+    if (matmulOp->hasAttr(kHmxDiagnosticTailAttr) &&
+        !isHmxDiagnosticTailMarker(matmulOp.getOperation())) {
+      matmulOp.emitError(
+          "hmx.diagnostic_tail_partition must be a unit attribute");
+      return failure();
+    }
     auto dstOp = cast<DestinationStyleOpInterface>(op);
     if (dstOp.hasPureBufferSemantics())
       return success();
     if (!dstOp.hasPureTensorSemantics())
       return op->emitError() << "op does not have pure tensor semantics";
 
-    auto matmulOp = cast<MatmulOp>(op);
     FailureOr<Value> lhsBuffer =
         getBuffer(rewriter, matmulOp.getLhs(), options, state);
     if (failed(lhsBuffer))
@@ -77,10 +83,13 @@ struct MatmulOpInterface
     if (failed(outBuffer))
       return failure();
 
-    auto bufferized =
-        MatmulOp::create(rewriter, matmulOp.getLoc(), /*result=*/TypeRange(),
-                         *lhsBuffer, *rhsBuffer, *outBuffer);
+    auto bufferized = MatmulOp::create(
+        rewriter, matmulOp.getLoc(), /*result=*/TypeRange(), *lhsBuffer,
+        *rhsBuffer, *outBuffer, matmulOp.getTailPlanAttr());
     copyDecisionId(op, bufferized.getOperation());
+    if (isHmxDiagnosticTailMarker(matmulOp.getOperation()))
+      bufferized->setAttr(kHmxDiagnosticTailAttr,
+                          matmulOp->getAttr(kHmxDiagnosticTailAttr));
     replaceOpWithBufferizedValues(rewriter, op, *outBuffer);
     return success();
   }
@@ -108,7 +117,8 @@ struct PackActOpInterface
 
     auto bufferized = PackActOp::create(
         rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer}, *dstBuffer,
-        *srcBuffer, packOp.getRow(), packOp.getCol(), packOp.getCountAttr());
+        *srcBuffer, packOp.getRow(), packOp.getCol(), packOp.getCountAttr(),
+        packOp.getValidRowsAttr(), packOp.getValidColsAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
@@ -138,7 +148,8 @@ struct PackWeightOpInterface
     auto bufferized = PackWeightOp::create(
         rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer}, *dstBuffer,
         *srcBuffer, packOp.getKTile(), packOp.getNTile(),
-        packOp.getCountAttr());
+        packOp.getCountAttr(), packOp.getValidRowsAttr(),
+        packOp.getValidColsAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
@@ -168,7 +179,8 @@ struct UnpackAccOpInterface
     auto bufferized = UnpackAccOp::create(
         rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
         *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
-        unpackOp.getCountAttr());
+        unpackOp.getCountAttr(), unpackOp.getValidRowsAttr(),
+        unpackOp.getValidColsAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
@@ -207,7 +219,8 @@ struct UnpackAccF32OpInterface
     auto bufferized = UnpackAccF32Op::create(
         rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
         *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
-        residualBuffer, unpackOp.getCountAttr());
+        residualBuffer, unpackOp.getCountAttr(),
+        unpackOp.getValidRowsAttr(), unpackOp.getValidColsAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();

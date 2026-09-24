@@ -17,6 +17,8 @@
 
 #include "llvm/ADT/SmallVector.h"
 
+#include <optional>
+
 using namespace mlir;
 using namespace mlir::hmx;
 
@@ -183,6 +185,32 @@ LogicalResult verifyCount(Operation *op, std::optional<uint64_t> count,
   return success();
 }
 
+/// Validate the static valid extent carried by a bounds-safe tail leaf. The
+/// attributes are deliberately paired: a partial leaf must not be able to
+/// describe only one axis. Bulk ranges are rejected because an edge tile is a
+/// single physical crouton; ranged full-tile calls must stay on the existing
+/// leaves.
+LogicalResult verifyTailExtents(Operation *op,
+                                std::optional<uint64_t> validRows,
+                                std::optional<uint64_t> validCols,
+                                std::optional<uint64_t> count) {
+  if (!validRows && !validCols)
+    return success();
+  if (!validRows || !validCols)
+    return op->emitOpError()
+           << "valid_rows and valid_cols must be provided together";
+  for (auto [value, name] : {std::pair{*validRows, "valid_rows"},
+                             std::pair{*validCols, "valid_cols"}}) {
+    if (value < 1 || value > static_cast<uint64_t>(layout::kTileEdge))
+      return op->emitOpError()
+             << name << " must be in [1, " << layout::kTileEdge << "]";
+  }
+  if (count && *count != 1)
+    return op->emitOpError()
+           << "bounds-safe tail leaves require count=1, got " << *count;
+  return success();
+}
+
 /// Structural legality of a pack source: the op contracts a *row-major* matrix,
 /// so its rows must be at least as far apart as it is wide. This is the
 /// invariant the lowering preserves by threading `stride(rank-2)` into the leaf
@@ -209,6 +237,84 @@ LogicalResult verifyPackSource(Operation *op, Value rowMajor, StringRef name) {
            << width
            << " columns: a row-major pack source cannot have overlapping rows";
 
+  return success();
+}
+
+/// Return the logical matrix carried by a crouton tensor or memref. The tensor
+/// form uses #hmx.crouton; after bufferization the same information is carried
+/// by #hmx.crouton_memref_layout. A layout-less crouton is legal when the
+/// encoding is intentionally erased, but there is no shape to cross-check in
+/// that form, so a tail plan simply cannot add a redundant check.
+std::optional<SmallVector<int64_t, 2>> croutonLogical(Type type) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type)) {
+    if (auto encoding = getCroutonEncoding(tensor))
+      return SmallVector<int64_t, 2>(encoding.getLogical().begin(),
+                                     encoding.getLogical().end());
+  }
+  if (auto memref = dyn_cast<MemRefType>(type)) {
+    if (auto layout = dyn_cast_or_null<CroutonMemRefLayoutAttr>(
+            memref.getLayout()))
+      return SmallVector<int64_t, 2>(layout.getLogical().begin(),
+                                     layout.getLogical().end());
+  }
+  return std::nullopt;
+}
+
+LogicalResult verifyTailPlan(Operation *op, TailPlanAttr plan, Value lhs,
+                             Value rhs, Value out) {
+  if (!plan)
+    return success();
+
+  // The physical rank-5 grid is present even when the encoding was erased. It
+  // is therefore the primary check: dropping #hmx.crouton must not erase the
+  // shape contract that the padded plan claims.
+  auto checkGrid = [&](StringRef name, ShapedType type, int64_t expected0,
+                       int64_t expected1) -> LogicalResult {
+    if (type.getDimSize(0) == expected0 && type.getDimSize(1) == expected1)
+      return success();
+    return op->emitOpError()
+           << "tail_plan " << name << " physical grid [" << type.getDimSize(0)
+           << ", " << type.getDimSize(1)
+           << "] does not match padded HMX grid [" << expected0 << ", "
+           << expected1 << "]";
+  };
+
+  ArrayRef<int64_t> padded = plan.getPadded();
+  if (failed(checkGrid("lhs", cast<ShapedType>(lhs.getType()),
+                       padded[0] / layout::kTileEdge,
+                       padded[2] / layout::kTileEdge)) ||
+      failed(checkGrid("rhs", cast<ShapedType>(rhs.getType()),
+                       padded[1] / layout::kTileEdge,
+                       padded[2] / layout::kTileEdge)) ||
+      failed(checkGrid("out", cast<ShapedType>(out.getType()),
+                       padded[0] / layout::kTileEdge,
+                       padded[1] / layout::kTileEdge)))
+    return failure();
+
+  std::optional<SmallVector<int64_t, 2>> lhsLogical = croutonLogical(lhs.getType());
+  std::optional<SmallVector<int64_t, 2>> rhsLogical = croutonLogical(rhs.getType());
+  std::optional<SmallVector<int64_t, 2>> outLogical = croutonLogical(out.getType());
+  if (!lhsLogical && !rhsLogical && !outLogical)
+    return success();
+  if (!lhsLogical || !rhsLogical || !outLogical)
+    return op->emitOpError()
+           << "tail_plan requires all three operands to carry a crouton logical "
+              "layout when any one does";
+
+  auto checkLogical = [&](StringRef name, ArrayRef<int64_t> actual,
+                          int64_t expected0, int64_t expected1) -> LogicalResult {
+    if (actual.size() == 2 && actual[0] == expected0 && actual[1] == expected1)
+      return success();
+    return op->emitOpError()
+           << "tail_plan " << name << " logical shape [" << actual[0] << ", "
+           << actual[1] << "] does not match padded HMX shape ["
+           << expected0 << ", " << expected1 << "]";
+  };
+
+  if (failed(checkLogical("lhs", *lhsLogical, padded[0], padded[2])) ||
+      failed(checkLogical("rhs", *rhsLogical, padded[1], padded[2])) ||
+      failed(checkLogical("out", *outLogical, padded[0], padded[1])))
+    return failure();
   return success();
 }
 
@@ -262,7 +368,9 @@ LogicalResult BiasInitOp::verify() {
 
 LogicalResult MatmulOp::verify() {
   Operation *op = getOperation();
-  return verifyMatmul(op, getLhs(), getRhs(), getOuts());
+  if (failed(verifyMatmul(op, getLhs(), getRhs(), getOuts())))
+    return failure();
+  return verifyTailPlan(op, getTailPlanAttr(), getLhs(), getRhs(), getOuts());
 }
 
 LogicalResult AllocCroutonOp::verify() {
@@ -338,8 +446,11 @@ LogicalResult PackActOp::verify() {
     return failure();
   // The bulk range runs along the activation grid's contiguous (K) axis.
   auto dstType = dyn_cast<ShapedType>(getDst().getType());
-  return verifyCount(getOperation(), getCount(),
-                     dstType ? dstType.getDimSize(1) : 1, "K tile");
+  if (failed(verifyCount(getOperation(), getCount(),
+                         dstType ? dstType.getDimSize(1) : 1, "K tile")))
+    return failure();
+  return verifyTailExtents(getOperation(), getValidRows(), getValidCols(),
+                           getCount());
 }
 
 LogicalResult PackWeightOp::verify() {
@@ -354,8 +465,11 @@ LogicalResult PackWeightOp::verify() {
   // The bulk range runs along the weight grid's contiguous (K) axis, dim 1 of
   // the [Nt, Kt] array.
   auto dstType = dyn_cast<ShapedType>(getDst().getType());
-  return verifyCount(getOperation(), getCount(),
-                     dstType ? dstType.getDimSize(1) : 1, "K tile");
+  if (failed(verifyCount(getOperation(), getCount(),
+                         dstType ? dstType.getDimSize(1) : 1, "K tile")))
+    return failure();
+  return verifyTailExtents(getOperation(), getValidRows(), getValidCols(),
+                           getCount());
 }
 
 LogicalResult UnpackAccOp::verify() {
@@ -363,8 +477,11 @@ LogicalResult UnpackAccOp::verify() {
                                     "dst")))
     return failure();
   // A tile row holds exactly 16 row-pairs; `col` selects the first.
-  return verifyCount(getOperation(), getCount(), layout::kCroutonPair,
-                     "row-pair");
+  if (failed(verifyCount(getOperation(), getCount(), layout::kCroutonPair,
+                         "row-pair")))
+    return failure();
+  return verifyTailExtents(getOperation(), getValidRows(), getValidCols(),
+                           getCount());
 }
 
 LogicalResult UnpackAccF32Op::verify() {
@@ -425,8 +542,7 @@ LogicalResult UnpackAccF32Op::verify() {
   // Same 16-row-pair tile row as `hmx.unpack_acc`.
   if (failed(verifyCount(op, getCount(), layout::kCroutonPair, "row-pair")))
     return failure();
-
-  return success();
+  return verifyTailExtents(op, getValidRows(), getValidCols(), getCount());
 }
 
 //===----------------------------------------------------------------------===//

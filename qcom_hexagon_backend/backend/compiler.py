@@ -21,6 +21,7 @@ from triton._C.libtriton import ir, passes, qcom_hexagon_backend  # type: ignore
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton.backends.qcom_hexagon_backend.utils import parse_return_types
 from triton.backends.qcom_hexagon_backend.utils import (
+    HMX_SHAPE_TAIL_ABI_VERSION,
     PACK_METADATA_REQUIRED,
     apply_translation_metadata,
     validate_pack_metadata,
@@ -179,12 +180,15 @@ class HexagonBackend(BaseBackend):
         Covers the target plus every effective backend option, so changing an
         option re-keys the cache instead of reusing a kernel compiled under the
         old one. The compiled backend library itself is deliberately not part
-        of this hash; tools/hexmlir/env.sh partitions TRITON_CACHE_DIR on the
-        libtriton.so identity for that.
+        of this hash; the semantic HMX shape/tail ABI token is mixed in as
+        well. tools/hexmlir/env.sh partitions TRITON_CACHE_DIR on the
+        libtriton.so identity for the compiled library.
         """
-        return hashlib.sha256(
-            f"{self.target}-{self._parsed_options.hash()}".encode("utf-8")
-        ).hexdigest()
+        cache_identity = (
+            f"{HMX_SHAPE_TAIL_ABI_VERSION}-{self.target}-"
+            f"{self._parsed_options.hash()}"
+        )
+        return hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()
 
     def parse_options(self, opts) -> Any:
         assert self.target.backend == "hexagon"

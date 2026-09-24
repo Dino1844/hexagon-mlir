@@ -46,6 +46,42 @@ class Hmx_Attr<string name, string _mnemonic, list<Trait> traits = []>
   let mnemonic = _mnemonic;
 }
 
+def Hmx_TailPlanAttr : Hmx_Attr<"TailPlan", "tail_plan"> {
+  let summary = "Static HMX padded/full/tail shape plan";
+
+  let description = [{
+    The compile-time shape contract for one padded HMX matmul.  It is kept as
+    a single attribute so bufferization and partitioning cannot re-derive tail
+    extents independently:
+
+    ```mlir
+    #hmx.tail_plan<logical = [65, 47, 70], padded = [96, 64, 96],
+                   full = [64, 32, 64], tail = [1, 15, 6],
+                   k_policy = "zero-pad-both-operands",
+                   mn_policy = "padded-edge-tile-bounded-store">
+    ```
+
+    `logical` is `[M, N, K]`, `padded` is the physical 32-aligned shape,
+    `full` is the leading 32-aligned region, and `tail` is the peeled edge.
+    The K policy currently has one legal value; the M/N policy names the
+    bounds-safe edge-store contract.  The attribute is descriptive contract
+    data, not a request to run the engine: capability and budget attribution
+    remain the responsibility of the HMX target pass.
+  }];
+
+  let parameters = (ins
+    ArrayRefParameter<"int64_t">:$logical,
+    ArrayRefParameter<"int64_t">:$padded,
+    ArrayRefParameter<"int64_t">:$full,
+    ArrayRefParameter<"int64_t">:$tail,
+    StringRefParameter<"">:$kPolicy,
+    StringRefParameter<"">:$mnPolicy
+  );
+
+  let hasCustomAssemblyFormat = 1;
+  let genVerifyDecl = 1;
+}
+
 def Hmx_CroutonLayoutAttr
     : Hmx_Attr<"CroutonLayout", "crouton",
                [DeclareAttrInterfaceMethods<VerifiableTensorEncoding>]> {

@@ -7,8 +7,8 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The v1 HMX manifest is module metadata, not an IR rewrite: it records the
-// engine decision for every original linalg.matmul and lets later HMX passes
+// The HMX manifest is module metadata, not an IR rewrite: it records the
+// semantic plan for every original linalg.matmul and lets later HMX passes
 // update the same decision as they lower it.
 //
 //===----------------------------------------------------------------------===//
@@ -19,6 +19,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Operation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
 #include <mutex>
@@ -32,10 +33,32 @@ namespace hmx {
 /// hand-off never depends on location metadata.
 inline constexpr StringLiteral kHmxDecisionIdAttr = "hmx.decision_id";
 
-/// Canonical v1 attribution reason vocabulary. Keep this as the single C++
-/// vocabulary shared by the producer and manifest validator; Python's
-/// transport validator mirrors the wire names for its independent boundary.
-inline constexpr StringLiteral kHmxReasonSelected = "selected";
+/// Internal, test-only IR marker. It is deliberately not a backend option:
+/// the normal attribution path never sets it, so production tail selection
+/// remains closed while diagnostic producer/consumer tests can exercise the
+/// full hmx-tail contract end to end.
+inline constexpr StringLiteral kHmxDiagnosticTailAttr =
+    "hmx.diagnostic_tail_partition";
+
+/// The diagnostic guard is deliberately presence-and-type checked. A marker
+/// carrying a string/integer/other payload is malformed test IR, not an
+/// implicit opt-in.
+inline bool isHmxDiagnosticTailMarker(Operation *op) {
+  return op && op->hasAttr(kHmxDiagnosticTailAttr) &&
+         isa<UnitAttr>(op->getAttr(kHmxDiagnosticTailAttr));
+}
+
+/// Canonical semantic plan vocabulary. The plan is the executable shape
+/// decision; a reason explains why that plan was selected or refused.
+inline constexpr StringLiteral kHmxPlanFullHMX = "full-hmx";
+inline constexpr StringLiteral kHmxPlanHMXTail = "hmx-tail";
+inline constexpr StringLiteral kHmxPlanHVX = "hvx";
+
+/// Canonical attribution reason vocabulary shared by the producer and the
+/// manifest validator. Keep the wire names centralized; Python mirrors this
+/// independent boundary.
+inline constexpr StringLiteral kHmxReasonSelectedAligned = "selected-aligned";
+inline constexpr StringLiteral kHmxReasonSelectedTail = "selected-tail";
 inline constexpr StringLiteral kHmxReasonLibraryCall = "library-call";
 inline constexpr StringLiteral kHmxReasonVtcmAllocatorDisabled =
     "vtcm-allocator-disabled";
@@ -44,22 +67,26 @@ inline constexpr StringLiteral kHmxReasonDynamicShape = "dynamic-shape";
 inline constexpr StringLiteral kHmxReasonUnsupportedDType = "unsupported-dtype";
 inline constexpr StringLiteral kHmxReasonMinRows = "min-rows";
 inline constexpr StringLiteral kHmxReasonTileAlignment = "tile-alignment";
+inline constexpr StringLiteral kHmxReasonUnsupportedLayout = "unsupported-layout";
 inline constexpr StringLiteral kHmxReasonVtcmBudget = "vtcm-budget";
 
 inline bool isCanonicalHmxMatmulReason(StringRef reason) {
-  return reason == kHmxReasonSelected || reason == kHmxReasonLibraryCall ||
+  return reason == kHmxReasonSelectedAligned ||
+         reason == kHmxReasonSelectedTail || reason == kHmxReasonLibraryCall ||
          reason == kHmxReasonVtcmAllocatorDisabled ||
          reason == kHmxReasonNonRank2 || reason == kHmxReasonDynamicShape ||
          reason == kHmxReasonUnsupportedDType || reason == kHmxReasonMinRows ||
-         reason == kHmxReasonTileAlignment || reason == kHmxReasonVtcmBudget;
+         reason == kHmxReasonTileAlignment ||
+         reason == kHmxReasonUnsupportedLayout ||
+         reason == kHmxReasonVtcmBudget;
 }
 
 /// Shared lock for passes that read or write module-level HMX state while
 /// nested under independently scheduled func.func operations.
 std::mutex &hmxModuleStateMutex();
 
-/// Create `hmx.kernel_manifest` when absent, or validate the existing v1 value.
-/// A malformed or schema-incompatible manifest is an error rather than a
+/// Create `hmx.kernel_manifest` when absent, or validate the existing semantic
+/// value. A malformed or schema-incompatible manifest is an error rather than a
 /// silently replaced value: downstream metadata must describe this module, not
 /// a best-effort reconstruction of it.
 LogicalResult ensureHmxManifest(ModuleOp module);
@@ -90,7 +117,38 @@ LogicalResult restoreHmxManifestDecisionIds(ModuleOp module, func::FuncOp func);
 /// count aligned with the final bridge IR.
 LogicalResult refreshHmxManifestBridgeCounts(ModuleOp module);
 
-/// Serialize the module's valid v1 manifest as a top-level JSON object.
+/// Rebind one record to the function argument slot proven by the resident
+/// weight pass. This is needed when attribution saw a layout-only view rather
+/// than the entry argument itself.
+LogicalResult bindHmxManifestWeightSlot(ModuleOp module, StringRef function,
+                                        int64_t recordId, int64_t slot);
+
+/// Publish the final policy for one function argument slot. This is called
+/// after the resident-weight pass has classified all consumers, so the manifest
+/// never advertises a partial first-consumer decision.
+LogicalResult setHmxManifestWeightPolicy(ModuleOp module, StringRef function,
+                                         int64_t slot, StringRef policy,
+                                         StringRef reason,
+                                         ArrayRef<int64_t> consumers);
+
+/// Reconcile the final slot policies against the module's prepack declarations
+/// after the resident-weight pass has finished its classify/rewrite phase.
+LogicalResult reconcileHmxManifestWeightPolicies(ModuleOp module,
+                                                  bool prepackRuntimeWeights);
+
+/// Update the workspace/grid facts after the workspace-residency pass has made
+/// its final decision for a function.
+LogicalResult setHmxManifestWorkspaceClass(ModuleOp module,
+                                           StringRef function,
+                                           StringRef workspaceClass,
+                                           StringRef gridPolicy);
+
+/// Complete final-only fields (pipeline presence, weight references, and
+/// fingerprints) and validate the semantic manifest before serialization.
+LogicalResult finalizeHmxManifest(ModuleOp module);
+
+/// Serialize the module's finalized semantic manifest as a top-level JSON
+/// object.
 std::string serializeHmxManifestJson(ModuleOp module);
 
 } // namespace hmx

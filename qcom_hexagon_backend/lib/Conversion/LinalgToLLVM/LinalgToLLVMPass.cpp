@@ -108,7 +108,7 @@ public:
     auto moduleOp = getOperation();
     if (enableHexKL) {
       moduleOp.emitError(
-          "enableHexKL is incompatible with the HMX v1 manifest contract: "
+          "enableHexKL is incompatible with the HMX manifest contract: "
           "HexKL consumes linalg.matmul before HMX attribution can record it");
       signalPassFailure();
       return;

@@ -19,6 +19,7 @@
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "hexagon/Dialect/Hmx/IR/HmxCroutonLayout.h"
+#include "llvm/ADT/StringRef.h"
 
 //===----------------------------------------------------------------------===//
 // HMX Dialect
@@ -60,6 +61,13 @@
 // shape, so a bare shape is not a crouton.
 namespace mlir {
 namespace hmx {
+
+/// The closed policy vocabulary carried by #hmx.tail_plan. Keep these names
+/// in one place so the parser, target planner, and leaf lowering cannot drift.
+inline constexpr llvm::StringLiteral kHmxTailKPolicy =
+    "zero-pad-both-operands";
+inline constexpr llvm::StringLiteral kHmxTailMNPolicy =
+    "padded-edge-tile-bounded-store";
 
 /// The implicit single hardware resource of the HMX path: the engine's
 /// accumulator / bias-register state and its staging pipeline. There is one

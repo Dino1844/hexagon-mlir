@@ -1,8 +1,9 @@
-"""Host-only tests for the HMX translation metadata envelope."""
+"""Host-only tests for the semantic HMX manifest consumer."""
 
+import copy
+import hashlib
 import importlib.util
 import json
-import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -20,42 +21,175 @@ _UTILS = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_UTILS)
 
 
-_MANIFEST = {
-    "schema": "hex.hmx.kernel_manifest/v1",
-    "matmuls": [
-        {
-            "function": "matmul_kernel",
-            "id": 0,
-            "engine": "hmx",
-            "reason": "selected",
-            "m": 64,
-            "n": 64,
-            "k": 64,
-            "lhs_elem": "f16",
-            "rhs_elem": "f16",
-            "out_elem": "f16",
-            "vtcm_budget": 8388608,
-            "vtcm_before": 0,
-            "vtcm_peak": 24576,
-            "blocking": "whole",
-            "block_m": 64,
+def _dimension(value=None, *, symbol=None):
+    if symbol is not None:
+        return {"kind": "dynamic", "symbol": symbol}
+    return {"kind": "static", "value": value}
+
+
+def _logical(m=64, n=64, k=64):
+    if m is None or n is None or k is None:
+        return {
+            "m": _dimension(symbol="m" if m is None else None, value=m),
+            "n": _dimension(symbol="n" if n is None else None, value=n),
+            "k": _dimension(symbol="k" if k is None else None, value=k),
+        }
+    return {"m": _dimension(m), "n": _dimension(n), "k": _dimension(k)}
+
+
+def _execution(*, block_m=64, blocking=None, pipeline=None, counts=None):
+    return {
+        "blocking": blocking or ("whole" if block_m == 64 else "m_blocked"),
+        "block_m": block_m,
+        "pipeline": pipeline
+        or {
+            "requested": 0,
+            "selected": "serial",
+            "depth": 0,
+            "reason": "shallow-k",
+        },
+        "bridge_counts": counts
+        or {
             "pack_act_sites": 1,
             "pack_weight_sites": 0,
             "unpack_sites": 1,
             "count_semantics": "ir_sites",
         },
-        {
-            "function": "matmul_kernel",
-            "id": 1,
-            "engine": "hvx",
-            "reason": "vtcm-budget",
+    }
+
+
+def _hmx_record(
+    *,
+    record_id=0,
+    function="matmul_kernel",
+    plan="full-hmx",
+    reason=None,
+    shape=(64, 64, 64),
+    weight_kind="compile-time-constant",
+    policy=None,
+    block_m=None,
+    counts=None,
+    workspace_class="runtime-internal",
+    grid_policy=None,
+):
+    m, n, k = shape
+    padded = {axis: ((value + 31) // 32) * 32 for axis, value in zip("mnk", shape)}
+    full = {axis: (value // 32) * 32 for axis, value in zip("mnk", shape)}
+    tail = {axis: value - full[axis] for axis, value in zip("mnk", shape)}
+    if reason is None:
+        reason = "selected-aligned" if plan == "full-hmx" else "selected-tail"
+    if block_m is None:
+        block_m = m
+    if grid_policy is None:
+        grid_policy = (
+            "legacy-runtime"
+            if plan == "full-hmx" and workspace_class == "runtime-internal"
+            else "single-instance"
+        )
+    record = {
+        "function": function,
+        "id": record_id,
+        "plan": plan,
+        "reason": reason,
+        "shape_state": "static",
+        "logical": _logical(m, n, k),
+        "dtypes": {
+            "lhs": "f16",
+            "rhs": "f16",
+            "out": "f16",
+            "crouton": "f16",
         },
-    ],
-    "pack_act_sites": 1,
-    "pack_weight_sites": 0,
-    "unpack_sites": 1,
-    "count_semantics": "ir_sites",
+        "padded": padded,
+        "full": full,
+        "tail": tail,
+        "layout": "row-major-inner-contiguous",
+        "workspace_class": workspace_class,
+        "grid_policy": grid_policy,
+        "vtcm_accounting": "bridge-only",
+        "vtcm_budget_bytes": 8388608,
+        "vtcm_before_bytes": 0,
+        "vtcm_bridge_peak_bytes": 24576,
+        "execution": _execution(
+            block_m=block_m,
+            blocking="whole" if block_m == m else "m_blocked",
+            counts=counts,
+        ),
+        "weight_binding": {"kind": weight_kind},
+    }
+    if plan == "hmx-tail":
+        record["tail_policy"] = {
+            "k": "zero-pad-both-operands",
+            "mn": "padded-edge-tile-bounded-store",
+        }
+    if weight_kind == "argument-slot":
+        record["weight_binding"]["policy_ref"] = {
+            "function": function,
+            "slot": policy["slot"],
+        }
+    record["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(record, policy)
+    return record
+
+
+def _hvx_record(
+    *,
+    record_id=1,
+    function="matmul_kernel",
+    reason="tile-alignment",
+    shape=(64, 64, 64),
+    dtypes=None,
+):
+    if shape is None:
+        logical = None
+        shape_state = "unavailable"
+    else:
+        logical = _logical(*shape)
+        static_count = sum(value is not None for value in shape)
+        if static_count == 3:
+            shape_state = "static"
+        elif static_count == 0:
+            shape_state = "dynamic"
+        else:
+            shape_state = "partially-dynamic"
+    record = {
+        "function": function,
+        "id": record_id,
+        "plan": "hvx",
+        "reason": reason,
+        "shape_state": shape_state,
+        "logical": logical,
+        "dtypes": dtypes
+        or {"lhs": "f16", "rhs": "f16", "out": "f16"},
+    }
+    record["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(record)
+    return record
+
+
+def _manifest(records, policies=None):
+    totals = {"pack_act_sites": 0, "pack_weight_sites": 0, "unpack_sites": 0}
+    for record in records:
+        if record["plan"] == "hvx":
+            continue
+        counts = record["execution"]["bridge_counts"]
+        for field in totals:
+            totals[field] += counts[field]
+    return {
+        "schema": _UTILS.HMX_MANIFEST_SCHEMA,
+        "matmuls": copy.deepcopy(records),
+        "weight_policies": copy.deepcopy(policies or []),
+        **totals,
+        "count_semantics": "ir_sites",
+    }
+
+
+_POLICY = {
+    "function": "matmul_kernel",
+    "slot": 1,
+    "policy": "device-pack",
+    "reason": "prepack-disabled",
+    "consumers": [0],
 }
+_MANIFEST_RECORD = _hmx_record()
+_MANIFEST = _manifest([_MANIFEST_RECORD])
 _WEIGHT = {"layout": None, "weights": []}
 _LAYOUT = {
     "ndims": 5,
@@ -75,12 +209,12 @@ _VALID_WEIGHT = {
 }
 
 
-def _envelope(*, manifest=_MANIFEST, weight=_WEIGHT):
+def _envelope(*, manifest=None, weight=None):
     return json.dumps(
         {
-            "schema": "hex.hmx.translation/v1",
-            "weight_prepack": weight,
-            "hmx_manifest": manifest,
+            "schema": _UTILS.TRANSLATION_METADATA_SCHEMA,
+            "weight_prepack": copy.deepcopy(_WEIGHT if weight is None else weight),
+            "hmx_manifest": copy.deepcopy(_MANIFEST if manifest is None else manifest),
         }
     )
 
@@ -110,108 +244,217 @@ def _metadata(**overrides):
 
 
 class TranslationMetadataTest(unittest.TestCase):
-    def test_valid_envelope_unpacks_independent_objects(self):
-        weight_json, manifest_json = _UTILS.parse_translation_metadata(_envelope())
-        self.assertEqual(json.loads(weight_json), _WEIGHT)
-        self.assertEqual(json.loads(manifest_json), _MANIFEST)
-        self.assertNotIn("translation", weight_json)
-        self.assertNotIn("translation", manifest_json)
-
-    def test_missing_manifest_is_rejected(self):
-        envelope = json.loads(_envelope())
-        del envelope["hmx_manifest"]
-        with self.assertRaisesRegex(ValueError, "hmx_manifest"):
-            _UTILS.parse_translation_metadata(json.dumps(envelope))
-
-    def test_bad_manifest_schema_is_rejected(self):
-        manifest = dict(_MANIFEST, schema="hex.hmx.kernel_manifest/v0")
-        with self.assertRaisesRegex(ValueError, "kernel_manifest/v1"):
-            _UTILS.parse_translation_metadata(_envelope(manifest=manifest))
-
-    def test_manifest_entry_missing_required_field_is_rejected(self):
-        manifest = json.loads(json.dumps(_MANIFEST))
-        del manifest["matmuls"][0]["reason"]
-        with self.assertRaisesRegex(ValueError, "reason"):
-            _UTILS.parse_translation_metadata(_envelope(manifest=manifest))
-
-    def test_manifest_entry_shape_is_checked(self):
-        bad = dict(_MANIFEST)
-        bad["matmuls"] = [
-            {
-                "function": "matmul_kernel",
-                "id": True,
-                "engine": "hmx",
-                "reason": "selected",
-            }
-        ]
-        with self.assertRaisesRegex(ValueError, "id must be a non-negative int"):
-            _UTILS.parse_translation_metadata(_envelope(manifest=bad))
-
-    def test_hmx_entry_requires_final_bridge_counts(self):
-        manifest = json.loads(json.dumps(_MANIFEST))
-        del manifest["matmuls"][0]["unpack_sites"]
-        with self.assertRaisesRegex(ValueError, "unpack_sites"):
-            _UTILS.validate_hmx_manifest(manifest)
-
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"][0]["pack_act_sites"] = -1
-        with self.assertRaisesRegex(ValueError, "non-negative"):
-            _UTILS.validate_hmx_manifest(manifest)
-
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["pack_act_sites"] = 2
-        with self.assertRaisesRegex(ValueError, "per-matmul counts sum"):
-            _UTILS.validate_hmx_manifest(manifest)
-
-    def test_engine_and_reason_must_agree(self):
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"][0]["reason"] = "tile-alignment"
-        with self.assertRaisesRegex(ValueError, "engine/reason disagree"):
-            _UTILS.validate_hmx_manifest(manifest)
-
-    def test_selected_contract_and_pipeline_relationships_are_checked(self):
-        cases = [
-            ("m", "partial matmul contract"),
-            ("block_m", "must be >= 1"),
-            ("vtcm_peak", "exceeds vtcm_budget"),
-            ("blocking", "must be 'whole' or 'm_blocked'"),
-        ]
-        for field, message in cases:
-            manifest = json.loads(json.dumps(_MANIFEST))
-            if field == "m":
-                del manifest["matmuls"][0][field]
-            elif field == "block_m":
-                manifest["matmuls"][0][field] = 0
-            elif field == "vtcm_peak":
-                manifest["matmuls"][0][field] = manifest["matmuls"][0]["vtcm_budget"] + 1
-            else:
-                manifest["matmuls"][0][field] = "none"
-            with self.subTest(field=field):
-                with self.assertRaisesRegex(ValueError, message):
-                    _UTILS.validate_hmx_manifest(manifest)
-
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"][0].update(
-            pipeline_requested=2,
-            pipeline_selected="staged",
-            pipeline_depth=0,
+    def test_current_manifest_accepts_full_plan_and_nested_execution(self):
+        self.assertIs(_UTILS.validate_hmx_manifest(_MANIFEST), _MANIFEST)
+        self.assertEqual(_MANIFEST["matmuls"][0]["shape_state"], "static")
+        self.assertNotIn("engine", _MANIFEST["matmuls"][0])
+        self.assertEqual(
+            _MANIFEST["matmuls"][0]["execution"]["bridge_counts"][
+                "count_semantics"
+            ],
+            "ir_sites",
         )
-        with self.assertRaisesRegex(ValueError, "positive for staged"):
-            _UTILS.validate_hmx_manifest(manifest)
 
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"][1]["pipeline_requested"] = 0
-        manifest["matmuls"][1]["pipeline_selected"] = "staged"
-        manifest["matmuls"][1]["pipeline_depth"] = 1
-        with self.assertRaisesRegex(ValueError, "HMX-only fields"):
-            _UTILS.validate_hmx_manifest(manifest)
+    def test_launch_contract_gates_single_instance_records(self):
+        tail = _manifest(
+            [_hmx_record(plan="hmx-tail", shape=(33, 33, 33), block_m=33)]
+        )
+        tail_json = json.dumps(tail)
+        self.assertEqual(
+            _UTILS.enforce_hmx_launch_contract(tail_json, (1, 1, 1)), tail
+        )
+        with self.assertRaisesRegex(ValueError, "single program instance"):
+            _UTILS.enforce_hmx_launch_contract(tail_json, (2, 1, 1))
 
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"].append(json.loads(json.dumps(manifest["matmuls"][0])))
-        with self.assertRaisesRegex(ValueError, "duplicates"):
-            _UTILS.validate_hmx_manifest(manifest)
+        resident = _manifest(
+            [
+                _hmx_record(
+                    workspace_class="resident-single-instance",
+                )
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "single program instance"):
+            _UTILS.enforce_hmx_launch_contract(json.dumps(resident), (1, 2, 1))
 
-    def test_apply_translation_metadata_publishes_both_fields(self):
+        # The legacy runtime-internal full plan deliberately retains the old
+        # grid behavior; this gate must not silently turn it into single-instance.
+        self.assertEqual(
+            _UTILS.enforce_hmx_launch_contract(json.dumps(_MANIFEST), (2, 1, 1)),
+            _MANIFEST,
+        )
+
+    def test_launch_contract_rejects_invalid_grid_shape(self):
+        with self.assertRaisesRegex(ValueError, "three dimensions"):
+            _UTILS.enforce_hmx_launch_contract(json.dumps(_MANIFEST), (1, 1))
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            _UTILS.enforce_hmx_launch_contract(json.dumps(_MANIFEST), (1, 0, 1))
+
+    def test_peeled_diagnostic_pipeline_reason_is_closed(self):
+        record = _hmx_record(plan="hmx-tail", shape=(33, 33, 33), block_m=33)
+        record["execution"]["pipeline"]["reason"] = "tail-peeled-edge"
+        record["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(record)
+        _UTILS.validate_hmx_manifest(_manifest([record]))
+
+        bad = copy.deepcopy(record)
+        bad["execution"]["pipeline"]["reason"] = "unknown-peeled-reason"
+        with self.assertRaisesRegex(ValueError, "pipeline.reason"):
+            _UTILS.validate_hmx_manifest(_manifest([bad]))
+
+    def test_tail_plan_arithmetic_is_checked(self):
+        record = _hmx_record(plan="hmx-tail", shape=(65, 47, 70), block_m=65)
+        manifest = _manifest([record])
+        _UTILS.validate_hmx_manifest(manifest)
+
+        bad = copy.deepcopy(manifest)
+        bad["matmuls"][0]["padded"]["k"] = 64
+        with self.assertRaisesRegex(ValueError, "padded.k"):
+            _UTILS.validate_hmx_manifest(bad)
+
+    def test_shape_state_is_derived_from_tagged_dimensions(self):
+        partial = _hvx_record(reason="dynamic-shape", shape=(64, None, 64))
+        dynamic = _hvx_record(record_id=2, reason="dynamic-shape", shape=(None, None, None))
+        manifest = _manifest([partial, dynamic])
+        _UTILS.validate_hmx_manifest(manifest)
+
+        bad = copy.deepcopy(manifest)
+        bad["matmuls"][0]["shape_state"] = "dynamic"
+        with self.assertRaisesRegex(ValueError, "shape_state"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        unavailable = _hvx_record(
+            record_id=3, reason="library-call", shape=None,
+            dtypes={"lhs": "unavailable", "rhs": "unavailable", "out": "unavailable"},
+        )
+        _UTILS.validate_hmx_manifest(_manifest([unavailable]))
+
+    def test_plan_and_reason_matrix_is_closed(self):
+        cases = [
+            ("full-hmx", "selected-aligned", (64, 64, 64)),
+            ("hmx-tail", "selected-tail", (65, 47, 70)),
+            ("hvx", "library-call", None),
+            ("hvx", "vtcm-allocator-disabled", (64, 64, 64)),
+            ("hvx", "non-rank-2", None),
+            ("hvx", "dynamic-shape", (None, 64, 64)),
+            ("hvx", "unsupported-dtype", (64, 64, 64)),
+            ("hvx", "min-rows", (4, 64, 64)),
+            ("hvx", "tile-alignment", (65, 64, 64)),
+            ("hvx", "unsupported-layout", (64, 64, 64)),
+            ("hvx", "vtcm-budget", (64, 64, 64)),
+        ]
+        for index, (plan, reason, shape) in enumerate(cases):
+            with self.subTest(plan=plan, reason=reason):
+                if plan == "hvx":
+                    record = _hvx_record(record_id=index, reason=reason, shape=shape)
+                else:
+                    record = _hmx_record(
+                        record_id=index, plan=plan, reason=reason, shape=shape
+                    )
+                _UTILS.validate_hmx_manifest(_manifest([record]))
+
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["reason"] = "selected-tail"
+        with self.assertRaisesRegex(ValueError, "canonical pair"):
+            _UTILS.validate_hmx_manifest(bad)
+
+    def test_unknown_and_legacy_fields_are_rejected(self):
+        for field, value in (
+            ("engine", "hmx"),
+            ("workspace", {"bytes": 1}),
+            ("tail_policy", {"k": "wrong", "mn": "wrong"}),
+        ):
+            with self.subTest(field=field):
+                bad = copy.deepcopy(_MANIFEST)
+                bad["matmuls"][0][field] = value
+                with self.assertRaisesRegex(ValueError, "unknown field"):
+                    _UTILS.validate_hmx_manifest(bad)
+
+        missing = copy.deepcopy(_MANIFEST)
+        del missing["weight_policies"]
+        with self.assertRaisesRegex(ValueError, "weight_policies"):
+            _UTILS.validate_hmx_manifest(missing)
+
+        legacy = copy.deepcopy(_MANIFEST)
+        legacy["schema"] = "hex.hmx.kernel_manifest/old"
+        with self.assertRaisesRegex(ValueError, _UTILS.HMX_MANIFEST_SCHEMA):
+            _UTILS.validate_hmx_manifest(legacy)
+
+    def test_execution_bridge_and_vtcm_contracts_are_nested_and_strict(self):
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["execution"]["bridge_counts"]["unpack_sites"] = -1
+        with self.assertRaisesRegex(ValueError, "unpack_sites"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["execution"]["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["workspace"] = {"bytes": 1}
+        with self.assertRaisesRegex(ValueError, "unknown field"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["grid_policy"] = "single-instance"
+        with self.assertRaisesRegex(ValueError, "grid_policy"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        bad = copy.deepcopy(_MANIFEST)
+        bad["matmuls"][0]["vtcm_accounting"] = "kernel-peak"
+        with self.assertRaisesRegex(ValueError, "bridge-only"):
+            _UTILS.validate_hmx_manifest(bad)
+
+    def test_weight_policies_and_bindings_are_resolved(self):
+        policy = copy.deepcopy(_POLICY)
+        record = _hmx_record(weight_kind="argument-slot", policy=policy)
+        manifest = _manifest([record], [policy])
+        _UTILS.validate_hmx_manifest(manifest)
+
+        missing = copy.deepcopy(manifest)
+        missing["weight_policies"] = []
+        with self.assertRaisesRegex(ValueError, "weight_policies"):
+            _UTILS.validate_hmx_manifest(missing)
+
+        bad = copy.deepcopy(manifest)
+        bad["weight_policies"][0]["policy"] = "resident-prepack"
+        with self.assertRaisesRegex(ValueError, "not valid for policy"):
+            _UTILS.validate_hmx_manifest(bad)
+
+        orphan = copy.deepcopy(manifest)
+        orphan["weight_policies"][0]["consumers"] = []
+        with self.assertRaisesRegex(ValueError, "consumer"):
+            _UTILS.validate_hmx_manifest(orphan)
+
+    def test_fingerprint_is_compact_sorted_json_and_covers_semantics(self):
+        record = copy.deepcopy(_MANIFEST["matmuls"][0])
+        expected_payload = {"schema": _UTILS.HMX_MANIFEST_SCHEMA}
+        expected_payload.update(
+            {
+                key: value
+                for key, value in record.items()
+                if key != "plan_fingerprint"
+            }
+        )
+        encoded = json.dumps(
+            expected_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        self.assertEqual(
+            record["plan_fingerprint"],
+            "sha256:" + hashlib.sha256(encoded).hexdigest(),
+        )
+        reordered = dict(reversed(list(record.items())))
+        reordered["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(reordered)
+        self.assertEqual(reordered["plan_fingerprint"], record["plan_fingerprint"])
+
+        changed = copy.deepcopy(_MANIFEST)
+        changed["matmuls"][0]["weight_binding"] = {"kind": "internal-value"}
+        with self.assertRaisesRegex(ValueError, "fingerprint"):
+            _UTILS.validate_hmx_manifest(changed)
+
+    def test_apply_translation_metadata_publishes_current_objects(self):
         metadata = {}
         _UTILS.apply_translation_metadata(metadata, _envelope())
         self.assertEqual(json.loads(metadata["weight_prepack"]), _WEIGHT)
@@ -219,25 +462,30 @@ class TranslationMetadataTest(unittest.TestCase):
 
     def test_strict_weight_contract_accepts_a_valid_nonempty_entry(self):
         _UTILS.validate_weight_prepack(_VALID_WEIGHT)
+        policy = copy.deepcopy(_POLICY)
+        policy["policy"] = "resident-prepack"
+        policy["reason"] = "eligible-aligned-f16"
+        record = _hmx_record(weight_kind="argument-slot", policy=policy)
+        manifest = _manifest([record], [policy])
         weight_json, _ = _UTILS.parse_translation_metadata(
-            _envelope(weight=_VALID_WEIGHT)
+            _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
 
     def test_strict_weight_contract_rejects_malformed_entries(self):
         def contract_with(**changes):
-            value = json.loads(json.dumps(_VALID_WEIGHT))
+            value = copy.deepcopy(_VALID_WEIGHT)
             value.update(changes)
             return value
 
         def entry_with(**changes):
-            value = json.loads(json.dumps(_VALID_WEIGHT))
+            value = copy.deepcopy(_VALID_WEIGHT)
             value["weights"][0].update(changes)
             return value
 
         cases = [
             (contract_with(weights={}), "weights must be a list"),
-            (contract_with(weights=[1]), "weights\\[0\\] must be an object"),
+            (contract_with(weights=[1]), r"weights\[0\] must be an object"),
             (contract_with(layout=None), "layout must be a non-empty object"),
             (contract_with(layout={}), "layout must be a non-empty object"),
             (entry_with(func=""), "func must be a non-empty string"),
@@ -246,10 +494,10 @@ class TranslationMetadataTest(unittest.TestCase):
             (entry_with(slot=-1), "slot must be >= 0"),
             (entry_with(shape=True), "shape must be a list"),
             (entry_with(shape=[64]), "shape must have 2 entries"),
-            (entry_with(shape=[True, 64]), "shape\\[0\\] must be an int"),
-            (entry_with(shape=[64, 0]), "shape\\[1\\] must be >= 1"),
+            (entry_with(shape=[True, 64]), r"shape\[0\] must be an int"),
+            (entry_with(shape=[64, 0]), r"shape\[1\] must be >= 1"),
             (entry_with(crouton=[2, 2, 16, 32]), "crouton must have 5 entries"),
-            (entry_with(crouton=[2, 2, 16, 32, 0]), "crouton\\[4\\] must be >= 1"),
+            (entry_with(crouton=[2, 2, 16, 32, 0]), r"crouton\[4\] must be >= 1"),
             (entry_with(dtype="f32"), "dtype must be 'f16'"),
         ]
         for value, message in cases:
@@ -257,18 +505,18 @@ class TranslationMetadataTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     _UTILS.validate_weight_prepack(value)
 
-        missing = json.loads(json.dumps(_VALID_WEIGHT))
+        missing = copy.deepcopy(_VALID_WEIGHT)
         del missing["weights"][0]["func"]
         with self.assertRaisesRegex(ValueError, "missing required field.*func"):
             _UTILS.validate_weight_prepack(missing)
 
-        duplicate = json.loads(json.dumps(_VALID_WEIGHT))
-        duplicate["weights"].append(json.loads(json.dumps(duplicate["weights"][0])))
+        duplicate = copy.deepcopy(_VALID_WEIGHT)
+        duplicate["weights"].append(copy.deepcopy(duplicate["weights"][0]))
         with self.assertRaisesRegex(ValueError, "duplicates"):
             _UTILS.validate_weight_prepack(duplicate)
 
-        multi_function = json.loads(json.dumps(_VALID_WEIGHT))
-        second = json.loads(json.dumps(multi_function["weights"][0]))
+        multi_function = copy.deepcopy(_VALID_WEIGHT)
+        second = copy.deepcopy(multi_function["weights"][0])
         second["func"] = "other_kernel"
         second["slot"] = 2
         multi_function["weights"].append(second)
@@ -288,62 +536,79 @@ class TranslationMetadataTest(unittest.TestCase):
         bad = _metadata(weight_prepack="{")
         with self.assertRaisesRegex(RuntimeError, "weight_prepack"):
             HexagonBackend.pack_metadata(object(), bad)
-        bad_manifest = _metadata(hmx_manifest="{")
+        bad_manifest = _metadata(hmx_manifest="[")
         with self.assertRaisesRegex(RuntimeError, "hmx_manifest"):
             HexagonBackend.pack_metadata(object(), bad_manifest)
 
-        invalid_weight = _metadata(
-            weight_prepack=json.dumps(
-                {
-                    "layout": _LAYOUT,
-                    "weights": [
-                        {
-                            "func": "matmul_kernel",
-                            "slot": True,
-                            "shape": [64, 64],
-                            "crouton": [2, 2, 16, 32, 2],
-                            "dtype": "f16",
-                        }
-                    ],
-                }
+        stale_manifest = copy.deepcopy(_MANIFEST)
+        stale_manifest["schema"] = "hex.hmx.kernel_manifest/v1"
+        with self.assertRaisesRegex(RuntimeError, "schema"):
+            HexagonBackend.pack_metadata(
+                object(), _metadata(hmx_manifest=json.dumps(stale_manifest))
             )
+
+    def test_translation_weight_policy_and_prepack_are_cross_checked(self):
+        policy = copy.deepcopy(_POLICY)
+        policy["policy"] = "resident-prepack"
+        policy["reason"] = "eligible-aligned-f16"
+        record = _hmx_record(weight_kind="argument-slot", policy=policy)
+        manifest = _manifest([record], [policy])
+        with self.assertRaisesRegex(ValueError, "matching weight_prepack"):
+            _UTILS.parse_translation_metadata(_envelope(manifest=manifest))
+
+        weight_json, _ = _UTILS.parse_translation_metadata(
+            _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
-        with self.assertRaisesRegex(RuntimeError, "slot"):
-            HexagonBackend.pack_metadata(object(), invalid_weight)
+        self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
 
-    def test_unknown_manifest_reason_is_rejected(self):
-        manifest = json.loads(json.dumps(_MANIFEST))
-        manifest["matmuls"][1]["reason"] = "future-unknown-reason"
-        with self.assertRaisesRegex(ValueError, "canonical HMX reason"):
-            _UTILS.validate_hmx_manifest(manifest)
+    def test_cpp_serialized_manifest_round_trips_through_python(self):
+        fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"
+        options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
+        options["enableWeightResident"] = "True"
 
-    def test_every_canonical_manifest_reason_is_accepted(self):
-        for reason in _UTILS.HMX_MANIFEST_REASONS:
-            with self.subTest(reason=reason):
-                manifest = json.loads(json.dumps(_MANIFEST))
-                if reason == "selected":
-                    manifest["matmuls"][0]["reason"] = reason
-                else:
-                    manifest["matmuls"][1]["reason"] = reason
-                _UTILS.validate_hmx_manifest(manifest)
-
-    def test_python_reason_allowlist_matches_cpp_vocabulary(self):
-        backend_root = _HERE.parents[1]
-        header_path = backend_root / "include/hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
-        producer_path = backend_root / "lib/Dialect/Hmx/Transforms/MatmulToHmxPass.cpp"
-        header_text = header_path.read_text()
-        reason_constants = dict(
-            re.findall(r"\b(kHmxReason\w+)\s*=\s*\"([^\"]+)\"", header_text)
+        context = ir.context()
+        qcom_hexagon_backend.load_dialects(context)
+        module = qcom_hexagon_backend.parse_mlir_module_from_str(
+            (fixture_root / "hmx-weight-resident-runtime-pipeline.mlir").read_text(),
+            context,
         )
-        canonical_body = header_text.split(
-            "inline bool isCanonicalHmxMatmulReason", 1
-        )[1].split("\n}", 1)[0]
-        producer_text = producer_path.read_text()
-        for name in reason_constants:
-            with self.subTest(constant=name):
-                self.assertIn(name, canonical_body)
-                self.assertIn(f"return {name};", producer_text)
-        self.assertEqual(set(reason_constants.values()), _UTILS.HMX_MANIFEST_REASONS)
+        _, metadata_json = qcom_hexagon_backend.translate_linalg_to_obj(
+            module, options, True
+        )
+        envelope = json.loads(metadata_json)
+        manifest = envelope["hmx_manifest"]
+        self.assertIs(_UTILS.validate_hmx_manifest(manifest), manifest)
+        self.assertEqual(
+            manifest["matmuls"][0]["plan_fingerprint"],
+            _UTILS.compute_hmx_plan_fingerprint(
+                manifest["matmuls"][0], manifest["weight_policies"][0]
+            ),
+        )
+        self.assertEqual(
+            manifest["weight_policies"][0]["policy"], "resident-prepack"
+        )
+
+    def test_cpp_serialized_manifest_publishes_workspace_facts(self):
+        fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"
+        options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
+        options["enableWorkspaceResident"] = "True"
+
+        context = ir.context()
+        qcom_hexagon_backend.load_dialects(context)
+        module = qcom_hexagon_backend.parse_mlir_module_from_str(
+            (fixture_root / "hmx-workspace-resident-pipeline.mlir").read_text(),
+            context,
+        )
+        _, metadata_json = qcom_hexagon_backend.translate_linalg_to_obj(
+            module, options, True
+        )
+        manifest = json.loads(metadata_json)["hmx_manifest"]
+        _UTILS.validate_hmx_manifest(manifest)
+        self.assertEqual(
+            manifest["matmuls"][0]["workspace_class"],
+            "resident-single-instance",
+        )
+        self.assertEqual(manifest["matmuls"][0]["grid_policy"], "single-instance")
 
     def test_cpp_api_rejects_unconsumed_prepack_without_meta(self):
         fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"

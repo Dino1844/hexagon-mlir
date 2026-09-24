@@ -1,10 +1,10 @@
 //===- hmx-hexkl-rejected.mlir - HexKL cannot bypass HMX attribution -------===//
 //
 // HexKL consumes linalg.matmul before the HMX manifest pass can attribute it.
-// The v1 translation contract therefore rejects the combination explicitly.
+// The semantic HMX manifest contract therefore rejects the combination explicitly.
 //
 // RUN: not linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hexkl=true})' 2>&1 | FileCheck %s
-// CHECK: error: enableHexKL is incompatible with the HMX v1 manifest contract
+// CHECK: error: enableHexKL is incompatible with the HMX manifest contract
 //===----------------------------------------------------------------------===//
 
 module {

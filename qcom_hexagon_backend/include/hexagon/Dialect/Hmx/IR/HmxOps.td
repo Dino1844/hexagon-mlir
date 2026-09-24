@@ -31,6 +31,7 @@ include "mlir/IR/CommonTypeConstraints.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/DestinationStyleOpInterface.td"
 include "hexagon/Dialect/Hmx/IR/HmxDialect.td"
+include "hexagon/Dialect/Hmx/IR/HmxAttrs.td"
 
 // The implicit single hardware resource of the HMX path (defined in
 // HmxDialect.h): the engine's accumulator / bias-register state and its
@@ -72,6 +73,11 @@ def Hmx_MatmulOp
     `linalg.pack`/`unpack`, which is also where `fold-pack-unpack-constants` turns a
     constant weight into a prepacked constant at compile time.
 
+    An optional `tail_plan` attribute carries the static padded/full/tail shape
+    contract when this op is part of a padded HMX region. It is copied through
+    bufferization; it does not itself authorize HMX attribution or bypass the
+    target/budget decision.
+
     The op is write-only on `outs` (like `linalg.fill`): the hardware accumulator
     is cleared before the tiles are summed, so the result does NOT accumulate into
     an incoming value. Whoever creates this op from a general matmul must prove
@@ -84,7 +90,8 @@ def Hmx_MatmulOp
   let arguments = (ins
     AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$lhs,
     AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$rhs,
-    AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$outs
+    AnyTypeOf<[Non0RankedTensorOf<[F16]>, Non0RankedMemRefOf<[F16]>]>:$outs,
+    OptionalAttr<Hmx_TailPlanAttr>:$tail_plan
   );
 
   let results = (outs Variadic<Non0RankedTensorOf<[F16]>>:$result);
@@ -182,6 +189,10 @@ def Hmx_PackActOp
     blocks of row `row`. Absent means one block (`count == 1`), which is the
     single-crouton form; the range exists so one runtime call (one whole vector
     of scatter offsets) covers a whole K run.
+
+    `valid_rows` and `valid_cols` are an optional static pair in [1, 32]. When
+    present, they select the bounds-safe tail leaf: rows and columns are the
+    valid part of this 32x32 block, and the range must be one block.
   }];
 
   let arguments = (ins
@@ -192,7 +203,9 @@ def Hmx_PackActOp
         "row-major source">:$src,
     Index:$row,
     Index:$col,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
   );
   // Tensor form: the crouton array. Memref form (DPS): the same `dst` buffer
   // that was written, so the destination is an SSA value.
@@ -236,6 +249,10 @@ def Hmx_PackWeightOp
     the same way: the grid is `[Nt, Kt]`, so `count` K tiles at a fixed `n_tile`
     are packed in one call -- croutons `(n_tile, k_tile) .. (n_tile, k_tile +
     count - 1)` -- with absent meaning one block.
+
+    `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
+    bounds-safe edge block: rows are valid K and columns are valid N. They
+    select a single-block tail leaf and are omitted for the full fast path.
   }];
 
   let arguments = (ins
@@ -246,7 +263,9 @@ def Hmx_PackWeightOp
         "row-major source">:$src,
     Index:$k_tile,
     Index:$n_tile,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
   );
   // Tensor form: the crouton array. Memref form (DPS): the same `dst` buffer
   // that was written, so the destination is an SSA value.
@@ -287,6 +306,10 @@ def Hmx_UnpackAccOp
     always walks a whole crouton row itself, so `count` pairs start at `col`
     (block `col`) and cover `count` consecutive 128-byte blocks. The whole tile
     row is `count == 16`, and absent means one pair (`count == 1`).
+
+    `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
+    bounds-safe edge block. They describe the valid logical M/N portion of the
+    tile; a tail leaf handles one row-pair and therefore requires `count == 1`.
   }];
 
   let arguments = (ins
@@ -296,7 +319,9 @@ def Hmx_UnpackAccOp
         "row-major fp16 destination">:$dst,
     Index:$row,
     Index:$col,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
   );
   // Tensor form: the row-major matrix. Memref form (DPS): the same `dst` buffer
   // that was written, so the destination is an SSA value.
@@ -342,6 +367,11 @@ def Hmx_UnpackAccF32Op
 
     The optional `count` ranges over row-pairs exactly as in `hmx.unpack_acc`:
     `count` pairs start at `col` at tile `row`, whole tile row = 16, absent = 1.
+
+    `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
+    bounds-safe edge block. They describe the valid logical M/N portion of the
+    tile; a tail leaf handles one row-pair and therefore requires `count == 1`.
+    With a residual, only this valid intersection is read.
   }];
 
   let arguments = (ins
@@ -352,7 +382,9 @@ def Hmx_UnpackAccF32Op
     Index:$row,
     Index:$col,
     Optional<AnyTypeOf<[Non0RankedTensorOf<[F32]>, Non0RankedMemRefOf<[F32]>]>>:$residual,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
   );
   // Tensor form: the row-major f32 matrix. Memref form (DPS): the same `dst`
   // buffer that was written, so the destination is an SSA value.

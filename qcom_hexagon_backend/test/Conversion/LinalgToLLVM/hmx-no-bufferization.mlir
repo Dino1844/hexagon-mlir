@@ -15,7 +15,9 @@
 // CHECK-NOT: HMX disabled
 // CHECK-NOT: HMX not applied
 // CHECK: hmx.kernel_manifest = {
-// CHECK-SAME: engine = "hvx"
+// CHECK-SAME: dtypes = {lhs = "f16", out = "f16", rhs = "f16"}
+// CHECK-SAME: logical = {k = {kind = "static", value = 64 : i64}, m = {kind = "static", value = 64 : i64}, n = {kind = "static", value = 64 : i64}}
+// CHECK-SAME: plan = "hvx"
 // CHECK-SAME: reason = "vtcm-allocator-disabled"
 // CHECK-NOT: hmx.matmul
 // CHECK: llvm.func @manual_buffer_matmul

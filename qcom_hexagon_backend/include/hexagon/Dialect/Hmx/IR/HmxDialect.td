@@ -50,9 +50,9 @@ def Hmx_Dialect : Dialect {
     "mlir::memref::MemRefDialect",
   ];
 
-  // The dialect defines attributes (`#hmx.crouton`); without this the generated
-  // dialect has no attribute parsing/printing hook and every `#hmx.` attribute
-  // fails to parse.
+  // The dialect defines attributes (`#hmx.crouton`, `#hmx.tail_plan`); without
+  // this the generated dialect has no attribute parsing/printing hook and every
+  // `#hmx.` attribute fails to parse.
   let useDefaultAttributePrinterParser = 1;
 
   let extraClassDeclaration = [{

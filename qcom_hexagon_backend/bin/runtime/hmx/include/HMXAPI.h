@@ -134,6 +134,30 @@ void hmx_pack_weight_f32_bulk(unsigned dst_addr, unsigned src_addr, unsigned k,
                               unsigned k_tile_start, unsigned n_tile,
                               unsigned n_k_tiles);
 
+/* Bounds-safe single-tile forms. The valid extents are in [1, 32] and are
+ * explicit on the IR op; these leaves copy only valid elements through a
+ * zero-padded temporary before invoking the established pack permutation.
+ * They are diagnostic/test leaves until the peeled-edge partition path owns
+ * their callers; no full-tile call is redirected here. */
+void hmx_pack_act_tail_f16(unsigned dst_addr, unsigned src_addr,
+                           unsigned src_rows, unsigned src_cols,
+                           unsigned src_stride, unsigned tile_row,
+                           unsigned tile_col, unsigned valid_rows,
+                           unsigned valid_cols);
+void hmx_pack_weight_tail_f16(unsigned dst_addr, unsigned src_addr,
+                              unsigned k, unsigned n, unsigned src_stride,
+                              unsigned k_tile, unsigned n_tile,
+                              unsigned valid_rows, unsigned valid_cols);
+void hmx_pack_act_tail_f32(unsigned dst_addr, unsigned src_addr,
+                           unsigned src_rows, unsigned src_cols,
+                           unsigned src_stride, unsigned tile_row,
+                           unsigned tile_col, unsigned valid_rows,
+                           unsigned valid_cols);
+void hmx_pack_weight_tail_f32(unsigned dst_addr, unsigned src_addr,
+                              unsigned k, unsigned n, unsigned src_stride,
+                              unsigned k_tile, unsigned n_tile,
+                              unsigned valid_rows, unsigned valid_cols);
+
 /* Unpack one AR crouton row-pair into a row-major fp16 block at `dst_addr`
  * (vectorised; the fp32 image is a widening in the compiler). The destination
  * rows are (tile_row*32 + 2*block_j, +1) and are separated by `dst_stride`
@@ -193,6 +217,24 @@ void hmx_unpack_acc_f32_bulk(unsigned dst_addr, unsigned res_addr,
                              unsigned dst_rows, unsigned dst_cols,
                              unsigned dst_stride, unsigned res_stride,
                              unsigned tile_row, unsigned n_pairs);
+
+/* Bounds-safe single-tile read-out. `valid_rows`/`valid_cols` are the
+ * logical extents of the 32x32 output tile; the single entry addresses one
+ * row-pair and writes only the intersection with that pair. The temporary is
+ * materialized before the valid rows/columns are copied, so neither the
+ * destination nor an optional residual can be read or written outside the
+ * requested logical region. */
+void hmx_unpack_acc_tail_f16(unsigned dst_addr, unsigned src_ar_addr,
+                             unsigned dst_rows, unsigned dst_cols,
+                             unsigned dst_stride, unsigned tile_row,
+                             unsigned block_j, unsigned valid_rows,
+                             unsigned valid_cols);
+void hmx_unpack_acc_tail_f32(unsigned dst_addr, unsigned res_addr,
+                             unsigned has_res, unsigned src_ar_addr,
+                             unsigned dst_rows, unsigned dst_cols,
+                             unsigned dst_stride, unsigned res_stride,
+                             unsigned tile_row, unsigned block_j,
+                             unsigned valid_rows, unsigned valid_cols);
 
 #ifdef __cplusplus
 }

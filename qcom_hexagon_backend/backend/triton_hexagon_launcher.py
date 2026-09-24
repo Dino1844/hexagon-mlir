@@ -24,6 +24,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     create_timestamped_folder,
 )
 from triton.backends.qcom_hexagon_backend.utils import (
+    enforce_hmx_launch_contract,
     parse_triton_llvm_kernel_signature,
     profile_triton_inputs,
 )
@@ -548,8 +549,19 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         compiled_enable_threaded_dispatch: bool | str | None = None,
         compiled_enable_lwp: bool | str | None = None,
         weight_prepack: str | None = None,
+        hmx_manifest: str | None = None,
         runtime_options: dict | None = None,
     ) -> list[Tensor]:
+        if hmx_manifest is None:
+            raise ValueError(
+                "compiled kernel metadata is missing the required hmx_manifest contract"
+            )
+        # Validate the launch contract before creating artifacts or constructing
+        # an executor. In particular, a tail manifest is single-instance by
+        # construction; rejecting grid>1 here prevents several closures from
+        # sharing the diagnostic/runtime workspace before any device access.
+        enforce_hmx_launch_contract(hmx_manifest, launch_grid)
+
         # Crash-triage override (rowmax plan §12, temporary): swap the freshly
         # compiled kernel .o for a caller-supplied one (binary-bisection of the
         # device crash without rebuilding the compiler).

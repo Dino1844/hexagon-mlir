@@ -341,6 +341,86 @@ void hmx_pack_weight_f32_bulk(unsigned dst_addr, unsigned src_addr, unsigned k,
                         src_stride, k_tile_start + t, n_tile);
 }
 
+/* ---- bounds-safe diagnostic tail leaves ---------------------------------- */
+/*
+ * These are deliberately conservative reference implementations. They stage
+ * the requested logical rectangle into an aligned, zero-filled 32x32 scratch
+ * buffer and then call the established permutation leaf. The scratch is large
+ * enough for the full vector load performed by the old leaf, while the source
+ * copy loop touches only valid logical elements. They are not a performance
+ * path; peeled-edge partition code must prove and own their callers before a
+ * production tail option can exist.
+ */
+static inline void hmx__pack_tail_f16_impl(
+    unsigned dst, unsigned src, unsigned rows, unsigned cols,
+    unsigned src_stride, unsigned tile_row, unsigned tile_col,
+    unsigned valid_rows, unsigned valid_cols) {
+  uint16_t scratch[HMX_TILE_ROWS][HMX_TILE_COLS]
+      __attribute__((aligned(128))) = {{0}};
+  const unsigned row0 = tile_row * HMX_TILE_ROWS;
+  const unsigned col0 = tile_col * HMX_TILE_COLS;
+  const unsigned vr = valid_rows < HMX_TILE_ROWS ? valid_rows : HMX_TILE_ROWS;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  const uint16_t *base = (const uint16_t *)(uintptr_t)src;
+  for (unsigned r = 0; r < vr && row0 + r < rows; ++r)
+    for (unsigned c = 0; c < vc && col0 + c < cols; ++c)
+      scratch[r][c] = base[(row0 + r) * src_stride + col0 + c];
+  hmx_pack_act_f16(dst, (unsigned)(uintptr_t)scratch, HMX_TILE_ROWS,
+                   HMX_TILE_COLS, HMX_TILE_COLS, 0, 0);
+}
+
+static inline void hmx__pack_tail_f32_impl(
+    unsigned dst, unsigned src, unsigned rows, unsigned cols,
+    unsigned src_stride, unsigned tile_row, unsigned tile_col,
+    unsigned valid_rows, unsigned valid_cols) {
+  uint32_t scratch[HMX_TILE_ROWS][HMX_TILE_COLS]
+      __attribute__((aligned(128))) = {{0}};
+  const unsigned row0 = tile_row * HMX_TILE_ROWS;
+  const unsigned col0 = tile_col * HMX_TILE_COLS;
+  const unsigned vr = valid_rows < HMX_TILE_ROWS ? valid_rows : HMX_TILE_ROWS;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  const uint32_t *base = (const uint32_t *)(uintptr_t)src;
+  for (unsigned r = 0; r < vr && row0 + r < rows; ++r)
+    for (unsigned c = 0; c < vc && col0 + c < cols; ++c)
+      scratch[r][c] = base[(row0 + r) * src_stride + col0 + c];
+  hmx_pack_act_f32(dst, (unsigned)(uintptr_t)scratch, HMX_TILE_ROWS,
+                   HMX_TILE_COLS, HMX_TILE_COLS, 0, 0);
+}
+
+void hmx_pack_act_tail_f16(unsigned dst_addr, unsigned src_addr,
+                           unsigned src_rows, unsigned src_cols,
+                           unsigned src_stride, unsigned tile_row,
+                           unsigned tile_col, unsigned valid_rows,
+                           unsigned valid_cols) {
+  hmx__pack_tail_f16_impl(dst_addr, src_addr, src_rows, src_cols, src_stride,
+                          tile_row, tile_col, valid_rows, valid_cols);
+}
+
+void hmx_pack_weight_tail_f16(unsigned dst_addr, unsigned src_addr, unsigned k,
+                              unsigned n, unsigned src_stride,
+                              unsigned k_tile, unsigned n_tile,
+                              unsigned valid_rows, unsigned valid_cols) {
+  hmx__pack_tail_f16_impl(dst_addr, src_addr, k, n, src_stride, k_tile,
+                          n_tile, valid_rows, valid_cols);
+}
+
+void hmx_pack_act_tail_f32(unsigned dst_addr, unsigned src_addr,
+                           unsigned src_rows, unsigned src_cols,
+                           unsigned src_stride, unsigned tile_row,
+                           unsigned tile_col, unsigned valid_rows,
+                           unsigned valid_cols) {
+  hmx__pack_tail_f32_impl(dst_addr, src_addr, src_rows, src_cols, src_stride,
+                          tile_row, tile_col, valid_rows, valid_cols);
+}
+
+void hmx_pack_weight_tail_f32(unsigned dst_addr, unsigned src_addr, unsigned k,
+                              unsigned n, unsigned src_stride,
+                              unsigned k_tile, unsigned n_tile,
+                              unsigned valid_rows, unsigned valid_cols) {
+  hmx__pack_tail_f32_impl(dst_addr, src_addr, k, n, src_stride, k_tile,
+                          n_tile, valid_rows, valid_cols);
+}
+
 /* One chunk: two column tiles (64 columns) of one row-pair, or the 32-column
  * tail. `aligned` is a compile-time constant (see hmx__unpack_acc_f16_body):
  * when it is set the full chunk's 128-byte store addresses are known 128-byte
@@ -646,4 +726,82 @@ void hmx_unpack_acc_f32_bulk(unsigned dst_addr, unsigned res_addr,
     hmx__unpack_acc_f32_body(dst_addr, res_addr, has_res, src_ar_addr, dst_rows,
                              dst_cols, dst_stride, res_stride, tile_row, j);
   }
+}
+
+static inline void hmx__unpack_tail_f16_impl(
+    unsigned dst, unsigned src, unsigned dst_rows, unsigned dst_cols,
+    unsigned dst_stride, unsigned tile_row, unsigned block_j,
+    unsigned valid_rows, unsigned valid_cols) {
+  /* A single unpack op addresses one row-pair. The full leaf is called on
+   * that pair only; the scratch is deliberately 2 x 32, so even a malformed
+   * valid_rows value cannot make the conversion itself write out of bounds. */
+  uint16_t scratch[2][HMX_TILE_COLS] __attribute__((aligned(128))) = {{0}};
+  hmx_unpack_acc_f16((unsigned)(uintptr_t)scratch,
+                     src + block_j * HMX_BLOCK_BYTES, 2u, HMX_TILE_COLS,
+                     HMX_TILE_COLS, 0, 0);
+
+  const unsigned first = block_j * 2u;
+  const unsigned vr = first < valid_rows
+                          ? (valid_rows - first < 2u ? valid_rows - first : 2u)
+                          : 0u;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  uint16_t *out = (uint16_t *)(uintptr_t)dst;
+  for (unsigned r = 0; r < vr; ++r) {
+    const unsigned global_row = tile_row * HMX_TILE_ROWS + first + r;
+    if (global_row >= dst_rows)
+      break;
+    for (unsigned c = 0; c < vc && c < dst_cols; ++c)
+      out[global_row * dst_stride + c] = scratch[r][c];
+  }
+}
+
+static inline void hmx__unpack_tail_f32_impl(
+    unsigned dst, unsigned res, unsigned has_res, unsigned src,
+    unsigned dst_rows, unsigned dst_cols, unsigned dst_stride,
+    unsigned res_stride, unsigned tile_row, unsigned block_j,
+    unsigned valid_rows, unsigned valid_cols) {
+  float scratch[2][HMX_TILE_COLS] __attribute__((aligned(128))) = {{0.0f}};
+  hmx_unpack_acc_f32((unsigned)(uintptr_t)scratch, 0, 0,
+                     src + block_j * HMX_BLOCK_BYTES, 2u, HMX_TILE_COLS,
+                     HMX_TILE_COLS, 0, 0, 0);
+
+  const unsigned first = block_j * 2u;
+  const unsigned vr = first < valid_rows
+                          ? (valid_rows - first < 2u ? valid_rows - first : 2u)
+                          : 0u;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  float *out = (float *)(uintptr_t)dst;
+  const float *residual = has_res ? (const float *)(uintptr_t)res : 0;
+  for (unsigned r = 0; r < vr; ++r) {
+    const unsigned global_row = tile_row * HMX_TILE_ROWS + first + r;
+    if (global_row >= dst_rows)
+      break;
+    for (unsigned c = 0; c < vc && c < dst_cols; ++c) {
+      float value = scratch[r][c];
+      if (residual)
+        value += residual[global_row * res_stride + c];
+      out[global_row * dst_stride + c] = value;
+    }
+  }
+}
+
+void hmx_unpack_acc_tail_f16(unsigned dst_addr, unsigned src_ar_addr,
+                             unsigned dst_rows, unsigned dst_cols,
+                             unsigned dst_stride, unsigned tile_row,
+                             unsigned block_j, unsigned valid_rows,
+                             unsigned valid_cols) {
+  hmx__unpack_tail_f16_impl(dst_addr, src_ar_addr, dst_rows, dst_cols,
+                            dst_stride, tile_row, block_j, valid_rows,
+                            valid_cols);
+}
+
+void hmx_unpack_acc_tail_f32(unsigned dst_addr, unsigned res_addr,
+                             unsigned has_res, unsigned src_ar_addr,
+                             unsigned dst_rows, unsigned dst_cols,
+                             unsigned dst_stride, unsigned res_stride,
+                             unsigned tile_row, unsigned block_j,
+                             unsigned valid_rows, unsigned valid_cols) {
+  hmx__unpack_tail_f32_impl(dst_addr, res_addr, has_res, src_ar_addr,
+                            dst_rows, dst_cols, dst_stride, res_stride,
+                            tile_row, block_j, valid_rows, valid_cols);
 }

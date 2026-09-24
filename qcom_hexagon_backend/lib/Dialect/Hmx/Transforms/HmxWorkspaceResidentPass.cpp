@@ -49,6 +49,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -162,6 +163,14 @@ struct HmxWorkspaceResidentPass
       LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] resident workspace #" << index
                               << " (" << bytes << " bytes, key 0x"
                               << llvm::Twine::utohexstr(key) << ")\n");
+    }
+
+    if (auto module = func->getParentOfType<ModuleOp>()) {
+      if (module->hasAttr("hmx.kernel_manifest") &&
+          failed(setHmxManifestWorkspaceClass(
+              module, func.getSymName(), "resident-single-instance",
+              "single-instance")))
+        return signalPassFailure();
     }
   }
 };

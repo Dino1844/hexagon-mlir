@@ -87,6 +87,7 @@
 #include "mlir/Dialect/SCF/Transforms/Transforms.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
@@ -95,6 +96,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <mutex>
 
@@ -152,6 +154,7 @@ enum class PipelineReason {
   VtcmBudget,
   TileCount,
   PipelinerFailed,
+  TailPeeledEdge,
 };
 
 StringRef pipelineReasonCode(PipelineReason reason) {
@@ -178,6 +181,8 @@ StringRef pipelineReasonCode(PipelineReason reason) {
     return "tile-count";
   case PipelineReason::PipelinerFailed:
     return "pipeliner-failed";
+  case PipelineReason::TailPeeledEdge:
+    return "tail-peeled-edge";
   }
   llvm_unreachable("unknown HMX pipeline reason");
 }
@@ -247,6 +252,9 @@ InFlightDiagnostic &renderPipelineRemark(InFlightDiagnostic &diag,
     return diag
            << "HMX pipeline not applied at depth 2: the SCF loop "
               "pipeliner declined the schedule; the staged loop runs serially";
+  case PipelineReason::TailPeeledEdge:
+    return diag << "HMX tail plan lowered as full + peeled serial regions; "
+                   "activation staging is not applied to tail plans";
   case PipelineReason::None:
   case PipelineReason::SerialRequested:
   case PipelineReason::TileCount:
@@ -327,6 +335,74 @@ std::optional<TileShape> getTileShape(MatmulOp op) {
   if (lhs.getRank() != 5 || rhs.getRank() != 5 || out.getRank() != 5)
     return std::nullopt;
   return TileShape{lhs.getDimSize(0), weightNTiles(rhs), lhs.getDimSize(1)};
+}
+
+struct TailGrid {
+  int64_t mTiles = 0, nTiles = 0, kTiles = 0;
+  int64_t mFullTiles = 0, nFullTiles = 0, kFullTiles = 0;
+  int64_t mTail = 0, nTail = 0, kTail = 0;
+  int64_t mLogical = 0, nLogical = 0, kLogical = 0;
+};
+
+/// Validate the complete static tail contract at the point where the physical
+/// grid is about to be walked. The op verifier already checks the rank-5 grid;
+/// this second check is intentionally about the plan arithmetic and keeps a
+/// hand-authored or stale attribute from turning into a different region walk.
+LogicalResult readTailGrid(MatmulOp op, const TileShape &shape,
+                           TailPlanAttr plan, TailGrid &grid) {
+  ArrayRef<int64_t> logical = plan.getLogical();
+  ArrayRef<int64_t> padded = plan.getPadded();
+  ArrayRef<int64_t> full = plan.getFull();
+  ArrayRef<int64_t> tail = plan.getTail();
+  if (logical.size() != 3 || padded.size() != 3 || full.size() != 3 ||
+      tail.size() != 3)
+    return op.emitError("tail_plan logical/padded/full/tail must each have 3 "
+                        "dimensions");
+  if (plan.getKPolicy() != "zero-pad-both-operands" ||
+      plan.getMnPolicy() != "padded-edge-tile-bounded-store")
+    return op.emitError("tail_plan has an unsupported padding or edge policy");
+
+  auto checkSplit = [&](int64_t value, int64_t expectedFull,
+                        int64_t expectedPadded, int64_t expectedTail,
+                        StringRef name) -> LogicalResult {
+    int64_t fullValue = 0, paddedValue = 0, tailValue = 0;
+    if (!HmxTarget::splitExtent(value, fullValue, paddedValue, tailValue))
+      return op.emitError() << "tail_plan " << name
+                             << " is not a representable positive extent";
+    if (paddedValue != expectedPadded || fullValue != expectedFull ||
+        tailValue != expectedTail)
+      return op.emitError() << "tail_plan " << name << " [full, padded, tail] "
+                             << "does not match logical extent " << value;
+    return success();
+  };
+
+  if (failed(checkSplit(logical[0], full[0], padded[0], tail[0], "M")) ||
+      failed(checkSplit(logical[1], full[1], padded[1], tail[1], "N")) ||
+      failed(checkSplit(logical[2], full[2], padded[2], tail[2], "K")))
+    return failure();
+
+  if (tail[0] == 0 && tail[1] == 0 && tail[2] == 0)
+    return op.emitError("tail_plan has no peeled edge");
+
+  if (padded[0] / layout::kTileEdge != shape.m ||
+      padded[1] / layout::kTileEdge != shape.n ||
+      padded[2] / layout::kTileEdge != shape.k)
+    return op.emitError("tail_plan padded shape does not match the matmul "
+                        "crouton grid");
+
+  grid = TailGrid{padded[0] / layout::kTileEdge,
+                  padded[1] / layout::kTileEdge,
+                  padded[2] / layout::kTileEdge,
+                  full[0] / layout::kTileEdge,
+                  full[1] / layout::kTileEdge,
+                  full[2] / layout::kTileEdge,
+                  tail[0],
+                  tail[1],
+                  tail[2],
+                  logical[0],
+                  logical[1],
+                  logical[2]};
+  return success();
 }
 
 /// Bytes already committed to VTCM in this function. After bufferization the
@@ -437,7 +513,8 @@ static Value emitPackAct(IRRewriter &rewriter, Location loc, Value dst,
                          std::optional<int64_t> decisionId,
                          IntegerAttr count = {}) {
   auto pack = PackActOp::create(rewriter, loc, TypeRange{dst.getType()}, dst,
-                                src, row, col, count);
+                                src, row, col, count, IntegerAttr(),
+                                IntegerAttr());
   // Standalone hand-written hmx.matmul has no manifest decision to carry;
   // production/full-pipeline IR always supplies the explicit id.
   if (decisionId)
@@ -516,6 +593,667 @@ static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
                kK);
   AccReadOp::create(rewriter, opLoc, bias, ar, m, nLoop.getInductionVar(),
                     rewriter.getI32IntegerAttr(0));
+}
+
+struct PackBridge {
+  Value source;
+  Value buffer;
+  scf::ForOp loop;
+  SmallVector<Operation *> ops;
+};
+
+struct UnpackBridge {
+  Value destination;
+  Value residual;
+  bool fused = false;
+  scf::ForOp loop;
+  Value result;
+  SmallVector<Operation *> ops;
+};
+
+/// The diagnostic tail slice owns direct bridges and the canonical single-loop
+/// DPS forms emitted by the current pack/unpack bridges. A loop with any
+/// other body operation, mixed destinations, or multiple loops is rejected
+/// rather than silently erased.
+static std::optional<PackBridge> findPackBridge(Value array,
+                                                            bool isWeight) {
+  PackBridge bridge;
+  bridge.buffer = array;
+  bool carriedArray = array.getDefiningOp<scf::ForOp>() != nullptr;
+
+  auto addPack = [&](Operation *owner) -> bool {
+    if (isWeight ? !isa<PackWeightOp>(owner) : !isa<PackActOp>(owner))
+      return false;
+    if (owner->getParentOfType<scf::ForOp>() != bridge.loop)
+      return false;
+    Value source = isWeight ? cast<PackWeightOp>(owner).getSrc()
+                            : cast<PackActOp>(owner).getSrc();
+    Value destination = isWeight ? cast<PackWeightOp>(owner).getDst()
+                                 : cast<PackActOp>(owner).getDst();
+    Value expectedDestination =
+        bridge.loop && carriedArray ? bridge.loop.getRegionIterArg(0) : array;
+    if (destination != expectedDestination)
+      return false;
+    if (!bridge.source)
+      bridge.source = source;
+    if (bridge.source != source)
+      return false;
+    bridge.ops.push_back(owner);
+    return true;
+  };
+
+  if (auto loop = array.getDefiningOp<scf::ForOp>()) {
+    if (loop.getNumResults() != 1 || loop.getResult(0) != array ||
+        loop.getNumRegionIterArgs() != 1 || loop.getInitArgs().empty())
+      return std::nullopt;
+    bridge.loop = loop;
+    bridge.buffer = loop.getInitArgs()[0];
+    for (Operation &inner : loop.getBody()->without_terminator())
+      if (isa<PackActOp, PackWeightOp>(&inner))
+        if (!addPack(&inner))
+          return std::nullopt;
+  } else {
+    for (OpOperand &use : array.getUses()) {
+      Operation *owner = use.getOwner();
+      if (isWeight ? !isa<PackWeightOp>(owner) : !isa<PackActOp>(owner))
+        continue;
+      if (owner->getParentOfType<scf::ForOp>()) {
+        if (bridge.loop && bridge.loop != owner->getParentOfType<scf::ForOp>())
+          return std::nullopt;
+        bridge.loop = owner->getParentOfType<scf::ForOp>();
+      }
+      if (!addPack(owner))
+        return std::nullopt;
+    }
+  }
+
+  if (!bridge.source || bridge.ops.empty())
+    return std::nullopt;
+  for (Operation *op : bridge.ops)
+    if (op->getParentOfType<scf::ForOp>() != bridge.loop)
+      return std::nullopt;
+  if (bridge.loop) {
+    for (Operation &inner : bridge.loop.getBody()->without_terminator())
+      if (!isa<PackActOp, PackWeightOp>(&inner) &&
+          inner.getName().getDialectNamespace() != "arith")
+        return std::nullopt;
+  }
+  return bridge;
+}
+
+static std::optional<int64_t> constantIndexValue(Value value) {
+  auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
+  if (!constant)
+    return std::nullopt;
+  auto integer = constant->getAttrOfType<IntegerAttr>("value");
+  if (!integer)
+    return std::nullopt;
+  return integer.getInt();
+}
+
+static LogicalResult verifyPackCoverage(Operation *anchor,
+                                              ArrayRef<Operation *> ops,
+                                              bool isWeight, int64_t outerTiles,
+                                              int64_t kTiles) {
+  if (outerTiles < 0 || kTiles < 0 ||
+      (kTiles != 0 && outerTiles >
+                         std::numeric_limits<int64_t>::max() / kTiles))
+    return anchor->emitError()
+           << "diagnostic tail bridge grid is not representable";
+  int64_t expected = outerTiles * kTiles;
+  if (static_cast<int64_t>(ops.size()) != expected)
+    return anchor->emitError()
+           << "diagnostic tail bridge must contain one pack per physical tile";
+  SmallVector<char> seen(ops.size(), false);
+  for (Operation *op : ops) {
+    int64_t first = 0, second = 0;
+    if (isWeight) {
+      auto pack = cast<PackWeightOp>(op);
+      auto k = constantIndexValue(pack.getKTile());
+      auto n = constantIndexValue(pack.getNTile());
+      if (!k || !n)
+        return anchor->emitError()
+               << "diagnostic tail weight bridge indices must be constant";
+      first = *n;
+      second = *k;
+    } else {
+      auto pack = cast<PackActOp>(op);
+      auto m = constantIndexValue(pack.getRow());
+      auto k = constantIndexValue(pack.getCol());
+      if (!m || !k)
+        return anchor->emitError()
+               << "diagnostic tail activation bridge indices must be constant";
+      first = *m;
+      second = *k;
+    }
+    if (first < 0 || first >= outerTiles || second < 0 || second >= kTiles)
+      return anchor->emitError()
+             << "diagnostic tail bridge index is outside the padded grid";
+    int64_t slot = first * kTiles + second;
+    if (seen[slot])
+      return anchor->emitError()
+             << "diagnostic tail bridge contains a duplicate tile";
+    seen[slot] = true;
+  }
+  return success();
+}
+
+static std::optional<UnpackBridge>
+findUnpackBridge(MatmulOp matmul) {
+  UnpackBridge bridge;
+  scf::ForOp commonLoop;
+  for (OpOperand &use : matmul.getOuts().getUses()) {
+    Operation *owner = use.getOwner();
+    if (owner == matmul.getOperation() || isa<memref::DeallocOp>(owner))
+      continue;
+    bool fused = isa<UnpackAccF32Op>(owner);
+    if (!fused && !isa<UnpackAccOp>(owner))
+      return std::nullopt;
+
+    if (auto loop = owner->getParentOfType<scf::ForOp>()) {
+      if (commonLoop && commonLoop != loop)
+        return std::nullopt;
+      commonLoop = loop;
+    }
+
+    Value destination;
+    Value residual;
+    if (auto f16Unpack = dyn_cast<UnpackAccOp>(owner)) {
+      destination = f16Unpack.getDst();
+    } else {
+      auto f32Unpack = cast<UnpackAccF32Op>(owner);
+      destination = f32Unpack.getDst();
+      residual = f32Unpack.getResidual();
+    }
+    if (!bridge.destination) {
+      bridge.destination = destination;
+      bridge.residual = residual;
+      bridge.fused = fused;
+    } else if (bridge.destination != destination ||
+               bridge.residual != residual || bridge.fused != fused) {
+      return std::nullopt;
+    }
+    bridge.ops.push_back(owner);
+  }
+  if (!bridge.destination || bridge.ops.empty())
+    return std::nullopt;
+
+  if (commonLoop) {
+    if (commonLoop.getNumResults() == 0) {
+      if (commonLoop.getNumRegionIterArgs() != 0)
+        return std::nullopt;
+    } else if (commonLoop.getNumResults() != 1 ||
+               commonLoop.getNumRegionIterArgs() != 1 ||
+               commonLoop.getInitArgs().empty() ||
+               bridge.destination != commonLoop.getRegionIterArg(0)) {
+      return std::nullopt;
+    }
+    for (Operation &inner : commonLoop.getBody()->without_terminator())
+      if (!isa<UnpackAccOp, UnpackAccF32Op>(&inner) &&
+          inner.getName().getDialectNamespace() != "arith")
+        return std::nullopt;
+    bridge.loop = commonLoop;
+    if (commonLoop.getNumResults() != 0) {
+      bridge.destination = commonLoop.getInitArgs()[0];
+      bridge.result = commonLoop.getResult(0);
+    }
+  }
+  return bridge;
+}
+
+/// Emit one rectangular tile region. The region is deliberately a plain SCF
+/// loop nest: a tail edge is outside the ordinary activation staging pipeline,
+/// so it must not be accidentally handed to `scf::pipelineForLoop`.
+static void emitTileRegion(IRRewriter &rewriter, Location loc, Value bias,
+                           Value act, Value wt, Value ar, int64_t mBegin,
+                           int64_t mEnd, int64_t nBegin, int64_t nEnd,
+                           int64_t kEnd, Operation *&cursor) {
+  if (mBegin >= mEnd || nBegin >= nEnd || kEnd <= 0)
+    return;
+
+  rewriter.setInsertionPoint(cursor);
+  auto zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  auto step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+  auto mStart = arith::ConstantIndexOp::create(rewriter, loc, mBegin);
+  auto mStop = arith::ConstantIndexOp::create(rewriter, loc, mEnd);
+  auto nStart = arith::ConstantIndexOp::create(rewriter, loc, nBegin);
+  auto nStop = arith::ConstantIndexOp::create(rewriter, loc, nEnd);
+  auto kStop = arith::ConstantIndexOp::create(rewriter, loc, kEnd);
+
+  auto mLoop = scf::ForOp::create(rewriter, loc, mStart, mStop, step,
+                                   ValueRange{});
+  rewriter.setInsertionPointToStart(mLoop.getBody());
+  auto nLoop = scf::ForOp::create(rewriter, loc, nStart, nStop, step,
+                                   ValueRange{});
+  rewriter.setInsertionPointToStart(nLoop.getBody());
+  AccClearOp::create(rewriter, loc);
+  emitMmaKLoop(rewriter, loc, act, wt, mLoop.getInductionVar(),
+               nLoop.getInductionVar(), zero, step, kStop);
+  AccReadOp::create(rewriter, loc, bias, ar, mLoop.getInductionVar(),
+                    nLoop.getInductionVar(),
+                    rewriter.getI32IntegerAttr(0));
+  rewriter.setInsertionPointAfter(mLoop);
+  cursor = mLoop.getOperation();
+}
+
+/// The fixed physical partition for a tail plan: the full M/N rectangle, then
+/// the three disjoint peeled rectangles (M edge, N edge, and their corner).
+/// K is always walked through the padded grid; the K-edge lanes are already
+/// zero-filled by the pack contract and are not a separate M/N region.
+static Operation *emitPeeledEdgeTileLoop(IRRewriter &rewriter, Location loc,
+                                         Value bias, MatmulOp op,
+                                         const TailGrid &grid) {
+  Operation *cursor = op.getOperation();
+  auto emit = [&](int64_t mBegin, int64_t mEnd, int64_t nBegin,
+                  int64_t nEnd) {
+    emitTileRegion(rewriter, loc, bias, op.getLhs(), op.getRhs(), op.getOuts(),
+                   mBegin, mEnd, nBegin, nEnd, grid.kTiles, cursor);
+  };
+
+  // The full rectangle is the ordinary fast region. It is still serial in this
+  // diagnostic slice; staging and its budget/pipeliner contract remain a
+  // separate optimization, not a property of the edge ABI.
+  emit(0, grid.mFullTiles, 0, grid.nFullTiles);
+  if (grid.mFullTiles < grid.mTiles)
+    emit(grid.mFullTiles, grid.mTiles, 0, grid.nFullTiles);
+  if (grid.nFullTiles < grid.nTiles) {
+    emit(0, grid.mFullTiles, grid.nFullTiles, grid.nTiles);
+    if (grid.mFullTiles < grid.mTiles)
+      emit(grid.mFullTiles, grid.mTiles, grid.nFullTiles, grid.nTiles);
+  }
+  return cursor;
+}
+
+static LogicalResult verifyDiagnosticRowMajor(Operation *anchor, Value value,
+                                              StringRef name) {
+  auto type = dyn_cast<MemRefType>(value.getType());
+  if (!type || !type.hasStaticShape() || type.getRank() != 2)
+    return anchor->emitError()
+           << name << " tail bridge requires a static rank-2 memref";
+  SmallVector<int64_t, 2> strides;
+  int64_t offset;
+  if (failed(type.getStridesAndOffset(strides, offset)) ||
+      strides.size() != 2 || ShapedType::isDynamic(strides[0]) ||
+      ShapedType::isDynamic(strides[1]) || strides[1] != 1 ||
+      strides[0] < type.getDimSize(1))
+    return anchor->emitError()
+           << name << " tail bridge requires a static row-major stride";
+  return success();
+}
+
+static LogicalResult verifyDiagnosticMatrixShape(
+    Operation *anchor, Value value, int64_t rows, int64_t cols,
+    int64_t paddedRows, int64_t paddedCols, StringRef name) {
+  auto type = dyn_cast<MemRefType>(value.getType());
+  if (!type ||
+      (type.getDimSize(0) != rows && type.getDimSize(0) != paddedRows) ||
+      (type.getDimSize(1) != cols && type.getDimSize(1) != paddedCols))
+    return anchor->emitError() << name << " shape does not match tail_plan "
+                               << "logical [" << rows << ", " << cols
+                               << "] or padded [" << paddedRows << ", "
+                               << paddedCols << "]";
+  return success();
+}
+
+static bool diagnosticValueDominates(const DominanceInfo &dominance,
+                                      Value value, Operation *insertionPoint) {
+  if (auto blockArgument = dyn_cast<BlockArgument>(value))
+    return blockArgument.getOwner()->findAncestorOpInBlock(*insertionPoint);
+  Operation *definition = value.getDefiningOp();
+  return definition && dominance.properlyDominates(definition, insertionPoint);
+}
+
+/// Move a diagnostic insertion cursor after any same-block definitions it uses.
+/// A value that is not already available at the cursor is not silently
+/// captured: either its definition is in this block and can be moved past, or
+/// the diagnostic bridge is rejected as non-dominating.
+static LogicalResult placeDiagnosticCursorAfterValues(
+    Operation *&cursor, ArrayRef<Value> values, const DominanceInfo &dominance,
+    Operation *anchor, StringRef name) {
+  for (Value value : values) {
+    if (!value)
+      continue;
+    Operation *definition = value.getDefiningOp();
+    if (!definition) {
+      if (!diagnosticValueDominates(dominance, value, cursor))
+        return anchor->emitError()
+               << name << " value does not dominate the diagnostic insertion point";
+      continue;
+    }
+    if (definition->getBlock() == cursor->getBlock()) {
+      if (!definition->isBeforeInBlock(cursor))
+        cursor = definition;
+      continue;
+    }
+    if (!diagnosticValueDominates(dominance, value, cursor))
+      return anchor->emitError()
+             << name << " value is defined outside the dominating diagnostic block";
+  }
+  return success();
+}
+
+static void setDiagnosticDecisionId(Operation *op,
+                                    std::optional<int64_t> decisionId) {
+  if (decisionId)
+    op->setAttr(
+        kHmxDecisionIdAttr,
+        IntegerAttr::get(IntegerType::get(op->getContext(), 64), *decisionId));
+}
+
+/// Rebuild the direct input bridges as four homogeneous regions per operand.
+/// Full regions use the existing pack op without valid attrs; only the peeled
+/// rectangle receives the explicit static valid extents.
+static LogicalResult emitDiagnosticInputBridges(
+    IRRewriter &rewriter, Location loc, MatmulOp op, const TailGrid &grid,
+    std::optional<int64_t> decisionId, Operation *&cursor,
+    SmallVectorImpl<Operation *> &retired) {
+  auto actBridge = findPackBridge(op.getLhs(), /*isWeight=*/false);
+  auto weightBridge = findPackBridge(op.getRhs(), /*isWeight=*/true);
+  if (!actBridge || !weightBridge)
+    return op.emitError("diagnostic tail partition requires direct activation "
+                        "and weight pack bridges");
+  DominanceInfo dominance(op.getOperation());
+  if (!diagnosticValueDominates(dominance, actBridge->source,
+                                op.getOperation()) ||
+      !diagnosticValueDominates(dominance, weightBridge->source,
+                                op.getOperation()))
+    return op.emitError("diagnostic tail partition requires pack sources that "
+                        "dominate the matmul");
+  if ((!actBridge->loop &&
+       failed(verifyPackCoverage(op.getOperation(), actBridge->ops,
+                                       /*isWeight=*/false, grid.mTiles,
+                                       grid.kTiles))) ||
+      (!weightBridge->loop &&
+       failed(verifyPackCoverage(op.getOperation(), weightBridge->ops,
+                                       /*isWeight=*/true, grid.nTiles,
+                                       grid.kTiles))))
+    return failure();
+  if (failed(verifyDiagnosticRowMajor(op.getOperation(), actBridge->source,
+                                      "activation source")) ||
+      failed(verifyDiagnosticRowMajor(op.getOperation(), weightBridge->source,
+                                      "weight source")) ||
+      failed(verifyDiagnosticMatrixShape(
+          op.getOperation(), actBridge->source, grid.mLogical, grid.kLogical,
+          grid.mTiles * layout::kTileEdge, grid.kTiles * layout::kTileEdge,
+          "activation source")) ||
+      failed(verifyDiagnosticMatrixShape(
+          op.getOperation(), weightBridge->source, grid.kLogical, grid.nLogical,
+          grid.kTiles * layout::kTileEdge, grid.nTiles * layout::kTileEdge,
+          "weight source")))
+    return failure();
+
+  Value actValue = actBridge->buffer;
+  Value weightValue = weightBridge->buffer;
+  auto checkArrayUsers = [&](Value array, PackBridge &bridge,
+                             bool isWeight) -> LogicalResult {
+    for (OpOperand &use : array.getUses()) {
+      Operation *owner = use.getOwner();
+      if (owner == op.getOperation() || isa<memref::DeallocOp>(owner) ||
+          (bridge.loop && owner == bridge.loop.getOperation()))
+        continue;
+      bool ownedPack =
+          (isWeight ? isa<PackWeightOp>(owner) : isa<PackActOp>(owner)) &&
+          (isWeight ? cast<PackWeightOp>(owner).getDst() == array
+                    : cast<PackActOp>(owner).getDst() == array) &&
+          llvm::is_contained(bridge.ops, owner) &&
+          (!bridge.loop || owner->getParentOfType<scf::ForOp>() == bridge.loop);
+      if (ownedPack)
+        continue;
+      return op.emitError("diagnostic tail partition found an unowned "
+                          "activation/weight bridge user");
+    }
+    // A carried bridge writes its region argument, but its init buffer must
+    // not have a second writer outside the canonical loop. Otherwise that
+    // writer could overwrite the array after the rebuilt engine read.
+    if (bridge.buffer != array) {
+      for (OpOperand &use : bridge.buffer.getUses()) {
+        Operation *owner = use.getOwner();
+        if ((bridge.loop && owner == bridge.loop.getOperation()) ||
+            isa<memref::DeallocOp>(owner))
+          continue;
+        return op.emitError("diagnostic tail partition found an external "
+                            "writer of a carried bridge buffer");
+      }
+    }
+    return success();
+  };
+  if (failed(checkArrayUsers(op.getLhs(), *actBridge, /*isWeight=*/false)) ||
+      failed(checkArrayUsers(op.getRhs(), *weightBridge, /*isWeight=*/true)))
+    return failure();
+
+  auto emitAct = [&](int64_t mBegin, int64_t mEnd, int64_t kBegin,
+                     int64_t kEnd, std::optional<int64_t> validRows,
+                     std::optional<int64_t> validCols) {
+    if (mBegin >= mEnd || kBegin >= kEnd)
+      return;
+    rewriter.setInsertionPoint(cursor);
+    auto step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto mStart = arith::ConstantIndexOp::create(rewriter, loc, mBegin);
+    auto mStop = arith::ConstantIndexOp::create(rewriter, loc, mEnd);
+    auto kStart = arith::ConstantIndexOp::create(rewriter, loc, kBegin);
+    auto kStop = arith::ConstantIndexOp::create(rewriter, loc, kEnd);
+    auto mLoop = scf::ForOp::create(rewriter, loc, mStart, mStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(mLoop.getBody());
+    auto kLoop = scf::ForOp::create(rewriter, loc, kStart, kStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(kLoop.getBody());
+    auto pack = PackActOp::create(
+        rewriter, loc, TypeRange{actValue.getType()}, actValue,
+        actBridge->source, mLoop.getInductionVar(), kLoop.getInductionVar(),
+        IntegerAttr(),
+        validRows ? rewriter.getI64IntegerAttr(*validRows) : IntegerAttr(),
+        validCols ? rewriter.getI64IntegerAttr(*validCols) : IntegerAttr());
+    setDiagnosticDecisionId(pack.getOperation(), decisionId);
+    rewriter.setInsertionPointAfter(mLoop);
+    cursor = mLoop.getOperation();
+  };
+
+  auto emitWeight = [&](int64_t nBegin, int64_t nEnd, int64_t kBegin,
+                        int64_t kEnd, std::optional<int64_t> validRows,
+                        std::optional<int64_t> validCols) {
+    if (nBegin >= nEnd || kBegin >= kEnd)
+      return;
+    rewriter.setInsertionPoint(cursor);
+    auto step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto nStart = arith::ConstantIndexOp::create(rewriter, loc, nBegin);
+    auto nStop = arith::ConstantIndexOp::create(rewriter, loc, nEnd);
+    auto kStart = arith::ConstantIndexOp::create(rewriter, loc, kBegin);
+    auto kStop = arith::ConstantIndexOp::create(rewriter, loc, kEnd);
+    auto nLoop = scf::ForOp::create(rewriter, loc, nStart, nStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(nLoop.getBody());
+    auto kLoop = scf::ForOp::create(rewriter, loc, kStart, kStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(kLoop.getBody());
+    auto pack = PackWeightOp::create(
+        rewriter, loc, TypeRange{weightValue.getType()}, weightValue,
+        weightBridge->source, kLoop.getInductionVar(),
+        nLoop.getInductionVar(), IntegerAttr(),
+        validRows ? rewriter.getI64IntegerAttr(*validRows) : IntegerAttr(),
+        validCols ? rewriter.getI64IntegerAttr(*validCols) : IntegerAttr());
+    setDiagnosticDecisionId(pack.getOperation(), decisionId);
+    rewriter.setInsertionPointAfter(nLoop);
+    cursor = nLoop.getOperation();
+  };
+
+  const std::optional<int64_t> noValid;
+  const std::optional<int64_t> full = layout::kTileEdge;
+  const std::optional<int64_t> validM = grid.mTail;
+  const std::optional<int64_t> validN = grid.nTail;
+  const std::optional<int64_t> validK = grid.kTail;
+  emitAct(0, grid.mFullTiles, 0, grid.kFullTiles, noValid, noValid);
+  if (grid.mFullTiles < grid.mTiles)
+    emitAct(grid.mFullTiles, grid.mTiles, 0, grid.kFullTiles, validM, full);
+  if (grid.kFullTiles < grid.kTiles) {
+    emitAct(0, grid.mFullTiles, grid.kFullTiles, grid.kTiles, full, validK);
+    if (grid.mFullTiles < grid.mTiles)
+      emitAct(grid.mFullTiles, grid.mTiles, grid.kFullTiles, grid.kTiles,
+              validM, validK);
+  }
+  emitWeight(0, grid.nFullTiles, 0, grid.kFullTiles, noValid, noValid);
+  if (grid.nFullTiles < grid.nTiles)
+    emitWeight(grid.nFullTiles, grid.nTiles, 0, grid.kFullTiles, full,
+               validN);
+  if (grid.kFullTiles < grid.kTiles) {
+    emitWeight(0, grid.nFullTiles, grid.kFullTiles, grid.kTiles, validK,
+               full);
+    if (grid.nFullTiles < grid.nTiles)
+      emitWeight(grid.nFullTiles, grid.nTiles, grid.kFullTiles, grid.kTiles,
+                 validK, validN);
+  }
+
+  auto retirePackBridge = [&](PackBridge &bridge) {
+    if (bridge.loop) {
+      if (bridge.loop.getNumResults() != 0)
+        bridge.loop.getResult(0).replaceAllUsesWith(bridge.buffer);
+      retired.push_back(bridge.loop.getOperation());
+    } else {
+      retired.append(bridge.ops.begin(), bridge.ops.end());
+    }
+  };
+  retirePackBridge(*actBridge);
+  retirePackBridge(*weightBridge);
+  return success();
+}
+
+/// Rebuild the direct output bridge after the peeled tile regions. Full M/N
+/// tiles keep the ranged row-pair read-out; every edge rectangle uses one
+/// explicit single-pair op per row-pair so the valid M/N extents are carried
+/// all the way to the leaf.
+static LogicalResult emitDiagnosticOutputBridge(
+    IRRewriter &rewriter, Location loc, MatmulOp op, const TailGrid &grid,
+    UnpackBridge &bridge, std::optional<int64_t> decisionId,
+    Operation *&cursor, SmallVectorImpl<Operation *> &retired) {
+  if (failed(verifyDiagnosticRowMajor(op.getOperation(), bridge.destination,
+                                      "unpack destination")) ||
+      failed(verifyDiagnosticMatrixShape(
+          op.getOperation(), bridge.destination, grid.mLogical, grid.nLogical,
+          grid.mTiles * layout::kTileEdge, grid.nTiles * layout::kTileEdge,
+          "unpack destination")))
+    return failure();
+  if (bridge.residual &&
+      (failed(verifyDiagnosticRowMajor(op.getOperation(), bridge.residual,
+                                       "unpack residual")) ||
+       failed(verifyDiagnosticMatrixShape(
+           op.getOperation(), bridge.residual, grid.mLogical, grid.nLogical,
+           grid.mTiles * layout::kTileEdge, grid.nTiles * layout::kTileEdge,
+           "unpack residual"))))
+    return failure();
+
+  // The epilogue allocation is allowed to follow the matmul in the
+  // bufferized producer form. Do not insert the rebuilt read-out before that
+  // allocation (or before a fused residual): otherwise the new loop would
+  // capture a non-dominating memref. Definitions from another region are only
+  // accepted when the dominance proof already holds.
+  DominanceInfo dominance(op.getOperation());
+  SmallVector<Value> outputValues{bridge.destination};
+  if (bridge.residual)
+    outputValues.push_back(bridge.residual);
+  if (failed(placeDiagnosticCursorAfterValues(
+          cursor, outputValues, dominance, op.getOperation(),
+          "unpack destination/residual")))
+    return failure();
+
+  const std::optional<int64_t> validM = grid.mTail;
+  const std::optional<int64_t> validN = grid.nTail;
+  const std::optional<int64_t> noValid;
+  const std::optional<int64_t> full = layout::kTileEdge;
+
+  auto emitOp = [&](Value row, Value col, IntegerAttr count,
+                    std::optional<int64_t> rows,
+                    std::optional<int64_t> cols) {
+    IntegerAttr validRows =
+        rows ? rewriter.getI64IntegerAttr(*rows) : IntegerAttr();
+    IntegerAttr validCols =
+        cols ? rewriter.getI64IntegerAttr(*cols) : IntegerAttr();
+    Operation *created = nullptr;
+    if (bridge.fused) {
+      auto unpack = UnpackAccF32Op::create(
+          rewriter, loc, TypeRange{bridge.destination.getType()}, op.getOuts(),
+          bridge.destination, row, col, bridge.residual, count, validRows,
+          validCols);
+      created = unpack.getOperation();
+    } else {
+      auto unpack = UnpackAccOp::create(
+          rewriter, loc, TypeRange{bridge.destination.getType()}, op.getOuts(),
+          bridge.destination, row, col, count, validRows, validCols);
+      created = unpack.getOperation();
+    }
+    setDiagnosticDecisionId(created, decisionId);
+  };
+
+  auto emitFull = [&](int64_t mBegin, int64_t mEnd, int64_t nBegin,
+                      int64_t nEnd) {
+    if (mBegin >= mEnd || nBegin >= nEnd)
+      return;
+    rewriter.setInsertionPointAfter(cursor);
+    auto step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto mStart = arith::ConstantIndexOp::create(rewriter, loc, mBegin);
+    auto mStop = arith::ConstantIndexOp::create(rewriter, loc, mEnd);
+    auto nStart = arith::ConstantIndexOp::create(rewriter, loc, nBegin);
+    auto nStop = arith::ConstantIndexOp::create(rewriter, loc, nEnd);
+    auto mLoop = scf::ForOp::create(rewriter, loc, mStart, mStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(mLoop.getBody());
+    auto nLoop = scf::ForOp::create(rewriter, loc, nStart, nStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(nLoop.getBody());
+    emitOp(mLoop.getInductionVar(),
+           arith::ConstantIndexOp::create(rewriter, loc, 0),
+           rewriter.getI64IntegerAttr(layout::kCroutonPair), noValid, noValid);
+    rewriter.setInsertionPointAfter(mLoop);
+    cursor = mLoop.getOperation();
+  };
+
+  auto emitEdge = [&](int64_t mBegin, int64_t mEnd, int64_t nBegin,
+                      int64_t nEnd, std::optional<int64_t> rows,
+                      std::optional<int64_t> cols) {
+    if (mBegin >= mEnd || nBegin >= nEnd)
+      return;
+    rewriter.setInsertionPointAfter(cursor);
+    auto step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+    auto mStart = arith::ConstantIndexOp::create(rewriter, loc, mBegin);
+    auto mStop = arith::ConstantIndexOp::create(rewriter, loc, mEnd);
+    auto nStart = arith::ConstantIndexOp::create(rewriter, loc, nBegin);
+    auto nStop = arith::ConstantIndexOp::create(rewriter, loc, nEnd);
+    auto pairStop = arith::ConstantIndexOp::create(
+        rewriter, loc, layout::kCroutonPair);
+    auto mLoop = scf::ForOp::create(rewriter, loc, mStart, mStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(mLoop.getBody());
+    auto nLoop = scf::ForOp::create(rewriter, loc, nStart, nStop, step,
+                                     ValueRange{});
+    rewriter.setInsertionPointToStart(nLoop.getBody());
+    auto pairLoop = scf::ForOp::create(rewriter, loc,
+                                        arith::ConstantIndexOp::create(
+                                            rewriter, loc, 0),
+                                        pairStop, step, ValueRange{});
+    rewriter.setInsertionPointToStart(pairLoop.getBody());
+    emitOp(mLoop.getInductionVar(), pairLoop.getInductionVar(), IntegerAttr(),
+           rows, cols);
+    rewriter.setInsertionPointAfter(mLoop);
+    cursor = mLoop.getOperation();
+  };
+
+  emitFull(0, grid.mFullTiles, 0, grid.nFullTiles);
+  if (grid.mFullTiles < grid.mTiles)
+    emitEdge(grid.mFullTiles, grid.mTiles, 0, grid.nFullTiles, validM, full);
+  if (grid.nFullTiles < grid.nTiles) {
+    emitEdge(0, grid.mFullTiles, grid.nFullTiles, grid.nTiles, full, validN);
+    if (grid.mFullTiles < grid.mTiles)
+      emitEdge(grid.mFullTiles, grid.mTiles, grid.nFullTiles, grid.nTiles,
+               validM, validN);
+  }
+
+  if (bridge.loop) {
+    if (bridge.result)
+      bridge.result.replaceAllUsesWith(bridge.destination);
+    retired.push_back(bridge.loop.getOperation());
+  } else {
+    retired.append(bridge.ops.begin(), bridge.ops.end());
+  }
+  return success();
 }
 
 /// The compute half of one tile: pack the awaited slot's 32 x K rows into the
@@ -955,6 +1693,69 @@ struct HmxPartitionPass
         op.emitError("hmx.matmul must operate on 5D crouton arrays here");
         return signalPassFailure();
       }
+      if (op->hasAttr(kHmxDiagnosticTailAttr) &&
+          !isHmxDiagnosticTailMarker(op.getOperation())) {
+        op.emitError("hmx.diagnostic_tail_partition must be a unit attribute");
+        return signalPassFailure();
+      }
+      if (auto tailPlan = op.getTailPlanAttr()) {
+        if (!isHmxDiagnosticTailMarker(op.getOperation())) {
+          op.emitError("tail_plan is not yet supported by hmx-partition");
+          return signalPassFailure();
+        }
+        TailGrid grid;
+        if (failed(readTailGrid(op, *shape, tailPlan, grid)))
+          return signalPassFailure();
+        std::optional<int64_t> decisionId;
+        if (failed(readDecisionId(op.getOperation(), decisionId)))
+          return signalPassFailure();
+        auto unpackBridge = findUnpackBridge(op);
+        if (!unpackBridge) {
+          op.emitError("diagnostic tail partition requires a direct unpack "
+                       "bridge");
+          return signalPassFailure();
+        }
+        SmallVector<Operation *> retired;
+        Operation *cursor = op.getOperation();
+        if (failed(emitDiagnosticInputBridges(
+                rewriter, op.getLoc(), op, grid, decisionId, cursor, retired)))
+          return signalPassFailure();
+        cursor = emitPeeledEdgeTileLoop(rewriter, op.getLoc(), bias, op, grid);
+        if (failed(emitDiagnosticOutputBridge(
+                rewriter, op.getLoc(), op, grid, *unpackBridge, decisionId,
+                cursor, retired)))
+          return signalPassFailure();
+
+        // The rebuilt memref DPS ops write the same buffers as the direct
+        // bridges they replace. Redirect any old result uses before erasing the
+        // old sites; a tensor-shaped result would not be the memref contract
+        // this diagnostic slice accepts.
+        for (Operation *old : retired) {
+          if (isa<scf::ForOp>(old) || old->getNumResults() == 0)
+            continue;
+          Value replacement;
+          if (isa<PackActOp, PackWeightOp>(old))
+            replacement = isa<PackActOp>(old) ? op.getLhs() : op.getRhs();
+          else
+            replacement = unpackBridge->destination;
+          if (old->getResult(0).getType() != replacement.getType()) {
+            op.emitError("diagnostic tail bridge result is not a memref DPS "
+                         "value");
+            return signalPassFailure();
+          }
+          old->getResult(0).replaceAllUsesWith(replacement);
+        }
+        for (Operation *old : retired)
+          rewriter.eraseOp(old);
+
+        PipelineDecision decision;
+        decision.requestedDepth = this->pipelineDepth;
+        decision.reason = PipelineReason::TailPeeledEdge;
+        if (failed(recordPipelineDecision(op, decision)))
+          return signalPassFailure();
+        rewriter.eraseOp(op);
+        continue;
+      }
       // Single-op grid self-consistency: each dot keeps its own grid -- grids
       // are never unified across dots. A mismatch is a loud failure, never a
       // silently wrong loop nest. (The op verifier checks the same contract on
@@ -976,6 +1777,15 @@ struct HmxPartitionPass
       // The matmul itself is replaced by the loop that walks its crouton
       // arrays.
       Location opLoc = op.getLoc();
+      // A `#hmx.tail_plan` is not a production request in this pass. Only the
+      // explicit `hmx.diagnostic_tail_partition` unit marker, preserved from
+      // the diagnostic producer (or set on a direct test bridge), reaches the
+      // diagnostic full + peeled serial emitter; every ordinary tail plan still
+      // fails closed.
+      // The diagnostic emitter rebuilds pack/unpack sites with explicit valid
+      // extents, but it does not claim the looped bridge, VTCM-accounting, or
+      // launcher gates.
+      //
       // `pipeline-depth=3` is the unstaged arm: skip the staging rewrite
       // outright and emit the plain tile loop, which leaves the activation
       // bridge and its array in place. It is chosen here rather than by asking

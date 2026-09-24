@@ -21,6 +21,9 @@
 #include "mlir/IR/DialectImplementation.h"
 #include "llvm/ADT/TypeSwitch.h"
 
+#include <limits>
+#include <string>
+
 using namespace mlir;
 using namespace mlir::hmx;
 
@@ -39,6 +42,142 @@ void HmxDialect::registerAttributes() {
 
 #define GET_ATTRDEF_CLASSES
 #include "hexagon/Dialect/Hmx/IR/HmxAttrs.cpp.inc"
+
+namespace {
+
+ParseResult parseTailPlanList(AsmParser &parser, StringRef name,
+                              SmallVectorImpl<int64_t> &values) {
+  if (parser.parseKeyword(name) || parser.parseEqual())
+    return failure();
+
+  if (parser.parseCommaSeparatedList(
+          AsmParser::Delimiter::Square, [&]() -> ParseResult {
+            int64_t dim = 0;
+            if (parser.parseInteger(dim))
+              return failure();
+            values.push_back(dim);
+            return success();
+          }))
+    return failure();
+  return success();
+}
+
+ParseResult parseTailPlanString(AsmParser &parser, StringRef name,
+                                std::string &value) {
+  if (parser.parseKeyword(name) || parser.parseEqual())
+    return failure();
+  return parser.parseString(&value);
+}
+
+bool alignUpTile(int64_t value, int64_t &result) {
+  constexpr int64_t kTile = layout::kTileEdge;
+  if (value <= 0 || value > std::numeric_limits<int64_t>::max() - (kTile - 1))
+    return false;
+  result = ((value + kTile - 1) / kTile) * kTile;
+  return true;
+}
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
+// Parsing and printing: #hmx.tail_plan<...>
+//===----------------------------------------------------------------------===//
+
+Attribute TailPlanAttr::parse(AsmParser &parser, Type) {
+  if (parser.parseLess())
+    return {};
+
+  SMLoc loc = parser.getCurrentLocation();
+  SmallVector<int64_t> logical;
+  SmallVector<int64_t> padded;
+  SmallVector<int64_t> full;
+  SmallVector<int64_t> tail;
+  std::string kPolicy;
+  std::string mnPolicy;
+  if (parseTailPlanList(parser, "logical", logical) || parser.parseComma() ||
+      parseTailPlanList(parser, "padded", padded) || parser.parseComma() ||
+      parseTailPlanList(parser, "full", full) || parser.parseComma() ||
+      parseTailPlanList(parser, "tail", tail) || parser.parseComma() ||
+      parseTailPlanString(parser, "k_policy", kPolicy) || parser.parseComma() ||
+      parseTailPlanString(parser, "mn_policy", mnPolicy) ||
+      parser.parseGreater())
+    return {};
+
+  return TailPlanAttr::getChecked(
+      [&]() { return parser.emitError(loc); }, parser.getContext(), logical,
+      padded, full, tail, StringRef(kPolicy), StringRef(mnPolicy));
+}
+
+void TailPlanAttr::print(AsmPrinter &printer) const {
+  printer << "<logical = [";
+  llvm::interleaveComma(getLogical(), printer);
+  printer << "], padded = [";
+  llvm::interleaveComma(getPadded(), printer);
+  printer << "], full = [";
+  llvm::interleaveComma(getFull(), printer);
+  printer << "], tail = [";
+  llvm::interleaveComma(getTail(), printer);
+  printer << "], k_policy = ";
+  printer.printString(getKPolicy());
+  printer << ", mn_policy = ";
+  printer.printString(getMnPolicy());
+  printer << ">";
+}
+
+LogicalResult TailPlanAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, ArrayRef<int64_t> logical,
+    ArrayRef<int64_t> padded, ArrayRef<int64_t> full, ArrayRef<int64_t> tail,
+    StringRef kPolicy, StringRef mnPolicy) {
+  if (logical.size() != 3 || padded.size() != 3 || full.size() != 3 ||
+      tail.size() != 3)
+    return emitError() << "expects exactly three extents for each of logical, "
+                          "padded, full, and tail";
+
+  if (kPolicy != kHmxTailKPolicy)
+    return emitError() << "k_policy must be '" << kHmxTailKPolicy
+                       << "', got '" << kPolicy << "'";
+  if (mnPolicy != kHmxTailMNPolicy)
+    return emitError() << "mn_policy must be '" << kHmxTailMNPolicy
+                       << "', got '" << mnPolicy << "'";
+
+  for (int64_t i = 0; i < 3; ++i) {
+    if (logical[i] <= 0)
+      return emitError() << "logical extents must be positive, got ["
+                         << logical[0] << ", " << logical[1] << ", "
+                         << logical[2] << "]";
+    if (padded[i] <= 0 || full[i] < 0 || tail[i] < 0)
+      return emitError() << "padded must be positive and full/tail non-negative, "
+                            "got padded ["
+                         << padded[0] << ", " << padded[1] << ", " << padded[2]
+                         << "], full [" << full[0] << ", " << full[1] << ", "
+                         << full[2] << "], tail [" << tail[0] << ", "
+                         << tail[1] << ", " << tail[2] << "]";
+    if (full[i] > logical[i])
+      return emitError() << "full extent exceeds logical extent at axis " << i;
+    if (full[i] % layout::kTileEdge != 0)
+      return emitError() << "full extent must be a multiple of "
+                         << layout::kTileEdge << " at axis " << i << ", got "
+                         << full[i];
+    if (tail[i] != logical[i] - full[i])
+      return emitError() << "logical must equal full + tail at axis " << i;
+    if (tail[i] >= layout::kTileEdge)
+      return emitError() << "tail extent must be less than "
+                         << layout::kTileEdge << " at axis " << i << ", got "
+                         << tail[i];
+
+    int64_t expectedPadded = 0;
+    if (!alignUpTile(logical[i], expectedPadded))
+      return emitError() << "logical extent cannot be aligned safely at axis "
+                         << i << ", got " << logical[i];
+    if (padded[i] != expectedPadded)
+      return emitError() << "padded extent must be align_up(logical, 32) at "
+                            "axis "
+                         << i << ", expected " << expectedPadded << ", got "
+                         << padded[i];
+  }
+
+  return success();
+}
 
 //===----------------------------------------------------------------------===//
 // Parsing and printing: #hmx.crouton<logical = [M, N]>

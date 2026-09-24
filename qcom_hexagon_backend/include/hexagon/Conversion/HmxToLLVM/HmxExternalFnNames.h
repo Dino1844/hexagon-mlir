@@ -40,6 +40,14 @@ std::string getPackActF32BulkFnName();
 std::string getPackWeightF32BulkFnName();
 std::string getUnpackAccF16BulkFnName();
 std::string getUnpackAccF32BulkFnName();
+// Bounds-safe single-tile forms used only when an explicit valid extent is
+// attached to a layout op. They never replace a full-tile leaf implicitly.
+std::string getPackActTailF16FnName();
+std::string getPackWeightTailF16FnName();
+std::string getPackActTailF32FnName();
+std::string getPackWeightTailF32FnName();
+std::string getUnpackAccTailF16FnName();
+std::string getUnpackAccTailF32FnName();
 
 // `hmx.stage` / `hmx.await` deliberately reuse the existing DMA runtime entries
 // (the interface plan fixes the cost at "the same one call as today's

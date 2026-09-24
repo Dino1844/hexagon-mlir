@@ -18,10 +18,12 @@
 // records the final bridge sites. Weight residency removes pack_weight before
 // hmx-partition performs the final count.
 // CHECK: hmx.kernel_manifest =
-// CHECK-SAME: function = "runtime_weight"
-// CHECK-SAME: pack_weight_sites = 0 : i64
-// CHECK-SAME: pipeline_selected = "serial"
-// CHECK-SAME: reason = "selected"
+// CHECK-DAG: function = "runtime_weight"
+// CHECK-DAG: pack_weight_sites = 0 : i64
+// CHECK-DAG: pipeline = {depth = 0 : i64, reason = "shallow-k", requested = 0 : i64, selected = "serial"}
+// CHECK-DAG: plan = "full-hmx"
+// CHECK-DAG: reason = "selected-aligned"
+// CHECK-DAG: weight_policies = [{consumers = [0], function = "runtime_weight", policy = "resident-prepack", reason = "eligible-aligned-f16", slot = 1 : i64}]
 // The runtime gets the argument's address; no per-launch pack leaf is emitted.
 // CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
 // CHECK-LABEL: llvm.func @runtime_weight
