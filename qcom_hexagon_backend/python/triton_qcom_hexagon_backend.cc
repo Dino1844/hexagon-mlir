@@ -83,8 +83,11 @@ void init_triton_hexagon_translation(py::module &m) {
       [](mlir::ModuleOp &linalg_module, py::dict arch_kwargs) {
         std::unordered_map<std::string, std::string> options_map;
         fill_options_map(arch_kwargs, options_map);
-        return hexagon_backend::translateLinalgToLLVMIR(linalg_module,
-                                                        options_map);
+        std::string translationMetadata;
+        auto llvmIR = hexagon_backend::translateLinalgToLLVMIR(
+            linalg_module, options_map, &translationMetadata);
+        return py::make_tuple(py::str(llvmIR),
+                              py::str(translationMetadata));
       },
       ret::take_ownership);
 
@@ -102,13 +105,16 @@ void init_triton_hexagon_translation(py::module &m) {
         // Goes from a py::dict (arch_kwargs) mapping python strings to python
         // strings to a C++ mapping of strings to strings
         fill_options_map(arch_kwargs, options_map);
-        std::string weightPrepack;
+        std::string translationMetadata;
         auto objs = hexagon_backend::translateLinalgToObj(
-            linalg_module, options_map, with_meta ? &weightPrepack : nullptr);
+            linalg_module, options_map,
+            with_meta ? &translationMetadata : nullptr);
         py::object packed = py::cast(objs);
         if (!with_meta)
           return packed;
-        return py::object(py::make_tuple(packed, py::str(weightPrepack)));
+        // Keep the public tuple shape stable: (object_codes, metadata_json).
+        return py::object(
+            py::make_tuple(packed, py::str(translationMetadata)));
       },
       py::arg("linalg_module"), py::arg("arch_kwargs"),
       py::arg("with_meta") = false, ret::take_ownership);

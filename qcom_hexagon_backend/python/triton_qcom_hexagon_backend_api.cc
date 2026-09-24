@@ -12,6 +12,7 @@
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
@@ -35,6 +36,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/FileUtilities.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/IPO.h"
@@ -391,13 +393,51 @@ mlir::ModuleOp parseMlirFromString(const std::string &src,
   return module->clone();
 }
 
+static void validatePrepackAttributes(mlir::ModuleOp module) {
+  auto validate = [&](llvm::StringRef name, bool array) {
+    mlir::Attribute raw = module->getAttr(name);
+    if (!raw)
+      return;
+    auto string = mlir::dyn_cast<mlir::StringAttr>(raw);
+    if (!string || string.getValue().empty())
+      fail("malformed HMX prepack attribute: " + name.str());
+    auto parsed = llvm::json::parse(string.getValue());
+    if (!parsed || (array ? !parsed->getAsArray() : !parsed->getAsObject()))
+      fail("malformed HMX prepack JSON: " + name.str());
+  };
+  validate("hmx.weight_prepack", /*array=*/true);
+  validate("hmx.weight_prepack_layout", /*array=*/false);
+}
+
+static std::string buildTranslationMetadata(mlir::ModuleOp module) {
+  validatePrepackAttributes(module);
+  auto weightAttr = module->getAttrOfType<mlir::StringAttr>(
+      "hmx.weight_prepack");
+  auto layoutAttr = module->getAttrOfType<mlir::StringAttr>(
+      "hmx.weight_prepack_layout");
+
+  std::string json = "{\"schema\":\"hex.hmx.translation/v1\",";
+  json += "\"weight_prepack\":{\"layout\":";
+  json += layoutAttr ? layoutAttr.getValue().str() : "null";
+  json += ",\"weights\":";
+  json += weightAttr ? weightAttr.getValue().str() : "[]";
+  std::string manifest = mlir::hmx::serializeHmxManifestJson(module);
+  if (manifest == "{}")
+    fail("HMX manifest is missing or malformed for the translated module");
+  json += "},\"hmx_manifest\":";
+  json += manifest;
+  json += "}";
+  return json;
+}
+
 std::vector<std::vector<char>> translateLinalgToObj(
     mlir::ModuleOp &linalg_module,
     const std::unordered_map<std::string, std::string> &options_map,
-    std::string *outWeightPrepack) {
+    std::string *outMetadata) {
   // The collection of object codes (each seen as a sequence of
   // bytes/char) that will be produced
   std::vector<std::vector<char>> mods_object_codes_as_bytes;
+  validatePrepackAttributes(linalg_module);
 
   // Needed to know if we should lower the constants separately or not
   mlir::hexagon::LinalgToLLVMOptions optionsLinalgToLLVM;
@@ -430,25 +470,31 @@ std::vector<std::vector<char>> translateLinalgToObj(
                               << " modules, including the main (code) one"
                               << "\n");
 
-  // The weight-residency contract, if the pipeline published one: the host
-  // pre-packer needs it and it only exists inside the compiled module, so it is
-  // handed back alongside the object bytes. Shape: a JSON object
-  // {"layout": <coeff map or null>, "weights": [ ... ]}.
-  if (outWeightPrepack) {
-    auto attr = mods.empty()
-                    ? mlir::StringAttr()
-                    : mods[0]->getAttrOfType<mlir::StringAttr>(
-                          "hmx.weight_prepack");
-    auto layout = mods.empty()
-                      ? mlir::StringAttr()
-                      : mods[0]->getAttrOfType<mlir::StringAttr>(
-                            "hmx.weight_prepack_layout");
-    std::string json = "{\"layout\":";
-    json += layout ? layout.getValue().str() : "null";
-    json += ",\"weights\":";
-    json += attr ? attr.getValue().str() : "[]";
-    json += "}";
-    *outWeightPrepack = json;
+  if (!outMetadata) {
+    if (mods.empty() ||
+        mlir::hmx::serializeHmxManifestJson(mods[0]) == "{}")
+      fail("translated module is missing a valid HMX manifest; request "
+           "with_meta=true for the versioned envelope");
+    validatePrepackAttributes(mods[0]);
+    if (auto prepack =
+            mods[0]->getAttrOfType<mlir::StringAttr>("hmx.weight_prepack")) {
+      llvm::StringRef value = prepack.getValue();
+      if (!value.empty() && value != "[]")
+        fail("translated module contains a runtime weight-prepack contract; "
+             "request with_meta=true and consume it");
+    }
+  }
+
+  // Return one versioned translation envelope alongside the object bytes.  The
+  // envelope is an internal C++/Python transport contract: the weight object
+  // is consumed by the launcher, while the HMX manifest is host diagnostics
+  // only.  The core owns manifest serialization; the weight fragments below
+  // preserve the existing launcher contract.
+  if (outMetadata) {
+    if (mods.empty())
+      fail("Cannot construct translation metadata: no translated module was "
+           "produced.");
+    *outMetadata = buildTranslationMetadata(mods[0]);
   }
 
   // Iterating through each LLVM/MLIR module that has been produced
@@ -941,11 +987,29 @@ std::vector<std::vector<char>> translateLinalgToObj(
 
 std::string translateLinalgToLLVMIR(
     mlir::ModuleOp &linalg_module,
-    const std::unordered_map<std::string, std::string> &options_map) {
+    const std::unordered_map<std::string, std::string> &options_map,
+    std::string *outMetadata) {
+  validatePrepackAttributes(linalg_module);
   auto mod =
       ::mlir::hexagon::translateLinalgToLLVMMLIR(linalg_module, options_map);
   if (!mod)
     fail("Failed to convert Triton Linalg to LLVM MLIR.");
+
+  if (outMetadata) {
+    *outMetadata = buildTranslationMetadata(mod);
+  } else {
+    validatePrepackAttributes(mod);
+    if (mlir::hmx::serializeHmxManifestJson(mod) == "{}")
+      fail("translated module is missing a valid HMX manifest; request "
+           "metadata for the versioned envelope");
+    if (auto prepack =
+            mod->getAttrOfType<mlir::StringAttr>("hmx.weight_prepack")) {
+      llvm::StringRef value = prepack.getValue();
+      if (!value.empty() && value != "[]")
+        fail("translated module contains a runtime weight-prepack contract; "
+             "request metadata and consume it");
+    }
+  }
 
   // llvm mlir module to llvm ir
   llvm::LLVMContext llvmContext;

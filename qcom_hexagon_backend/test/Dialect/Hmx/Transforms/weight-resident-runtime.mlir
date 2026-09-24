@@ -22,8 +22,9 @@
 // CHECK: hmx.weight_prepack_layout = "{{[{]\\22ndims\\22:5,\\22results\\22:\[\[\[1,32\],\[2,2\],\[4,1\]\],\[\[0,32\],\[3,1\]\]\][}]}}"
 // CHECK: hmx.weight_resident_bytes = 8192 : i64
 module {
+  // The host slot is the tensor ordinal: the scalar argument must not shift it.
   // CHECK-LABEL: func.func @runtime_weight
-  func.func @runtime_weight(%a: memref<64x64xf16>, %w: memref<64x64xf16>) {
+  func.func @runtime_weight(%scale: i32, %a: memref<64x64xf16>, %w: memref<64x64xf16>) {
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
     %c2 = arith.constant 2 : index

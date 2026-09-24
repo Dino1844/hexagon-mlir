@@ -33,11 +33,12 @@ mlir::ModuleOp parseMlirFromString(const std::string &src,
 std::vector<std::vector<char>> translateLinalgToObj(
     mlir::ModuleOp &linalg_module,
     const std::unordered_map<std::string, std::string> &options_map,
-    std::string *outWeightPrepack = nullptr);
+    std::string *outMetadata = nullptr);
 
 std::string translateLinalgToLLVMIR(
     mlir::ModuleOp &linalg_module,
-    const std::unordered_map<std::string, std::string> &options_map);
+    const std::unordered_map<std::string, std::string> &options_map,
+    std::string *outMetadata = nullptr);
 
 bool reorderFuncArgsAndCallsTensorFirst(mlir::ModuleOp &module_op,
                                         const std::string &fname);

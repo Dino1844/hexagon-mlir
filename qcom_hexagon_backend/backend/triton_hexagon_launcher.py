@@ -694,9 +694,13 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         )
         # P2: the compiler's weight-residency contract, if any. Attached to the
         # generator so the shared input-writing path can pre-pack the named
-        # argument slots (None keeps every argument row-major, as before).
+        # argument slots. A valid empty contract means no slot is prepacked.
         from triton.backends.qcom_hexagon_backend.hmx_weight_prepack import WeightPrepack
 
+        if weight_prepack is None:
+            raise ValueError(
+                "compiled kernel metadata is missing the required weight_prepack contract"
+            )
         wrapper_generator.weight_prepack = WeightPrepack.from_metadata(weight_prepack)
         print("==> Wrapper generator correctly instantiated")
 

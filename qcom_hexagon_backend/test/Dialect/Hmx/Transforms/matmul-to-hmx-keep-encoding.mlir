@@ -29,12 +29,12 @@
 // Same attribution as matmul-to-hmx.mlir's @aligned_f16; with the option on,
 // every crouton tensor keeps its encoding (the pack bridge included).
 // CHECK-LABEL: func.func @aligned_f16
-// CHECK: hmx.pack_act {{.*}} {count = 4 : i64}
+// CHECK: hmx.pack_act {{.*}} {count = 4 : i64, hmx.decision_id = 0 : i64}
 // CHECK-SAME: tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
-// CHECK: hmx.pack_weight {{.*}} {count = 4 : i64}
+// CHECK: hmx.pack_weight {{.*}} {count = 4 : i64, hmx.decision_id = 0 : i64}
 // CHECK-SAME: tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
-// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>, tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>) outs(%{{.*}} : tensor<2x2x16x32x2xf16, #hmx.crouton<logical = [64, 64]>>) -> tensor<2x2x16x32x2xf16, #hmx.crouton<logical = [64, 64]>>
-// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64}
+// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>, tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>) outs(%{{.*}} : tensor<2x2x16x32x2xf16, #hmx.crouton<logical = [64, 64]>>) {{.*}} -> tensor<2x2x16x32x2xf16, #hmx.crouton<logical = [64, 64]>>
+// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64, hmx.decision_id = 0 : i64}
 // BUF-LABEL: func.func @aligned_f16
 // BUF-DAG: memref.alloc
 // BUF-DAG: memref<2x4x16x32x2xf16, #hmx.crouton_memref_layout<logical = [64, 128]>, 1>

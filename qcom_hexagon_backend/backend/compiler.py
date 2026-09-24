@@ -21,8 +21,9 @@ from triton._C.libtriton import ir, passes, qcom_hexagon_backend  # type: ignore
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton.backends.qcom_hexagon_backend.utils import parse_return_types
 from triton.backends.qcom_hexagon_backend.utils import (
-    PACK_METADATA_DEFAULTS,
     PACK_METADATA_REQUIRED,
+    apply_translation_metadata,
+    validate_pack_metadata,
 )
 
 # Temporary measure to compile .so for HTP without calling the Triton driver
@@ -82,7 +83,9 @@ def ttir_to_ttsharedir(mod: str, options):
 # This is a stopgap solution to allow more control over compiling kernels for QNN custom ops.
 # When we later have a better way to pass compilation flags to ttsharedir_to_obj(),
 # this function can be deprecated- we'd use ttsharedir_to_obj() in all cases.
-def ttsharedir_to_llir(mod: str, options, metadata={}):
+def ttsharedir_to_llir(mod: str, options, metadata=None):
+    if metadata is None:
+        metadata = {}
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
     mlir_mod = qcom_hexagon_backend.parse_mlir_module_from_str(mod, context)
@@ -92,10 +95,16 @@ def ttsharedir_to_llir(mod: str, options, metadata={}):
     metadata["return_types"] = parse_return_types(return_values)
 
     options_map = {k: str(v) for k, v in (options.__dict__).items()}
-    return qcom_hexagon_backend.translate_linalg_to_llvmir(mlir_mod, options_map)
+    llvmir, translation_metadata = (
+        qcom_hexagon_backend.translate_linalg_to_llvmir(mlir_mod, options_map)
+    )
+    apply_translation_metadata(metadata, translation_metadata)
+    return llvmir
 
 
-def ttsharedir_to_obj(mod: str, options, metadata={}) -> bytes:
+def ttsharedir_to_obj(mod: str, options, metadata=None) -> bytes:
+    if metadata is None:
+        metadata = {}
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
     # Temporary regex substitution to lower tt.scan
@@ -118,13 +127,15 @@ def ttsharedir_to_obj(mod: str, options, metadata={}) -> bytes:
     # TODO: The lowering pipeline needs to be refactored similar to other Triton backends to
     # have a dynamic pipeline filtered by options with each pass represented by a pybind function.
     # See make_ttgir() in nvidia backend as an example.
-    # `with_meta=True` also returns the host pre-pack contract for runtime
-    # weights (P2). It is a JSON string, passed to the launcher through the
-    # kernel metadata so the generated wrapper can pre-pack those arguments.
-    mods_llvmir_bytes, weight_prepack = qcom_hexagon_backend.translate_linalg_to_obj(
-        mlir_mod, options_map, True
+    # `with_meta=True` returns the versioned translation metadata envelope.  It
+    # carries two independent JSON objects: the launcher-facing weight
+    # pre-pack contract and the host-only HMX manifest.  Unpack and validate
+    # both before any object code is returned; never turn a missing feature
+    # into an empty/default object.
+    mods_llvmir_bytes, translation_metadata = (
+        qcom_hexagon_backend.translate_linalg_to_obj(mlir_mod, options_map, True)
     )
-    metadata["weight_prepack"] = weight_prepack
+    apply_translation_metadata(metadata, translation_metadata)
     # Note: translate_linalg_to_obj() now returns a collection of object codes in general,
     # which in the case of the triton flow will only contain one element (i.e. one object code)
     # since there is no separation of constants for the triton flow.
@@ -305,10 +316,7 @@ class HexagonBackend(BaseBackend):
                 "TRITON_CACHE_DIR (tools/hexmlir/env.sh)"
             )
         packed = {k: getattr(metadata, k) for k in PACK_METADATA_REQUIRED}
-        # Optional fields: the cached JSON may predate them, hence the default.
-        for key, default in PACK_METADATA_DEFAULTS.items():
-            packed[key] = getattr(metadata, key, default)
-        return packed
+        return validate_pack_metadata(packed)
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.backends.qcom_hexagon_backend.hexagon_extern.hexagon import (

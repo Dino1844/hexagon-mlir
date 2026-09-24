@@ -25,8 +25,10 @@ def MatmulToHmx : InterfacePass<"matmul-to-hmx", "mlir::FunctionOpInterface"> {
     asking `HmxTarget`) followed by a residency check
     (`HmxTarget::planBridge`: the crouton arrays of one M block must fit VTCM; a
     contraction too large to hold whole is walked in M blocks, and only one that
-    fits no block at all is left alone). There is no enable/disable switch --
-    only `vtcm-budget`, which caps the residency the bridge may claim.
+    fits no block at all is left alone). There is no ordinary enable/disable
+    switch -- only `vtcm-budget`, which caps the residency the bridge may
+    claim, plus the metadata-only `record-only` mode used by pipelines that do
+    not lower HMX.
 
     Version 1 (plain HMX) requires f16 or f32 inputs (an f32 source is quantised
     to the engine's fp16 by the bridge pack), an f16 or f32 output, 2D static
@@ -54,6 +56,13 @@ def MatmulToHmx : InterfacePass<"matmul-to-hmx", "mlir::FunctionOpInterface"> {
            "arrays (the hexagonmem path that lowers space-1 allocations). The "
            "engine reads and writes VTCM only, so without it an attributed "
            "matmul would hand the leaves addresses the engine cannot use.">,
+    Option<"recordOnly", "record-only", "bool", /*default=*/"false",
+           "Record the attribution manifest without rewriting linalg.matmul or "
+           "emitting HMX operations. The pass still evaluates the same "
+           "eligibility and VTCM capability contract, but treats VTCM as "
+           "unavailable in this mode so records carry the canonical "
+           "vtcm-allocator-disabled reason; callers should set vtcm-allocator "
+           "to false explicitly when constructing it.">,
     Option<"dropEncodings", "drop-encodings", "bool", /*default=*/"true",
            "Erase every #hmx.crouton tensor encoding once the pass is done, "
            "restoring the bare rank-5 physical types the rest of the pipeline "

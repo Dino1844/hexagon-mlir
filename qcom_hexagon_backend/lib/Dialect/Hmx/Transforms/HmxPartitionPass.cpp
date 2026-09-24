@@ -76,6 +76,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
@@ -95,6 +96,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <optional>
+#include <mutex>
 
 #define DEBUG_TYPE "hmx-partition"
 
@@ -137,6 +139,179 @@ constexpr int64_t kSerialPipelineDepth = 3;
 /// the A/B arms and stage whatever the shape is, and `3` never reaches the
 /// staged emitter.
 constexpr int64_t kStageMinKTiles = 32;
+
+enum class PipelineReason {
+  None,
+  SerialRequested,
+  NoRowMajorBridge,
+  ExtraActivationReader,
+  InvalidStagingGeometry,
+  EmptyStagingGrid,
+  StagingGridMismatch,
+  ShallowK,
+  VtcmBudget,
+  TileCount,
+  PipelinerFailed,
+};
+
+StringRef pipelineReasonCode(PipelineReason reason) {
+  switch (reason) {
+  case PipelineReason::None:
+    return {};
+  case PipelineReason::SerialRequested:
+    return "serial-requested";
+  case PipelineReason::NoRowMajorBridge:
+    return "no-row-major-bridge";
+  case PipelineReason::ExtraActivationReader:
+    return "extra-activation-reader";
+  case PipelineReason::InvalidStagingGeometry:
+    return "invalid-staging-geometry";
+  case PipelineReason::EmptyStagingGrid:
+    return "empty-staging-grid";
+  case PipelineReason::StagingGridMismatch:
+    return "staging-grid-mismatch";
+  case PipelineReason::ShallowK:
+    return "shallow-k";
+  case PipelineReason::VtcmBudget:
+    return "vtcm-budget";
+  case PipelineReason::TileCount:
+    return "tile-count";
+  case PipelineReason::PipelinerFailed:
+    return "pipeliner-failed";
+  }
+  llvm_unreachable("unknown HMX pipeline reason");
+}
+
+struct PipelineDecision {
+  int64_t requestedDepth = 0;
+  bool staged = false;
+  int64_t depth = 0;
+  PipelineReason reason = PipelineReason::None;
+  int64_t neededBytes = 0;
+  int64_t freeBytes = 0;
+  int64_t budgetDepth = 0;
+};
+
+bool hasPipelineRemark(PipelineReason reason) {
+  return reason != PipelineReason::None &&
+         reason != PipelineReason::SerialRequested &&
+         reason != PipelineReason::TileCount;
+}
+
+InFlightDiagnostic &renderPipelineRemark(InFlightDiagnostic &diag,
+                                         const PipelineDecision &decision) {
+  switch (decision.reason) {
+  case PipelineReason::NoRowMajorBridge:
+    return diag
+           << "HMX pipeline not applied: the activation is not a "
+              "row-major staging bridge (nothing to re-host onto a VTCM "
+              "slot), so the tile loop reads the crouton array where it is";
+  case PipelineReason::ExtraActivationReader:
+    return diag << "HMX pipeline not applied: the activation array has a "
+                   "reader the staging rewrite does not own";
+  case PipelineReason::InvalidStagingGeometry:
+    return diag << "HMX pipeline not applied: the activation staging geometry "
+                   "does not describe rank-5 f16 crouton arrays with a static "
+                   "row-major f16/f32 source";
+  case PipelineReason::EmptyStagingGrid:
+    return diag << "HMX pipeline not applied: the activation staging geometry "
+                   "has an empty crouton grid";
+  case PipelineReason::StagingGridMismatch:
+    return diag << "HMX pipeline not applied: the source, activation and "
+                   "weight grids disagree on the staging tile shape";
+  case PipelineReason::ShallowK:
+    return diag << "HMX pipeline not applied: Kt " << decision.freeBytes
+                << " is below the staging floor of " << kStageMinKTiles
+                << " -- one transfer is too small to hide the DMA engine's "
+                   "fixed cost behind the tile's compute";
+  case PipelineReason::VtcmBudget:
+    if (!decision.staged)
+      return diag
+             << "HMX pipeline not applied: activation staging needs "
+             << decision.neededBytes
+             << " bytes of VTCM (one crouton scratch plus the serial ring), "
+                "only "
+             << decision.freeBytes << " are free";
+    if (decision.requestedDepth <= 0)
+      return diag << "HMX pipeline not applied at depth 2: double-buffered "
+                     "activation staging needs "
+                  << decision.neededBytes << " bytes of VTCM, only "
+                  << decision.freeBytes << " are free; using the serial ring";
+    return diag << "HMX pipeline depth " << decision.requestedDepth
+                << " requested, but only " << decision.freeBytes
+                << " bytes of VTCM are free after the crouton scratch: a depth-"
+                << decision.budgetDepth << " ring needs "
+                << decision.neededBytes << " bytes; using depth "
+                << decision.budgetDepth;
+  case PipelineReason::PipelinerFailed:
+    return diag
+           << "HMX pipeline not applied at depth 2: the SCF loop "
+              "pipeliner declined the schedule; the staged loop runs serially";
+  case PipelineReason::None:
+  case PipelineReason::SerialRequested:
+  case PipelineReason::TileCount:
+    llvm_unreachable("silent pipeline decision rendered as a diagnostic");
+  }
+  llvm_unreachable("unknown HMX pipeline diagnostic");
+}
+
+LogicalResult readDecisionId(Operation *op, std::optional<int64_t> &id) {
+  id.reset();
+  Attribute raw = op->getAttr(kHmxDecisionIdAttr);
+  if (!raw)
+    return success();
+  auto integer = dyn_cast<IntegerAttr>(raw);
+  if (!integer || !integer.getType().isSignlessInteger(64)) {
+    op->emitError("hmx.matmul has an invalid hmx.decision_id");
+    return failure();
+  }
+  id = integer.getInt();
+  return success();
+}
+
+LogicalResult recordPipelineDecision(MatmulOp op,
+                                     const PipelineDecision &decision) {
+  std::optional<int64_t> id;
+  if (failed(readDecisionId(op.getOperation(), id)))
+    return failure();
+  if (id) {
+    auto func = op->getParentOfType<func::FuncOp>();
+    auto module = op->getParentOfType<ModuleOp>();
+    if (!func || !module) {
+      op.emitError("hmx.matmul is not inside a function and module");
+      return failure();
+    }
+    if (!module->hasAttr("hmx.kernel_manifest")) {
+      op.emitError("hmx.matmul has a decision id but no module manifest");
+      return failure();
+    }
+    if (failed(setHmxManifestPipelineDecision(
+            module, func.getName(), *id, decision.requestedDepth,
+            decision.staged ? "staged" : "serial", decision.depth,
+            pipelineReasonCode(decision.reason))))
+      return failure();
+  }
+  if (hasPipelineRemark(decision.reason)) {
+    InFlightDiagnostic diag = op.emitRemark();
+    renderPipelineRemark(diag, decision);
+  }
+  return success();
+}
+
+LogicalResult declineStageLoop(MatmulOp op, int64_t requestedDepth,
+                               PipelineReason reason, int64_t detail = 0,
+                               int64_t neededBytes = 0,
+                               int64_t budgetDepth = 0) {
+  PipelineDecision decision;
+  decision.requestedDepth = requestedDepth;
+  decision.staged = false;
+  decision.depth = 0;
+  decision.reason = reason;
+  decision.freeBytes = detail;
+  decision.neededBytes = neededBytes;
+  decision.budgetDepth = budgetDepth;
+  return recordPipelineDecision(op, decision);
+}
 
 /// The tile sizes of a matmul, read off the crouton arrays' leading dimensions.
 struct TileShape {
@@ -259,10 +434,16 @@ std::optional<ActivationBridge> findActivationBridge(Value act) {
 /// the result is what makes the dependency visible to an external scheduler.
 static Value emitPackAct(IRRewriter &rewriter, Location loc, Value dst,
                          Value src, Value row, Value col,
+                         std::optional<int64_t> decisionId,
                          IntegerAttr count = {}) {
-  return PackActOp::create(rewriter, loc, TypeRange{dst.getType()}, dst, src,
-                           row, col, count)
-      ->getResult(0);
+  auto pack = PackActOp::create(rewriter, loc, TypeRange{dst.getType()}, dst,
+                                src, row, col, count);
+  // Standalone hand-written hmx.matmul has no manifest decision to carry;
+  // production/full-pipeline IR always supplies the explicit id.
+  if (decisionId)
+    pack->setAttr(kHmxDecisionIdAttr,
+                  rewriter.getI64IntegerAttr(*decisionId));
+  return pack->getResult(0);
 }
 
 /// One `hmx.stage`: start the DMA of activation tile `row` from the row-major
@@ -355,14 +536,14 @@ static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
 static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
                             Value scratch, Value wt, Value ar, Value m,
                             Value stagedSlot, Value c0, Value c1, Value cKt,
-                            Value cNt) {
+                            Value cNt, std::optional<int64_t> decisionId) {
   // The pack's destination is the scratch itself: its crouton grid is one row
   // tall, so the destination crouton is (0, k) while the source block is
   // (row 0, column k) of the staged slot. The scratch's contiguous axis is K,
   // so one ranged pack covers the whole K run -- the same shape the row-major
   // bridge uses (`packCroutonsWithLeaves`); `cKt` is not needed as a loop bound.
   auto scratchType = cast<MemRefType>(scratch.getType());
-  emitPackAct(rewriter, loc, scratch, stagedSlot, c0, c0,
+  emitPackAct(rewriter, loc, scratch, stagedSlot, c0, c0, decisionId,
               rewriter.getI64IntegerAttr(scratchType.getDimSize(1)));
 
   auto nLoop = scf::ForOp::create(rewriter, loc, c0, cNt, c1, ValueRange{});
@@ -404,21 +585,22 @@ static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
 /// Whatever the knob says, the pass never exceeds the budget: an impossible
 /// request becomes a remark plus the best depth that fits, never a silent
 /// over-commit.
-static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
-                          MatmulOp op, func::FuncOp func, int64_t vtcmBudget,
-                          int64_t requestedDepth) {
+static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
+                                   Value bias, MatmulOp op, func::FuncOp func,
+                                   int64_t vtcmBudget, int64_t requestedDepth,
+                                   bool &staged) {
+  staged = false;
+  std::optional<int64_t> decisionId;
+  if (failed(readDecisionId(op.getOperation(), decisionId)))
+    return failure();
   Value act = op.getLhs();
   Value wt = op.getRhs();
   Value ar = op.getOuts();
 
   auto bridge = findActivationBridge(act);
-  if (!bridge) {
-    op.emitRemark() << "HMX pipeline not applied: the activation is not a "
-                       "row-major staging bridge (nothing to re-host onto a "
-                       "VTCM slot), so the tile loop reads the crouton array "
-                       "where it is";
-    return false;
-  }
+  if (!bridge)
+    return declineStageLoop(op, requestedDepth,
+                            PipelineReason::NoRowMajorBridge);
 
   // The array is refilled by the tile loop, so the only other readers allowed
   // are the bridge's own packs, this matmul, and its deallocation. A second
@@ -429,9 +611,8 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
         (isa<PackActOp>(owner) && cast<PackActOp>(owner).getDst() == act) ||
         isa<memref::DeallocOp, scf::YieldOp>(owner))
       continue;
-    op.emitRemark() << "HMX pipeline not applied: the activation array has a "
-                       "reader the staging rewrite does not own";
-    return false;
+    return declineStageLoop(op, requestedDepth,
+                            PipelineReason::ExtraActivationReader);
   }
 
   auto actType = dyn_cast<MemRefType>(bridge->buffer.getType());
@@ -439,47 +620,35 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   auto srcType = dyn_cast<MemRefType>(bridge->src.getType());
   if (!actType || !wtType || !srcType || srcType.getRank() != 2 ||
       !srcType.hasStaticShape() ||
-      !(srcType.getElementType().isF16() || srcType.getElementType().isF32())) {
-    op.emitRemark() << "HMX pipeline not applied: the activation staging "
-                       "geometry does not describe rank-5 f16 crouton arrays "
-                       "with a static row-major f16/f32 source";
-    return false;
-  }
+      !(srcType.getElementType().isF16() || srcType.getElementType().isF32()))
+    return declineStageLoop(op, requestedDepth,
+                            PipelineReason::InvalidStagingGeometry);
 
   int64_t Mt = actType.getDimSize(0), Kt = actType.getDimSize(1);
   int64_t Nt = weightNTiles(wtType);
   int64_t K = srcType.getDimSize(1);
-  if (Mt < 1 || Kt < 1) {
-    op.emitRemark() << "HMX pipeline not applied: the activation staging "
-                       "geometry has an empty crouton grid";
-    return false;
-  }
+  if (Mt < 1 || Kt < 1)
+    return declineStageLoop(op, requestedDepth,
+                            PipelineReason::EmptyStagingGrid);
   if (srcType.getDimSize(0) != Mt * layout::kTileEdge ||
-      K != Kt * layout::kTileEdge || weightKTiles(wtType) != Kt) {
-    op.emitRemark() << "HMX pipeline not applied: the source, activation and "
-                       "weight grids disagree on the staging tile shape";
-    return false;
-  }
+      K != Kt * layout::kTileEdge || weightKTiles(wtType) != Kt)
+    return declineStageLoop(op, requestedDepth,
+                            PipelineReason::StagingGridMismatch);
 
   // `auto` declines a shallow-K shape: below `kStageMinKTiles` the transfer is
   // too small for the fixed DMA cost to hide behind the tile's compute, so the
   // overlap does not pay (the threshold's mechanism and the device numbers are
   // on the constant). An explicit `pipeline-depth=1/2` skips the floor -- those
   // are the A/B arms -- and `3` never reaches this emitter.
-  if (requestedDepth <= 0 && Kt < kStageMinKTiles) {
-    op.emitRemark() << "HMX pipeline not applied: Kt " << Kt
-                    << " is below the staging floor of " << kStageMinKTiles
-                    << " -- one transfer is too small to hide the DMA engine's "
-                       "fixed cost behind the tile's compute";
-    return false;
-  }
+  if (requestedDepth <= 0 && Kt < kStageMinKTiles)
+    return declineStageLoop(op, requestedDepth, PipelineReason::ShallowK, Kt);
 
   // The staged loop allocates, on top of the arrays the attribution already
   // counted: one crouton-row scratch (the pack destination, reused by every
   // tile) and `depth` staging slots (one 32 x K f16 tile each) plus `depth`
   // status words. The whole activation array is retired by this path, so its
-  // bytes come back to the room -- not counting them would turn a ring that fits
-  // into a spurious fallback.
+  // bytes come back to the room -- not counting them would turn a ring that
+  // fits into a spurious fallback.
   int64_t actBytes = actType.getNumElements() * 2;
   int64_t scratchBytes = Kt * layout::kCroutonBytes;
   int64_t srcElemBytes = srcType.getElementTypeBitWidth() / 8;
@@ -495,72 +664,62 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   // activation.
   auto fits = [&](int64_t d) { return scratchBytes + d * ringBytes <= room; };
   int64_t budgetDepth = fits(2) ? 2 : (fits(1) ? 1 : 0);
-  if (budgetDepth == 0) {
-    op.emitRemark() << "HMX pipeline not applied: activation staging needs "
-                    << (scratchBytes + ringBytes)
-                    << " bytes of VTCM (one crouton scratch plus the serial "
-                       "ring), only "
-                    << room << " are free";
-    return false;
-  }
+  if (budgetDepth == 0)
+    return declineStageLoop(op, requestedDepth, PipelineReason::VtcmBudget,
+                            room, scratchBytes + ringBytes, budgetDepth);
 
   // The knob selects a depth, then the budget caps it. `requestedDepth` <= 0 is
   // auto; anything above 2 is clamped to the deepest ring that exists.
-  int64_t depth = requestedDepth <= 0 ? budgetDepth
-                                      : std::min<int64_t>(requestedDepth, 2);
+  int64_t depth =
+      requestedDepth <= 0 ? budgetDepth : std::min<int64_t>(requestedDepth, 2);
+  PipelineReason manifestReason = PipelineReason::None;
+  int64_t manifestNeededBytes = 0;
   if (depth > budgetDepth) {
-    op.emitRemark() << "HMX pipeline depth " << depth
-                    << " requested, but only " << room
-                    << " bytes of VTCM are free after the crouton scratch: "
-                    << "a depth-" << budgetDepth << " ring needs "
-                    << (scratchBytes + budgetDepth * ringBytes)
-                    << " bytes; using depth " << budgetDepth;
+    manifestReason = PipelineReason::VtcmBudget;
+    manifestNeededBytes = scratchBytes + budgetDepth * ringBytes;
     depth = budgetDepth;
   }
   // A ring at least as deep as the tile count has no steady state worth a
   // second slot -- the extra transfer would overlap nothing -- so geometry caps
-  // it too. This is a shape property, not a budget one, so it is only a debug
-  // note. (The pipeliner's prologue could not stage past the end anyway: it
+  // it too. (The pipeliner's prologue could not stage past the end anyway: it
   // issues exactly one tile per pipeline stage, and the kernel stops that many
   // iterations short.)
   if (Mt <= depth) {
     LLVM_DEBUG(llvm::dbgs()
                << "hmx-partition: ring depth capped by tile count Mt=" << Mt
                << " (wanted " << depth << ")\n");
+    if (depth == 2)
+      manifestReason = PipelineReason::TileCount;
     depth = 1;
   }
-  // Auto narrowing from the double ring to the serial one is worth a remark too:
-  // the pipeline still applies, but the overlap it was chosen for is gone.
-  if (requestedDepth <= 0 && budgetDepth == 1 && Mt > 1)
-    op.emitRemark() << "HMX pipeline not applied at depth 2: double-buffered "
-                       "activation staging needs "
-                    << (scratchBytes + 2 * ringBytes)
-                    << " bytes of VTCM, only " << room
-                    << " are free; using the serial ring";
-  LLVM_DEBUG(llvm::dbgs()
-             << "hmx-partition: activation staging depth " << depth
-             << " (requested " << requestedDepth << ", budget depth "
-             << budgetDepth << ", room " << room << " B, scratch "
-             << scratchBytes << " B, ring/depth " << ringBytes << " B)\n");
+  // Auto narrowing from the double ring to the serial one is still a staged
+  // loop, but the overlap it was chosen for is gone.
+  if (requestedDepth <= 0 && budgetDepth == 1 && Mt > 1) {
+    manifestReason = PipelineReason::VtcmBudget;
+    manifestNeededBytes = scratchBytes + 2 * ringBytes;
+  }
+  LLVM_DEBUG(llvm::dbgs() << "hmx-partition: activation staging depth " << depth
+                          << " (requested " << requestedDepth
+                          << ", budget depth " << budgetDepth << ", room "
+                          << room << " B, scratch " << scratchBytes
+                          << " B, ring/depth " << ringBytes << " B)\n");
 
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(op);
   Location loc = opLoc;
 
-  auto slotType = MemRefType::get({layout::kTileEdge, K},
-                                  srcType.getElementType(), AffineMap{},
-                                  hexagon::VTCM_ADDRESS_SPACE);
+  auto slotType =
+      MemRefType::get({layout::kTileEdge, K}, srcType.getElementType(),
+                      AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
   auto statusType = MemRefType::get({1}, rewriter.getI32Type());
   // One crouton row: the pack destination, re-filled (not re-allocated) every
   // tile. It replaces the whole activation array, so the staged path pays one
   // row of croutons instead of `Mt` of them. The pack's DPS result is this same
   // buffer, so the mma consumes the packed croutons by address -- no copy
   // between pack and mma, and no second row in flight.
-  auto scratchType =
-      MemRefType::get({1, Kt, layout::kCroutonPair, layout::kCroutonCol,
-                       layout::kCroutonHalf},
-                      rewriter.getF16Type(), AffineMap{},
-                      hexagon::VTCM_ADDRESS_SPACE);
+  auto scratchType = MemRefType::get(
+      {1, Kt, layout::kCroutonPair, layout::kCroutonCol, layout::kCroutonHalf},
+      rewriter.getF16Type(), AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
 
   // The static ring: `depth` (slot, status) pairs, one per in-flight tile, plus
   // the one scratch. All allocated once here and released once after the
@@ -569,15 +728,18 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
       memref::AllocOp::create(rewriter, loc, scratchType, ValueRange{});
   SmallVector<Value> slots, statuses;
   for (int64_t i = 0; i < depth; ++i) {
-    slots.push_back(memref::AllocOp::create(rewriter, loc, slotType, ValueRange{},
+    slots.push_back(memref::AllocOp::create(rewriter, loc, slotType,
+                                            ValueRange{},
                                             rewriter.getI64IntegerAttr(128)));
-    statuses.push_back(memref::AllocOp::create(
-        rewriter, loc, statusType, ValueRange{}, rewriter.getI64IntegerAttr(4)));
+    statuses.push_back(memref::AllocOp::create(rewriter, loc, statusType,
+                                               ValueRange{},
+                                               rewriter.getI64IntegerAttr(4)));
   }
 
   auto c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
   auto c1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
-  auto cTileEdge = arith::ConstantIndexOp::create(rewriter, loc, layout::kTileEdge);
+  auto cTileEdge =
+      arith::ConstantIndexOp::create(rewriter, loc, layout::kTileEdge);
   auto cKt = arith::ConstantIndexOp::create(rewriter, loc, Kt);
   auto cNt = arith::ConstantIndexOp::create(rewriter, loc, Nt);
   auto cMt = arith::ConstantIndexOp::create(rewriter, loc, Mt);
@@ -607,9 +769,8 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   Value statusSel = statuses[0];
   if (depth == 2) {
     auto parity = arith::AndIOp::create(rewriter, loc, m, c1);
-    auto odd =
-        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne, parity,
-                              c0);
+    auto odd = arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::ne,
+                                     parity, c0);
     slotSel = arith::SelectOp::create(rewriter, loc, odd, slots[1], slots[0])
                   .getResult();
     statusSel =
@@ -625,7 +786,7 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   Value token = emitStage(rewriter, loc, bridge->src, row, slotSel, statusSel);
   Value ready = emitAwait(rewriter, loc, token, slotSel);
   emitTileCompute(rewriter, loc, bias, scratch, wt, ar, m, ready, c0, c1, cKt,
-                  cNt);
+                  cNt, decisionId);
 
   // The pipeliner owns the schedule from here: everything through the
   // `hmx.stage` is stage 0, the await and the compute are stage 1. With the
@@ -661,15 +822,28 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
       // The source loop is intact: keep it as the serial staged loop, with
       // everything after it following the loop as usual.
       rewriter.setInsertionPointAfter(mLoop);
-      op.emitRemark() << "HMX pipeline not applied at depth 2: the SCF loop "
-                         "pipeliner declined the schedule; the staged loop "
-                         "runs serially";
+      manifestReason = PipelineReason::PipelinerFailed;
     }
   } else {
     // Depth 1 is the source loop as emitted: move the insertion point back out
     // of the body the compute left it in, so what follows follows the loop.
     rewriter.setInsertionPointAfter(mLoop);
   }
+
+  PipelineDecision decision;
+  decision.requestedDepth = requestedDepth;
+  // Reaching this point means the staged source loop was emitted. A failed
+  // SCF pipeliner leaves that loop serial, but it is still staged: the manifest
+  // reason, not `pipeline_selected`, records the lost overlap.
+  decision.staged = true;
+  decision.depth = depth;
+  decision.reason = manifestReason;
+  decision.neededBytes = manifestNeededBytes;
+  decision.freeBytes = room;
+  decision.budgetDepth = budgetDepth;
+  if (failed(recordPipelineDecision(op, decision)))
+    return failure();
+  staged = true;
 
   // The ring and the scratch live exactly as long as the tile loop. The
   // insertion point is after the pipelined epilogue (or after the serial loop
@@ -680,13 +854,13 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
     memref::DeallocOp::create(rewriter, loc, status);
   memref::DeallocOp::create(rewriter, loc, scratch);
 
-  // Retire the bridge, the matmul and the activation array. The array is dead in
-  // this path: the tile loop writes the scratch instead, so neither the bridge
-  // loop that filled it nor the array itself survives. Collect the array's
-  // deallocations before its bridge loop is erased -- in the carried form the
-  // loop is what defines the array -- then drop the bridge and the matmul, then
-  // the deallocations, and finally the allocation underneath. The earlier reader
-  // check guarantees nothing else observes the array.
+  // Retire the bridge, the matmul and the activation array. The array is dead
+  // in this path: the tile loop writes the scratch instead, so neither the
+  // bridge loop that filled it nor the array itself survives. Collect the
+  // array's deallocations before its bridge loop is erased -- in the carried
+  // form the loop is what defines the array -- then drop the bridge and the
+  // matmul, then the deallocations, and finally the allocation underneath. The
+  // earlier reader check guarantees nothing else observes the array.
   SmallVector<memref::DeallocOp> actDeallocs;
   for (Operation *user : act.getUsers())
     if (auto d = dyn_cast<memref::DeallocOp>(user))
@@ -704,8 +878,8 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
 
   // The allocation is `act` itself in the canonicalized form and the bridge
   // loop's init arg in the carried one; either way it is unreferenced now. Drop
-  // its deallocation (if the array value was not the thing deallocated) and then
-  // the allocation, so the activation stops occupying VTCM.
+  // its deallocation (if the array value was not the thing deallocated) and
+  // then the allocation, so the activation stops occupying VTCM.
   if (auto alloc = bridge->buffer.getDefiningOp<memref::AllocOp>()) {
     SmallVector<memref::DeallocOp> bufferDeallocs;
     for (Operation *user : bridge->buffer.getUsers())
@@ -716,7 +890,7 @@ static bool emitStageLoop(IRRewriter &rewriter, Location opLoc, Value bias,
     if (alloc->use_empty())
       rewriter.eraseOp(alloc);
   }
-  return true;
+  return success();
 }
 
 struct HmxPartitionPass
@@ -729,7 +903,26 @@ struct HmxPartitionPass
   }
 
   void runOnOperation() override {
+    // The manifest and its bridge-site totals are module state, while this
+    // interface pass may run concurrently for sibling functions.
+    std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
+
     func::FuncOp func = cast<func::FuncOp>(getOperation());
+    ModuleOp module = func->getParentOfType<ModuleOp>();
+    if (!module) {
+      func.emitError("hmx-partition requires a builtin.module parent");
+      return signalPassFailure();
+    }
+    // A standalone hmx-partition invocation may lower hand-written hmx.matmul
+    // IR that has not gone through matmul-to-hmx.  Such IR has no attribution
+    // record to update; production/full-pipeline IR always carries the module
+    // manifest created by matmul-to-hmx.
+    const bool hasManifest = module->hasAttr("hmx.kernel_manifest");
+    if (hasManifest &&
+        (failed(ensureHmxManifest(module)) ||
+         failed(restoreHmxManifestDecisionIds(module, func)) ||
+         failed(refreshHmxManifestBridgeCounts(module))))
+      return signalPassFailure();
 
     SmallVector<MatmulOp> matmuls;
     func.walk([&](MatmulOp op) { matmuls.push_back(op); });
@@ -738,17 +931,17 @@ struct HmxPartitionPass
 
     // The engine's budget, with the one field a caller may narrow: 0 means the
     // device default (see HmxTarget).
-    const int64_t vtcmBudget =
-        this->vtcmBudgetBytes > 0 ? this->vtcmBudgetBytes
+    const int64_t vtcmBudget = this->vtcmBudgetBytes > 0
+                                   ? this->vtcmBudgetBytes
                                   : HmxTarget::defaultVtcmBudget;
 
     Location loc = func.getLoc();
     IRRewriter rewriter(func.getContext());
     rewriter.setInsertionPointToStart(&func.getBody().front());
 
-    // The identity conversion state is kernel-level setup, so it is created once
-    // for the whole function. It is an ordinary space-1 block: the VTCM machinery
-    // below places it next to the crouton arrays.
+    // The identity conversion state is kernel-level setup, so it is created
+    // once for the whole function. It is an ordinary space-1 block: the VTCM
+    // machinery below places it next to the crouton arrays.
     auto biasType = MemRefType::get({kConvStateBytes}, rewriter.getI8Type(),
                                     AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
     auto bias = memref::AllocOp::create(
@@ -780,37 +973,54 @@ struct HmxPartitionPass
         return signalPassFailure();
       }
 
-      // The matmul itself is replaced by the loop that walks its crouton arrays.
+      // The matmul itself is replaced by the loop that walks its crouton
+      // arrays.
       Location opLoc = op.getLoc();
       // `pipeline-depth=3` is the unstaged arm: skip the staging rewrite
       // outright and emit the plain tile loop, which leaves the activation
       // bridge and its array in place. It is chosen here rather than by asking
-      // the staged emitter to decline, so a bridge shape is preserved -- letting
-      // the staged loop run and then undoing it would already have retired
-      // `act`.
-      if (this->pipelineDepth != kSerialPipelineDepth &&
-          emitStageLoop(rewriter, opLoc, bias, op, func, vtcmBudget,
-                        this->pipelineDepth))
-        continue;
+      // the staged emitter to decline, so a bridge shape is preserved --
+      // letting the staged loop run and then undoing it would already have
+      // retired `act`.
+      if (this->pipelineDepth == kSerialPipelineDepth) {
+        PipelineDecision serial;
+        serial.requestedDepth = this->pipelineDepth;
+        serial.reason = PipelineReason::SerialRequested;
+        if (failed(recordPipelineDecision(op, serial)))
+          return signalPassFailure();
+      } else {
+        bool staged = false;
+        if (failed(emitStageLoop(rewriter, opLoc, bias, op, func, vtcmBudget,
+                                 this->pipelineDepth, staged)))
+          return signalPassFailure();
+        if (staged)
+          continue;
+      }
       emitSerialTileLoop(rewriter, opLoc, bias, op, *shape);
       rewriter.eraseOp(op);
     }
 
     // The conversion-state block is kernel-level setup: it is filled once at
-    // entry and read by every tile's read-out, so it is released on the way out,
-    // after the last tile loop that reads it -- every exit gets its own
+    // entry and read by every tile's read-out, so it is released on the way
+    // out, after the last tile loop that reads it -- every exit gets its own
     // deallocation, and the entry block defines the buffer so it dominates all
-    // of them. The tile loops were inserted before their `hmx.matmul`, which the
-    // erase above removed, so no reader follows a return. Without this
+    // of them. The tile loops were inserted before their `hmx.matmul`, which
+    // the erase above removed, so no reader follows a return. Without this
     // deallocation the 256 B state leaks on every launch -- it is the one VTCM
-    // allocation this pass makes with no partner -- and the runtime's pool never
-    // gets it back.
+    // allocation this pass makes with no partner -- and the runtime's pool
+    // never gets it back.
     SmallVector<func::ReturnOp> returns;
     func.walk([&](func::ReturnOp ret) { returns.push_back(ret); });
     for (func::ReturnOp ret : returns) {
       rewriter.setInsertionPoint(ret);
       memref::DeallocOp::create(rewriter, loc, bias);
     }
+
+    // Weight residency and this pass may both have retired bridge writers. The
+    // final count is therefore a walk of the post-partition IR, never the count
+    // observed when attribution began.
+    if (hasManifest && failed(refreshHmxManifestBridgeCounts(module)))
+      signalPassFailure();
   }
 };
 

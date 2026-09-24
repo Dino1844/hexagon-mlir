@@ -24,7 +24,9 @@ corrupting the weight.
 
 Identity/caching: packing is keyed by ``(slot, shape, dtype, content hash)`` --
 a content-addressed cache, never a tensor `data_ptr` cache -- so repeated
-launches of the same weight reuse one packed image.
+launches of the same weight reuse one packed image. The host contract accepts
+one function per module; multi-function resident contracts are rejected before
+launch rather than guessing which function a slot belongs to.
 """
 
 from __future__ import annotations
@@ -35,52 +37,87 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from triton.backends.qcom_hexagon_backend.utils import validate_weight_prepack
+
 _TILE = 32
 
 
 class WeightPrepack:
     """Parsed ``hmx.weight_prepack`` contract plus a content-addressed cache."""
 
-    def __init__(self, layout: Optional[dict], weights: list):
+    def __init__(self, layout: dict, weights: list):
+        contract = {"layout": layout, "weights": weights}
+        validate_weight_prepack(contract)
         self._by_slot: Dict[int, dict] = {}
         for w in weights:
-            self._by_slot[int(w["slot"])] = w
+            self._by_slot[w["slot"]] = w
+        self._function_name = weights[0]["func"] if weights else None
         self._layout = layout
         self._layout_verified = False
         self._cache: Dict[Tuple, bytes] = {}
 
     @classmethod
     def from_metadata(
-        cls, weight_prepack_json: Optional[str]
+        cls, weight_prepack_json: str
     ) -> Optional["WeightPrepack"]:
-        """Parse the metadata string; None when the contract is absent/empty."""
-        if not weight_prepack_json:
-            return None
+        """Parse a contract; only a valid empty contract means no prepacking."""
+        if not isinstance(weight_prepack_json, str):
+            raise ValueError(
+                "weight_prepack must be a JSON string, got "
+                f"{type(weight_prepack_json).__name__}"
+            )
+        if weight_prepack_json == "":
+            raise ValueError("weight_prepack must contain a JSON object")
         try:
             doc = json.loads(weight_prepack_json)
-        except (TypeError, ValueError):
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"weight_prepack is not valid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError(
+                "weight_prepack must decode to an object, got "
+                f"{type(doc).__name__}"
+            )
+        validate_weight_prepack(doc)
+        if not doc["weights"]:
             return None
-        weights = doc.get("weights") or []
-        if not weights:
-            return None
-        return cls(doc.get("layout"), weights)
+        return cls(doc["layout"], doc["weights"])
+
+    @property
+    def function_name(self) -> Optional[str]:
+        return self._function_name
 
     def has_slot(self, slot: int) -> bool:
         return slot in self._by_slot
 
+    def unconsumed_slots(self, consumed: set[int]) -> set[int]:
+        return set(self._by_slot) - set(consumed)
+
     def pack(self, tensor, slot: int) -> Optional[bytes]:
-        """Return the crouton-ordered bytes for `tensor`, or None if it does not
-        match the slot's contract (the caller then falls back to the raw bytes,
-        which is correct only if the gate is off)."""
+        """Return crouton-ordered bytes for a contract slot.
+
+        ``None`` means that the contract has no such slot.  Once a slot is
+        present, a runtime shape or dtype mismatch is an error: the generated
+        kernel consumes the resident image directly and has no safe raw-byte
+        fallback.
+        """
         desc = self._by_slot.get(slot)
         if desc is None:
             return None
-        shape = tuple(int(x) for x in desc["shape"])
-        arr = np.ascontiguousarray(tensor.detach().cpu().numpy())
+        try:
+            arr = np.ascontiguousarray(tensor.detach().cpu().numpy())
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                f"weight slot {slot} must be a tensor-like object"
+            ) from exc
+        shape = tuple(desc["shape"])
         if tuple(arr.shape) != shape:
-            return None
-        if arr.dtype != np.float16:
-            return None
+            raise ValueError(
+                f"weight slot {slot} has shape {tuple(arr.shape)}, expected {shape}"
+            )
+        if arr.dtype != np.dtype(np.float16):
+            raise ValueError(
+                f"weight slot {slot} has dtype {arr.dtype}, expected float16"
+            )
         raw = arr.tobytes()
         key = (
             slot,
@@ -112,7 +149,9 @@ class WeightPrepack:
         return np.ascontiguousarray(mid.transpose(3, 0, 1, 4, 2))
 
     def _pack_crouton(self, arr: np.ndarray, shape, desc) -> bytes:
-        t0, t1, j, c, h = (int(x) for x in desc["crouton"])
+        # The contract validator has already enforced strict positive ints;
+        # do not coerce malformed metadata back into a plausible layout here.
+        t0, t1, j, c, h = desc["crouton"]
         rows, cols = shape
         if rows != t1 * _TILE or cols != t0 * _TILE:
             raise ValueError(

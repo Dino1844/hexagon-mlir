@@ -25,6 +25,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
 )
 from triton.backends.qcom_hexagon_backend.utils import (
     parse_return_types,
+    parse_translation_metadata,
     profile_torch_mlir_inputs,
 )
 from triton._C.libtriton import qcom_hexagon_backend, ir  # type: ignore
@@ -128,13 +129,14 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
 class TorchMLIRHexagonLauncher(HexagonLauncherBase):
     # Lower mlir module to (potentially several) object codes
     # which are returned in a vector, each as vector<char>
-    def mlir_to_obj(self, mlir_mod: ir.module, options: dict) -> list[bytes]:
+    def mlir_to_obj(
+        self, mlir_mod: ir.module, options: dict
+    ) -> tuple[list[bytes], str]:
         # Must cast options to strings before passing to backend
         options = {k: str(v) for k, v in options.items()}
-        modules_compiled_as_bytes = qcom_hexagon_backend.translate_linalg_to_obj(
-            mlir_mod, options
+        return qcom_hexagon_backend.translate_linalg_to_obj(
+            mlir_mod, options, True
         )
-        return modules_compiled_as_bytes
 
     # Compile the mlir bytecode from file `mlir_bytecode_path` that lives in `local_dir`,
     # whose principal function to call is `func_name`, using the HexagonExecutor `hexec`.
@@ -167,8 +169,14 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
         result_types = qcom_hexagon_backend.get_return_list(mlir_mod, func_name)
         func_name_with_ciface = "_mlir_ciface_" + func_name
 
-        # MLIR to (potentially several) object files (as strings)
-        obj_modules: list[bytes] = self.mlir_to_obj(mlir_mod, options)
+        # MLIR to (potentially several) object files (as strings) plus the
+        # required translation envelope. Resident weights are safe here only
+        # because the wrapper consumes the same contract before writing inputs.
+        obj_modules, translation_metadata = self.mlir_to_obj(mlir_mod, options)
+        weight_metadata, _ = parse_translation_metadata(translation_metadata)
+        from triton.backends.qcom_hexagon_backend.hmx_weight_prepack import WeightPrepack
+
+        weight_prepack = WeightPrepack.from_metadata(weight_metadata)
         # We now need to link each object code obtained (separately!), to obtain a collection of shared objects (.so)
 
         # We will populate this collection with the path of the generated shared libraries
@@ -224,6 +232,7 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
                     return_types,
                     options,
                 )
+                wrapper_generator.weight_prepack = weight_prepack
                 print("==> Wrapper generator correctly instanciated")
 
                 # The directory path used for execution is given by the executor, and if it's the empty string (meaning running on device),

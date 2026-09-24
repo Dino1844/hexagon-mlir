@@ -14,6 +14,14 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-weight-resident=true})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
+// The full pipeline restores the manifest decision id across bufferization and
+// records the final bridge sites. Weight residency removes pack_weight before
+// hmx-partition performs the final count.
+// CHECK: hmx.kernel_manifest =
+// CHECK-SAME: function = "runtime_weight"
+// CHECK-SAME: pack_weight_sites = 0 : i64
+// CHECK-SAME: pipeline_selected = "serial"
+// CHECK-SAME: reason = "selected"
 // The runtime gets the argument's address; no per-launch pack leaf is emitted.
 // CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
 // CHECK-LABEL: llvm.func @runtime_weight

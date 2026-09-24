@@ -7,6 +7,7 @@
 #
 # ===------------------------------------------------------------------------===
 
+import json
 import os, re
 import torch
 from collections import namedtuple
@@ -254,11 +255,10 @@ def get_exec_mode():
 # Triton core treats this object as opaque: CompiledKernel stores
 # backend.pack_metadata(...) as kernel.packed_metadata and passes it to run() as
 # one positional argument (triton/python/triton/compiler/compiler.py), where
-# this backend reads it back as args[5]. Nothing outside this backend indexes
-# it, so it is a dict of field names rather than a positional tuple: with a
-# tuple, appending a field shifted every consumer index silently, and the old
-# `len(x) > i` guards turned "this cached artifact predates field X" into
-# "treat it as off" instead of an error.
+# this backend reads it back as args[5].  Nothing outside this backend indexes
+# it, so it is a dict of field names rather than a positional tuple.  Every
+# field is required: a cache entry without the translation envelope is stale,
+# not a kernel with an optional feature disabled.
 PACK_METADATA_REQUIRED = (
     "num_warps",
     "num_ctas",
@@ -271,20 +271,432 @@ PACK_METADATA_REQUIRED = (
     "enableMultiThreading",
     "enableThreadedDispatch",
     "enableLWP",
+    "weight_prepack",
+    "hmx_manifest",
 )
 
-# A cached artifact may legitimately lack these (weight_prepack is written by a
-# later compilation stage), so the producer fills in the default and consumers
-# always see the key.
-PACK_METADATA_DEFAULTS = {"weight_prepack": ""}
+TRANSLATION_METADATA_SCHEMA = "hex.hmx.translation/v1"
+HMX_MANIFEST_SCHEMA = "hex.hmx.kernel_manifest/v1"
+HMX_MANIFEST_REASONS = frozenset(
+    {
+        "selected",
+        "library-call",
+        "vtcm-allocator-disabled",
+        "non-rank-2",
+        "dynamic-shape",
+        "unsupported-dtype",
+        "min-rows",
+        "tile-alignment",
+        "vtcm-budget",
+    }
+)
+HMX_PIPELINE_REASONS = frozenset(
+    {
+        "serial-requested",
+        "no-row-major-bridge",
+        "extra-activation-reader",
+        "invalid-staging-geometry",
+        "empty-staging-grid",
+        "staging-grid-mismatch",
+        "shallow-k",
+        "vtcm-budget",
+        "tile-count",
+        "pipeliner-failed",
+    }
+)
+_KEBAB_CASE_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
 
 
-def require_pack_metadata(packed):
-    """Validate the packed metadata dict and return it.
+def _json_object(value, field_name):
+    """Decode one JSON object and turn every failure into an actionable error."""
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{field_name} must be a JSON string, got {type(value).__name__}"
+        )
+    try:
+        decoded = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{field_name} is not valid JSON: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(
+            f"{field_name} must decode to an object, got {type(decoded).__name__}"
+        )
+    return decoded
 
-    Fails with an actionable message instead of letting a missing field turn
-    into a silent "feature off" (the old positional guards) or a bare
-    AttributeError out of a stale cached JSON.
+
+def validate_hmx_manifest(manifest, field_name="hmx_manifest"):
+    """Validate the versioned HMX kernel manifest object.
+
+    This is deliberately a small schema check rather than a second decision
+    engine.  The C++ HMX passes own the values; host code only ensures that a
+    missing or malformed diagnostic cannot silently turn into a feature-off
+    path.
+    """
+    if not isinstance(manifest, dict):
+        raise ValueError(
+            f"{field_name} must be an object, got {type(manifest).__name__}"
+        )
+    schema = manifest.get("schema")
+    if schema != HMX_MANIFEST_SCHEMA:
+        raise ValueError(
+            f"{field_name}.schema must be {HMX_MANIFEST_SCHEMA!r}, got {schema!r}"
+        )
+    matmuls = manifest.get("matmuls")
+    if not isinstance(matmuls, list):
+        raise ValueError(
+            f"{field_name}.matmuls must be a list, got {type(matmuls).__name__}"
+        )
+    for key in ("pack_act_sites", "pack_weight_sites", "unpack_sites"):
+        value = manifest.get(key)
+        if type(value) is not int or value < 0:
+            raise ValueError(
+                f"{field_name}.{key} must be a non-negative int, got {value!r}"
+            )
+    if manifest.get("count_semantics") != "ir_sites":
+        raise ValueError(
+            f"{field_name}.count_semantics must be 'ir_sites', got "
+            f"{manifest.get('count_semantics')!r}"
+        )
+
+    required = ("function", "id", "engine", "reason")
+    totals = {"pack_act_sites": 0, "pack_weight_sites": 0, "unpack_sites": 0}
+    seen_records = set()
+    for index, entry in enumerate(matmuls):
+        path = f"{field_name}.matmuls[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{path} must be an object, got {type(entry).__name__}"
+            )
+        missing = [key for key in required if key not in entry]
+        if missing:
+            raise ValueError(f"{path} is missing required field(s): {missing}")
+
+        function = entry["function"]
+        if not isinstance(function, str) or not function.strip():
+            raise ValueError(f"{path}.function must be a non-empty string")
+
+        entry_id = entry["id"]
+        if type(entry_id) is not int or entry_id < 0:
+            raise ValueError(
+                f"{path}.id must be a non-negative int, got {entry_id!r}"
+            )
+        record_key = (function, entry_id)
+        if record_key in seen_records:
+            raise ValueError(f"{path} duplicates function-local id {entry_id}")
+        seen_records.add(record_key)
+
+        engine = entry["engine"]
+        if engine not in ("hmx", "hvx"):
+            raise ValueError(
+                f"{path}.engine must be 'hmx' or 'hvx', got {engine!r}"
+            )
+
+        reason = entry["reason"]
+        if (
+            not isinstance(reason, str)
+            or not reason
+            or _KEBAB_CASE_RE.fullmatch(reason) is None
+        ):
+            raise ValueError(
+                f"{path}.reason must be a non-empty kebab-case code, got {reason!r}"
+            )
+        if reason not in HMX_MANIFEST_REASONS:
+            raise ValueError(f"{path}.reason is not a canonical HMX reason: {reason!r}")
+
+        if (engine == "hmx") != (reason == "selected"):
+            raise ValueError(
+                f"{path} engine/reason disagree on HMX attribution"
+            )
+        _validate_hmx_matmul_contract(entry, path, selected=engine == "hmx")
+        _validate_hmx_pipeline(entry, path)
+        if engine == "hvx":
+            hmx_only = (
+                "vtcm_budget",
+                "vtcm_before",
+                "vtcm_peak",
+                "blocking",
+                "block_m",
+                "pipeline_requested",
+                "pipeline_selected",
+                "pipeline_depth",
+                "pipeline_reason",
+                "count_semantics",
+                "pack_act_sites",
+                "pack_weight_sites",
+                "unpack_sites",
+            )
+            present_hmx_only = [key for key in hmx_only if key in entry]
+            if present_hmx_only:
+                raise ValueError(
+                    f"{path} HVX record must not carry HMX-only fields: "
+                    f"{present_hmx_only}"
+                )
+        if engine == "hmx":
+            count_fields = (
+                "pack_act_sites",
+                "pack_weight_sites",
+                "unpack_sites",
+            )
+            missing_counts = [key for key in count_fields if key not in entry]
+            if missing_counts:
+                raise ValueError(
+                    f"{path} is missing bridge count field(s): {missing_counts}"
+                )
+            for key in count_fields:
+                value = entry[key]
+                if type(value) is not int or value < 0:
+                    raise ValueError(
+                        f"{path}.{key} must be a non-negative int, got {value!r}"
+                    )
+                totals[key] += value
+            if entry.get("count_semantics") != "ir_sites":
+                raise ValueError(
+                    f"{path}.count_semantics must be 'ir_sites', got "
+                    f"{entry.get('count_semantics')!r}"
+                )
+            for key in ("vtcm_budget", "vtcm_before", "vtcm_peak", "block_m"):
+                if key not in entry:
+                    raise ValueError(f"{path} is missing selected field {key}")
+                _require_strict_int(
+                    entry[key], f"{path}.{key}", minimum=1 if key == "block_m" else 0
+                )
+            if entry["vtcm_peak"] < entry["vtcm_before"]:
+                raise ValueError(f"{path}.vtcm_peak is below vtcm_before")
+            if entry["vtcm_peak"] > entry["vtcm_budget"]:
+                raise ValueError(f"{path}.vtcm_peak exceeds vtcm_budget")
+            blocking = entry.get("blocking")
+            if blocking not in ("whole", "m_blocked"):
+                raise ValueError(
+                    f"{path}.blocking must be 'whole' or 'm_blocked', got {blocking!r}"
+                )
+            if blocking == "whole":
+                if entry["block_m"] != entry["m"]:
+                    raise ValueError(f"{path}.block_m must equal m for whole blocking")
+            elif entry["block_m"] >= entry["m"] or entry["m"] % entry["block_m"]:
+                raise ValueError(f"{path}.block_m is not a proper divisor for m_blocked")
+    for key, total in totals.items():
+        if manifest[key] != total:
+            raise ValueError(
+                f"{field_name}.{key} is {manifest[key]}, but per-matmul counts "
+                f"sum to {total}"
+            )
+    return manifest
+
+
+def validate_hmx_manifest_json(manifest_json, field_name="hmx_manifest"):
+    """Validate the JSON text stored in packed kernel metadata."""
+    return validate_hmx_manifest(_json_object(manifest_json, field_name), field_name)
+
+
+def _require_strict_int(value, path, *, minimum=None):
+    # bool is an int subclass, but accepting it here would turn malformed JSON
+    # values into plausible argument slots and tile dimensions.
+    if type(value) is not int:
+        raise ValueError(f"{path} must be an int, got {type(value).__name__}")
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{path} must be >= {minimum}, got {value}")
+    return value
+
+
+def _require_positive_int_list(value, path, length):
+    if not isinstance(value, list):
+        raise ValueError(f"{path} must be a list, got {type(value).__name__}")
+    if len(value) != length:
+        raise ValueError(f"{path} must have {length} entries, got {len(value)}")
+    for index, item in enumerate(value):
+        _require_strict_int(item, f"{path}[{index}]", minimum=1)
+    return value
+
+
+def _validate_hmx_matmul_contract(entry, path, *, selected):
+    contract_fields = ("m", "n", "k", "lhs_elem", "rhs_elem", "out_elem")
+    present = [field for field in contract_fields if field in entry]
+    if present and len(present) != len(contract_fields):
+        missing = [field for field in contract_fields if field not in entry]
+        raise ValueError(f"{path} has a partial matmul contract; missing {missing}")
+    if not present:
+        if selected:
+            raise ValueError(f"{path} is missing the matmul contract")
+        return
+
+    for field in ("m", "n", "k"):
+        _require_strict_int(entry[field], f"{path}.{field}", minimum=1)
+    for field in ("lhs_elem", "rhs_elem", "out_elem"):
+        value = entry[field]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{path}.{field} must be a non-empty string")
+        if selected and value not in ("f16", "f32"):
+            raise ValueError(
+                f"{path}.{field} must be 'f16' or 'f32' for HMX, got {value!r}"
+            )
+
+
+def _validate_hmx_pipeline(entry, path):
+    fields = (
+        "pipeline_requested",
+        "pipeline_selected",
+        "pipeline_depth",
+        "pipeline_reason",
+    )
+    present = [field for field in fields if field in entry]
+    if not present:
+        return
+    required = ("pipeline_requested", "pipeline_selected", "pipeline_depth")
+    missing = [field for field in required if field not in entry]
+    if missing:
+        raise ValueError(f"{path} has a partial pipeline decision: {missing}")
+    _require_strict_int(
+        entry["pipeline_requested"], f"{path}.pipeline_requested", minimum=0
+    )
+    depth = _require_strict_int(
+        entry["pipeline_depth"], f"{path}.pipeline_depth", minimum=0
+    )
+    selected = entry["pipeline_selected"]
+    if selected not in ("serial", "staged"):
+        raise ValueError(
+            f"{path}.pipeline_selected must be 'serial' or 'staged', got {selected!r}"
+        )
+    if selected == "serial" and depth != 0:
+        raise ValueError(f"{path}.pipeline_depth must be 0 for serial selection")
+    if selected == "staged" and depth == 0:
+        raise ValueError(f"{path}.pipeline_depth must be positive for staged selection")
+    reason = entry.get("pipeline_reason")
+    if reason is not None and (
+        not isinstance(reason, str)
+        or not reason
+        or _KEBAB_CASE_RE.fullmatch(reason) is None
+    ):
+        raise ValueError(f"{path}.pipeline_reason must be a kebab-case code")
+    if reason is not None and reason not in HMX_PIPELINE_REASONS:
+        raise ValueError(
+            f"{path}.pipeline_reason is not a canonical pipeline reason: {reason!r}"
+        )
+
+
+def validate_weight_prepack(weight_prepack, field_name="weight_prepack"):
+    """Validate the versioned host-side weight pre-pack contract."""
+    if not isinstance(weight_prepack, dict):
+        raise ValueError(
+            f"{field_name} must be an object, got {type(weight_prepack).__name__}"
+        )
+    missing = [key for key in ("layout", "weights") if key not in weight_prepack]
+    if missing:
+        raise ValueError(f"{field_name} is missing required field(s): {missing}")
+
+    weights = weight_prepack["weights"]
+    if not isinstance(weights, list):
+        raise ValueError(
+            f"{field_name}.weights must be a list, got {type(weights).__name__}"
+        )
+    layout = weight_prepack["layout"]
+    if layout is not None and not isinstance(layout, dict):
+        raise ValueError(
+            f"{field_name}.layout must be an object or null, got "
+            f"{type(layout).__name__}"
+        )
+    if weights and not layout:
+        raise ValueError(
+            f"{field_name}.layout must be a non-empty object when weights is "
+            "non-empty"
+        )
+
+    required = ("func", "slot", "shape", "crouton", "dtype")
+    seen_slots = set()
+    functions = set()
+    for index, entry in enumerate(weights):
+        path = f"{field_name}.weights[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{path} must be an object, got {type(entry).__name__}"
+            )
+        missing = [key for key in required if key not in entry]
+        if missing:
+            raise ValueError(f"{path} is missing required field(s): {missing}")
+
+        function = entry["func"]
+        if not isinstance(function, str) or not function.strip():
+            raise ValueError(f"{path}.func must be a non-empty string")
+
+        slot = _require_strict_int(entry["slot"], f"{path}.slot", minimum=0)
+        functions.add(function)
+        if slot in seen_slots:
+            raise ValueError(f"{path}.slot duplicates an earlier slot")
+        seen_slots.add(slot)
+
+        _require_positive_int_list(entry["shape"], f"{path}.shape", 2)
+        _require_positive_int_list(entry["crouton"], f"{path}.crouton", 5)
+        if entry["dtype"] != "f16":
+            raise ValueError(f"{path}.dtype must be 'f16', got {entry['dtype']!r}")
+    if len(functions) > 1:
+        raise ValueError(
+            f"{field_name}.weights spans multiple functions {sorted(functions)}; "
+            "resident prepack currently supports one function per module"
+        )
+    return weight_prepack
+
+
+def _validate_weight_prepack_json(weight_prepack_json, field_name="weight_prepack"):
+    return validate_weight_prepack(_json_object(weight_prepack_json, field_name), field_name)
+
+
+def parse_translation_metadata(metadata_json):
+    """Unpack the C++ translation envelope into launcher-facing JSON strings.
+
+    The returned pair is ``(weight_prepack, hmx_manifest)``.  Both values stay
+    JSON text because the existing launcher contract consumes the former as a
+    string and the latter is consumed by host tooling/diagnostics.  No default
+    object is manufactured for a missing field: a stale or malformed envelope
+    is an actionable compilation error.
+    """
+    envelope = _json_object(metadata_json, "translation metadata")
+    expected_schema = TRANSLATION_METADATA_SCHEMA
+    actual_schema = envelope.get("schema")
+    if actual_schema != expected_schema:
+        raise ValueError(
+            "translation metadata.schema must be "
+            f"{expected_schema!r}, got {actual_schema!r}"
+        )
+    missing = [
+        key for key in ("weight_prepack", "hmx_manifest") if key not in envelope
+    ]
+    if missing:
+        raise ValueError(
+            f"translation metadata is missing required field(s): {missing}"
+        )
+
+    weight_prepack = envelope["weight_prepack"]
+    validate_weight_prepack(weight_prepack)
+    hmx_manifest = envelope["hmx_manifest"]
+    validate_hmx_manifest(hmx_manifest)
+
+    # Re-encode only the two inner objects.  The envelope itself is an internal
+    # C++/Python transport detail and must not leak into either consumer.
+    return (
+        json.dumps(weight_prepack, separators=(",", ":"), ensure_ascii=False),
+        json.dumps(hmx_manifest, separators=(",", ":"), ensure_ascii=False),
+    )
+
+
+def apply_translation_metadata(metadata, metadata_json):
+    """Validate an envelope and publish its two independent fields."""
+    try:
+        weight_prepack, hmx_manifest = parse_translation_metadata(metadata_json)
+    except ValueError as exc:
+        raise RuntimeError(
+            "invalid HMX translation metadata returned by the backend: "
+            f"{exc}; rebuild the kernel and check the HMX manifest publisher"
+        ) from exc
+    metadata["weight_prepack"] = weight_prepack
+    metadata["hmx_manifest"] = hmx_manifest
+
+
+def require_pack_metadata_fields(packed):
+    """Check the packed metadata shape without decoding its JSON payloads.
+
+    ``pack_metadata`` performs the full semantic validation once, including
+    cache-hit construction.  The launcher still checks this small structural
+    contract on every call so a manually supplied/stale value produces an
+    actionable missing-field error without reparsing JSON on every launch.
     """
     if not isinstance(packed, dict):
         raise RuntimeError(
@@ -292,13 +704,25 @@ def require_pack_metadata(packed):
             f"{type(packed).__name__}; the kernel was built by a different "
             "backend version - clear TRITON_CACHE_DIR (tools/hexmlir/env.sh)"
         )
-    missing = [
-        k for k in (*PACK_METADATA_REQUIRED, *PACK_METADATA_DEFAULTS) if k not in packed
-    ]
+    missing = [key for key in PACK_METADATA_REQUIRED if key not in packed]
     if missing:
         raise RuntimeError(
             f"compiled kernel metadata is missing {missing} (has {sorted(packed)}); "
             "this artifact was written by an older backend - clear "
             "TRITON_CACHE_DIR (tools/hexmlir/env.sh)"
         )
+    return packed
+
+
+def validate_pack_metadata(packed):
+    """Validate packed metadata once at CompiledKernel construction."""
+    require_pack_metadata_fields(packed)
+    try:
+        _validate_weight_prepack_json(packed["weight_prepack"])
+        validate_hmx_manifest_json(packed["hmx_manifest"])
+    except ValueError as exc:
+        raise RuntimeError(
+            f"invalid compiled kernel metadata: {exc}; clear "
+            "TRITON_CACHE_DIR (tools/hexmlir/env.sh) and rebuild the kernel"
+        ) from exc
     return packed

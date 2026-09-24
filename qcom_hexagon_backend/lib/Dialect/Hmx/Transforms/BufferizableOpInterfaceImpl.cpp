@@ -32,6 +32,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 
 #include "mlir/Dialect/Bufferization/IR/DstBufferizableOpInterfaceImpl.h"
@@ -41,6 +42,14 @@ using namespace mlir::hmx;
 using namespace mlir::bufferization;
 
 namespace {
+
+/// The tensor-form operations are rebuilt by their destination-style bufferizer
+/// models. Preserve the explicit decision id across that rebuild; locations
+/// are not a metadata channel and must not be used for this hand-off.
+void copyDecisionId(Operation *from, Operation *to) {
+  if (Attribute id = from->getAttr(kHmxDecisionIdAttr))
+    to->setAttr(kHmxDecisionIdAttr, id);
+}
 
 struct MatmulOpInterface
     : public DstBufferizableOpInterfaceExternalModel<MatmulOpInterface,
@@ -68,8 +77,10 @@ struct MatmulOpInterface
     if (failed(outBuffer))
       return failure();
 
-    MatmulOp::create(rewriter, matmulOp.getLoc(), /*result=*/TypeRange(),
-                     *lhsBuffer, *rhsBuffer, *outBuffer);
+    auto bufferized =
+        MatmulOp::create(rewriter, matmulOp.getLoc(), /*result=*/TypeRange(),
+                         *lhsBuffer, *rhsBuffer, *outBuffer);
+    copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *outBuffer);
     return success();
   }
@@ -95,9 +106,10 @@ struct PackActOpInterface
     if (failed(srcBuffer))
       return failure();
 
-    PackActOp::create(rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
-                      *dstBuffer, *srcBuffer, packOp.getRow(), packOp.getCol(),
-                      packOp.getCountAttr());
+    auto bufferized = PackActOp::create(
+        rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer}, *dstBuffer,
+        *srcBuffer, packOp.getRow(), packOp.getCol(), packOp.getCountAttr());
+    copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
   }
@@ -123,9 +135,11 @@ struct PackWeightOpInterface
     if (failed(srcBuffer))
       return failure();
 
-    PackWeightOp::create(rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
-                         *dstBuffer, *srcBuffer, packOp.getKTile(),
-                         packOp.getNTile(), packOp.getCountAttr());
+    auto bufferized = PackWeightOp::create(
+        rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer}, *dstBuffer,
+        *srcBuffer, packOp.getKTile(), packOp.getNTile(),
+        packOp.getCountAttr());
+    copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
   }
@@ -151,9 +165,11 @@ struct UnpackAccOpInterface
     if (failed(dstBuffer))
       return failure();
 
-    UnpackAccOp::create(rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
-                        *srcBuffer, *dstBuffer, unpackOp.getRow(),
-                        unpackOp.getCol(), unpackOp.getCountAttr());
+    auto bufferized = UnpackAccOp::create(
+        rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
+        *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
+        unpackOp.getCountAttr());
+    copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
   }
@@ -188,10 +204,11 @@ struct UnpackAccF32OpInterface
       residualBuffer = *buf;
     }
 
-    UnpackAccF32Op::create(rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
-                           *srcBuffer, *dstBuffer, unpackOp.getRow(),
-                           unpackOp.getCol(), residualBuffer,
-                           unpackOp.getCountAttr());
+    auto bufferized = UnpackAccF32Op::create(
+        rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
+        *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
+        residualBuffer, unpackOp.getCountAttr());
+    copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
   }

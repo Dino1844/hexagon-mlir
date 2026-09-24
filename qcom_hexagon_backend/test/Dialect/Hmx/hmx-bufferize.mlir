@@ -19,12 +19,13 @@
 // CHECK-SAME: memref<2x4x16x32x2xf16,
 // CHECK-SAME: outs(
 // CHECK-SAME: memref<2x2x16x32x2xf16,
+// CHECK-SAME: hmx.decision_id = 7 : i64
 // CHECK-NOT: tensor<
 func.func @matmul_buffers(%a: tensor<2x4x16x32x2xf16>,
                           %b: tensor<2x4x16x32x2xf16>,
                           %c: tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16> {
   %0 = hmx.matmul ins(%a, %b : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>)
-                  outs(%c : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+                  outs(%c : tensor<2x2x16x32x2xf16>) {hmx.decision_id = 7 : i64} -> tensor<2x2x16x32x2xf16>
   return %0 : tensor<2x2x16x32x2xf16>
 }
 
@@ -38,6 +39,7 @@ func.func @matmul_buffers(%a: tensor<2x4x16x32x2xf16>,
 // CHECK: hmx.unpack_acc_f32 ins(
 // CHECK-SAME: memref<2x2x16x32x2xf16, 1>) outs(
 // CHECK-SAME: memref<64x64xf32>)
+// CHECK-SAME: hmx.decision_id = 7 : i64
 // CHECK-NOT: tensor<
 func.func @fused_tail_buffers(%a: tensor<2x2x16x32x2xf16>,
                               %b: tensor<2x2x16x32x2xf16>) -> tensor<64x64xf32> {
@@ -47,13 +49,13 @@ func.func @fused_tail_buffers(%a: tensor<2x2x16x32x2xf16>,
   %c32 = arith.constant 32 : index
   %crout = bufferization.alloc_tensor() {memory_space = 1 : i64} : tensor<2x2x16x32x2xf16>
   %mm = hmx.matmul ins(%a, %b : tensor<2x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>)
-                   outs(%crout : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+                   outs(%crout : tensor<2x2x16x32x2xf16>) {hmx.decision_id = 7 : i64} -> tensor<2x2x16x32x2xf16>
   %e = tensor.empty() : tensor<64x64xf32>
   %0 = scf.for %i = %c0 to %c32 step %c1 iter_args(%d = %e) -> (tensor<64x64xf32>) {
     %row = arith.divui %i, %c16 : index
     %col = arith.remui %i, %c16 : index
     %u = hmx.unpack_acc_f32 ins(%mm, %row, %col : tensor<2x2x16x32x2xf16>)
-                            outs(%d : tensor<64x64xf32>) -> tensor<64x64xf32>
+                            outs(%d : tensor<64x64xf32>) {hmx.decision_id = 7 : i64} -> tensor<64x64xf32>
     scf.yield %u : tensor<64x64xf32>
   }
   return %0 : tensor<64x64xf32>
@@ -72,6 +74,7 @@ func.func @fused_tail_buffers(%a: tensor<2x2x16x32x2xf16>,
 // CHECK: hmx.unpack_acc_f32 ins(
 // CHECK-SAME: memref<2x2x16x32x2xf16, 1>, memref<64x64xf32>) outs(
 // CHECK-SAME: memref<64x64xf32>)
+// CHECK-SAME: hmx.decision_id = 7 : i64
 // CHECK-NOT: tensor<
 func.func @fused_tail_residual_buffers(%a: tensor<2x2x16x32x2xf16>,
                                        %b: tensor<2x2x16x32x2xf16>) -> tensor<64x64xf32> {
@@ -81,14 +84,14 @@ func.func @fused_tail_residual_buffers(%a: tensor<2x2x16x32x2xf16>,
   %c32 = arith.constant 32 : index
   %crout = bufferization.alloc_tensor() {memory_space = 1 : i64} : tensor<2x2x16x32x2xf16>
   %mm = hmx.matmul ins(%a, %b : tensor<2x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>)
-                   outs(%crout : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+                   outs(%crout : tensor<2x2x16x32x2xf16>) {hmx.decision_id = 7 : i64} -> tensor<2x2x16x32x2xf16>
   %res = arith.constant dense<1.000000e+00> : tensor<64x64xf32>
   %e = tensor.empty() : tensor<64x64xf32>
   %0 = scf.for %i = %c0 to %c32 step %c1 iter_args(%d = %e) -> (tensor<64x64xf32>) {
     %row = arith.divui %i, %c16 : index
     %col = arith.remui %i, %c16 : index
     %u = hmx.unpack_acc_f32 ins(%mm, %row, %col, %res : tensor<2x2x16x32x2xf16>, tensor<64x64xf32>)
-                            outs(%d : tensor<64x64xf32>) -> tensor<64x64xf32>
+                            outs(%d : tensor<64x64xf32>) {hmx.decision_id = 7 : i64} -> tensor<64x64xf32>
     scf.yield %u : tensor<64x64xf32>
   }
   return %0 : tensor<64x64xf32>
@@ -100,17 +103,33 @@ func.func @fused_tail_residual_buffers(%a: tensor<2x2x16x32x2xf16>,
 // with it: the ranged range survives bufferization and the lowering can still
 // select the ranged leaf.
 // CHECK-LABEL: func.func @ranged_buffers
-// CHECK: hmx.pack_act {{.*}} {count = 2 : i64}
-// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64}
+// CHECK: hmx.pack_act {{.*}} {count = 2 : i64, hmx.decision_id = 8 : i64}
+// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64, hmx.decision_id = 8 : i64}
 func.func @ranged_buffers(%src: tensor<64x64xf16>,
                           %act: tensor<2x2x16x32x2xf16>,
                           %dst: tensor<64x32xf16>) -> tensor<64x32xf16> {
   %c0 = arith.constant 0 : index
   %p = hmx.pack_act ins(%src, %c0, %c0 : tensor<64x64xf16>)
-      outs(%act : tensor<2x2x16x32x2xf16>) {count = 2 : i64} -> tensor<2x2x16x32x2xf16>
+      outs(%act : tensor<2x2x16x32x2xf16>) {count = 2 : i64, hmx.decision_id = 8 : i64} -> tensor<2x2x16x32x2xf16>
   %u = hmx.unpack_acc ins(%p, %c0, %c0 : tensor<2x2x16x32x2xf16>)
-      outs(%dst : tensor<64x32xf16>) {count = 16 : i64} -> tensor<64x32xf16>
+      outs(%dst : tensor<64x32xf16>) {count = 16 : i64, hmx.decision_id = 8 : i64} -> tensor<64x32xf16>
   return %u : tensor<64x32xf16>
+}
+
+// -----
+
+// The weight bridge uses the same explicit hand-off as the activation and
+// read-out bridges. This pins the PackWeightOp external model as well.
+// CHECK-LABEL: func.func @weight_bridge_buffers
+// CHECK: hmx.pack_weight {{.*}} {hmx.decision_id = 9 : i64}
+func.func @weight_bridge_buffers(%src: tensor<64x64xf16>,
+                                  %dst: tensor<2x2x16x32x2xf16>)
+    -> tensor<2x2x16x32x2xf16> {
+  %c0 = arith.constant 0 : index
+  %p = hmx.pack_weight ins(%src, %c0, %c0 : tensor<64x64xf16>)
+      outs(%dst : tensor<2x2x16x32x2xf16>) {hmx.decision_id = 9 : i64}
+      -> tensor<2x2x16x32x2xf16>
+  return %p : tensor<2x2x16x32x2xf16>
 }
 
 // -----

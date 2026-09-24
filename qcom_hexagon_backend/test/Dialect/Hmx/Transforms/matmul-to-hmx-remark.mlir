@@ -24,11 +24,11 @@
 // ENV: HMX disabled: this pipeline has no VTCM allocator (enableConvertToHexagonmem is off)
 //===----------------------------------------------------------------------===//
 
-// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4; matmul M=64, N=64, K=100, lhsElem='f16', rhsElem='f16', outElem='f16'}}
+// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=tile-alignment]; matmul M=64, N=64, K=100, lhsElem='f16', rhsElem='f16', outElem='f16'}}
 module {
 func.func @k_not_aligned(%a: tensor<64x100xf16>, %b: tensor<100x64xf16>) -> tensor<64x64xf16> {
   %c = tensor.empty() : tensor<64x64xf16>
-  // expected-remark @+1 {{HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4}}
+  // expected-remark @+1 {{HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=tile-alignment]}}
   %0 = linalg.matmul ins(%a, %b : tensor<64x100xf16>, tensor<100x64xf16>) outs(%c : tensor<64x64xf16>) -> tensor<64x64xf16>
   return %0 : tensor<64x64xf16>
 }
@@ -36,11 +36,11 @@ func.func @k_not_aligned(%a: tensor<64x100xf16>, %b: tensor<100x64xf16>) -> tens
 
 // -----
 
-// expected-warning @+1 {{first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4; matmul M=64, N=48, K=128}}
+// expected-warning @+1 {{first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=tile-alignment]; matmul M=64, N=48, K=128}}
 module {
 func.func @n_not_aligned(%a: tensor<64x128xf16>, %b: tensor<128x48xf16>) -> tensor<64x48xf16> {
   %c = tensor.empty() : tensor<64x48xf16>
-  // expected-remark @+1 {{HMX not applied}}
+  // expected-remark @+1 {{HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=tile-alignment]}}
   %0 = linalg.matmul ins(%a, %b : tensor<64x128xf16>, tensor<128x48xf16>) outs(%c : tensor<64x48xf16>) -> tensor<64x48xf16>
   return %0 : tensor<64x48xf16>
 }
@@ -49,11 +49,11 @@ func.func @n_not_aligned(%a: tensor<64x128xf16>, %b: tensor<128x48xf16>) -> tens
 // -----
 
 // Too few rows to form a tile.
-// expected-warning @+1 {{first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4; matmul M=2, N=64, K=64}}
+// expected-warning @+1 {{first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=min-rows]; matmul M=2, N=64, K=64}}
 module {
 func.func @too_few_rows(%a: tensor<2x64xf16>, %b: tensor<64x64xf16>) -> tensor<2x64xf16> {
   %c = tensor.empty() : tensor<2x64xf16>
-  // expected-remark @+1 {{M > 4}}
+  // expected-remark @+1 {{M > 4 [reason=min-rows]}}
   %0 = linalg.matmul ins(%a, %b : tensor<2x64xf16>, tensor<64x64xf16>) outs(%c : tensor<2x64xf16>) -> tensor<2x64xf16>
   return %0 : tensor<2x64xf16>
 }
@@ -65,11 +65,11 @@ func.func @too_few_rows(%a: tensor<2x64xf16>, %b: tensor<64x64xf16>) -> tensor<2
 // a 64x64x64 bridge is 24576 bytes and its smallest M block (one 32-row tile,
 // 16384 bytes) is still over the budget below, so no block fits and the op is
 // refused rather than blocked.
-// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: matmul (M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16', vtcmUsed=0) bridge footprint does not fit remaining VTCM (vtcmBudget=10000 bytes); matmul M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16'}}
+// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: matmul (M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16', vtcmUsed=0) bridge footprint does not fit remaining VTCM (vtcmBudget=10000 bytes) [reason=vtcm-budget]; matmul M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16'}}
 module {
 func.func @over_budget(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>) -> tensor<64x64xf16> {
   %c = tensor.empty() : tensor<64x64xf16>
-  // expected-remark @+1 {{HMX not applied: matmul (M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16', vtcmUsed=0) bridge footprint does not fit remaining VTCM (vtcmBudget=10000 bytes)}}
+  // expected-remark @+1 {{HMX not applied: matmul (M=64, N=64, K=64, lhsElem='f16', rhsElem='f16', outElem='f16', vtcmUsed=0) bridge footprint does not fit remaining VTCM (vtcmBudget=10000 bytes) [reason=vtcm-budget]}}
   %0 = linalg.matmul ins(%a, %b : tensor<64x64xf16>, tensor<64x64xf16>) outs(%c : tensor<64x64xf16>) -> tensor<64x64xf16>
   return %0 : tensor<64x64xf16>
 }

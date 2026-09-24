@@ -1,8 +1,8 @@
 # Hexagon-MLIR — HMX 后端路线图（Roadmap）
 
 > 本文是本 fork（`hmx` 分支）的路线图：现状定位与后续工作方向。上游 [README.md](README.md) 保持原样。
-> 事实与勘误以工作区 `docs/state/STATE-OF-PLAY.md` 为唯一权威入口；
-> agent 修改/测试规则见工作区 `AGENTS.md`。
+> 当前仓库没有提交 `docs/state/STATE-OF-PLAY.md`；因此本文件只把已在源码、测试、文档和提交记录中可复核的事实作为基线。后续 agent 必须先更新本文件中的状态和证据，再实现对应工作项。
+> agent 修改/测试规则见工作区的会话级 `AGENTS.md`。
 
 ---
 
@@ -71,19 +71,20 @@ Triton → TTIR → triton-shared / Linalg
 
 | # | 工作项 | 内容 | 验收 |
 |---|---|---|---|
-| M1.1 | **决策系统 / kernel manifest**（评审差距①） | 每个 matmul 报告：是否走 HMX、为何没走、VTCM 用量、是否 blocking、pack/unpack 次数。现有 remark/warning 收敛为**结构化 manifest + 诊断接口** | 标准批可一键打印 manifest；字段与 pass 内判定一一对应 |
+| M1.1 | **决策系统 / kernel manifest**（评审差距①） | 每个 matmul 报告：是否走 HMX、为何没走、VTCM 用量、是否 blocking、pack/unpack 次数。现有 remark/warning 收敛为**结构化 manifest + 诊断接口**；先保留现有 remark/warning 作为兼容输出 | 标准批可一键打印 manifest；字段与 pass 内判定一一对应；manifest 缺失或字段不一致使测试失败 |
 | M1.2 | **Triton 支持矩阵**（差距②） | 明确四档：可编译 / 可 HMX / 仅 HVX / 拒绝；落成文档 + 测试矩阵，替代"散落在 pass 条件里" | 矩阵每格有对应测试；新 kernel 能 5 分钟查到归宿 |
-| M1.3 | **记档项按触发执行** | `STATE §7.8` 布局生命周期（`drop-encodings` 双路 + 死校验 + stride 启发式，已拍板"先不动"，触发=第二布局需求或收口宣言）；`STATE §7.9` alloc 失败链（重试耗尽点带诊断终止 vs lowering 判空，**先读全 BufferManager 五入口**）+ 预算记账收敛 + resident 内容 debug 校验 | 各自独立一轮：设计→lit 锁→可行的设备验证 |
-| M1.4 | **清理与退役** | 既存红 `return_alloc_from_loop`（XFAIL 或修）；triage env 门按期退役（`HEXAGON_EPI_LOG` 自标 TEMP）；既存红线移出豁免清单 | `run_lit_all` 真·全绿；无未记档 env 门 |
+| M1.3 | **记档项按触发执行** | 先建立缺失状态文档，记录布局生命周期、BufferManager 五入口、预算归属、resident 内容校验的现状和触发条件；再按文档中的触发条件实施，不把未存在的 `STATE §7.8/§7.9` 当作已批准设计 | 每个记档项都有源码证据、设计决议、lit 锁和设备验证记录 |
+| M1.4 | **清理与退役** | 先复现并分类 `return_alloc_from_loop`；只有确认是既存且与本线无关时才 XFAIL。对 `HEXAGON_EPI_LOG`、`HEXAGON_PTR_LOG`、`HEXAGON_ASM_DUMP` 等环境门逐项标明用途、默认值、移除条件 | `run_lit_all` 的结果可复现；每个红测/临时门都有 issue、owner 和退出条件 |
 
 ### 阶段二 · 形状与类型扩展（P1 — 解锁可用面）
 
 | # | 工作项 | 内容 | 验收 |
 |---|---|---|---|
-| M2.1 | **动态 shape specialization**（差距③） | 任意 shape 分四路：完整 HMX tile / HMX+tail / HVX fallback / 混合 kernel（compile 或 runtime specialization） | 形状 sweep（含非 32 对齐）正确性全过、混合路径性能不低于纯 fallback |
-| M2.2 | **tail 与 padding 机制** | 非 32 对齐边界的 HMX 尾块处理（与 M2.1 同一机制，不加 shape 特判） | 同上 |
-| M2.3 | **dtype 能力契约表** | 按 (dtype 对, 累加/读出位宽, 每操作数行走轴) 键化的 `HmxTarget` 契约；int8/bf16/fp8 **先 PRM/引擎能力调研再落** | 第二个 dtype 至少一条真机 A/B；"加能力只改一处"成立 |
-| M2.4 | **大 shape 常态化** | `planBridge` M 分块已落（4096² 不再整 op 拒绝）→ 补**全 kernel VTCM 记账**（归属期盲区收口）+ 大 shape 真机用例 | 预算判定对整池成立；大 shape 进标准批 |
+| M2.1 | **形状语义与 specialization 前置设计** | 先定义 Triton/TTIR/Linalg 中的运行时 shape、边界 mask、padding、返回布局和 launcher 参数契约；明确 compile-time specialization 与 runtime dispatch 的责任边界 | 设计文档包含 IR 示例、非法输入诊断、缓存 key 影响、正确性 oracle 和 fallback 选择表；没有该契约不得开始尾块实现 |
+| M2.2 | **tail 与 padding 机制** | 在独立的 HMX tail IR 形式和 runtime ABI 上实现非 32 对齐边界；完整 tile 继续走现有 `MatmulToHmxPass`，无法证明安全时保留 Linalg/HVX | 非 32 对齐 shape sweep 正确性全过；每个尾块路径都有 FileCheck 和设备用例；无按 kernel 名称的特判 |
+| M2.3 | **动态 shape specialization**（差距③） | 在 M2.1/M2.2 之后实现四路选择：完整 HMX tile / HMX+tail / HVX fallback / 混合 kernel；选择结果写入 manifest，并纳入 Triton cache key | 动态 shape sweep 正确性全过；混合路径相对纯 fallback 的性能门槛和失败回退规则写入测试；编译失败与运行时回退可区分 |
+| M2.4 | **dtype 能力契约表** | 按 (dtype 对, 累加/读出位宽, 每操作数行走轴) 键化的 `HmxTarget` 契约；int8/bf16/fp8 **先 PRM/引擎能力调研再落** | 第二个 dtype 至少一条真机 A/B；"加能力只改一处"成立；不支持 dtype 必须有稳定诊断 |
+| M2.5 | **大 shape 常态化** | `planBridge` 的 M 分块已落；补**全 kernel VTCM 记账**，覆盖 resident weight、activation ring、accumulator、status、workspace 和其他 space-1 分配的生命周期 | 预算判定对整池成立；大 shape 进入标准批；manifest 能解释每一项 VTCM 占用 |
 
 ### 阶段三 · 统一决策与代价模型（P2 — 差距④）
 
@@ -129,6 +130,80 @@ Triton → TTIR → triton-shared / Linalg
 | P1 | 动态 shape/tail + dtype 契约 + 大 shape 记账 | 任意 shape、更多 dtype 可用 | 部分已落（M 分块 ✅） |
 | P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
+
+---
+
+## 6. 后续 agent 执行合同
+
+下面的顺序是实现顺序，不是建议列表。每一项完成后才能进入下一项；同一阶段内可并行的任务必须拥有互不重叠的文件范围。
+
+### 6.1 开始前的固定基线
+
+1. 记录 `git rev-parse HEAD`、`git status --short`、`triton`/`triton_shared` 子仓库版本、`libtriton.so` 和 `libhmxapi.a` 指纹。
+2. 运行一次 host lit、Python smoke tests，并保存失败清单；不得把当前失败误归因于新改动。
+3. 用源码确认实际 pipeline：
+   - 前端：`qcom_hexagon_backend/backend/compiler.py`；
+   - 主 pipeline：`qcom_hexagon_backend/lib/Conversion/LinalgToLLVM/LinalgToLLVMPass.cpp`；
+   - HMX 归属：`MatmulToHmxPass.cpp`；
+   - tile/staging：`HmxPartitionPass.cpp`；
+   - resident：`WeightResidentPass.cpp`、`HmxWorkspaceResidentPass.cpp`；
+   - runtime lowering：`HmxToLLVMPass.cpp`、`HexagonMemToLLVMPass.cpp`；
+   - host contract：`triton_qcom_hexagon_backend_api.cc`、`hmx_weight_prepack.py`、`triton_hexagon_launcher.py`。
+4. 为本轮建立 `docs/state/STATE-OF-PLAY.md`，只记录已验证事实、证据路径、未决问题和触发条件。该文件建成后，ROADMAP 的状态引用才能恢复为权威引用。
+
+### 6.2 每个工作项的实现模板
+
+每项必须按以下顺序提交，避免“先写代码再猜测验收”：
+
+1. **契约**：写输入 IR、输出 IR、属性/metadata、错误/回退语义和缓存影响。
+2. **决策点**：列出所有拒绝原因及其优先级；每个原因只能有一个 canonical code，文本诊断从 code 渲染。
+3. **源码改动**：优先复用现有 `HmxTarget`、VTCM 记账、weight-prepack 和 launcher 机制；禁止复制一套并行规则。
+4. **静态测试**：先加最小 FileCheck/验证器测试，再改 pass；覆盖成功、拒绝、预算边界、dtype、布局和错误路径。
+5. **host 测试**：覆盖 metadata/manifest、cache key、launcher 参数排列、prepack canary 和 fallback。
+6. **设备测试**：同构建、双指纹、固定线程/频率/输入；至少 warmup + 重复采样，按 `max(3×CV, 15%)` 判定。
+7. **审查记录**：记录变更文件、删除的旧逻辑、测试命令、设备结果、未测试项和回滚方式；更新 `STATE-OF-PLAY.md` 与本表状态。
+
+### 6.3 依赖图和并行边界
+
+```text
+P0.1 基线与状态文档
+  ├─ P0.2 manifest/诊断契约 ──┐
+  ├─ P0.3 Triton 支持矩阵 ────┼─ P0.4 清理与退役
+  └─ P0.5 BufferManager/布局记档 ┘
+                 │
+                 ▼
+P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specialization
+                 ├──────────────► P1.4 dtype contract
+                 └──────────────► P1.5 full-kernel VTCM accounting
+                                  │
+                                  ▼
+                         P2.1 unified cost model
+                                  ├─ P2.2 launch-tax amortization
+                                  └─ P2.3 HVX×HMX scheduling
+                                  │
+                                  ▼
+                         P3.1 reduction pipeline
+                                  → P3.2 whitelist expansion
+                                  → P3.3 attention block fusion
+```
+
+允许并行：P0.2 与 P0.3；P1.4 与 P1.5；P2.2 与 P2.3。禁止并行：manifest 与 cost model、shape ABI 与 tail implementation、tail implementation 与 dynamic specialization、VTCM accounting 与任何依赖其预算的 cost model。
+
+### 6.4 统一验收门
+
+- **正确性**：编译期 verifier、FileCheck、Python reference 对比和设备结果全部通过；f32 输入走 HMX 时使用相对误差预算，不宣称 bit-exact。
+- **回退**：任何 HMX 不可证明安全的输入必须保留可执行 HVX/Linalg 路径，并在 manifest 中给出稳定原因码。
+- **可观测**：manifest、remark、launcher metadata 和 runtime 日志中的 shape/dtype/VTCM/路径字段互相一致。
+- **性能**：只比较同一构建和同一输入；报告中位数、CV、线程数、warmup、重复次数和完整环境指纹。
+- **回滚**：每项改动可由单个 commit 或明确的文件集合撤销；不得依赖未提交的生成物或本地环境变量。
+
+### 6.5 当前 Roadmap 的勘误
+
+1. `docs/state/STATE-OF-PLAY.md` 原先被引用但未提交，已改为先建立状态文档。
+2. M2 的“任意 shape 四路”原先跳过了 shape ABI 和 tail IR 依赖，已拆成设计、tail、specialization 三步。
+3. “清理后 lit 必须全绿”改为先记录基线、分类既存失败、为临时门设置退出条件，避免把未知失败伪装成完成。
+4. `hmx.stage/await` 已存在于 HMX dialect、partition pass 和对应 FileCheck 测试中；P3 可以复用该机制，但仍需为 reduction/normalization 定义新的数据依赖和正确性契约。
+5. 当前 `compiler.py` 仍明确标注 pass pipeline 动态化为 TODO；因此支持矩阵和 cost model 应先提供外部诊断/manifest，再逐步把 pipeline 选择从硬编码迁移出去。
 
 ---
 

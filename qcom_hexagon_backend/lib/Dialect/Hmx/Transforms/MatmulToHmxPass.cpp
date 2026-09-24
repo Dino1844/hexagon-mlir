@@ -9,7 +9,7 @@
 //
 // Engine attribution for the HMX matrix engine.
 //
-// The whole decision is a legality predicate (`hmxEligible`, asking `HmxTarget`)
+// The whole decision is one capability query (`HmxTarget::queryContraction`)
 // followed by a worth-it question (`HmxTarget::planBridge`) asking how the
 // crouton bridge fits the VTCM pool -- whole when it fits, in M blocks when it
 // does not -- the same shape Triton's AccelerateMatmul uses.
@@ -48,6 +48,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
@@ -62,9 +63,11 @@
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include <mutex>
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/raw_ostream.h"
 #include <cstdlib>
 #include <iterator>
 #include <optional>
@@ -83,27 +86,6 @@ namespace hmx {
 } // namespace mlir
 
 namespace {
-
-/// The three dimensions of the product, when the op is shaped like a matmul.
-struct MatmulShape {
-  int64_t m, n, k;
-};
-
-std::optional<MatmulShape> getShape(linalg::MatmulOp op) {
-  auto lhsType = dyn_cast<RankedTensorType>(op.getDpsInputOperand(0)->get().getType());
-  auto rhsType = dyn_cast<RankedTensorType>(op.getDpsInputOperand(1)->get().getType());
-  auto outType = dyn_cast<RankedTensorType>(op.getDpsInitOperand(0)->get().getType());
-  if (!lhsType || !rhsType || !outType)
-    return std::nullopt;
-  if (lhsType.getRank() != 2 || rhsType.getRank() != 2 ||
-      outType.getRank() != 2)
-    return std::nullopt;
-  if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
-      !outType.hasStaticShape())
-    return std::nullopt;
-  return MatmulShape{lhsType.getDimSize(0), rhsType.getDimSize(1),
-                     lhsType.getDimSize(1)};
-}
 
 /// True when the accumulator initialiser is provably empty or all zeros. Only
 /// then is it safe to hand the matmul to an engine that clears its hardware
@@ -132,170 +114,282 @@ struct MatmulContract {
   Type lhsElem, rhsElem, outElem;
 };
 
-std::optional<MatmulContract> getContract(linalg::MatmulOp op) {
-  auto shape = getShape(op);
-  if (!shape)
-    return std::nullopt;
-
-  auto lhsElem = cast<RankedTensorType>(op.getDpsInputOperand(0)->get().getType())
-                     .getElementType();
-  auto rhsElem = cast<RankedTensorType>(op.getDpsInputOperand(1)->get().getType())
-                     .getElementType();
-  auto outElem = cast<RankedTensorType>(op.getDpsInitOperand(0)->get().getType())
-                     .getElementType();
-  // The two operands may differ -- an f32 activation against an f16 weight is
-  // the shape llama.cpp's f32-activation path has. The engine hides the
-  // difference by quantising whichever side is wider in its pack, so both sides
-  // are asked only for an element type the engine's operands can come from.
-  if (!HmxTarget::isContractionOperand(lhsElem) ||
-      !HmxTarget::isContractionOperand(rhsElem))
-    return std::nullopt;
-  return MatmulContract{shape->m, shape->n, shape->k, lhsElem, rhsElem, outElem};
-}
-
-/// The three refusals a contracted matmul can meet, in the order the pipeline
-/// checks them. The environment one is kept apart from the two op-shaped ones
-/// because it does not cost a single op: without the VTCM allocator no matmul
-/// can be attributed at all, so the run's summary must name the switch.
-enum class SkipReason { NoVtcmAllocator, Capability, Budget };
-
-/// The first refusal of a run, so the summary can quote it verbatim together
-/// with the matmul that hit it.
-struct FirstRefusal {
-  SkipReason kind;
-  MatmulContract contract;
-  int64_t vtcmUsed;
+/// One canonical decision code per original linalg.matmul. The first
+/// successful rewrite of that op is the only point at which the code becomes
+/// `selected`; every later failure updates the same record in place.
+enum class MatmulReason {
+  Selected,
+  LibraryCall,
+  VtcmAllocatorDisabled,
+  NonRank2,
+  DynamicShape,
+  UnsupportedDType,
+  MinRows,
+  TileAlignment,
+  VtcmBudget,
 };
 
-/// What one run of the pass saw, reported as a single module-level warning:
-/// which matmuls were refused (a set -- the greedy driver may try the pattern
-/// on one op more than once, and one op must count once), how many were
-/// attributed, and the first refusal. Counts and text only: nothing here is
-/// keyed on a shape, a kernel name or a test.
-struct AttributionTally {
-  int64_t attributed = 0;
-  llvm::SmallPtrSet<Operation *, 8> skipped;
-  std::optional<FirstRefusal> first;
-};
-
-/// Remember a refusal for the summary. Idempotent per op; only the first
-/// refusal is kept -- the summary is one warning, not a log.
-void recordSkip(AttributionTally &tally, linalg::MatmulOp op, SkipReason kind,
-                const MatmulContract &contract, int64_t vtcmUsed = 0) {
-  if (!tally.skipped.insert(op).second)
-    return;
-  if (!tally.first)
-    tally.first = FirstRefusal{kind, contract, vtcmUsed};
-}
-
-/// The refusal texts, one place each: the per-op remark and the run's single
-/// summary warning stream the same words, so the warning quotes the remark
-/// verbatim and the two can never drift apart.
-InFlightDiagnostic &refusalNoVtcmAllocator(InFlightDiagnostic &diag) {
-  return diag << "HMX not applied: the crouton arrays live in VTCM and "
-                 "this pipeline has no VTCM allocator (the hexagonmem path)";
-}
-
-InFlightDiagnostic &refusalCapability(InFlightDiagnostic &diag) {
-  return diag << "HMX not applied: needs f16/f32 inputs and an f16/f32 result, "
-                 "2D static shapes, M/N/K multiples of "
-              << HmxTarget::tileEdge << ", M > " << HmxTarget::minRows;
-}
-
-InFlightDiagnostic &refusalBudget(InFlightDiagnostic &diag,
-                                  const MatmulContract &contract,
-                                  int64_t vtcmUsed, int64_t vtcmBudget) {
-  return diag << "HMX not applied: matmul (M=" << contract.m
-              << ", N=" << contract.n << ", K=" << contract.k
-              << ", lhsElem=" << contract.lhsElem
-              << ", rhsElem=" << contract.rhsElem
-              << ", outElem=" << contract.outElem << ", vtcmUsed=" << vtcmUsed
-              << ") bridge footprint does not fit remaining VTCM (vtcmBudget="
-              << vtcmBudget << " bytes)";
-}
-
-/// The whole run's report, on the module: one warning, and only when a matmul
-/// was actually refused. The per-op remarks stay as they are (they explain an
-/// individual op when someone asks for remarks); this is what makes a silently
-/// refused path visible in the production pipeline, where remarks are never
-/// shown -- the case that hid an entire HMX kernel behind a closed
-/// `enableConvertToHexagonmem` switch.
-void emitSkipSummary(Operation *within, const HmxTarget &target,
-                     const AttributionTally &tally) {
-  if (tally.skipped.empty()) {
-    // Full success is silent to diagnostics; the attributed count is the only
-    // number someone debugging "why did/didn't this matmul go to HMX" needs.
-    LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE << "] " << tally.attributed
-                            << " matmul(s) attributed, none refused\n");
-    return; // Nothing refused: no warning.
+StringRef reasonCode(MatmulReason reason) {
+  switch (reason) {
+  case MatmulReason::Selected:
+    return "selected";
+  case MatmulReason::LibraryCall:
+    return "library-call";
+  case MatmulReason::VtcmAllocatorDisabled:
+    return "vtcm-allocator-disabled";
+  case MatmulReason::NonRank2:
+    return "non-rank-2";
+  case MatmulReason::DynamicShape:
+    return "dynamic-shape";
+  case MatmulReason::UnsupportedDType:
+    return "unsupported-dtype";
+  case MatmulReason::MinRows:
+    return "min-rows";
+  case MatmulReason::TileAlignment:
+    return "tile-alignment";
+  case MatmulReason::VtcmBudget:
+    return "vtcm-budget";
   }
-  Operation *module = within->getParentOfType<ModuleOp>();
-  if (!module)
-    module = within;
-  const FirstRefusal &first = *tally.first;
-  InFlightDiagnostic diag = module->emitWarning();
-  // The environment refusal names the switch first: it silences the whole HMX
-  // path, not one op, and a reader must see that at a glance.
-  if (first.kind == SkipReason::NoVtcmAllocator)
+  llvm_unreachable("unknown HMX manifest reason");
+}
+
+struct MatmulDecision {
+  linalg::MatmulOp op;
+  std::string functionName;
+  int64_t id = 0;
+  std::optional<MatmulContract> contract;
+  MatmulReason reason = MatmulReason::Selected;
+  int64_t vtcmBefore = 0;
+  int64_t vtcmPeak = 0;
+  std::optional<HmxTarget::BridgePlan> plan;
+};
+
+/// Stamp an HMX bridge operation with the function-local decision id. The
+/// bufferization model copies this explicit attribute when it rebuilds the op;
+/// locations are intentionally not used as a metadata channel.
+void setDecisionId(Operation *op, int64_t id) {
+  op->setAttr(kHmxDecisionIdAttr,
+              IntegerAttr::get(IntegerType::get(op->getContext(), 64), id));
+}
+
+/// The pass-scoped, per-op decision table. It is populated before the greedy
+/// driver starts, so a pattern that tries an op repeatedly still updates one
+/// record and the final manifest has one entry per original op.
+class AttributionTally {
+public:
+  AttributionTally(func::FuncOp func, const HmxTarget &target,
+                   bool recordOnly) {
+    int64_t nextId = 0;
+    func.walk([&](linalg::MatmulOp op) {
+      auto shapedType = [&](Value value) -> ShapedType {
+        if (auto tensor = dyn_cast<RankedTensorType>(value.getType()))
+          return tensor;
+        // Record-only also observes manually managed memref form. The normal
+        // rewrite remains tensor-only because its bridge builders consume
+        // tensor values, but metadata must not lose those matmuls.
+        if (recordOnly)
+          return dyn_cast<ShapedType>(value.getType());
+        return {};
+      };
+      ShapedType lhsType = shapedType(op.getDpsInputOperand(0)->get());
+      ShapedType rhsType = shapedType(op.getDpsInputOperand(1)->get());
+      ShapedType outType = shapedType(op.getDpsInitOperand(0)->get());
+      bool ranked = lhsType && rhsType && outType;
+      bool rank2 = ranked && lhsType.getRank() == 2 && rhsType.getRank() == 2 &&
+                   outType.getRank() == 2;
+      bool dynamic =
+          rank2 && (!lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
+                    !outType.hasStaticShape());
+
+      MatmulDecision decision{op, func.getName().str(), nextId++};
+      if (rank2 && !dynamic) {
+        decision.contract =
+            MatmulContract{lhsType.getDimSize(0),    rhsType.getDimSize(1),
+                           lhsType.getDimSize(1),    lhsType.getElementType(),
+                           rhsType.getElementType(), outType.getElementType()};
+      }
+
+      if (op->hasAttr("library_call")) {
+        decision.reason = MatmulReason::LibraryCall;
+      } else if (!rank2) {
+        decision.reason = MatmulReason::NonRank2;
+      } else if (dynamic) {
+        decision.reason = MatmulReason::DynamicShape;
+      } else if (!target.vtcmAllocator) {
+        decision.reason = MatmulReason::VtcmAllocatorDisabled;
+      } else {
+        HmxTarget::ContractionDecision capability = target.queryContraction(
+            decision.contract->m, decision.contract->n, decision.contract->k,
+            decision.contract->lhsElem, decision.contract->rhsElem,
+            decision.contract->outElem);
+        if (!capability.supported()) {
+          switch (capability.refusal) {
+          case HmxTarget::ContractionRefusal::UnsupportedDType:
+            decision.reason = MatmulReason::UnsupportedDType;
+            break;
+          case HmxTarget::ContractionRefusal::MinRows:
+            decision.reason = MatmulReason::MinRows;
+            break;
+          case HmxTarget::ContractionRefusal::TileAlignment:
+            decision.reason = MatmulReason::TileAlignment;
+            break;
+          case HmxTarget::ContractionRefusal::None:
+            llvm_unreachable("supported contraction has a refusal");
+          }
+        } else {
+          decision.reason = MatmulReason::Selected;
+        }
+      }
+      byOp[op.getOperation()] = decisions.size();
+      decisions.push_back(std::move(decision));
+    });
+  }
+
+  MatmulDecision &operator[](linalg::MatmulOp op) {
+    auto it = byOp.find(op.getOperation());
+    assert(it != byOp.end() && "matmul has no attribution record");
+    return decisions[it->second];
+  }
+
+  ArrayRef<MatmulDecision> records() const { return decisions; }
+
+private:
+  llvm::DenseMap<Operation *, size_t> byOp;
+  SmallVector<MatmulDecision> decisions;
+};
+
+/// The diagnostic view is intentionally a projection of the manifest record,
+/// rather than a second set of predicates. The few cases that were silent
+/// before attribution (library dispatch, missing rank/static shape and an
+/// unsupported element type) stay silent; their reason is still published.
+bool reportsRefusal(MatmulReason reason) {
+  return reason == MatmulReason::VtcmAllocatorDisabled ||
+         reason == MatmulReason::MinRows ||
+         reason == MatmulReason::TileAlignment ||
+         reason == MatmulReason::VtcmBudget;
+}
+
+InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
+                                  const MatmulDecision &decision,
+                                  const HmxTarget &target) {
+  diag << "HMX not applied: ";
+  switch (decision.reason) {
+  case MatmulReason::VtcmAllocatorDisabled:
+    diag << "the crouton arrays live in VTCM and this pipeline has no VTCM "
+            "allocator (the hexagonmem path)";
+    break;
+  case MatmulReason::UnsupportedDType:
+  case MatmulReason::MinRows:
+  case MatmulReason::TileAlignment:
+    diag << "needs f16/f32 inputs and an f16/f32 result, 2D static shapes, "
+            "M/N/K multiples of "
+         << HmxTarget::tileEdge << ", M > " << HmxTarget::minRows;
+    break;
+  case MatmulReason::VtcmBudget:
+    diag << "matmul (M=" << decision.contract->m
+         << ", N=" << decision.contract->n << ", K=" << decision.contract->k
+         << ", lhsElem=" << decision.contract->lhsElem
+         << ", rhsElem=" << decision.contract->rhsElem
+         << ", outElem=" << decision.contract->outElem
+         << ", vtcmUsed=" << decision.vtcmBefore
+         << ") bridge footprint does not fit remaining VTCM (vtcmBudget="
+         << target.vtcmBudget << " bytes)";
+    break;
+  case MatmulReason::LibraryCall:
+  case MatmulReason::NonRank2:
+  case MatmulReason::DynamicShape:
+  case MatmulReason::Selected:
+    llvm_unreachable("silent or successful decision rendered as refusal");
+  }
+  return diag << " [reason=" << reasonCode(decision.reason) << "]";
+}
+
+void emitDecisionDiagnostics(ModuleOp module, const HmxTarget &target,
+                             const AttributionTally &tally) {
+  int64_t attributed = 0;
+  SmallVector<const MatmulDecision *> reportable;
+  for (const MatmulDecision &decision : tally.records()) {
+    if (decision.reason == MatmulReason::Selected) {
+      ++attributed;
+      continue;
+    }
+    if (reportsRefusal(decision.reason)) {
+      InFlightDiagnostic diag = decision.op->emitRemark();
+      renderRefusal(diag, decision, target);
+      reportable.push_back(&decision);
+    }
+  }
+
+  if (reportable.empty()) {
+    LLVM_DEBUG(llvm::dbgs()
+               << "[" DEBUG_TYPE << "] " << attributed
+               << " matmul(s) attributed, no reportable refusal\n");
+    return;
+  }
+
+  const MatmulDecision &first = *reportable.front();
+  InFlightDiagnostic diag = module.emitWarning();
+  if (first.reason == MatmulReason::VtcmAllocatorDisabled)
     diag << "HMX disabled: this pipeline has no VTCM allocator "
             "(enableConvertToHexagonmem is off); ";
-  diag << "HMX: " << static_cast<int64_t>(tally.skipped.size())
-       << " matmul(s) skipped";
-  if (tally.attributed > 0)
-    diag << ", " << tally.attributed << " attributed";
+  diag << "HMX: " << reportable.size() << " matmul(s) skipped";
+  if (attributed)
+    diag << ", " << attributed << " attributed";
   diag << "; first refusal: ";
-  switch (first.kind) {
-  case SkipReason::NoVtcmAllocator:
-    refusalNoVtcmAllocator(diag);
-    break;
-  case SkipReason::Capability:
-    refusalCapability(diag);
-    break;
-  case SkipReason::Budget:
-    refusalBudget(diag, first.contract, first.vtcmUsed, target.vtcmBudget);
-    break;
-  }
-  diag << "; matmul M=" << first.contract.m << ", N=" << first.contract.n
-       << ", K=" << first.contract.k << ", lhsElem=" << first.contract.lhsElem
-       << ", rhsElem=" << first.contract.rhsElem
-       << ", outElem=" << first.contract.outElem;
+  renderRefusal(diag, first, target);
+  if (first.contract)
+    diag << "; matmul M=" << first.contract->m << ", N=" << first.contract->n
+         << ", K=" << first.contract->k
+         << ", lhsElem=" << first.contract->lhsElem
+         << ", rhsElem=" << first.contract->rhsElem
+         << ", outElem=" << first.contract->outElem;
 }
 
-/// True when this matmul belongs to the engine. A `library_call` matmul is a user
-/// directive to a named function and is not the engine's; otherwise the target's
-/// contract decides (see include/hexagon/Dialect/Hmx/Transforms/HmxTarget.h). A near miss --
-/// operands the engine could take that miss the grid -- is explained, because
-/// that is the one case a user would want to know about; a matmul whose elements
-/// the engine's operands can never come from was never HMX's to begin with
-/// (`getContract` already refused it). Every refusal here is also recorded in
-/// `tally`, so the pass can emit its single module-level summary warning.
-bool hmxEligible(linalg::MatmulOp op, const HmxTarget &target,
-                 AttributionTally &tally) {
-  // The other matmul attributions all skip `library_call` (GeneralizePass,
-  // ScheduleMatmulForHVXPass, ReplaceWithLibraryCallsPass), but this pass runs
-  // before the library-call pass and would otherwise swallow it.
-  if (op->hasAttr("library_call"))
-    return false;
-  auto contract = getContract(op);
-  if (!contract)
-    return false;
-  // The engine's operands live in VTCM, so a pipeline without the allocator
-  // that provides it cannot host the engine at all. Refused before the shape
-  // question: this is about the environment, not the op.
-  if (!target.vtcmAllocator) {
-    InFlightDiagnostic diag = op.emitRemark();
-    refusalNoVtcmAllocator(diag);
-    recordSkip(tally, op, SkipReason::NoVtcmAllocator, *contract);
-    return false;
+std::string typeName(Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  type.print(stream);
+  return text;
+}
+
+DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
+                              const HmxTarget &target) {
+  auto i64 = IntegerType::get(ctx, 64);
+  NamedAttrList fields;
+  fields.append("function", StringAttr::get(ctx, decision.functionName));
+  fields.append("id", IntegerAttr::get(i64, decision.id));
+  fields.append("engine",
+                StringAttr::get(ctx, decision.reason == MatmulReason::Selected
+                                         ? "hmx"
+                                         : "hvx"));
+  fields.append("reason", StringAttr::get(ctx, reasonCode(decision.reason)));
+  if (decision.contract) {
+    fields.append("m", IntegerAttr::get(i64, decision.contract->m));
+    fields.append("n", IntegerAttr::get(i64, decision.contract->n));
+    fields.append("k", IntegerAttr::get(i64, decision.contract->k));
+    fields.append("lhs_elem",
+                  StringAttr::get(ctx, typeName(decision.contract->lhsElem)));
+    fields.append("rhs_elem",
+                  StringAttr::get(ctx, typeName(decision.contract->rhsElem)));
+    fields.append("out_elem",
+                  StringAttr::get(ctx, typeName(decision.contract->outElem)));
   }
-  if (target.supportsContraction(contract->m, contract->n, contract->k,
-                                 contract->lhsElem, contract->rhsElem,
-                                 contract->outElem))
-    return true;
-  InFlightDiagnostic diag = op.emitRemark();
-  refusalCapability(diag);
-  recordSkip(tally, op, SkipReason::Capability, *contract);
-  return false;
+  if (decision.reason == MatmulReason::Selected) {
+    assert(decision.plan && "selected matmul has no bridge plan");
+    fields.append("vtcm_budget", IntegerAttr::get(i64, target.vtcmBudget));
+    fields.append("vtcm_before", IntegerAttr::get(i64, decision.vtcmBefore));
+    fields.append("vtcm_peak", IntegerAttr::get(i64, decision.vtcmPeak));
+    fields.append("blocking", StringAttr::get(ctx, decision.plan->blocked(
+                                                       decision.contract->m)
+                                                       ? "m_blocked"
+                                                       : "whole"));
+    fields.append("block_m", IntegerAttr::get(i64, decision.plan->blockM));
+    fields.append("pack_act_sites", IntegerAttr::get(i64, 0));
+    fields.append("pack_weight_sites", IntegerAttr::get(i64, 0));
+    fields.append("unpack_sites", IntegerAttr::get(i64, 0));
+    fields.append("count_semantics", StringAttr::get(ctx, "ir_sites"));
+  }
+  return fields.getDictionary(ctx);
 }
 
 /// A destination the engine will read: a crouton array allocated in VTCM.
@@ -432,7 +526,8 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
 /// lowering synthesises element-wise moves, measured at 99.3% of the kernel's
 /// runtime, while the leaves are the vectorised HVX packers from Phase 0.
 Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
-                             RankedTensorType crouton, bool isWeight) {
+                             RankedTensorType crouton, bool isWeight,
+                             int64_t decisionId) {
   if (Value folded = prepackedCrouton(b, loc, src, crouton, isWeight))
     return folded;
   auto srcType = cast<RankedTensorType>(src.getType());
@@ -460,13 +555,18 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
     Value carried = loop.getRegionIterArg(0);
     // Activation: (row = m tile = i, col = k run [0, Kt)); weight: (k run
     // [0, Kt), n tile = i).
-    Value out = isWeight
-                    ? hmx::PackWeightOp::create(b, loc, crouton, carried, src,
-                                                zero, i, count)
-                          ->getResult(0)
-                    : hmx::PackActOp::create(b, loc, crouton, carried, src, i,
-                                             zero, count)
-                          ->getResult(0);
+    Value out;
+    if (isWeight) {
+      auto pack = hmx::PackWeightOp::create(b, loc, crouton, carried, src,
+                                             zero, i, count);
+      setDecisionId(pack.getOperation(), decisionId);
+      out = pack->getResult(0);
+    } else {
+      auto pack = hmx::PackActOp::create(b, loc, crouton, carried, src, i,
+                                          zero, count);
+      setDecisionId(pack.getOperation(), decisionId);
+      out = pack->getResult(0);
+    }
     scf::YieldOp::create(b, loc, out);
   }
   return loop.getResult(0);
@@ -537,7 +637,7 @@ bool isDenseInternal(Value v, int depth = 0) {
 /// afterwards) -- which is what the allocator-side 128 B guarantee applies to.
 Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
                        RankedTensorType outType, bool fused,
-                       Value residual = {}) {
+                       int64_t decisionId, Value residual = {}) {
   auto arType = cast<RankedTensorType>(ar.getType());
   Value dst = tensor::EmptyOp::create(b, loc, outType.getShape(),
                                       outType.getElementType());
@@ -554,13 +654,18 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
     b.setInsertionPointToStart(loop.getBody());
     Value i = loop.getInductionVar();
     Value arg = loop.getRegionIterArg(0);
-    Value out =
-        fused ? hmx::UnpackAccF32Op::create(b, loc, outType, ar, arg, i, zero,
-                                            residual, count)
-                    ->getResult(0)
-              : hmx::UnpackAccOp::create(b, loc, outType, ar, arg, i, zero,
-                                         count)
-                    ->getResult(0);
+    Value out;
+    if (fused) {
+      auto unpack = hmx::UnpackAccF32Op::create(
+          b, loc, outType, ar, arg, i, zero, residual, count);
+      setDecisionId(unpack.getOperation(), decisionId);
+      out = unpack->getResult(0);
+    } else {
+      auto unpack =
+          hmx::UnpackAccOp::create(b, loc, outType, ar, arg, i, zero, count);
+      setDecisionId(unpack.getOperation(), decisionId);
+      out = unpack->getResult(0);
+    }
     scf::YieldOp::create(b, loc, out);
   }
   return loop.getResult(0);
@@ -618,13 +723,15 @@ Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
 /// `addInto` (see `isDenseInternal`).
 static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
                           RankedTensorType outType, Value residual,
-                          bool canFuseTail) {
+                          bool canFuseTail, int64_t decisionId) {
   if (outType.getElementType().isF32() && fusedTailLegal(outType) &&
       canFuseTail && (!residual || isDenseInternal(residual)))
-    return unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, residual);
+    return unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
+                             residual);
 
   auto f16Out = RankedTensorType::get(outType.getShape(), b.getF16Type());
-  Value result = unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false);
+  Value result = unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false,
+                                  decisionId);
   if (outType.getElementType().isF32())
     result = widenToF32(b, loc, result);
   if (residual)
@@ -645,7 +752,7 @@ static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
 /// correct; only the residency differs.
 Value emitBridgeAbove(RewriterBase &b, Location loc, Value src,
                       RankedTensorType crouton, bool isWeight,
-                      Operation *consumer, bool hoist) {
+                      Operation *consumer, bool hoist, int64_t decisionId) {
   Operation *insertBefore = consumer;
   if (hoist) {
     for (Operation *parent = consumer->getParentOp(); parent;
@@ -660,7 +767,7 @@ Value emitBridgeAbove(RewriterBase &b, Location loc, Value src,
   }
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(insertBefore);
-  return packCroutonsWithLeaves(b, loc, src, crouton, isWeight);
+  return packCroutonsWithLeaves(b, loc, src, crouton, isWeight, decisionId);
 }
 
 /// True when `v` is defined outside `loop` (a block argument counts as defined
@@ -696,8 +803,12 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
 
   LogicalResult matchAndRewrite(linalg::MatmulOp op,
                                 PatternRewriter &rewriter) const override {
-    if (!hmxEligible(op, target, *tally))
-      return rewriter.notifyMatchFailure(op, "not an HMX matmul");
+    MatmulDecision &decision = (*tally)[op];
+    if (decision.reason != MatmulReason::Selected &&
+        decision.reason != MatmulReason::VtcmBudget)
+      return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
+    assert(decision.contract && "attributable matmul has no contract");
+    const MatmulContract &contract = *decision.contract;
 
     Location loc = op.getLoc();
     Value lhs = op.getDpsInputOperand(0)->get();
@@ -707,43 +818,43 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     auto lhsType = cast<RankedTensorType>(lhs.getType());
     auto rhsType = cast<RankedTensorType>(rhs.getType());
 
-    auto contract = getContract(op);
-    if (!contract)
-      return rewriter.notifyMatchFailure(op, "no matmul contract");
-
     // Region residency, not a single-op fiction: bytes earlier attributions in
-    // this function already committed to VTCM, so the second dot of an attention
-    // pair is weighed with the first dot's arrays resident.
+    // this function already committed to VTCM, so the second dot of an
+    // attention pair is weighed with the first dot's arrays resident.
     int64_t vtcmUsed = vtcmBytesCommitted(op);
 
     // The second question after legality: the crouton bridge must pay for
-    // itself. The plan names the M block the bridge allocates for -- the whole M
-    // when the contraction fits, a smaller block when only a block does, and an
-    // empty plan when not even one block does. A "no" leaves the IR exactly as
-    // it was -- an untouched linalg.matmul is an engine choice the HVX/linalg
-    // paths handle, never a half-built hmx region the verifier could see.
+    // itself. The plan names the M block the bridge allocates for -- the whole
+    // M when the contraction fits, a smaller block when only a block does, and
+    // an empty plan when not even one block does. A "no" leaves the IR exactly
+    // as it was -- an untouched linalg.matmul is an engine choice the
+    // HVX/linalg paths handle, never a half-built hmx region the verifier could
+    // see.
     HmxTarget::BridgePlan plan =
-        target.planBridge(contract->m, contract->n, contract->k, vtcmUsed);
+        target.planBridge(contract.m, contract.n, contract.k, vtcmUsed);
+    decision.vtcmBefore = vtcmUsed;
     if (!plan) {
-      // The full request, AMD style: every parameter plus the gate that
-      // blocked, so the remark names the threshold to beat.
-      InFlightDiagnostic diag = op.emitRemark();
-      refusalBudget(diag, *contract, vtcmUsed, target.vtcmBudget);
-      recordSkip(*tally, op, SkipReason::Budget, *contract, vtcmUsed);
-      return rewriter.notifyMatchFailure(op, "HMX bridge not worth it");
+      decision.reason = MatmulReason::VtcmBudget;
+      decision.plan.reset();
+      return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
     }
+    decision.reason = MatmulReason::Selected;
+    decision.vtcmPeak = vtcmUsed + plan.bytes;
+    decision.plan = plan;
 
     // The engine's read-out is an fp16 crouton regardless of the result's
     // element type; a wider result is the fp16 image widened after the unpack.
-    auto f16Out = RankedTensorType::get(outType.getShape(), rewriter.getF16Type());
+    auto f16Out =
+        RankedTensorType::get(outType.getShape(), rewriter.getF16Type());
     bool empty = isEmptyInit(init);
     bool escapes = resultEscapesUnconsumed(op);
 
-    // The bridge stages crouton arrays, which are the engine's fp16 whatever the
-    // sources' element type is, so every byte figure here is a crouton byte.
+    // The bridge stages crouton arrays, which are the engine's fp16 whatever
+    // the sources' element type is, so every byte figure here is a crouton
+    // byte.
     constexpr int64_t inBytes = HmxTarget::croutonElemBytes;
     int64_t room = target.vtcmBudget - vtcmUsed;
-    int64_t rhsBytes = contract->k * contract->n * inBytes;
+    int64_t rhsBytes = contract.k * contract.n * inBytes;
     bool aInvariant = isLoopInvariant(lhs, op);
     bool bInvariant = isLoopInvariant(rhs, op);
 
@@ -752,7 +863,7 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // lowering, whose element-wise moves cost more than the mma itself. Chains
     // never get here: FoldChainedPack replaces this pack with the producer's
     // read-out array.
-    if (!plan.blocked(contract->m)) {
+    if (!plan.blocked(contract.m)) {
       // Whole contraction: one bridge, one hmx.matmul -- the pre-blocking form,
       // byte-identical to before for every shape whose arrays fit whole.
       //
@@ -760,33 +871,33 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       // hoisted (packed once, kept resident) only if its buffer fits what is
       // left after prior residency and the rest of this attribution; otherwise
       // it is emitted at the consumer and re-packed once per block iteration.
-      int64_t lhsBytes = contract->m * contract->k * inBytes;
-      int64_t outBytes = contract->m * contract->n * 2;
+      int64_t lhsBytes = contract.m * contract.k * inBytes;
+      int64_t outBytes = contract.m * contract.n * 2;
       bool hoistLhs = aInvariant && lhsBytes <= room - rhsBytes - outBytes;
       bool hoistRhs =
           bInvariant && rhsBytes <= room - (hoistLhs ? lhsBytes : 0) - outBytes;
 
-      Value packedLhs = emitBridgeAbove(rewriter, loc, lhs,
-                                        hmx::croutonLayoutType(lhsType),
-                                        /*isWeight=*/false, op, hoistLhs);
-      Value packedRhs = emitBridgeAbove(rewriter, loc, rhs,
-                                        hmx::weightCroutonType(rhsType),
-                                        /*isWeight=*/true, op, hoistRhs);
+      Value packedLhs = emitBridgeAbove(
+          rewriter, loc, lhs, hmx::croutonLayoutType(lhsType),
+          /*isWeight=*/false, op, hoistLhs, decision.id);
+      Value packedRhs = emitBridgeAbove(
+          rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
+          /*isWeight=*/true, op, hoistRhs, decision.id);
 
       // The accumulator is read out into VTCM: the engine has nowhere else to
       // write.
       Value outEmpty = vtcmEmpty(rewriter, loc, hmx::croutonLayoutType(f16Out));
-      auto matmul = hmx::MatmulOp::create(rewriter, loc,
-                                          hmx::croutonLayoutType(f16Out),
-                                          packedLhs, packedRhs, outEmpty);
+      auto matmul = hmx::MatmulOp::create(
+          rewriter, loc, hmx::croutonLayoutType(f16Out), packedLhs, packedRhs,
+          outEmpty);
+      setDecisionId(matmul.getOperation(), decision.id);
       // The fused tail replaces the unpack+widen[+add] epilogue with one leaf
       // when the result is f32 and the leaf contract holds by construction (see
       // `fusedTailLegal`); the residual is threaded only when it is dense by
       // construction, anything else keeps the old epilogue.
       Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
-                                  empty ? Value{} : init, escapes);
+                                  empty ? Value{} : init, escapes, decision.id);
       rewriter.replaceOp(op, result);
-      ++tally->attributed;
       return success();
     }
 
@@ -798,31 +909,32 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // the block loop exactly as in the whole form, so it is paid once.
     int64_t blockM = plan.blockM;
     auto blockLhsType =
-        RankedTensorType::get({blockM, contract->k}, lhsType.getElementType());
+        RankedTensorType::get({blockM, contract.k}, lhsType.getElementType());
     auto blockF16Out =
-        RankedTensorType::get({blockM, contract->n}, rewriter.getF16Type());
+        RankedTensorType::get({blockM, contract.n}, rewriter.getF16Type());
     auto blockOutType =
-        RankedTensorType::get({blockM, contract->n}, outType.getElementType());
+        RankedTensorType::get({blockM, contract.n}, outType.getElementType());
     auto blockCroutonOut = hmx::croutonLayoutType(blockF16Out);
 
     // The block's arrays are the activation block and the read-out block; the
     // weight is whole. This is exactly `plan.bytes`, and the same budget the
     // plan was chosen against.
-    int64_t blockActBytes = blockM * contract->k * inBytes;
-    int64_t blockArBytes = blockM * contract->n * 2;
-    bool hoistRhs = bInvariant && rhsBytes <= room - blockActBytes - blockArBytes;
+    int64_t blockActBytes = blockM * contract.k * inBytes;
+    int64_t blockArBytes = blockM * contract.n * 2;
+    bool hoistRhs =
+        bInvariant && rhsBytes <= room - blockActBytes - blockArBytes;
 
-    Value packedRhs = emitBridgeAbove(rewriter, loc, rhs,
-                                      hmx::weightCroutonType(rhsType),
-                                      /*isWeight=*/true, op, hoistRhs);
+    Value packedRhs = emitBridgeAbove(
+        rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
+        /*isWeight=*/true, op, hoistRhs, decision.id);
 
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    Value cM = arith::ConstantIndexOp::create(rewriter, loc, contract->m);
+    Value cM = arith::ConstantIndexOp::create(rewriter, loc, contract.m);
     Value cBlock = arith::ConstantIndexOp::create(rewriter, loc, blockM);
 
-    // The full output is carried and each block inserted into it, so a block that
-    // does not escape still composes with its siblings. `init` is the C term
-    // (or an undefined `tensor.empty`, which the blocks fully overwrite).
+    // The full output is carried and each block inserted into it, so a block
+    // that does not escape still composes with its siblings. `init` is the C
+    // term (or an undefined `tensor.empty`, which the blocks fully overwrite).
     auto blockLoop = scf::ForOp::create(rewriter, loc, c0, cM, cBlock,
                                         ValueRange{init});
     {
@@ -835,33 +947,34 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       // covers rows `[m0, m0 + blockM)`.
       SmallVector<OpFoldResult> blockOffsets{m0, c0};
       SmallVector<OpFoldResult> blockSizes{rewriter.getIndexAttr(blockM),
-                                           rewriter.getIndexAttr(contract->k)};
+                                           rewriter.getIndexAttr(contract.k)};
       SmallVector<OpFoldResult> outSizes{rewriter.getIndexAttr(blockM),
-                                         rewriter.getIndexAttr(contract->n)};
+                                         rewriter.getIndexAttr(contract.n)};
       SmallVector<OpFoldResult> oneStrides{rewriter.getIndexAttr(1),
                                            rewriter.getIndexAttr(1)};
 
-      Value lhsBlock = tensor::ExtractSliceOp::create(
-          rewriter, loc, blockLhsType, lhs, blockOffsets, blockSizes,
-          oneStrides);
-      Value packedLhs =
-          packCroutonsWithLeaves(rewriter, loc, lhsBlock,
-                                 hmx::croutonLayoutType(blockLhsType),
-                                 /*isWeight=*/false);
+      Value lhsBlock =
+          tensor::ExtractSliceOp::create(rewriter, loc, blockLhsType, lhs,
+                                         blockOffsets, blockSizes, oneStrides);
+      Value packedLhs = packCroutonsWithLeaves(
+          rewriter, loc, lhsBlock, hmx::croutonLayoutType(blockLhsType),
+          /*isWeight=*/false, decision.id);
 
-      // The C term is materialised per block. An empty initialiser has no C term
-      // at all, so the block starts from the engine's cleared accumulator.
+      // The C term is materialised per block. An empty initialiser has no C
+      // term at all, so the block starts from the engine's cleared accumulator.
       Value residual;
       if (!empty)
-        residual = tensor::ExtractSliceOp::create(
-            rewriter, loc, blockOutType, init, blockOffsets, outSizes,
-            oneStrides);
+        residual =
+            tensor::ExtractSliceOp::create(rewriter, loc, blockOutType, init,
+                                           blockOffsets, outSizes, oneStrides);
 
       Value outEmpty = vtcmEmpty(rewriter, loc, blockCroutonOut);
-      auto matmul = hmx::MatmulOp::create(rewriter, loc, blockCroutonOut,
-                                          packedLhs, packedRhs, outEmpty);
+      auto matmul = hmx::MatmulOp::create(
+          rewriter, loc, blockCroutonOut, packedLhs, packedRhs, outEmpty);
+      setDecisionId(matmul.getOperation(), decision.id);
       Value blockResult = emitEpilogue(rewriter, loc, matmul->getResult(0),
-                                       blockOutType, residual, escapes);
+                                       blockOutType, residual, escapes,
+                                       decision.id);
 
       Value inserted =
           tensor::InsertSliceOp::create(rewriter, loc, blockResult, carried,
@@ -869,7 +982,6 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       scf::YieldOp::create(rewriter, loc, ValueRange{inserted});
     }
     rewriter.replaceOp(op, blockLoop.getResult(0));
-    ++tally->attributed;
     return success();
   }
 
@@ -1458,7 +1570,8 @@ static void dropCroutonEncodings(Operation *root) {
   });
 }
 
-struct MatmulToHmxPass : public mlir::hmx::impl::MatmulToHmxBase<MatmulToHmxPass> {
+struct MatmulToHmxPass
+    : public mlir::hmx::impl::MatmulToHmxBase<MatmulToHmxPass> {
   using mlir::hmx::impl::MatmulToHmxBase<MatmulToHmxPass>::MatmulToHmxBase;
 
   void getDependentDialects(DialectRegistry &registry) const override {
@@ -1470,6 +1583,11 @@ struct MatmulToHmxPass : public mlir::hmx::impl::MatmulToHmxBase<MatmulToHmxPass
   }
 
   void runOnOperation() override {
+    // The manifest is module state while this interface pass is nested under
+    // func.func. MLIR may invoke those function instances concurrently; keep
+    // the rewrite/read/refresh transaction serial so records cannot race.
+    std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
+
     LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE << "] running\n");
 
     // The engine's contract, with the fields a caller may narrow: the VTCM
@@ -1478,32 +1596,53 @@ struct MatmulToHmxPass : public mlir::hmx::impl::MatmulToHmxBase<MatmulToHmxPass
     HmxTarget target;
     if (vtcmBudgetBytes > 0)
       target.vtcmBudget = vtcmBudgetBytes;
-    target.vtcmAllocator = vtcmAllocator;
+    // Record-only is a metadata pass, not a partial HMX lowering. It must not
+    // claim that VTCM is usable when no HMX allocation will be emitted.
+    target.vtcmAllocator = recordOnly ? false : vtcmAllocator;
 
-    // Pass-scoped, exactly as long as the rewrite: the pattern records into it
-    // (the pattern itself must not warn -- it can run more than once per op,
-    // and the tally is what turns those attempts into one count) and the single
-    // module-level warning reads it back.
-    AttributionTally tally;
+    auto func = cast<func::FuncOp>(getOperation());
+    auto module = func->getParentOfType<ModuleOp>();
+    if (!module) {
+      getOperation()->emitError(
+          "matmul-to-hmx requires a func.func inside a builtin.module");
+      return signalPassFailure();
+    }
 
-    RewritePatternSet patterns(&getContext());
-    patterns.add<MatmulToHmx>(&getContext(), target, &tally);
-    patterns.add<FoldChainedPack, FoldElementwiseIntoLayout>(&getContext());
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+    // Pass-scoped, exactly as long as the rewrite. It is populated before the
+    // greedy driver and keyed by the original op, so repeated pattern attempts
+    // cannot duplicate a record.
+    AttributionTally tally(func, target, recordOnly);
+
+    if (!recordOnly) {
+      RewritePatternSet patterns(&getContext());
+      patterns.add<MatmulToHmx>(&getContext(), target, &tally);
+      patterns.add<FoldChainedPack, FoldElementwiseIntoLayout>(&getContext());
+      if (failed(applyPatternsGreedily(getOperation(), std::move(patterns))))
+        return signalPassFailure();
+    }
+
+    SmallVector<DictionaryAttr> records;
+    records.reserve(tally.records().size());
+    for (const MatmulDecision &decision : tally.records())
+      records.push_back(manifestRecord(&getContext(), decision, target));
+    if (failed(addOrReplaceHmxManifestRecords(module, records)) ||
+        failed(refreshHmxManifestBridgeCounts(module)))
       return signalPassFailure();
 
-    // One warning for the whole run, on the module: the per-op remarks have no
-    // visible output in the production pipeline, so a silently refused HMX
-    // path (a closed VTCM-allocator switch above all) must surface once --
-    // never once per refused op.
-    emitSkipSummary(getOperation(), target, tally);
+    // The manifest and the diagnostics are two views of the same final records.
+    // In particular, no remark is emitted while the greedy driver is still
+    // changing a decision. Record-only is intentionally silent: its expected
+    // allocator-disabled records describe metadata, not a user-visible refusal.
+    if (!recordOnly)
+      emitDecisionDiagnostics(module, target, tally);
 
     // The encoding is a tensor-stage annotation; bufferization would drop it
     // and fall back to fully dynamic strides (survey section 1.3), so erase it
     // here by default, leaving the rank-5 physical types the rest of the
     // pipeline knows. `drop-encodings=0` keeps them for the bufferizer that
-    // carries the layout over as #hmx.crouton_memref_layout.
-    if (dropEncodings)
+    // carries the layout over as #hmx.crouton_memref_layout. Record-only never
+    // drops encodings because it promises not to rewrite the input IR.
+    if (!recordOnly && dropEncodings)
       dropCroutonEncodings(getOperation());
   }
 };

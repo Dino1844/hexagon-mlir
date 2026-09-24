@@ -31,7 +31,7 @@
 // SMALL: hmx.pack_act
 // The block's croutons: activation [Mt=1, Kt=2], weight [Nt=2, Kt=2], read-out
 // [Mt=1, Nt=2].
-// SMALL: hmx.matmul ins({{.*}} : tensor<1x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>) outs({{.*}} : tensor<1x2x16x32x2xf16>) -> tensor<1x2x16x32x2xf16>
+// SMALL: hmx.matmul ins({{.*}} : tensor<1x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>) outs({{.*}} : tensor<1x2x16x32x2xf16>) {{.*}} -> tensor<1x2x16x32x2xf16>
 // SMALL: hmx.unpack_acc
 // Each block is written back into the carried output.
 // SMALL: tensor.insert_slice {{.*}} into %arg3[%arg2, %c0] [32, 64] [1, 1] : tensor<32x64xf16> into tensor<64x64xf16>
@@ -51,7 +51,7 @@ func.func @blocked_m(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>) -> tensor<64x
 // 64-row blocks.
 // DIV-LABEL: func.func @block_divisor
 // DIV: tensor.extract_slice %arg0[%arg2, %c0] [64, 64] [1, 1] : tensor<256x64xf16> to tensor<64x64xf16>
-// DIV: hmx.matmul ins({{.*}} : tensor<2x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>) outs({{.*}} : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+// DIV: hmx.matmul ins({{.*}} : tensor<2x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>) outs({{.*}} : tensor<2x2x16x32x2xf16>) {{.*}} -> tensor<2x2x16x32x2xf16>
 // DIV: tensor.insert_slice {{.*}} into %arg3[%arg2, %c0] [64, 64] [1, 1] : tensor<64x64xf16> into tensor<256x64xf16>
 func.func @block_divisor(%a: tensor<256x64xf16>, %b: tensor<64x64xf16>) -> tensor<256x64xf16> {
   %c = tensor.empty() : tensor<256x64xf16>

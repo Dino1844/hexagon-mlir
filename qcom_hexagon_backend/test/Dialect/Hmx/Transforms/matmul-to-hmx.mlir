@@ -19,10 +19,10 @@
 // The pack bridge walks the outer tile and covers the whole K run in one ranged
 // op (`count = Kt = 4`); the unpack covers the whole tile row (`count = 16`).
 // CHECK-LABEL: func.func @aligned_f16
-// CHECK: hmx.pack_act {{.*}} {count = 4 : i64}
-// CHECK: hmx.pack_weight {{.*}} {count = 4 : i64}
-// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
-// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64}
+// CHECK: hmx.pack_act {{.*}} {count = 4 : i64, hmx.decision_id = 0 : i64}
+// CHECK: hmx.pack_weight {{.*}} {count = 4 : i64, hmx.decision_id = 0 : i64}
+// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) {{.*}} -> tensor<2x2x16x32x2xf16>
+// CHECK: hmx.unpack_acc {{.*}} {count = 16 : i64, hmx.decision_id = 0 : i64}
 func.func @aligned_f16(%a: tensor<64x128xf16>, %b: tensor<128x64xf16>) -> tensor<64x64xf16> {
   %c = tensor.empty() : tensor<64x64xf16>
   %0 = linalg.matmul ins(%a, %b : tensor<64x128xf16>, tensor<128x64xf16>)
@@ -41,7 +41,7 @@ func.func @aligned_f16(%a: tensor<64x128xf16>, %b: tensor<128x64xf16>) -> tensor
 // CHECK-LABEL: func.func @f32_result
 // CHECK: hmx.pack_act
 // CHECK: hmx.pack_weight
-// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) {{.*}} -> tensor<2x2x16x32x2xf16>
 // CHECK: hmx.unpack_acc_f32
 // CHECK-NOT: hmx.unpack_acc
 // CHECK-NOT: arith.extf
@@ -264,7 +264,7 @@ func.func @map_between(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>,
 // CHECK-LABEL: func.func @f32_activation
 // CHECK: hmx.pack_act ins(%{{.*}}, %{{.*}}, %{{.*}} : tensor<64x128xf32>)
 // CHECK: hmx.pack_weight ins(%{{.*}}, %{{.*}}, %{{.*}} : tensor<128x64xf16>)
-// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+// CHECK: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) {{.*}} -> tensor<2x2x16x32x2xf16>
 // CHECK: hmx.unpack_acc
 func.func @f32_activation(%a: tensor<64x128xf32>, %b: tensor<128x64xf16>) -> tensor<64x64xf16> {
   %c = tensor.empty() : tensor<64x64xf16>
@@ -303,7 +303,7 @@ func.func @f32_operands(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> tensor<
 // CHECK: scf.for {{.*}} step {{.*}} iter_args({{.*}}) -> (tensor<4096x4096xf16>)
 // CHECK: tensor.extract_slice %arg0[%arg2, %c0] [512, 64] [1, 1] : tensor<4096x64xf16> to tensor<512x64xf16>
 // CHECK: hmx.pack_act
-// CHECK: hmx.matmul ins({{.*}} : tensor<16x2x16x32x2xf16>, tensor<128x2x16x32x2xf16>) outs({{.*}} : tensor<16x128x16x32x2xf16>) -> tensor<16x128x16x32x2xf16>
+// CHECK: hmx.matmul ins({{.*}} : tensor<16x2x16x32x2xf16>, tensor<128x2x16x32x2xf16>) outs({{.*}} : tensor<16x128x16x32x2xf16>) {{.*}} -> tensor<16x128x16x32x2xf16>
 // CHECK: tensor.insert_slice {{.*}} into %arg3[%arg2, %c0] [512, 4096] [1, 1] : tensor<512x4096xf16> into tensor<4096x4096xf16>
 func.func @large_shape_blocks(%a: tensor<4096x64xf16>, %b: tensor<64x4096xf16>) -> tensor<4096x4096xf16> {
   %c = tensor.empty() : tensor<4096x4096xf16>

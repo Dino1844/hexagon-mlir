@@ -86,6 +86,13 @@ public:
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
+    if (enableHexKL) {
+      moduleOp.emitError(
+          "enableHexKL is incompatible with the HMX v1 manifest contract: "
+          "HexKL consumes linalg.matmul before HMX attribution can record it");
+      signalPassFailure();
+      return;
+    }
     MLIRContext *context = moduleOp.getContext();
 
     setTargetTriple(moduleOp);
@@ -248,26 +255,19 @@ public:
       pm.addPass(createCanonicalizerPass());
     }
 
-    // HMX engine attribution, deliberately not behind a switch: the pass decides
-    // per op and a matmul it declines is left to the existing paths. It must run
-    // before lower-pack, which turns the crouton layouts it seeds into data movement.
-    // The engine's operands live in VTCM, so the attribution only exists when
-    // this pipeline allocates it (the hexagonmem path); without that the pass
-    // refuses, rather than placing croutons where the engine cannot read them.
+    // HMX engine attribution is always scheduled so the module manifest
+    // describes every linalg.matmul, including runs that intentionally keep
+    // manual buffer management. The normal path rewrites eligible matmuls;
+    // without bufferization the same tally runs in record-only mode, with VTCM
+    // capability disabled, so it cannot leave an hmx.matmul that HmxToLLVM
+    // could not lower. Attribution stays before lower-pack, which turns the
+    // crouton layouts it seeds into data movement.
     mlir::hmx::MatmulToHmxOptions matmulToHmxOpts;
-    matmulToHmxOpts.vtcmAllocator = enableConvertToHexagonmem;
-    // Attribution is gated on the same condition as the tile level below
-    // (`weight-resident` / `hmx-partition` / `hmx-workspace-resident` all live
-    // inside `if (enableBufferization)`): `hmx.matmul` has no other consumer --
-    // HmxToLLVMPass marks the dialect illegal and has no MatmulOp pattern, and
-    // nothing erases it -- so attributing while bufferization is off leaves IR
-    // that cannot be lowered (compile failure, possibly an assert on
-    // cast<MemRefType> of a tensor). Must stay before `lower-pack` (below), so
-    // it cannot simply move into that block.
-    if (enableBufferization) {
-      pm.addNestedPass<func::FuncOp>(
-          mlir::hmx::createMatmulToHmxPass(matmulToHmxOpts));
-    }
+    matmulToHmxOpts.recordOnly = !enableBufferization;
+    matmulToHmxOpts.vtcmAllocator =
+        enableBufferization && enableConvertToHexagonmem;
+    pm.addNestedPass<func::FuncOp>(
+        mlir::hmx::createMatmulToHmxPass(matmulToHmxOpts));
     pm.addPass(createCanonicalizerPass());
 
     // enableMatmulToConv and enableSeedLayoutConversions are supposed to be set

@@ -84,15 +84,39 @@ struct HmxTarget {
     return elem.isF16() || elem.isF32();
   }
 
+  /// The single capability query behind both attribution and its diagnostics.
+  /// Keeping the refusal here prevents the pass from growing a second copy of
+  /// the engine contract merely to explain it.
+  enum class ContractionRefusal {
+    None,
+    UnsupportedDType,
+    MinRows,
+    TileAlignment,
+  };
+
+  struct ContractionDecision {
+    ContractionRefusal refusal = ContractionRefusal::None;
+
+    bool supported() const { return refusal == ContractionRefusal::None; }
+    explicit operator bool() const { return supported(); }
+  };
+
+  ContractionDecision queryContraction(int64_t m, int64_t n, int64_t k,
+                                      Type lhsElem, Type rhsElem,
+                                      Type outElem) const {
+    if (!isContractionOperand(lhsElem) || !isContractionOperand(rhsElem) ||
+        (!outElem.isF16() && !outElem.isF32()))
+      return {ContractionRefusal::UnsupportedDType};
+    if (m <= minRows)
+      return {ContractionRefusal::MinRows};
+    if (m % tileEdge != 0 || n % tileEdge != 0 || k % tileEdge != 0)
+      return {ContractionRefusal::TileAlignment};
+    return {};
+  }
+
   bool supportsContraction(int64_t m, int64_t n, int64_t k, Type lhsElem,
                            Type rhsElem, Type outElem) const {
-    if (!isContractionOperand(lhsElem) || !isContractionOperand(rhsElem))
-      return false;
-    if (!outElem.isF16() && !outElem.isF32())
-      return false;
-    if (m <= minRows)
-      return false;
-    return m % tileEdge == 0 && n % tileEdge == 0 && k % tileEdge == 0;
+    return queryContraction(m, n, k, lhsElem, rhsElem, outElem).supported();
   }
 
   /// How the crouton bridge pays for its residency: the M extent it walks in

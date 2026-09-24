@@ -15,7 +15,7 @@ from triton.backends.qcom_hexagon_backend.triton_hexagon_launcher import (
     HexagonUtils,
 )
 from triton.backends.qcom_hexagon_backend.utils import make_profiled_return
-from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata
+from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata_fields
 
 
 def getHexagonLauncherClass(device_type="dsp"):
@@ -41,7 +41,7 @@ def getHexagonLauncherClass(device_type="dsp"):
             # Validated once, then read by name: a positional tuple made every
             # appended field shift these indices silently, and `len(x) > i`
             # turned a stale cached JSON into "treat the feature as off".
-            pack_metadata = require_pack_metadata(args[5])
+            pack_metadata = require_pack_metadata_fields(args[5])
             unstructured_return_types = pack_metadata["return_types"]
             return_profs = [
                 make_profiled_return(ret) for ret in unstructured_return_types

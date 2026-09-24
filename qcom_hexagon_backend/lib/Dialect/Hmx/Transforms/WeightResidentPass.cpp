@@ -57,6 +57,7 @@
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -329,6 +330,22 @@ static BlockArgument underlyingDenseArgument(Value v) {
   return {};
 }
 
+/// The host contract addresses tensor arguments by their tensor ordinal, not by
+/// the raw MLIR argument number (scalars may precede tensors). Keep that ABI in
+/// one place so compiler and launcher cannot silently drift.
+static std::optional<int64_t> tensorArgumentSlot(func::FuncOp func,
+                                                  BlockArgument target) {
+  int64_t slot = 0;
+  for (BlockArgument arg : func.getArguments()) {
+    if (!isa<RankedTensorType, MemRefType, UnrankedMemRefType>(arg.getType()))
+      continue;
+    if (arg == target)
+      return slot;
+    ++slot;
+  }
+  return std::nullopt;
+}
+
 /// True when `v` is provably a multiple of `factor`, for the small affine forms
 /// a program-id offset takes (`pid * BN`, sums of such). The subview that reads
 /// one N block of the resident weight is indexed in croutons, so the block
@@ -453,6 +470,10 @@ struct WeightResidentPass
   }
 
   void runOnOperation() override {
+    // Resident prepack declarations and aggregate bytes are module state; the
+    // nested function pass may otherwise race sibling functions.
+    std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
+
     func::FuncOp func = cast<func::FuncOp>(getOperation());
     ModuleOp module = func->getParentOfType<ModuleOp>();
     if (!module)
@@ -579,7 +600,12 @@ struct WeightResidentPass
         }
         if (arg.getOwner() != &func.getBody().front())
           continue;
-        int64_t slot = arg.getArgNumber();
+        std::optional<int64_t> tensorSlot = tensorArgumentSlot(func, arg);
+        if (!tensorSlot) {
+          op.emitError("resident weight argument is not a tensor argument");
+          return signalPassFailure();
+        }
+        int64_t slot = *tensorSlot;
 
         Value resident = residentBySlot.lookup(slot);
         // One resident per slot: if the same argument resolved to a different

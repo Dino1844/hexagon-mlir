@@ -433,7 +433,16 @@ class HexagonLauncherBase:
         # contract, the kernel reads these arguments as crouton arrays and will
         # not pack them itself, so the bytes written here must already be in
         # crouton order. `WeightPrepack` is keyed by slot and cached by content.
+        # The generic Torch-MLIR wrapper has no P2 contract and keeps raw inputs.
         prepack = getattr(wrapper, "weight_prepack", None)
+        consumed_slots = set()
+        if prepack is not None and prepack.function_name is not None:
+            canonical_name = file_name.removeprefix("_mlir_ciface_")
+            if prepack.function_name not in (file_name, canonical_name):
+                raise RuntimeError(
+                    f"weight_prepack function {prepack.function_name!r} does not "
+                    f"match launcher function {file_name!r}"
+                )
 
         for inp in wrapper.input_profs:
             if inp.input_type == "tensor":
@@ -442,18 +451,25 @@ class HexagonLauncherBase:
                 input_path = os.path.join(directory, f"{file_name}_t{i}.raw")
                 payload = None
                 if prepack is not None and prepack.has_slot(i):
+                    consumed_slots.add(i)
                     payload = prepack.pack(data, i)
                     if payload is None:
-                        print(
-                            f"==> warning: weight slot {i} does not match its "
-                            f"prepack contract; writing row-major bytes while "
-                            f"the kernel expects a crouton image"
+                        raise RuntimeError(
+                            f"weight slot {i} has a prepack contract but no packed image"
                         )
                 if payload is None:
                     payload = data.numpy().tobytes()
                 with open(input_path, "wb") as file:
                     file.write(payload)
                 input_paths.append(input_path)
+
+        if prepack is not None:
+            missing = prepack.unconsumed_slots(consumed_slots)
+            if missing:
+                raise RuntimeError(
+                    f"weight_prepack contract has unconsumed argument slots: "
+                    f"{sorted(missing)}"
+                )
 
         # The output path count is provided by the frontend. There are
         # several cases (writing back ptrs, return values, or both)
