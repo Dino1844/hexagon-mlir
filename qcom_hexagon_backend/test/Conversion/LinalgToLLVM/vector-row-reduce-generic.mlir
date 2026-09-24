@@ -117,7 +117,7 @@ func.func @generic_non_fold_body(%src: memref<32xf32>, %dst: memref<f32>) {
 func.func @skip_generic_rowmax(%src: tensor<32xf32>, %out: tensor<f32>) -> tensor<f32> {
   %init = arith.constant 0.000000e+00 : f32
   %o = tensor.empty() : tensor<f32>
-  %fill = tensor.fill %init, %o : tensor<f32>
+  %fill = linalg.fill ins(%init : f32) outs(%o : tensor<f32>) -> tensor<f32>
   %0 = linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
                        iterator_types = ["reduction"]}
       ins(%src : tensor<32xf32>) outs(%fill : tensor<f32>) {

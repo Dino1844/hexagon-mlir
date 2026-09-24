@@ -42,6 +42,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/Transforms/RequestCWrappers.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/Passes.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Dialect/MemRef/Transforms/Passes.h"
@@ -66,6 +67,25 @@ using namespace hexagon;
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h.inc"
 
 namespace {
+
+bool hasTensorValue(Operation *op) {
+  for (Value value : op->getOperands())
+    if (isa<RankedTensorType, UnrankedTensorType>(value.getType()))
+      return true;
+  for (Value value : op->getResults())
+    if (isa<RankedTensorType, UnrankedTensorType>(value.getType()))
+      return true;
+  return false;
+}
+
+bool containsTensorLinalgOp(ModuleOp module) {
+  bool found = false;
+  module.walk([&](linalg::LinalgOp op) {
+    if (hasTensorValue(op.getOperation()))
+      found = true;
+  });
+  return found;
+}
 
 struct LinalgToLLVMPass : public ::impl::LinalgToLLVMBase<LinalgToLLVMPass> {
 public:
@@ -93,6 +113,20 @@ public:
       signalPassFailure();
       return;
     }
+
+    // The record-only path is intentionally available to hand-written memref
+    // IR, but it cannot translate the tensor ABI produced by Triton: the HVX
+    // pipeline needs a bufferized memref entry before it can lower the op. Do
+    // this check at the translation boundary, over every Linalg operation, so
+    // batch/generic tensor paths cannot evade the guard via rank reduction.
+    if (!enableBufferization && containsTensorLinalgOp(moduleOp)) {
+      moduleOp.emitError(
+          "tensor-valued Linalg operations require enableBufferization=true; "
+          "the no-bufferization path accepts manually managed memrefs only");
+      signalPassFailure();
+      return;
+    }
+
     MLIRContext *context = moduleOp.getContext();
 
     setTargetTriple(moduleOp);

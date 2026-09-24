@@ -32,6 +32,28 @@ namespace hmx {
 /// hand-off never depends on location metadata.
 inline constexpr StringLiteral kHmxDecisionIdAttr = "hmx.decision_id";
 
+/// Canonical v1 attribution reason vocabulary. Keep this as the single C++
+/// vocabulary shared by the producer and manifest validator; Python's
+/// transport validator mirrors the wire names for its independent boundary.
+inline constexpr StringLiteral kHmxReasonSelected = "selected";
+inline constexpr StringLiteral kHmxReasonLibraryCall = "library-call";
+inline constexpr StringLiteral kHmxReasonVtcmAllocatorDisabled =
+    "vtcm-allocator-disabled";
+inline constexpr StringLiteral kHmxReasonNonRank2 = "non-rank-2";
+inline constexpr StringLiteral kHmxReasonDynamicShape = "dynamic-shape";
+inline constexpr StringLiteral kHmxReasonUnsupportedDType = "unsupported-dtype";
+inline constexpr StringLiteral kHmxReasonMinRows = "min-rows";
+inline constexpr StringLiteral kHmxReasonTileAlignment = "tile-alignment";
+inline constexpr StringLiteral kHmxReasonVtcmBudget = "vtcm-budget";
+
+inline bool isCanonicalHmxMatmulReason(StringRef reason) {
+  return reason == kHmxReasonSelected || reason == kHmxReasonLibraryCall ||
+         reason == kHmxReasonVtcmAllocatorDisabled ||
+         reason == kHmxReasonNonRank2 || reason == kHmxReasonDynamicShape ||
+         reason == kHmxReasonUnsupportedDType || reason == kHmxReasonMinRows ||
+         reason == kHmxReasonTileAlignment || reason == kHmxReasonVtcmBudget;
+}
+
 /// Shared lock for passes that read or write module-level HMX state while
 /// nested under independently scheduled func.func operations.
 std::mutex &hmxModuleStateMutex();

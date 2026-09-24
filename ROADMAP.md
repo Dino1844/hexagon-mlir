@@ -50,8 +50,8 @@ Triton → TTIR → triton-shared / Linalg
 | 稳态 vs llama.cpp 手写（WR 默认开） | **S1 1.13× / S2 0.92× / S3 0.58×**（S2/S3 已快过手写） |
 | FlashAttention | 稳态 **32.4 → 17.4 ms（1.86×，f32 激活 ABI）**；仓库 FA 测试 **18312 → 8184 µs**（NUM_THREADS 4→1）；评审引述 39.4 → 18.1 ms 未复测 |
 | 常用算子 | `vec_add` 快手写 4.8×、`matmul` 1.15×、softmax/rms_norm 见 `docs/results/op-steady-state-2026-09-21.md` |
-| host 门 | 手动 lit **191：189 过 / 1 既存红（顺序敏感，与本线正交）/ 1 skip** |
-| 仓库状态 | `b947063`（2026-09-23，双评审收口后提交并推送 fork `hmx`）；补丁 157 files / 267 hunks 无损 |
+| host 门 | full manual lit **198：197 过 / 0 失败 / 1 skip**（`vector_size.mlir` 的 `REQUIRES`；P0.3 复审后重跑） |
+| 仓库状态 | inner `HEAD=4410d12`（P0 manifest 已提交）；P0.3 工作树未提交；按要求未重生成 stored patch |
 
 ---
 
@@ -59,9 +59,9 @@ Triton → TTIR → triton-shared / Linalg
 
 1. **HMX 适用面窄**：rank-2、静态、M/N/K 32 对齐、f16/f32、accumulator 可证明为空、VTCM 放得下（`MatmulToHmxPass` 合法性谓词 + `HmxTarget` 能力表）。非对齐 / 动态 shape / 非标 contraction / int8·bf16·fp8 / 复杂 mask·padding / 多 matmul 预算不足 ⇒ **编译成功但退回 HVX/Linalg，性能不等于 HMX**。且 f32 经 pack 量化到 f16、读出再 widen——是**相对误差预算语义，不是 bit-exact fp32**。
 2. **融合是保守白名单**：仅 all-parallel、单入单出、全 f16、add/sub/mul/div、常量 splat、单一使用者；reduction / mask·cmpi·select / exp·log·sqrt / 类型转换 / max·min / 多用户 producer 一律不进（有设备测量依据：mask/phi/exp 链搬进 crouton 序可能慢 ~10×）。⇒ FA 中只有 QK·PV 两个 dot 有机会走 HMX，softmax 链仍是断点，做不到整块 attention 融合。
-3. **前端仍是实验性入口**：实际走 `triton-shared-opt --triton-to-linalg-experimental`；缺支持矩阵、不支持语法的诊断、按 shape 的策略选择、cost model、HMX/HVX/HexKL 统一决策器（`compiler.py` 自注需重构为动态 pass pipeline）。
+3. **前端仍是实验性入口**：实际走 `triton-shared-opt --triton-to-linalg-experimental`；已有 v1 文档支持矩阵（`docs/codegen/triton-support-matrix.md`），但前端自动查询、按 shape 的策略选择、cost model、HMX/HVX/HexKL 统一决策器仍未接入（`compiler.py` 自注需重构为动态 pass pipeline）。
 4. **单资源 ≠ 并行扩展**：Triton grid 并行 ≠ HMX engine 并行；多线程最终在 runtime HMX lock 处串行化（线程路径已四次证伪），workspace-resident 明确要求 single-instance（grid>1 需自担风险，opt-in）。
-5. **成熟度**：R1（maxnum legalize）等上游 LLVM Hexagon 后端 RA bug 待修 ⇒ 默认 OFF；triage env 门保留待退役；1 条既存 lit 红；`docs/`、`tools/`、`AGENTS.md` 在工作区侧无版本控制。
+5. **成熟度**：R1（maxnum legalize）等上游 LLVM Hexagon 后端 RA bug 待修 ⇒ 默认 OFF；triage env 门保留待退役；full manual lit 当前 0 红、1 个 `REQUIRES` skip；`docs/`、`tools/`、`AGENTS.md` 在工作区侧无版本控制。
 
 ---
 
@@ -107,7 +107,7 @@ Triton → TTIR → triton-shared / Linalg
 - **前端**：`triton-to-linalg-experimental` → 支持矩阵 + 明确诊断；`compiler.py` pass pipeline 动态化（其自注 TODO）；
 - **上机纪律**：同构建 A/B、`libtriton.so` 与 `libhmxapi.a` **双指纹**、设备锁、判据 `max(3×CV,15%)`；
 - **流程**：每个行为改动过 **architecture-review + ai-slop-cleaner 双评审**（先例：`b947063`），writer/reviewer 分离；
-- **补丁**：改工作树后 `split_patch.py` 重生成（计数 157 files / 267 hunks 无损为当前基线）。
+- **补丁**：P0.2 基线 stored patch 已校验；P0.3 当前工作树尚未重生成 patch（doctor 明确报 `167 files / 287 hunks` vs stored `151 / 260`），不得为消除门红灯自动改 patch。
 
 ---
 
@@ -126,10 +126,12 @@ Triton → TTIR → triton-shared / Linalg
 
 | 阶段 | 主题 | 解锁能力 | 状态 |
 |---|---|---|---|
-| P0 | manifest + 支持矩阵 + 记档收口 + 清理 | 可解释、可维护、门真绿 | 规划中 |
+| P0 | manifest + 支持矩阵 + 记档收口 + 清理 | 可解释、可维护、门真绿 | P0.2 manifest 已完成；P0.3 支持矩阵已复审，待用户批准提交 |
 | P1 | 动态 shape/tail + dtype 契约 + 大 shape 记账 | 任意 shape、更多 dtype 可用 | 部分已落（M 分块 ✅） |
 | P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
+
+> **当前状态（2026-09-24）**：P0.2 manifest 已在 `4410d12` 提交；P0.3 支持矩阵已建立于 `docs/codegen/triton-support-matrix.md`，采用 module 两态 + matmul record 两态的两层四态模型，并补了 mixed/f32 contract、多条件 priority、显式 tensor/no-bufferization reject、固定 metadata fixture 与多 `RUN` runner 覆盖。full manual lit 当前 `197/198` 通过、`vector_size.mlir` 因 `REQUIRES` 显式 skip；P0.3 尚未 commit，等待用户批准。
 
 ---
 
@@ -209,8 +211,8 @@ P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specializat
 
 ## 附 · 评审勘误（2026-09-23，本 fork 事实更新）
 
-1. 评审时"工作树不干净、仍有未提交的 crash-triage 改动"→ **已解决**：`b947063` 全部提交，且经 architecture-review + ai-slop-cleaner 双评审收口（2 Critical + 4 Major + 全部 Minor 修复后入库）。
-2. 评审引"184 个 lit"→ 现为 **191（189 过 / 1 既存红 / 1 skip）**。
+1. 评审时"工作树不干净、仍有未提交的 crash-triage 改动"→ **P0.2 已解决**：`b947063` 之后又有 P0 manifest commit `4410d12`；当前 P0.3 仍按用户要求未提交，且已完成独立复审。
+2. 评审引"184 个 lit"→ 当前 P0.3 full manual lit 为 **198（197 过 / 0 失败 / 1 `REQUIRES` skip）**。
 3. 上游 README 的 "Matrix Processing (experimental) via HexKL" → 本 fork 主线是 **`hmx` 方言**；hexkl 路径依 ADR-001 保持 inert。
 4. FlashAttention 39.4 → 18.1 ms 为评审引述，未本轮复测；本页表内数字以我方同构建 A/B 记录为准。
 

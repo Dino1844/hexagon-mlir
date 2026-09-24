@@ -42,7 +42,7 @@
 // BUF-NOT: tensor<
 // DROP-LABEL: func.func @aligned_f16
 // DROP-NOT: #hmx
-// DROP: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+// DROP: hmx.matmul ins(%{{.*}}, %{{.*}} : tensor<2x4x16x32x2xf16>, tensor<2x4x16x32x2xf16>) outs(%{{.*}} : tensor<2x2x16x32x2xf16>) {hmx.decision_id = 0 : i64} -> tensor<2x2x16x32x2xf16>
 // DROP-NOT: #hmx
 func.func @aligned_f16(%a: tensor<64x128xf16>, %b: tensor<128x64xf16>) -> tensor<64x64xf16> {
   %c = tensor.empty() : tensor<64x64xf16>

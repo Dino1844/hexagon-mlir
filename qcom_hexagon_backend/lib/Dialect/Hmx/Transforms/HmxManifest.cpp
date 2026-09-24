@@ -59,14 +59,6 @@ constexpr StringLiteral kKeyUnpackSites = "unpack_sites";
 constexpr StringLiteral kKeyCountSemantics = "count_semantics";
 constexpr StringLiteral kCountSemantics = "ir_sites";
 
-bool isCanonicalMatmulReason(StringRef reason) {
-  return reason == "selected" || reason == "library-call" ||
-         reason == "vtcm-allocator-disabled" || reason == "non-rank-2" ||
-         reason == "dynamic-shape" || reason == "unsupported-dtype" ||
-         reason == "min-rows" || reason == "tile-alignment" ||
-         reason == "vtcm-budget";
-}
-
 bool isCanonicalPipelineReason(StringRef reason) {
   return reason == "serial-requested" || reason == "no-row-major-bridge" ||
          reason == "extra-activation-reader" ||
@@ -119,11 +111,11 @@ LogicalResult validateRecord(ModuleOp module, DictionaryAttr record,
     return emitManifestError(module, report,
                              "HMX manifest record has no valid engine");
   StringAttr reason = stringField(kKeyReason);
-  if (!reason || !isCanonicalMatmulReason(reason.getValue()))
+  if (!reason || !isCanonicalHmxMatmulReason(reason.getValue()))
     return emitManifestError(module, report,
                              "HMX manifest record has no canonical reason");
   if ((engine.getValue().str() == "hmx") !=
-      (reason.getValue().str() == "selected"))
+      (reason.getValue().str() == kHmxReasonSelected))
     return emitManifestError(
         module, report,
         "HMX manifest engine and reason disagree on attribution");

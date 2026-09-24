@@ -40,10 +40,10 @@
 //     constant into a prepacked constant at compile time, so W never costs a
 //     runtime pack.
 //
-// The accumulator is the engine's, and it is fp16: the read-out produces an fp16
-// crouton. A matmul that must accumulate in f32 is therefore NOT this engine's
-// -- silently accumulating in fp16 would be a precision change the frontend did
-// not ask for.
+// The engine's read-out is an fp16 crouton. f32 source and result values are
+// admitted as a quantization/widening ABI: the pack leaf materializes f16
+// croutons and the fused tail reads them back as f32. This is not bit-exact
+// fp32 accumulation; callers requiring that semantic belong outside v1.
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"
@@ -132,23 +132,23 @@ enum class MatmulReason {
 StringRef reasonCode(MatmulReason reason) {
   switch (reason) {
   case MatmulReason::Selected:
-    return "selected";
+    return kHmxReasonSelected;
   case MatmulReason::LibraryCall:
-    return "library-call";
+    return kHmxReasonLibraryCall;
   case MatmulReason::VtcmAllocatorDisabled:
-    return "vtcm-allocator-disabled";
+    return kHmxReasonVtcmAllocatorDisabled;
   case MatmulReason::NonRank2:
-    return "non-rank-2";
+    return kHmxReasonNonRank2;
   case MatmulReason::DynamicShape:
-    return "dynamic-shape";
+    return kHmxReasonDynamicShape;
   case MatmulReason::UnsupportedDType:
-    return "unsupported-dtype";
+    return kHmxReasonUnsupportedDType;
   case MatmulReason::MinRows:
-    return "min-rows";
+    return kHmxReasonMinRows;
   case MatmulReason::TileAlignment:
-    return "tile-alignment";
+    return kHmxReasonTileAlignment;
   case MatmulReason::VtcmBudget:
-    return "vtcm-budget";
+    return kHmxReasonVtcmBudget;
   }
   llvm_unreachable("unknown HMX manifest reason");
 }

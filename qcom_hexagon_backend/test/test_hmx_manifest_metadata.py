@@ -2,11 +2,13 @@
 
 import importlib.util
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
 
 from triton.backends.qcom_hexagon_backend.compiler import HexagonBackend
+from triton.backends.qcom_hexagon_backend.hexagon_options import HexagonOptions
 from triton._C.libtriton import ir, qcom_hexagon_backend  # type: ignore
 
 
@@ -308,6 +310,57 @@ class TranslationMetadataTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "slot"):
             HexagonBackend.pack_metadata(object(), invalid_weight)
+
+    def test_unknown_manifest_reason_is_rejected(self):
+        manifest = json.loads(json.dumps(_MANIFEST))
+        manifest["matmuls"][1]["reason"] = "future-unknown-reason"
+        with self.assertRaisesRegex(ValueError, "canonical HMX reason"):
+            _UTILS.validate_hmx_manifest(manifest)
+
+    def test_every_canonical_manifest_reason_is_accepted(self):
+        for reason in _UTILS.HMX_MANIFEST_REASONS:
+            with self.subTest(reason=reason):
+                manifest = json.loads(json.dumps(_MANIFEST))
+                if reason == "selected":
+                    manifest["matmuls"][0]["reason"] = reason
+                else:
+                    manifest["matmuls"][1]["reason"] = reason
+                _UTILS.validate_hmx_manifest(manifest)
+
+    def test_python_reason_allowlist_matches_cpp_vocabulary(self):
+        backend_root = _HERE.parents[1]
+        header_path = backend_root / "include/hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+        producer_path = backend_root / "lib/Dialect/Hmx/Transforms/MatmulToHmxPass.cpp"
+        header_text = header_path.read_text()
+        reason_constants = dict(
+            re.findall(r"\b(kHmxReason\w+)\s*=\s*\"([^\"]+)\"", header_text)
+        )
+        canonical_body = header_text.split(
+            "inline bool isCanonicalHmxMatmulReason", 1
+        )[1].split("\n}", 1)[0]
+        producer_text = producer_path.read_text()
+        for name in reason_constants:
+            with self.subTest(constant=name):
+                self.assertIn(name, canonical_body)
+                self.assertIn(f"return {name};", producer_text)
+        self.assertEqual(set(reason_constants.values()), _UTILS.HMX_MANIFEST_REASONS)
+
+    def test_cpp_api_rejects_unconsumed_prepack_without_meta(self):
+        fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"
+        options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
+        options["enableWeightResident"] = "True"
+
+        def translate(name):
+            context = ir.context()
+            qcom_hexagon_backend.load_dialects(context)
+            module = qcom_hexagon_backend.parse_mlir_module_from_str(
+                (fixture_root / name).read_text(), context
+            )
+            return qcom_hexagon_backend.translate_linalg_to_obj(module, options, False)
+
+        translate("hmx-weight-resident-pipeline.mlir")
+        with self.assertRaisesRegex(RuntimeError, "runtime weight-prepack contract"):
+            translate("hmx-weight-resident-runtime-pipeline.mlir")
 
     def test_cpp_api_rejects_malformed_prepack_attributes(self):
         for attr in ('hmx.weight_prepack = ""', 'hmx.weight_prepack = 1 : i32'):

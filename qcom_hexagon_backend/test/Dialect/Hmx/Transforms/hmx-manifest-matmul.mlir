@@ -6,7 +6,10 @@
 //   https://github.com/qualcomm/hexagon-mlir/LICENSE.txt
 //
 //===----------------------------------------------------------------------===//
-// Every original linalg.matmul owns one function-local record. Selected records
+// This is the canonical host-side fixture for
+// docs/codegen/triton-support-matrix.md: each prefix is one matrix row or
+// transport boundary. Every original linalg.matmul owns one function-local
+// record. Selected records
 // carry the target/budget decision; HVX records carry the first canonical reason
 // that kept the op on the existing path. Bridge counts are static IR sites, not
 // launch-time call counts.
@@ -15,6 +18,8 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx))' -split-input-file | FileCheck %s --check-prefix=SELECTED
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx))' -split-input-file | FileCheck %s --check-prefix=BLOCKED
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx))' -split-input-file | FileCheck %s --check-prefix=REFUSALS
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx))' -split-input-file | FileCheck %s --check-prefix=MIXED
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx))' -split-input-file | FileCheck %s --check-prefix=F32
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx{vtcm-budget=10000}))' -split-input-file | FileCheck %s --check-prefix=BUDGET
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx{vtcm-allocator=false}))' -split-input-file | FileCheck %s --check-prefix=ALLOC
 //===----------------------------------------------------------------------===//
@@ -100,7 +105,7 @@ module {
 
 // -----
 
-// The four HVX decisions remain four records in deterministic function-local
+// The five HVX decisions remain five records in deterministic function-local
 // walk order. This is the duplicate-counting guard: the greedy driver may ask
 // the pattern repeatedly, but these ids are created before it starts.
 // REFUSALS: hmx.kernel_manifest = {
@@ -112,10 +117,13 @@ module {
 // REFUSALS: reason = "library-call"
 // REFUSALS: }, {engine = "hvx", function = "refusals", id = 3 : i64
 // REFUSALS: reason = "dynamic-shape"
+// REFUSALS: }, {engine = "hvx", function = "refusals", id = 4 : i64
+// REFUSALS: reason = "min-rows"
 module {
   func.func @refusals(%a: tensor<64x31xf16>, %b: tensor<31x64xf16>,
                       %d: tensor<64x64xf64>, %e: tensor<64x64xf64>,
-                      %x: tensor<?x31xf16>, %n: index) -> (tensor<64x64xf16>, tensor<64x64xf64>, tensor<64x64xf16>, tensor<?x64xf16>) {
+                      %x: tensor<?x31xf16>, %small_a: tensor<2x64xf16>,
+                      %small_b: tensor<64x64xf16>, %n: index) -> (tensor<64x64xf16>, tensor<64x64xf64>, tensor<64x64xf16>, tensor<?x64xf16>, tensor<2x64xf16>) {
     %c0 = tensor.empty() : tensor<64x64xf16>
     %m0 = linalg.matmul ins(%a, %b : tensor<64x31xf16>, tensor<31x64xf16>)
                        outs(%c0 : tensor<64x64xf16>) -> tensor<64x64xf16>
@@ -132,7 +140,10 @@ module {
     %c3 = tensor.empty(%n) : tensor<?x64xf16>
     %m3 = linalg.matmul ins(%x, %b : tensor<?x31xf16>, tensor<31x64xf16>)
                        outs(%c3 : tensor<?x64xf16>) -> tensor<?x64xf16>
-    return %m0, %m1, %m2, %m3 : tensor<64x64xf16>, tensor<64x64xf64>, tensor<64x64xf16>, tensor<?x64xf16>
+    %small_c = tensor.empty() : tensor<2x64xf16>
+    %m4 = linalg.matmul ins(%small_a, %small_b : tensor<2x64xf16>, tensor<64x64xf16>)
+                       outs(%small_c : tensor<2x64xf16>) -> tensor<2x64xf16>
+    return %m0, %m1, %m2, %m3, %m4 : tensor<64x64xf16>, tensor<64x64xf64>, tensor<64x64xf16>, tensor<?x64xf16>, tensor<2x64xf16>
   }
 }
 
@@ -152,5 +163,51 @@ module {
     %0 = linalg.matmul ins(%a, %b : tensor<64x64xf16>, tensor<64x64xf16>)
                        outs(%c : tensor<64x64xf16>) -> tensor<64x64xf16>
     return %0 : tensor<64x64xf16>
+  }
+}
+
+// -----
+
+// A module may contain both decisions. The manifest is a list of per-matmul
+// records; it must not collapse the module into an invented "mixed" state.
+// MIXED: matmuls = [{{.*}}engine = "hmx", function = "mixed", id = 0 : i64
+// MIXED-SAME: reason = "selected"
+// MIXED-SAME: }, {engine = "hvx", function = "mixed", id = 1 : i64
+// MIXED-SAME: reason = "tile-alignment"
+// MIXED-NOT: function = "mixed"
+// MIXED: hmx.matmul
+// MIXED: hmx.decision_id = 0 : i64
+module {
+  func.func @mixed(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>,
+                   %tail_a: tensor<64x31xf16>, %tail_b: tensor<31x64xf16>)
+      -> (tensor<64x64xf16>, tensor<64x64xf16>) {
+    %c0 = tensor.empty() : tensor<64x64xf16>
+    %m0 = linalg.matmul ins(%a, %b : tensor<64x64xf16>, tensor<64x64xf16>)
+                       outs(%c0 : tensor<64x64xf16>) -> tensor<64x64xf16>
+    %c1 = tensor.empty() : tensor<64x64xf16>
+    %m1 = linalg.matmul ins(%tail_a, %tail_b : tensor<64x31xf16>, tensor<31x64xf16>)
+                       outs(%c1 : tensor<64x64xf16>) -> tensor<64x64xf16>
+    return %m0, %m1 : tensor<64x64xf16>, tensor<64x64xf16>
+  }
+}
+
+// -----
+
+// f32 source and result values are part of the same v1 contract. The manifest
+// records the source element types even though the engine croutons are f16.
+// F32: hmx.kernel_manifest = {
+// F32: engine = "hmx"
+// F32: function = "f32_contract"
+// F32: lhs_elem = "f32"
+// F32: out_elem = "f32"
+// F32: reason = "selected"
+// F32: rhs_elem = "f32"
+// F32: hmx.matmul
+module {
+  func.func @f32_contract(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> tensor<64x64xf32> {
+    %c = tensor.empty() : tensor<64x64xf32>
+    %0 = linalg.matmul ins(%a, %b : tensor<64x64xf32>, tensor<64x64xf32>)
+                       outs(%c : tensor<64x64xf32>) -> tensor<64x64xf32>
+    return %0 : tensor<64x64xf32>
   }
 }
