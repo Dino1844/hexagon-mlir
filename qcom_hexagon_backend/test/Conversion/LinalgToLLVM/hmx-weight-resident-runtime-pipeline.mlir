@@ -25,9 +25,9 @@
 // CHECK-DAG: reason = "selected-aligned"
 // CHECK-DAG: weight_policies = [{consumers = [0], function = "runtime_weight", policy = "resident-prepack", reason = "eligible-aligned-f16", slot = 1 : i64}]
 // The runtime gets the argument's address; no per-launch pack leaf is emitted.
-// CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_weight_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
 // CHECK-LABEL: llvm.func @runtime_weight
-// CHECK: llvm.call @hexagon_runtime_weight_resident_dsp
+// CHECK: llvm.call @hexagon_runtime_weight_resident_v2_dsp
 // CHECK-NOT: llvm.call @hmx_pack_weight_f16
 module {
   func.func @runtime_weight(%a: tensor<64x64xf16>, %w: tensor<64x64xf16>) -> tensor<64x64xf16> {

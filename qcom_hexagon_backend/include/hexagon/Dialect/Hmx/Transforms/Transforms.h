@@ -33,6 +33,8 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>> createWeightResidentPass(
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHmxWorkspaceResidentPass();
 
+std::unique_ptr<Pass> createHmxVtcmAccountingPass();
+
 } // namespace hmx
 } // namespace mlir
 

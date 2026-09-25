@@ -8,6 +8,7 @@
 # ===------------------------------------------------------------------------===
 
 from pathlib import Path
+import hashlib
 import os, tempfile
 from datetime import datetime
 from typing import Optional
@@ -19,6 +20,19 @@ from triton._C.libtriton import qcom_hexagon_backend  # type: ignore
 # and it passes type-verification with mypy (a type checker).
 # To typecheck this set of files, do:
 # mypy compiler.py hexagon_executor.py hexagon_launcher_base.py torch_mlir_hexagon_launcher.py triton_hexagon_launcher.py --follow-untyped-imports --check-untyped-defs
+
+
+def make_resident_scope_id(kernel_obj: bytes, func_name: str) -> tuple[int, int]:
+    """Derive a stable 128-bit identity for one principal kernel object."""
+    digest = hashlib.sha256()
+    digest.update(len(kernel_obj).to_bytes(8, "little"))
+    digest.update(kernel_obj)
+    digest.update(func_name.encode("utf-8"))
+    raw = digest.digest()[:16]
+    return (
+        int.from_bytes(raw[:8], "little"),
+        int.from_bytes(raw[8:], "little"),
+    )
 
 
 class WrapperGeneratorStrings:
@@ -86,6 +100,9 @@ tr.save();
 #include "CRunnerUtils.cpp"
 #include "debug.h"
 #include "prof_utils.h"
+extern "C" int hexagon_runtime_resident_scope_enter_v2_dsp(uint64_t low64,
+                                                            uint64_t high64)
+    __attribute__((weak));
 """
 
         # Codegen string for the data structures and functions defined before the main body.
@@ -98,6 +115,7 @@ tr.save();
         # Codegen string for the contents of main body.
         self.code_body = """
 int main() {{
+{resident_scope_setup}
 {tensor_definition_str}
 {input_wrapper_structs_init}
 {result_struct_init}
@@ -120,7 +138,14 @@ return 0;
 
 class HexagonWrapperGenerator:
     def __init__(
-        self, input_profs, iterations, func_name, output_profs, common_strings, options
+        self,
+        input_profs,
+        iterations,
+        func_name,
+        output_profs,
+        common_strings,
+        options,
+        resident_scope_id: tuple[int, int] | None = None,
     ):
         """
         Initialize the HexagonWrapperGenerator instance.
@@ -137,6 +162,23 @@ class HexagonWrapperGenerator:
         self.output_profs = output_profs
         self.common_strings = common_strings
         self.enable_lwp = options["enableLWP"]
+        self.resident_scope_id = resident_scope_id
+
+    def generate_resident_scope_setup(self) -> str:
+        # The weak declaration is for ordinary kernels that do not pull the
+        # runtime module at all.  Any kernel that actually uses a resident-v2
+        # call has a strong reference to that ABI in its LLVM object, so the
+        # linker still fails closed if the runtime implementation is missing.
+        if self.resident_scope_id is None:
+            return ""
+        low64, high64 = self.resident_scope_id
+        return f"""
+if (hexagon_runtime_resident_scope_enter_v2_dsp != nullptr &&
+    hexagon_runtime_resident_scope_enter_v2_dsp(0x{low64:x}ULL, 0x{high64:x}ULL) != 0) {{
+  FARF(ERROR, "resident scope registration failed");
+  return -1;
+}}
+"""
 
     def generate_input_declarations(self):
         """
@@ -345,6 +387,7 @@ class HexagonWrapperGenerator:
 
     def generate_cpp_code_body(self, file_name, exec_dir) -> str:
         code_body = self.common_strings.code_body.format(
+            resident_scope_setup=self.generate_resident_scope_setup(),
             tensor_definition_str=self.generate_input_declarations(),
             input_wrapper_structs_init=self.generate_input_wrapper_structs_init(),
             result_struct_init=self.generate_result_struct_init(),

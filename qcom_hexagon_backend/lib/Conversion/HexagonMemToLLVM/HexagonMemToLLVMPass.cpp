@@ -109,9 +109,11 @@ static Value computeAllocationSize(MemRefType type,
   return sizeI32;
 }
 
-/// the 2 runtime call prototypes are :
-/// void* (size_t bytes, bool isVtcm) for memref type
-/// void* (size_t numBlocks, size_t blockSize, bool isVtcm) for crouton type
+/// the ordinary runtime allocation prototypes are:
+/// void* (size_t bytes, uint64_t alignment, bool isVtcm) for memref type
+/// void* (size_t numBlocks, size_t blockSize, uint64_t alignment, bool isVtcm)
+/// for crouton type. Resident allocations use the versioned ABI with
+/// key/source, bytes, and an i32 alignment in that order.
 static FailureOr<LLVM::LLVMFuncOp>
 getAllocFn(Operation *module, StringRef fnName,
            ConversionPatternRewriter &rewriter, bool isCroutonType) {
@@ -221,6 +223,12 @@ public:
       return success();
     }
 
+    // Keep the requested alignment on every VTCM allocation ABI.  The ordinary
+    // allocator already accepts it, while resident entries use a distinct
+    // versioned ABI so a 256-byte workspace cannot silently become a 128-byte
+    // buffer on its way through the resident lookup.
+    const uint64_t alignment = op.getAlignment();
+
     // A resident workspace skips the per-launch allocator entirely: the runtime
     // allocates the buffer on the first launch, pins it (the per-launch
     // deallocation was dropped by the marking pass), and returns the same
@@ -238,8 +246,8 @@ public:
       }
       FailureOr<LLVM::LLVMFuncOp> residentFn = LLVM::lookupOrCreateFn(
           rewriter, op->getParentOfType<ModuleOp>(),
-          "hexagon_runtime_workspace_resident_dsp",
-          {rewriter.getI64Type(), rewriter.getI32Type()},
+          "hexagon_runtime_workspace_resident_v2_dsp",
+          {rewriter.getI64Type(), rewriter.getI32Type(), rewriter.getI32Type()},
           getPtrTy(rewriter.getContext()));
       if (failed(residentFn))
         return failure();
@@ -250,8 +258,11 @@ public:
       Value keyValue = arith::ConstantOp::create(
           rewriter, loc, rewriter.getI64IntegerAttr(keyAttr.getInt()));
       Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
-      auto callOp = LLVM::CallOp::create(rewriter, loc, residentFn.value(),
-                                         ValueRange({keyValue, bytesValue}));
+      Value residentAlignmentValue =
+          getI32Constant(rewriter, loc, static_cast<int64_t>(alignment));
+      auto callOp = LLVM::CallOp::create(
+          rewriter, loc, residentFn.value(),
+          ValueRange({keyValue, bytesValue, residentAlignmentValue}));
 
       auto origMemRefType = mlir::cast<MemRefType>(type);
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
@@ -324,8 +335,9 @@ public:
 
       FailureOr<LLVM::LLVMFuncOp> residentFn = LLVM::lookupOrCreateFn(
           rewriter, op->getParentOfType<ModuleOp>(),
-          "hexagon_runtime_weight_resident_dsp",
-          {srcType, rewriter.getI32Type()}, getPtrTy(rewriter.getContext()));
+          "hexagon_runtime_weight_resident_v2_dsp",
+          {srcType, rewriter.getI32Type(), rewriter.getI32Type()},
+          getPtrTy(rewriter.getContext()));
       if (failed(residentFn))
         return failure();
       (*residentFn)->setAttr(
@@ -333,8 +345,11 @@ public:
           rewriter.getArrayAttr({rewriter.getStringAttr("noinline"),
                                  rewriter.getStringAttr("willreturn")}));
       Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
-      auto callOp = LLVM::CallOp::create(rewriter, loc, residentFn.value(),
-                                         ValueRange({src, bytesValue}));
+      Value residentAlignmentValue =
+          getI32Constant(rewriter, loc, static_cast<int64_t>(alignment));
+      auto callOp = LLVM::CallOp::create(
+          rewriter, loc, residentFn.value(),
+          ValueRange({src, bytesValue, residentAlignmentValue}));
 
       auto origMemRefType = mlir::cast<MemRefType>(type);
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
@@ -353,12 +368,8 @@ public:
       return success();
     }
 
-    Value alignmentValue;
-    auto alignmentAttr = op.getAlignment();
-    Type indexType = getIndexType();
-    alignmentValue =
-        createIndexAttrConstant(rewriter, loc, indexType, alignmentAttr);
-
+    Value alignmentValue = createIndexAttrConstant(
+        rewriter, loc, rewriter.getI64Type(), static_cast<int64_t>(alignment));
     auto allocFnName = getAllocFnName(isCroutonType, deviceType);
     FailureOr<LLVM::LLVMFuncOp> funcOp =
         getAllocFn(op->getParentWithTrait<OpTrait::SymbolTable>(), allocFnName,
@@ -397,6 +408,9 @@ public:
       mlir::LLVM::CallOp callOp = LLVM::CallOp::create(
           rewriter, loc, funcOp.value(),
           ValueRange({sizeAsI32, alignmentValue, isInVtcmValue}));
+      // The runtime pointer-returning ABI enforces a non-null result contract
+      // (allocation failure aborts before this point). Do not build a descriptor
+      // from an unchecked null result.
       auto memRefDescriptor = this->createMemRefDescriptor(
           loc, memRefType, callOp.getResult(), callOp.getResult(), sizes,
           strides, rewriter);

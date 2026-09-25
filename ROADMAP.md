@@ -50,8 +50,8 @@ Triton → TTIR → triton-shared / Linalg
 | 稳态 vs llama.cpp 手写（WR 默认开） | **S1 1.13× / S2 0.92× / S3 0.58×**（S2/S3 已快过手写） |
 | FlashAttention | 稳态 **32.4 → 17.4 ms（1.86×，f32 激活 ABI）**；仓库 FA 测试 **18312 → 8184 µs**（NUM_THREADS 4→1）；评审引述 39.4 → 18.1 ms 未复测 |
 | 常用算子 | `vec_add` 快手写 4.8×、`matmul` 1.15×、softmax/rms_norm 见 `docs/results/op-steady-state-2026-09-21.md` |
-| host 门 | full manual lit **198：197 过 / 0 失败 / 1 skip**（`vector_size.mlir` 的 `REQUIRES`；P0.3 复审后重跑） |
-| 仓库状态 | inner `HEAD=ca679fd`（P0.3 已提交并 push 到 `fork/hmx`）；按要求未重生成 stored patch |
+| host 门 | full manual lit **240：239 过 / 0 失败 / 1 skip**（`vector_size.mlir` 的 `REQUIRES`；P1.5 alignment/resident-v2 slice 后重跑） |
+| 仓库状态 | inner `HEAD=26bbba0`（P1.3c 已提交并 push 到 `fork/hmx`）；当前 P1.5 census/liveness slice 未提交，按要求未重生成 stored patch |
 
 ---
 
@@ -85,6 +85,55 @@ Triton → TTIR → triton-shared / Linalg
 | M2.3 | **动态 shape specialization**（差距③） | 在 M2.1/M2.2 之后实现四路选择：完整 HMX tile / HMX+tail / HVX fallback / 混合 kernel；选择结果写入 manifest，并纳入 Triton cache key | 动态 shape sweep 正确性全过；混合路径相对纯 fallback 的性能门槛和失败回退规则写入测试；编译失败与运行时回退可区分 |
 | M2.4 | **dtype 能力契约表** | 按 (dtype 对, 累加/读出位宽, 每操作数行走轴) 键化的 `HmxTarget` 契约；int8/bf16/fp8 **先 PRM/引擎能力调研再落** | 第二个 dtype 至少一条真机 A/B；"加能力只改一处"成立；不支持 dtype 必须有稳定诊断 |
 | M2.5 | **大 shape 常态化** | `planBridge` 的 M 分块已落；补**全 kernel VTCM 记账**，覆盖 resident weight、activation ring、accumulator、status、workspace 和其他 space-1 分配的生命周期 | 预算判定对整池成立；大 shape 进入标准批；manifest 能解释每一项 VTCM 占用 |
+
+> **P1.5 第一 slice（2026-09-25，未提交）**：内部 `hmx-vtcm-accounting` diagnostic pass 仍只在显式 marker 下运行，发布 raw allocation-site census；`hmx.diagnostic_vtcm_liveness` 另发独立 structured live-range。当前可证明范围包括 canonical source identity、nested single-block `scf.execute_region`、views/aliases、HMX DPS aliases、部分 scalar loop-carry、direct balanced dealloc 与 resident floor；call、async/DMA、dynamic extent、multi-block/plain CFG、pointer escape、region-carried VTCM、ambiguous identity/dealloc 和 external declaration 均显式 `incomplete/not-proven` 并 fail closed。两项结果不比较 VTCM budget、不写 manifest v2、不被 launcher 消费；runtime allocator/high-water、static↔runtime site join、content/general peak 与 schema 升级仍是 M2.5 未完成部分。
+
+> **M2.5 版本决策（2026-09-25）**：v2 `hex.hmx.kernel_manifest/v2` 继续逐字保持 bridge-only；v3 是新的 record-only wire schema，禁止从 v2 自动转换，需 coordinated envelope/cache/launcher migration，但不授权 production budget、`hmx-tail` 或 grid 决策；v4 延后到 full-kernel runtime evidence 完成后，才评审 production admission/budget gating。v3 不阻断已有 bridge-budgeted `full-hmx`，但阻断依赖 full-kernel facts 的 tail/cost-model 决策。当前 gate-ON allocation-only probe 已用四artifact manifest 连续 capture 两次（每次 6 pass / 8 not-proven / 0 fail），随后恢复 gate OFF；最终 gate-OFF SHA 与 tail build 一致。**但 site/runtime join、resident identity/content、完整 allocator model 与 production full-kernel tail gate 仍是 v3 promotion blockers。** 正式契约见 [`docs/hmx/hmx-v3-manifest-decision.md`](../docs/hmx/hmx-v3-manifest-decision.md)。
+
+> **P1.5 evidence closeout（2026-09-25）**：static identity sidecar、strict resident provenance、扩展后的 structured liveness、marker-gated `n_tile`、scratch 后 accounting、workspace manifest mutex、v2-only resident ABI 和严格四artifact probe manifest 已分别收口；legacy unversioned resident path 已删除。backend 全量 manual lit `269 passed / 0 failed / 1 skipped`（270 tests），metadata pytest `21 passed + 31 subtests`，runtime identity/resident-v2/Layer-B source contracts PASS，resident launcher pytest `2 passed`。host/source matrix 为 `13 pass / 14 not-proven / 0 fail`；两次 gate-ON device capture 均为 `6 pass / 8 not-proven / 0 fail`，capture 后 gate OFF 且 SHA 与最终 tail build 一致。最终 gate-OFF build 的 direct 19×5 tail matrix **95/95 PASS**、resident control **1/1 PASS**、0 correctness failure，2 次 transient 均恢复，证据为 `logs/hmx/tail-r-b1-final-m1-complete.json` 与 `logs/hmx/vtcm-probe-final2-device-evidence.json`；全部结果 `performance_claimed=false`。这只关闭当前 build 的 grid=1 correctness 与 process-level device evidence 子门；static↔runtime site join、resident content/address reuse、完整 allocator/header/peak model、multi-function/process scope 和 production full-kernel admission 仍未证明，因此 **R-A/R-B 不出口，R-C/v3 与 v4/production tail 不启动**。
+
+### M2.5-R：Evidence-before-manifest（当前唯一主线）
+
+**研究结论**：先冻结事实语义和证据，不先冻结 manifest wire schema。v3 只能在
+identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚一个阶段。
+
+#### R-A：Identity / Allocator 轨道
+
+- 冻结 `build_id / function_id / allocation_site_id / resident_scope_id`；
+  不记录 raw address。
+- 建立 static site ↔ runtime event 的 join；若 join 不可证明，则 v3 明确
+  aggregate-only，不生成 per-site observed。
+- 完成 resident key/content/process identity：同 key 不同 bytes/alignment/content、
+  多 module/process、cold/warm reuse 必须有明确接受或 fail-closed 结论。
+- 建立 requested / allocator-aligned / charged / resident 的单位和关系模型，
+  覆盖 128/256/2048 alignment、split/coalesce、free-cache 和 fragmentation。
+
+**出口**：同一 build/scope 的 host/runtime evidence 可复核，且每个未证明轴都有
+机器可读的 `not-proven/incomplete`；不要求先写 v3。
+
+#### R-B：Liveness / Tail 轨道
+
+- 将 structured-SCF 子集扩展到所有 function blocks、nested region、alias/view、
+  pointer escape、call、async/DMA、dynamic extent，并对未支持形状 fail closed。
+- 真实 production-shaped tail fixture：`grid=1`、M/N/K 单轴和组合 tail、
+  zero-pad、residual store、workspace/weight resident。
+- 先完成 correctness oracle 和边界矩阵；性能 A/B 只能在 correctness 闭合后开始。
+
+**出口**：host lit + device correctness 全部通过，且 tail 不依赖静默 HVX retry。
+
+#### R-C：Wire / Migration 轨道（依赖 A+B）
+
+- 先实现独立 internal facts/sidecar；不让 launcher 消费 diagnostic probe。
+- A/B 出口后，才实现 v3 producer、strict validator、Python consumer、envelope、
+  cache token 和 stale-cache 负例；禁止 `v2_to_v3()`。
+- v3 仍只记录，不授权 budget/tail/grid；v4 admission 另立评审。
+
+#### 并行与禁止项
+
+- A 与 B 在 fact contract 冻结后并行；C 必须等 A/B evidence。
+- 不新增 backend option，不向 v2 填 peak/workspace/observed 字段。
+- 不把 process high-water 归因到单 function/site，不用 `not-proven` 代替 0。
+- 不在 v3 record-only 上直接打开 production `hmx-tail`。
 
 ### 阶段三 · 统一决策与代价模型（P2 — 差距④）
 
@@ -131,7 +180,7 @@ Triton → TTIR → triton-shared / Linalg
 | P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
 
-> **当前状态（2026-09-24）**：P0.2 manifest 已在 `4410d12` 提交；P0.3 支持矩阵已建立于 `docs/codegen/triton-support-matrix.md`，采用 module 两态 + matmul record 两态的两层四态模型，并补了 mixed/f32 contract、多条件 priority、显式 tensor/no-bufferization reject、固定 metadata fixture 与多 `RUN` runner 覆盖。full manual lit 当前 `197/198` 通过、`vector_size.mlir` 因 `REQUIRES` 显式 skip；P0.3 已在 `ca679fd` 提交并 push 到 `fork/hmx`。
+> **当前状态（2026-09-25）**：P0.2 manifest 已在 `4410d12` 提交，P0.3 支持矩阵已在 `ca679fd` 提交并 push；P1.2/P1.3c 已在 `26bbba0` 提交并 push。当前工作树包含尚未提交的 P1.5 evidence slice：raw VTCM allocation-site census、marker-gated structured liveness、v2 bridge-only、v2-only resident ABI、严格 artifact manifest 和 diagnostic tail correctness bridge。host manual lit 为 `269 passed / 0 failed / 1 skipped`（270 tests），metadata pytest 为 `21 passed + 31 subtests`；host/source matrix 为 `13 pass / 14 not-proven / 0 fail`，两次 gate-ON device capture 均为 `6 pass / 8 not-proven / 0 fail`，最终 gate-OFF build 的 direct tail matrix 为 `95/95 PASS`、resident control 为 `1/1 PASS`，均为 `performance_claimed=false`。R-A/R-B 尚未出口；R-C/v3、v4 和 production `hmx-tail` 尚未启动。
 
 ---
 

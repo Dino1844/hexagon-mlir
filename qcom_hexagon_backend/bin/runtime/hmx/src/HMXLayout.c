@@ -612,7 +612,8 @@ static inline void hmx__unpack_f32_tile(unsigned dst_addr, unsigned res_addr,
                                         unsigned col, unsigned ncols,
                                         unsigned r0, unsigned r1,
                                         unsigned dst_rows, unsigned dst_stride,
-                                        unsigned res_stride, HVX_Vector one) {
+                                        unsigned res_stride, HVX_Vector one,
+                                        const int aligned) {
   /* Full-block read: one 128 B load holds rows (2j, 2j+1) interleaved as
    * [r0_0, r1_0, r0_1, r1_1, ...]. Widening via x1.0 is exact; .lo is row 0,
    * .hi is row 1 (the same split llama.cpp's transfer_output_chunk relies on).
@@ -640,16 +641,25 @@ static inline void hmx__unpack_f32_tile(unsigned dst_addr, unsigned res_addr,
     }
   }
 
-  if (ncols == HMX_TILE_COLS) {
+  if (ncols == HMX_TILE_COLS && aligned) {
     if (r0 < dst_rows)
       *(HVX_Vector *)(uintptr_t)(dst_addr + (r0 * dst_stride + col) * 4u) =
           out0;
     if (r1 < dst_rows)
       *(HVX_Vector *)(uintptr_t)(dst_addr + (r1 * dst_stride + col) * 4u) =
           out1;
+  } else if (ncols == HMX_TILE_COLS) {
+    // Match the f16 leaf: a guarded/strided destination uses the unaligned
+    // vector store form rather than assuming a 128-byte boundary.
+    if (r0 < dst_rows)
+      *(HVX_UVector *)(uintptr_t)(dst_addr + (r0 * dst_stride + col) * 4u) =
+          out0;
+    if (r1 < dst_rows)
+      *(HVX_UVector *)(uintptr_t)(dst_addr + (r1 * dst_stride + col) * 4u) =
+          out1;
   } else {
-    /* Column tail: the address is still 128 B aligned (row start + k*128),
-     * so a first-bytes predicate stores exactly the remainder. */
+    /* Column tail: a first-bytes predicate stores exactly the remainder,
+     * without assuming an aligned destination row. */
     const HVX_VectorPred keep = Q6_Q_vsetq_R(ncols * 4u);
     if (r0 < dst_rows)
       Q6_vmem_QRIV(keep,
@@ -678,6 +688,7 @@ static inline __attribute__((always_inline)) void hmx__unpack_acc_f32_body(
 
   /* fp16 1.0: the widening multiplier. */
   const HVX_Vector one = Q6_Vh_vsplat_R(0x3C00);
+  const int aligned = (dst_addr & 127u) == 0u && (dst_stride & 63u) == 0u;
   const unsigned full_tiles = dst_cols / HMX_TILE_COLS;
   const unsigned tail = dst_cols % HMX_TILE_COLS;
 
@@ -687,14 +698,14 @@ static inline __attribute__((always_inline)) void hmx__unpack_acc_f32_body(
         src_ar_addr + t * HMX_TILE_BYTES + block_j * HMX_BLOCK_BYTES);
     hmx__unpack_f32_tile(dst_addr, res_addr, has_res, block, col,
                          HMX_TILE_COLS, r0, r1, dst_rows, dst_stride,
-                         res_stride, one);
+                         res_stride, one, aligned);
   }
   if (tail) {
     const unsigned col = full_tiles * HMX_TILE_COLS;
     const HVX_Vector *block = (const HVX_Vector *)(const void *)(uintptr_t)(
         src_ar_addr + full_tiles * HMX_TILE_BYTES + block_j * HMX_BLOCK_BYTES);
     hmx__unpack_f32_tile(dst_addr, res_addr, has_res, block, col, tail, r0, r1,
-                         dst_rows, dst_stride, res_stride, one);
+                         dst_rows, dst_stride, res_stride, one, aligned);
   }
 }
 

@@ -13,14 +13,21 @@
 #include <cstddef>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+#include <cstdint>
+#endif
 
 #include "HexagonBuffer.h"
 #include "HexagonBufferAlias.h"
 #include "HexagonCommon.h"
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+#include "VTCMPool.h"
+#endif
 
 class HexagonBufferAlias;
 
@@ -28,10 +35,11 @@ class HexagonBufferAlias;
 /// stays a plain aggregate owned by HexagonBuffer.
 struct HexagonBufferCacheKeyHash {
   size_t operator()(const HexagonBuffer::CacheKey &key) const {
-    size_t h = std::hash<size_t>{}(key.numAllocations);
+    size_t h = std::hash<size_t>{}(key.ndim);
     auto mix = [&h](size_t value) {
       h ^= value + 0x9e3779b9u + (h << 6) + (h >> 2);
     };
+    mix(std::hash<size_t>{}(key.numAllocations));
     mix(std::hash<size_t>{}(key.bytesPerAllocation));
     mix(std::hash<size_t>{}(key.alignment));
     mix(std::hash<bool>{}(key.isVtcm));
@@ -41,6 +49,41 @@ struct HexagonBufferCacheKeyHash {
 
 class BufferManager {
 public:
+  BufferManager() = default;
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  /// The optional pool link is used only by the opt-in diagnostic stream. It
+  /// keeps free-cache events in the same bounded sequence as pool events
+  /// without hashing the cache key or retaining any address in the report.
+  explicit BufferManager(VtcmPool *accountingPool)
+      : accountingPool_(accountingPool) {}
+  /// Address-free counters for the optional VTCM accounting report. The
+  /// cumulative counters are kept separately from the current cache occupancy
+  /// so a report can distinguish reuse from retention.
+  struct AccountingSnapshot {
+    uint64_t freeCacheHits;
+    uint64_t freeCacheHitBytes;
+    uint64_t freeCacheHitRequestedBytes;
+    uint64_t freeCacheRetains;
+    uint64_t freeCacheRetainedBytes;
+    uint64_t freeCacheRetainRequestedBytes;
+    uint64_t freeCacheDrops;
+    uint64_t freeCacheDropBytes;
+    uint64_t freeCacheEvictions;
+    uint64_t freeCacheEvictionBytes;
+    // Historical retained-cache high-water is separate from the pool's
+    // charged-allocation high-water. Keeping both ledgers prevents a cache
+    // retention number from being mistaken for full VTCM occupancy.
+    uint64_t highWaterCachedVtcmBytes;
+    uint64_t highWaterCachedBuffers;
+    size_t cachedBuffers;
+    size_t cachedBytes;
+    size_t cachedVtcmBytes;
+    size_t cacheCapacityBytes;
+  };
+
+  AccountingSnapshot getAccountingSnapshot();
+#endif
+
   ~BufferManager() {
     if (!bufferMap_.empty()) {
       CHECK((true), "BufferManager is not empty upon destruction");
@@ -62,14 +105,48 @@ public:
           "Attempt made to free unknown or already freed allocation");
     CHECK(it->second != nullptr);
     std::unique_ptr<HexagonBuffer> buf = std::move(it->second);
+    const HexagonBuffer::CacheKey cacheKey = buf->GetCacheKey();
+    const size_t bytes = buf->GetAllocatedBytes();
     bufferMap_.erase(it);
-
-    size_t bytes = buf->GetAllocatedBytes();
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+    size_t requestedBytes = 0;
+    size_t allocatorInputBytes = 0;
+    size_t sizeAlignedBytes = 0;
+    const bool vtcmAccounting =
+        cacheAccountingSizes(cacheKey, requestedBytes, allocatorInputBytes,
+                             sizeAlignedBytes);
+#endif
     if (bytes != 0 && bytes <= kMaxCachedBytes &&
         cachedBytes_ + bytes <= kMaxCachedBytes) {
       cachedBytes_ += bytes;
-      freeCache_[buf->GetCacheKey()].push_back(std::move(buf));
+      freeCache_[cacheKey].push_back(std::move(buf));
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+      if (vtcmAccounting) {
+        ++freeCacheRetains_;
+        freeCacheRetainedBytes_ += bytes;
+        freeCacheRetainRequestedBytes_ += requestedBytes;
+        cachedVtcmBytes_ += bytes;
+        ++cachedBufferCount_;
+        if (cachedVtcmBytes_ > highWaterCachedVtcmBytes_)
+          highWaterCachedVtcmBytes_ = cachedVtcmBytes_;
+        if (cachedBufferCount_ > highWaterCachedBuffers_)
+          highWaterCachedBuffers_ = cachedBufferCount_;
+        recordAccountingCacheEventLocked(
+            VtcmPool::AccountingCacheEventKind::kRetain, requestedBytes,
+            allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment);
+        validateAccountingStateLocked();
+      }
+#endif
     }
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+    else if (vtcmAccounting) {
+      ++freeCacheDrops_;
+      freeCacheDropBytes_ += bytes;
+      recordAccountingCacheEventLocked(
+          VtcmPool::AccountingCacheEventKind::kDrop, requestedBytes,
+          allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment);
+    }
+#endif
     // Otherwise `buf` is destroyed at the end of this scope and the block
     // returns to the pool (the bounded-cache fallback).
   }
@@ -83,7 +160,31 @@ public:
     if (cached != freeCache_.end() && !cached->second.empty()) {
       std::unique_ptr<HexagonBuffer> buf = std::move(cached->second.back());
       cached->second.pop_back();
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+      const size_t bytes = buf->GetAllocatedBytes();
+      size_t requestedBytes = 0;
+      size_t allocatorInputBytes = 0;
+      size_t sizeAlignedBytes = 0;
+      const bool vtcmAccounting = cacheAccountingSizes(
+          key, requestedBytes, allocatorInputBytes, sizeAlignedBytes);
+      cachedBytes_ -= bytes;
+      if (vtcmAccounting) {
+        ++freeCacheHits_;
+        freeCacheHitBytes_ += bytes;
+        freeCacheHitRequestedBytes_ += requestedBytes;
+        assert(cachedVtcmBytes_ >= bytes);
+        assert(cachedBufferCount_ != 0);
+        cachedVtcmBytes_ -= bytes;
+        if (cachedBufferCount_ != 0)
+          --cachedBufferCount_;
+        recordAccountingCacheEventLocked(
+            VtcmPool::AccountingCacheEventKind::kHit, requestedBytes,
+            allocatorInputBytes, sizeAlignedBytes, bytes, key.alignment);
+        validateAccountingStateLocked();
+      }
+#else
       cachedBytes_ -= buf->GetAllocatedBytes();
+#endif
       void *ptr = buf->GetPointer();
       bufferMap_.insert({ptr, std::move(buf)});
       return ptr;
@@ -92,13 +193,56 @@ public:
     auto buf = std::make_unique<HexagonBuffer>(std::forward<Args>(args)...);
     if (!buf->HasValidAllocation()) {
       // The pool could not satisfy the request while the cache was holding
-      // storage: drop the cache (returning those blocks to the pool) and run the
-      // real allocator once more. The cache is a perf aid, never a reason to
-      // fail an allocation that would otherwise succeed.
+      // storage: drop the cache (returning those blocks to the pool) and run
+      // the real allocator once more. The cache is a perf aid, never a reason
+      // to fail an allocation that would otherwise succeed.
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+      size_t evictedBytes = 0;
+      size_t evictedRequestedBytes = 0;
+      size_t evictedAllocatorInputBytes = 0;
+      size_t evictedSizeAlignedBytes = 0;
+      size_t evictedBuffers = 0;
+      for (const auto &entry : freeCache_) {
+        size_t requestedBytes = 0;
+        size_t allocatorInputBytes = 0;
+        size_t sizeAlignedBytes = 0;
+        if (!cacheAccountingSizes(entry.first, requestedBytes,
+                                  allocatorInputBytes, sizeAlignedBytes))
+          continue;
+        evictedBuffers += entry.second.size();
+        freeCacheEvictions_ += entry.second.size();
+        for (const auto &cachedBuffer : entry.second) {
+          const size_t charged = cachedBuffer->GetAllocatedBytes();
+          evictedBytes += charged;
+          freeCacheEvictionBytes_ += charged;
+        }
+        evictedRequestedBytes +=
+            checkedMultiply(requestedBytes, entry.second.size());
+        evictedAllocatorInputBytes +=
+            checkedMultiply(allocatorInputBytes, entry.second.size());
+        evictedSizeAlignedBytes +=
+            checkedMultiply(sizeAlignedBytes, entry.second.size());
+      }
+      assert(evictedBuffers == cachedBufferCount_);
+      assert(evictedBytes == cachedVtcmBytes_);
+      cachedVtcmBytes_ = 0;
+      cachedBufferCount_ = 0;
+#endif
       freeCache_.clear();
       cachedBytes_ = 0;
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+      validateAccountingStateLocked();
+      if (evictedBuffers != 0) {
+        recordAccountingCacheEventLocked(
+            VtcmPool::AccountingCacheEventKind::kEvict, evictedRequestedBytes,
+            evictedAllocatorInputBytes, evictedSizeAlignedBytes, evictedBytes, 0);
+      }
+#endif
       buf = std::make_unique<HexagonBuffer>(std::forward<Args>(args)...);
     }
+    if (!buf->HasValidAllocation())
+      return nullptr;
+
     void *ptr = buf->GetPointer();
     bufferMap_.insert({ptr, std::move(buf)});
     return ptr;
@@ -169,10 +313,10 @@ public:
 
 private:
   /// Contains the HexagonBuffer objects managed by this class.
-  /// Serialises the buffer bookkeeping. A launch can run on several quRT threads
-  /// (one program per thread), and the maps below are plain containers, so
-  /// concurrent allocate/free corrupts them (measured: dead DSP when VTCM and
-  /// multi-threading are both on).
+  /// Serialises the buffer bookkeeping. A launch can run on several quRT
+  /// threads (one program per thread), and the maps below are plain containers,
+  /// so concurrent allocate/free corrupts them (measured: dead DSP when VTCM
+  /// and multi-threading are both on).
   std::mutex mutex_;
 
   std::unordered_map<void *, std::unique_ptr<HexagonBuffer>> bufferMap_;
@@ -183,35 +327,154 @@ private:
 
   /// Upper bound on the bytes the free cache may hold. Sized to a per-launch
   /// activation set for the HMX paths (S1 is ~1.2 MiB: a 1 MiB accumulator plus
-  /// 128 KiB/64 KiB operands) with headroom, while staying a small fraction of a
-  /// multi-MiB VTCM pool so live allocations are never starved. This is a perf
-  /// heuristic only: allocation failure drops the whole cache and retries, so the
-  /// bound cannot turn a would-succeed allocation into a failure.
+  /// 128 KiB/64 KiB operands) with headroom, while staying a small fraction of
+  /// a multi-MiB VTCM pool so live allocations are never starved. This is a
+  /// perf heuristic only: allocation failure drops the whole cache and retries,
+  /// so the bound cannot turn a would-succeed allocation into a failure.
   static constexpr size_t kMaxCachedBytes = 2u * 1024 * 1024;
 
   /// Build the cache key from an alloc request. Overloaded on arity: the 3-arg
-  /// form is the 1-D request (bytes, alignment, isVtcm), the 4-arg form the 2-D
-  /// one (nallocs, bytes, alignment, isVtcm); these are exactly the two
-  /// HexagonBuffer constructor shapes.
+  /// form is the 1-D request (bytes, alignment, isVtcm) and sets ndim=1; the
+  /// 4-arg form is the 2-D request (nallocs, bytes, alignment, isVtcm) and sets
+  /// ndim=2. These are exactly the two HexagonBuffer constructor shapes.
   static HexagonBuffer::CacheKey MakeCacheKey(size_t nbytes, size_t alignment,
                                               bool isVtcm) {
-    return HexagonBuffer::CacheKey{1, nbytes, alignment, isVtcm};
+    return HexagonBuffer::CacheKey{1, 1, nbytes, alignment, isVtcm};
   }
   static HexagonBuffer::CacheKey MakeCacheKey(size_t nallocs, size_t nbytes,
                                               size_t alignment, bool isVtcm) {
-    return HexagonBuffer::CacheKey{nallocs, nbytes, alignment, isVtcm};
+    return HexagonBuffer::CacheKey{2, nallocs, nbytes, alignment, isVtcm};
   }
 
   /// Freed-but-still-reserved buffers, keyed by footprint. LIFO per key so the
-  /// most recently freed block (still the hottest in cache) is handed back first.
+  /// most recently freed block (still the hottest in cache) is handed back
+  /// first.
   std::unordered_map<HexagonBuffer::CacheKey,
                      std::vector<std::unique_ptr<HexagonBuffer>>,
                      HexagonBufferCacheKeyHash>
       freeCache_;
 
-  /// Bytes currently held by freeCache_, charged on the aligned reservation so it
-  /// matches the VTCM the cache is pinning.
+  /// Bytes currently held by freeCache_, charged on the aligned reservation so
+  /// it matches the VTCM the cache is pinning.
   size_t cachedBytes_ = 0;
+
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  VtcmPool *accountingPool_{nullptr};
+
+  /// Cache state is process-scoped; the pool event deliberately does not
+  /// inherit the current function/allocation-site context.
+  void recordAccountingCacheEventLocked(
+      VtcmPool::AccountingCacheEventKind kind, size_t requestedBytes,
+      size_t allocatorInputBytes, size_t sizeAlignedBytes, size_t chargedBytes,
+      size_t requestedAlignment) const {
+    if (accountingPool_ != nullptr) {
+      accountingPool_->recordAccountingCacheEvent(
+          kind, requestedBytes, allocatorInputBytes, sizeAlignedBytes,
+          chargedBytes, requestedAlignment, cachedVtcmBytes_,
+          cachedBufferCount_);
+    }
+  }
+
+  static size_t checkedMultiply(size_t lhs, size_t rhs) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs)
+      return std::numeric_limits<size_t>::max();
+    return lhs * rhs;
+  }
+
+  static size_t alignUpForCache(size_t bytes, size_t alignment) {
+    if (alignment == 0)
+      return std::numeric_limits<size_t>::max();
+    const size_t remainder = bytes % alignment;
+    if (remainder == 0)
+      return bytes;
+    const size_t padding = alignment - remainder;
+    if (bytes > std::numeric_limits<size_t>::max() - padding)
+      return std::numeric_limits<size_t>::max();
+    return bytes + padding;
+  }
+
+  void validateAccountingStateLocked() const {
+    size_t allBytes = 0;
+    size_t vtcmBytes = 0;
+    size_t vtcmBuffers = 0;
+    for (const auto &entry : freeCache_) {
+      for (const auto &buffer : entry.second) {
+        const size_t charged = buffer->GetAllocatedBytes();
+        allBytes += charged;
+        size_t requestedBytes = 0;
+        size_t allocatorInputBytes = 0;
+        size_t sizeAlignedBytes = 0;
+        if (cacheAccountingSizes(entry.first, requestedBytes,
+                                  allocatorInputBytes, sizeAlignedBytes)) {
+          vtcmBytes += charged;
+          ++vtcmBuffers;
+        }
+      }
+    }
+    assert(cachedBytes_ == allBytes);
+    assert(cachedVtcmBytes_ == vtcmBytes);
+    assert(cachedBufferCount_ == vtcmBuffers);
+    assert(cachedVtcmBytes_ <= cachedBytes_);
+  }
+
+  static bool cacheAccountingSizes(const HexagonBuffer::CacheKey &key,
+                                   size_t &requestedBytes,
+                                   size_t &allocatorInputBytes,
+                                   size_t &sizeAlignedBytes) {
+    // `requestedBytes` is the raw BufferManager request. For a 2-D VTCM
+    // buffer, HexagonBuffer first pads each block to the requested address
+    // alignment before handing the monolithic region to VtcmPool; that
+    // intermediate value is `allocatorInputBytes`. The allocator's independent
+    // 128/2048 size quantum is applied only afterwards. DDR keys are outside
+    // this VTCM accounting stream altogether.
+    requestedBytes = checkedMultiply(key.numAllocations,
+                                     key.bytesPerAllocation);
+    allocatorInputBytes = 0;
+    sizeAlignedBytes = 0;
+    if (!key.isVtcm)
+      return false;
+
+    size_t perAllocation = key.bytesPerAllocation;
+    // A 2-D allocation pads every block, including a one-block allocation;
+    // use dimensionality rather than block count to decide this intermediate
+    // allocator-input unit.
+    if (key.ndim == 2)
+      perAllocation = alignUpForCache(perAllocation, key.alignment);
+    allocatorInputBytes = checkedMultiply(key.numAllocations, perAllocation);
+    sizeAlignedBytes = VtcmPool::SizeAlignedCharge(allocatorInputBytes);
+    return true;
+  }
+
+  uint64_t freeCacheHits_ = 0;
+  uint64_t freeCacheHitBytes_ = 0;
+  uint64_t freeCacheHitRequestedBytes_ = 0;
+  uint64_t freeCacheRetains_ = 0;
+  uint64_t freeCacheRetainedBytes_ = 0;
+  uint64_t freeCacheRetainRequestedBytes_ = 0;
+  uint64_t freeCacheDrops_ = 0;
+  uint64_t freeCacheDropBytes_ = 0;
+  uint64_t freeCacheEvictions_ = 0;
+  uint64_t freeCacheEvictionBytes_ = 0;
+  uint64_t highWaterCachedVtcmBytes_ = 0;
+  uint64_t highWaterCachedBuffers_ = 0;
+  size_t cachedBufferCount_ = 0;
+  size_t cachedVtcmBytes_ = 0;
+#endif
 };
+
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+inline BufferManager::AccountingSnapshot
+BufferManager::getAccountingSnapshot() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return AccountingSnapshot{
+      freeCacheHits_,          freeCacheHitBytes_,
+      freeCacheHitRequestedBytes_, freeCacheRetains_,
+      freeCacheRetainedBytes_, freeCacheRetainRequestedBytes_,
+      freeCacheDrops_,         freeCacheDropBytes_, freeCacheEvictions_,
+      freeCacheEvictionBytes_, highWaterCachedVtcmBytes_,
+      highWaterCachedBuffers_, cachedBufferCount_, cachedBytes_,
+      cachedVtcmBytes_, kMaxCachedBytes};
+}
+#endif
 
 #endif // BUFFERMANAGER_H_

@@ -95,6 +95,16 @@ if(HEXMLIR_BRINGUP_PROBE)
   message(STATUS "BRINGUP probe enabled: ${HEXAGON_FLAGS}")
 endif()
 
+# VTCM accounting probe: bounded, address-free allocation/free diagnostics.
+# This is a build-time opt-in only; it is deliberately not a backend option or
+# a manifest field. The default runtime has no probe state, methods, or report
+# symbol. Enable with -DHEXMLIR_VTCM_ACCOUNTING_PROBE=ON for a diagnostic build.
+option(HEXMLIR_VTCM_ACCOUNTING_PROBE "Record VTCM allocation accounting diagnostics" OFF)
+if(HEXMLIR_VTCM_ACCOUNTING_PROBE)
+  list(APPEND HEXAGON_FLAGS -DHEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE)
+  message(STATUS "VTCM accounting probe enabled: ${HEXAGON_FLAGS}")
+endif()
+
 # NOTE: the HMX leaves (src/HMXAPI.c, src/HMXLayout.c) are NOT built as bitcode
 # candidates: they use llvm.hexagon.M8.* intrinsics, which only Qualcomm's clang
 # lowers, and this build links its bitcode into a module that OUR LLVM compiles.

@@ -62,7 +62,11 @@ public:
     BringupProbeStep("vtcm_pool_ctor");
 
     CHECK_EQ(bufferManager, nullptr);
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+    bufferManager = std::make_unique<BufferManager>(runtimeVtcm.get());
+#else
     bufferManager = std::make_unique<BufferManager>();
+#endif
     BringupProbeStep("buffer_manager_ctor");
 
     hmx_context_id = initialize_and_acquire_hmx();
@@ -105,17 +109,13 @@ public:
   /// Allocate the region(s) needed for Hexagon's indirect-tensor format.
   void *Alloc(size_t nallocs, size_t nbytes, uint64_t alignment, bool isVtcm);
 
-  /// Allocate (once) a resident VTCM buffer for `key`, filled from `src` on the
-  /// first call; later calls return the same address without copying. See
-  /// VtcmPool::Resident for the pinning and lifetime contract.
-  void *WeightResident(uint64_t key, size_t nbytes, const void *src);
-
-  /// Allocate (once) a resident, *uninitialised* VTCM workspace buffer for
-  /// `key`: later calls return the same address, no copy ever happens. This is
-  /// the per-launch workspace flavour of the same pinning mechanism -- the
-  /// kernel owns the contents and refills the buffer on every launch. See
-  /// VtcmPool::Resident (`src == nullptr`).
-  void *WorkspaceResident(uint64_t key, size_t nbytes);
+  /// Allocate (once) a resident VTCM buffer through the sole versioned path.
+  /// The key/source, requested byte count, and address alignment form an exact
+  /// descriptor: only an identical request may reuse a process-local resident
+  /// block. Scope registration is enforced by the C API before this method is
+  /// reached.
+  void *WeightResidentV2(uint64_t source, size_t nbytes, size_t alignment);
+  void *WorkspaceResidentV2(uint64_t key, size_t nbytes, size_t alignment);
 
   /// Takes a `ptr` to the base of the memref and returns a pointer to the
   /// crouton table
@@ -127,6 +127,9 @@ public:
 
   /// Frees the allocated memory region.
   void Free(void *ptr);
+
+  /// Record a resident deallocation while keeping the pinned block alive.
+  bool FreeResident(void *ptr, size_t nbytes);
 
   /// Copies the data from source src into destination dst.
   void Copy(void *dst, void *src, size_t nbytes);

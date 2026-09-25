@@ -8,12 +8,13 @@
 //===----------------------------------------------------------------------===//
 // A runtime (non-constant) resident weight carries its source address as the
 // alloc's extra operand (the residency key the runtime pins on), and lowers to
-// the same runtime entry the constant path uses.
+// the same versioned runtime entry as the constant path with its byte count and
+// requested alignment.
 //
 // RUN: linalg-hexagon-opt %s -hexagonmem-to-llvm | FileCheck %s
 //===----------------------------------------------------------------------===//
 
-// CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_weight_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
 
 module {
   // CHECK-LABEL: func.func @resident_runtime
@@ -22,7 +23,9 @@ module {
     // The residency key operand (the weight's aligned pointer) becomes the
     // call's first argument. The index operand is carried into i64 by the
     // surrounding conversion.
-    // CHECK: llvm.call @hexagon_runtime_weight_resident_dsp({{.*}}, {{.*}}) : (i64, i32) -> !llvm.ptr
+    // CHECK-DAG: %[[BYTES:.*]] = llvm.mlir.constant(8192 : i32) : i32
+    // CHECK-DAG: %[[ALIGN:.*]] = llvm.mlir.constant(128 : i32) : i32
+    // CHECK: llvm.call @hexagon_runtime_weight_resident_v2_dsp({{.*}}, %[[BYTES]], %[[ALIGN]]) : (i64, i32, i32) -> !llvm.ptr
     %w = hexagonmem.alloc(%addr) {alignment = 128 : i64, hmx.weight_resident = {address, bytes = 8192 : i64}} : memref<2x2x16x32x2xf16, 1>
     return
   }

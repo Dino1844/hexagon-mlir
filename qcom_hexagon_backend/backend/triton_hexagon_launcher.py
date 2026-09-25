@@ -22,6 +22,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     HexagonWrapperGenerator,
     WrapperGeneratorStrings,
     create_timestamped_folder,
+    make_resident_scope_id,
 )
 from triton.backends.qcom_hexagon_backend.utils import (
     enforce_hmx_launch_contract,
@@ -111,6 +112,7 @@ FuncInput<{tensor_ctype}, {tensor_rank}> *{input_wrapper_ptr_name}{i} = &{input_
         # Main triton cpp code body.
         self.triton_code_body = """
 int main() {{
+{resident_scope_setup}
 {tensor_definition_str}
 {read_from_file_calls}
 {setup_thread_pool}
@@ -140,6 +142,7 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
         output_profs,
         launch_grid,
         options: dict,
+        resident_scope_id: tuple[int, int] | None = None,
     ):
 
         # Setting the grid and grid_strides which correspond to the Triton kernel launch grid.
@@ -178,6 +181,7 @@ class TritonHexagonWrapperGenerator(HexagonWrapperGenerator):
             output_profs,
             TritonWrapperGeneratorStrings(),
             options,
+            resident_scope_id,
         )
         self.scratch = options["scratch"]
         self._init_vtcm_resources()
@@ -504,6 +508,7 @@ FuncInput<int8_t, 1> *pVtcmScratch = &wrVtcmScratch;
             setup_thread_pool = ""
 
         code_body = self.common_strings.triton_code_body.format(
+            resident_scope_setup=self.generate_resident_scope_setup(),
             tensor_definition_str=self.generate_input_declarations()
             + self.generate_input_wrapper_structs_init(),
             read_from_file_calls=self.generate_tensor_read_from_file_calls(
@@ -569,6 +574,7 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         if _ov:
             kernel_obj_as_bytes = Path(_ov).read_bytes()
             print(f"==> FA_O_OVERRIDE active: {_ov} ({len(kernel_obj_as_bytes)} B)")
+        resident_scope_id = make_resident_scope_id(kernel_obj_as_bytes, func_name)
         # Getting the input metadata for effective wrapper codegen.
         input_profs = profile_triton_inputs(inputs)
         input_tensor_count = sum(
@@ -702,7 +708,13 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         # TritonHexagonWrapperGenerator will assert for lwp and multithreading conflict.
         # HexagonWrapperGenerator will create the call to WriteLWPOutput() if lwp is enabled.
         wrapper_generator = TritonHexagonWrapperGenerator(
-            input_profs, iterations, func_name, output_profs, launch_grid, options
+            input_profs,
+            iterations,
+            func_name,
+            output_profs,
+            launch_grid,
+            options,
+            resident_scope_id,
         )
         # P2: the compiler's weight-residency contract, if any. Attached to the
         # generator so the shared input-writing path can pre-pack the named

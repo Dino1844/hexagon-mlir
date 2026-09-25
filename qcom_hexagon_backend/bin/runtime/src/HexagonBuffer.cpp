@@ -41,26 +41,14 @@ struct DDRAllocation : public Allocation {
 struct VTCMAllocation : public Allocation {
   VTCMAllocation(size_t nbytes, size_t alignment)
       : Allocation(nbytes, alignment) {
-    // For simplicity, the current VTCM dynamic pool supports the following
-    // alignments: less than
-    // or equal to 128 (0x80), and 2k (0x800)
-    CHECK(((alignment <= 0x80) || (alignment == 0x800)),
+    CHECK(VtcmPool::IsSupportedAlignment(alignment),
           "VTCMAllocation called for invalid alignment " << alignment);
-
-    if (alignment == 0x800) {
-      // Adjust size to be a multiple of 2k so that we will allocate from the
-      // front of the pool.
-      nbytes = (nbytes + 0x7ff) & -0x800;
-    } else if (alignment <= 0x80) {
-      // Adjust size to be a multiple of 128 so that we will allocate from the
-      // back of the pool in 128 byte increments.
-      nbytes = (nbytes + 0x7f) & -0x80;
-    }
-    if (allocatedBytes_ != nbytes) {
-      allocatedBytes_ = nbytes;
-    }
     CHECK(HexagonAPI::Global()->getVtcmPool(), "VTCM not acquired\n");
-    data_ = HexagonAPI::Global()->getVtcmPool()->Allocate(allocatedBytes_);
+    // The pool preserves the historical 128/2048 size-rounding and placement
+    // rules while enforcing the requested address boundary. Passing the
+    // original request avoids rounding alignment against the wrong threshold.
+    data_ = HexagonAPI::Global()->getVtcmPool()->Allocate(nbytes, alignment,
+                                                          &allocatedBytes_);
   }
   ~VTCMAllocation() {
     HexagonAPI::Global()->getVtcmPool()->Free(data_, allocatedBytes_);
@@ -103,6 +91,9 @@ HexagonBuffer::HexagonBuffer(size_t nallocs, size_t nbytes, size_t alignment,
     : ndim_(2), nbytesPerAllocation_(nbytes), alignment_(alignment) {
   SetStorageScope(isVtcm);
 
+  // A 2-D buffer has an alignment-padded stride for every block, including
+  // the one-block case. This is part of the representation contract even when
+  // there is only one row/block in the table.
   size_t nbytesAligned = ((nbytes + (alignment - 1)) / alignment) * alignment;
   size_t nbytesMonolithic = nallocs * nbytesAligned;
 
@@ -143,7 +134,7 @@ HexagonBuffer::StorageScope HexagonBuffer::GetStorageScope() const {
 }
 
 HexagonBuffer::CacheKey HexagonBuffer::GetCacheKey() const {
-  return CacheKey{allocations_.size(), nbytesPerAllocation_, alignment_,
+  return CacheKey{ndim_, allocations_.size(), nbytesPerAllocation_, alignment_,
                   storageScope_ == StorageScope::kVTCM};
 }
 

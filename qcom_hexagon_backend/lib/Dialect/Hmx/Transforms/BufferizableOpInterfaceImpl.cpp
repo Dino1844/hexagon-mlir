@@ -180,7 +180,7 @@ struct UnpackAccOpInterface
         rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
         *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
         unpackOp.getCountAttr(), unpackOp.getValidRowsAttr(),
-        unpackOp.getValidColsAttr());
+        unpackOp.getValidColsAttr(), unpackOp.getNTileAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();
@@ -220,7 +220,8 @@ struct UnpackAccF32OpInterface
         rewriter, unpackOp.getLoc(), /*result=*/TypeRange{*dstBuffer},
         *srcBuffer, *dstBuffer, unpackOp.getRow(), unpackOp.getCol(),
         residualBuffer, unpackOp.getCountAttr(),
-        unpackOp.getValidRowsAttr(), unpackOp.getValidColsAttr());
+        unpackOp.getValidRowsAttr(), unpackOp.getValidColsAttr(),
+        unpackOp.getNTileAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();

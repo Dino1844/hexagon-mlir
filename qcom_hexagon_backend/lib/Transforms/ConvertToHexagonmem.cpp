@@ -61,8 +61,14 @@ struct AllocConverter : public OpRewritePattern<memref::AllocOp> {
     Type type = op.getType();
     if (!isSafe(type) || getMemorySpace(type) != VTCM_ADDRESS_SPACE)
       return failure();
+    // Preserve an explicitly requested memref alignment.  In particular,
+    // hmx-partition's conversion-state block is 256-byte aligned; rebuilding
+    // the op without this attribute would silently turn it into the
+    // hexagonmem.alloc default of 128 bytes.  An absent memref alignment keeps
+    // the existing hexagonmem.alloc default unchanged.
     auto alloc = hexagonmem::AllocOp::create(rewriter, op.getLoc(), type,
-                                             op.getDynamicSizes());
+                                             op.getDynamicSizes(),
+                                             op.getAlignmentAttr());
     // The HMX workspace residency is a property of the allocation's lowering,
     // not of the memref dialect, so it has to survive this rewrite: the
     // `hexagonmem.alloc` the lowering sees carries the same tag the marking

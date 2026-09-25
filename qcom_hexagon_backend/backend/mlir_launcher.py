@@ -22,6 +22,11 @@ primiarily to be used for debugging only and not to run large models.
 The main difference from other launchers is that reading and creating inputs
 is deferred to the C++ stub along with validation of the result, if required.
 This is done intentionally to keep the launcher to be as lean as possible.
+
+A custom wrapper that uses the versioned resident ABI must call
+``hexagon_runtime_resident_scope_enter_v2_dsp(low64, high64)`` once before
+invoking the kernel. Resident calls before registration fail closed; there is
+no implicit legacy fallback.
 """
 
 

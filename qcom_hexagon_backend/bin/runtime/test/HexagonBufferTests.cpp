@@ -7,9 +7,19 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "BufferManager.h"
 #include "HexagonBuffer.h"
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+#include "HexagonAPI.h"
+#endif
 #include "HexagonResources.h"
 #include <gtest/gtest.h>
+
+#include <cstdint>
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+#include <string>
+#include <vector>
+#endif
 
 class HexagonBufferTest : public ::testing::Test {
 public:
@@ -36,6 +46,167 @@ TEST_F(HexagonBufferTest, vtcmScope2) {
   HexagonBuffer hb(8 /* nbytes */, 8 /* alignment */, true);
   EXPECT_EQ(hb.GetStorageScope(), HexagonBuffer::StorageScope::kVTCM);
 }
+
+TEST_F(HexagonBufferTest, vtcmCarriesRequested256Alignment) {
+  HexagonBuffer hb(257 /* nbytes */, 256 /* alignment */, true);
+  ASSERT_TRUE(hb.HasValidAllocation());
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(hb.GetPointer()) % 256, 0u);
+}
+
+TEST_F(HexagonBufferTest, cacheKeyIncludesDimensionality) {
+  const HexagonBuffer::CacheKey oneD{1, 1, 257, 128, false};
+  const HexagonBuffer::CacheKey oneBlock2D{2, 1, 257, 128, false};
+
+  EXPECT_FALSE(oneD == oneBlock2D);
+}
+
+TEST_F(HexagonBufferTest, freeCacheSeparates1DFromOneBlock2D) {
+  constexpr size_t bytes = 257;
+  constexpr size_t alignment = 128;
+  BufferManager manager;
+
+  void *oneD = manager.AllocateHexagonBuffer(bytes, alignment, false);
+  ASSERT_NE(oneD, nullptr);
+  manager.FreeHexagonBuffer(oneD);
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  const auto before = manager.getAccountingSnapshot();
+#endif
+
+  void *oneBlock2D =
+      manager.AllocateHexagonBuffer(1, bytes, alignment, false);
+  ASSERT_NE(oneBlock2D, nullptr);
+  // A one-block 2-D request returns a pointer table, whereas a 1-D request
+  // returns the allocation itself. Reusing the 1-D cache entry would expose
+  // the former as the latter's raw pointer.
+  EXPECT_NE(oneBlock2D, oneD);
+  EXPECT_NE(static_cast<void **>(oneBlock2D)[0], nullptr);
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  EXPECT_EQ(manager.getAccountingSnapshot().freeCacheHits,
+            before.freeCacheHits);
+#endif
+  manager.FreeHexagonBuffer(oneBlock2D);
+}
+
+TEST_F(HexagonBufferTest, freeCacheSeparatesOneBlock2DFrom1D) {
+  constexpr size_t bytes = 263;
+  constexpr size_t alignment = 128;
+  BufferManager manager;
+
+  void *oneBlock2D =
+      manager.AllocateHexagonBuffer(1, bytes, alignment, false);
+  ASSERT_NE(oneBlock2D, nullptr);
+  void *row = static_cast<void **>(oneBlock2D)[0];
+  ASSERT_NE(row, nullptr);
+  manager.FreeHexagonBuffer(oneBlock2D);
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  const auto before = manager.getAccountingSnapshot();
+#endif
+
+  void *oneD = manager.AllocateHexagonBuffer(bytes, alignment, false);
+  ASSERT_NE(oneD, nullptr);
+  // A cache collision would hand the old 2-D object to the 1-D caller, whose
+  // GetPointer() then returns the first row address instead of allocating a
+  // fresh 1-D object.
+  EXPECT_NE(oneD, row);
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  EXPECT_EQ(manager.getAccountingSnapshot().freeCacheHits,
+            before.freeCacheHits);
+#endif
+  manager.FreeHexagonBuffer(oneD);
+}
+
+TEST_F(HexagonBufferTest, oneBlock2DPreservesPerBlockPadding) {
+  constexpr size_t bytes = 257;
+  constexpr size_t alignment = 128;
+  HexagonBuffer oneD(bytes, alignment, false);
+  HexagonBuffer oneBlock2D(1, bytes, alignment, false);
+
+  EXPECT_EQ(oneD.GetAllocatedBytes(), bytes);
+  EXPECT_EQ(oneBlock2D.GetAllocatedBytes(), 384);
+}
+
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+TEST_F(HexagonBufferTest, oneBlock2DAccountingKeepsRawInputAlignedCharged) {
+  constexpr size_t rawBytes = 4097;
+  constexpr size_t alignment = 256;
+  VtcmPool *pool = HexagonAPI::Global()->getVtcmPool();
+  BufferManager manager(pool);
+
+  void *buffer = manager.AllocateHexagonBuffer(1, rawBytes, alignment, true);
+  ASSERT_NE(buffer, nullptr);
+  manager.FreeHexagonBuffer(buffer);
+
+  // The 2-D constructor pads the one block before entering VtcmPool. Keep all
+  // four accounting units distinct in this regression: raw request, padded
+  // allocator input, size-rounding quantum, and the actual pool charge.
+  std::vector<char> reportBuffer(256 * 1024);
+  const int reportLength = pool->writeAccountingReport(
+      reportBuffer.data(), static_cast<int>(reportBuffer.size()));
+  ASSERT_NE(reportLength, VtcmPool::kAccountingReportTruncated);
+  ASSERT_GE(reportLength, 0);
+  const std::string report(reportBuffer.data(),
+                           static_cast<size_t>(reportLength));
+  EXPECT_NE(report.find("kind=free_cache_retain requested_bytes=4097 "
+                        "allocator_input_bytes=4352 size_aligned_bytes=6144 "
+                        "charged_bytes=6144"),
+            std::string::npos);
+}
+
+TEST_F(HexagonBufferTest, cacheAccountingSeparatesVTCMAndDDR) {
+  BufferManager *manager = HexagonAPI::Global()->getBufferManager();
+  const auto before = manager->getAccountingSnapshot();
+
+  // DDR retention is real cache behavior, but it must not enter the VTCM
+  // accounting counters or the VTCM event stream.
+  void *ddr = manager->AllocateHexagonBuffer(257, 128, false);
+  ASSERT_NE(ddr, nullptr);
+  manager->FreeHexagonBuffer(ddr);
+  const auto afterDdr = manager->getAccountingSnapshot();
+  EXPECT_EQ(afterDdr.freeCacheRetains, before.freeCacheRetains);
+  EXPECT_EQ(afterDdr.cachedBytes, before.cachedBytes + 257);
+  EXPECT_EQ(afterDdr.cachedBuffers, before.cachedBuffers);
+  EXPECT_EQ(afterDdr.cachedVtcmBytes, before.cachedVtcmBytes);
+
+  void *vtcm = manager->AllocateHexagonBuffer(257, 128, true);
+  ASSERT_NE(vtcm, nullptr);
+  manager->FreeHexagonBuffer(vtcm);
+  const auto afterRetain = manager->getAccountingSnapshot();
+  EXPECT_EQ(afterRetain.freeCacheRetains, before.freeCacheRetains + 1);
+  EXPECT_EQ(afterRetain.freeCacheRetainRequestedBytes,
+            before.freeCacheRetainRequestedBytes + 257);
+  EXPECT_EQ(afterRetain.freeCacheRetainedBytes,
+            before.freeCacheRetainedBytes + 384);
+  EXPECT_EQ(afterRetain.cachedBytes, afterDdr.cachedBytes + 384);
+  EXPECT_EQ(afterRetain.cachedBuffers, before.cachedBuffers + 1);
+  EXPECT_EQ(afterRetain.cachedVtcmBytes, before.cachedVtcmBytes + 384);
+
+  void *hit = manager->AllocateHexagonBuffer(257, 128, true);
+  ASSERT_EQ(hit, vtcm);
+  const auto afterHit = manager->getAccountingSnapshot();
+  EXPECT_EQ(afterHit.freeCacheHits, before.freeCacheHits + 1);
+  EXPECT_EQ(afterHit.cachedBytes, afterDdr.cachedBytes);
+  EXPECT_EQ(afterHit.cachedBuffers, before.cachedBuffers);
+  EXPECT_EQ(afterHit.cachedVtcmBytes, before.cachedVtcmBytes);
+  manager->FreeHexagonBuffer(hit);
+
+  // A bounded-cache failure path must evict and account only VTCM entries.
+  void *large = manager->AllocateHexagonBuffer((2u << 20) + 128, 128, true);
+  ASSERT_NE(large, nullptr);
+  manager->FreeHexagonBuffer(large);
+  const auto afterDrop = manager->getAccountingSnapshot();
+  EXPECT_EQ(afterDrop.freeCacheDrops, before.freeCacheDrops + 1);
+
+  void *live = manager->AllocateHexagonBuffer(3u << 20, 128, true);
+  ASSERT_NE(live, nullptr);
+  void *failed = manager->AllocateHexagonBuffer(4u << 20, 128, true);
+  if (failed != nullptr)
+    manager->FreeHexagonBuffer(failed);
+  manager->FreeHexagonBuffer(live);
+  const auto afterEvict = manager->getAccountingSnapshot();
+  EXPECT_GE(afterEvict.freeCacheEvictions,
+            before.freeCacheEvictions + 1);
+}
+#endif
 
 TEST_F(HexagonBufferTest, microCopiesCorrespondingRegions) {
   auto ptr = [](auto val) { return reinterpret_cast<void *>(val); };

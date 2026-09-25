@@ -312,15 +312,17 @@ void *HexagonAPI::Alloc(size_t nallocs, size_t nbytes, uint64_t alignment,
   return base_ptr;
 }
 
-void *HexagonAPI::WeightResident(uint64_t key, size_t nbytes,
-                                 const void *src) {
-  return runtimeVtcm->Resident(key, nbytes, src);
+void *HexagonAPI::WeightResidentV2(uint64_t source, size_t nbytes,
+                                   size_t alignment) {
+  return runtimeVtcm->Resident(
+      VtcmPool::ResidentKind::kWeight, source, nbytes, alignment,
+      reinterpret_cast<const void *>(static_cast<uintptr_t>(source)));
 }
 
-void *HexagonAPI::WorkspaceResident(uint64_t key, size_t nbytes) {
-  // No source: nothing is copied in, the pinning of the storage is the whole
-  // point. The kernel refills the buffer on every launch.
-  return runtimeVtcm->Resident(key, nbytes, nullptr);
+void *HexagonAPI::WorkspaceResidentV2(uint64_t key, size_t nbytes,
+                                      size_t alignment) {
+  return runtimeVtcm->Resident(VtcmPool::ResidentKind::kWorkspace, key, nbytes,
+                               alignment, nullptr);
 }
 
 /// Takes a `ptr` to the base of the memref and returns a pointer to the
@@ -347,6 +349,12 @@ void HexagonAPI::Free(void *ptr) {
 }
 
 // TODO: Add support to handle buffer aliases on copying
+bool HexagonAPI::FreeResident(void *ptr, size_t nbytes) {
+  if (!runtimeVtcm)
+    return false;
+  return runtimeVtcm->FreeResident(ptr, nbytes);
+}
+
 void HexagonAPI::Copy(void *dst, void *src, size_t nbytes) {
   if (bufferManager) {
     bufferManager->Copy(dst, src, nbytes);

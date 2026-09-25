@@ -283,7 +283,7 @@ TRANSLATION_METADATA_SCHEMA = "hex.hmx.translation/v1"
 HMX_MANIFEST_SCHEMA = "hex.hmx.kernel_manifest/v2"
 # Bump this semantic ABI token whenever the generated HMX plan/object contract
 # changes. It is deliberately independent of the manifest wire spelling.
-HMX_SHAPE_TAIL_ABI_VERSION = "shape-tail-abi-2026-09-24-peeled-looped"
+HMX_SHAPE_TAIL_ABI_VERSION = "shape-tail-abi-2026-09-25-resident-v2-aligned"
 
 HMX_TILE_EDGE = 32
 HMX_PLANS = frozenset({"full-hmx", "hmx-tail", "hvx"})

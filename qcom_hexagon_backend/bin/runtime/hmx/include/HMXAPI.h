@@ -189,21 +189,20 @@ void hmx_unpack_acc_f16_bulk(unsigned dst_addr, unsigned src_ar_addr,
 /* Fused tail: unpack one AR crouton row-pair straight into row-major fp32.
  * One call covers destination rows (tile_row*32 + 2*block_j, +1) across the
  * first `dst_cols` columns of rows with `dst_stride` elements: each 32-column
- * tile is one aligned 128 B crouton load, widened via x1.0 (exact, the same
- * idiom as llama.cpp's transfer_output_chunk_fp16_to_fp32), optionally added
- * with the f32 residual row (`res_addr`, stride `res_stride`, is read iff
- * `has_res` is nonzero), and written with aligned 128 B stores. The column
- * tail (`dst_cols % 32`) uses predicated stores; out-of-range rows are
- * skipped. No stack temporaries; one VTCM read per tile serves both rows.
+ * tile is one 128 B crouton load, widened via x1.0 (exact, the same idiom as
+ * llama.cpp's transfer_output_chunk_fp16_to_fp32), optionally added with the
+ * f32 residual row (`res_addr`, stride `res_stride`, is read iff `has_res` is
+ * nonzero). Full tiles use the aligned vector store when the destination base
+ * is 128-byte aligned and its row stride is a multiple of 64 elements; guarded
+ * or strided destinations use the unaligned vector form. The column tail
+ * (`dst_cols % 32`) uses predicated stores; out-of-range rows are skipped. No
+ * stack temporaries; one VTCM read per tile serves both rows.
  *
  * Preconditions: `src_ar_addr` is the row's first crouton in VTCM (same as
- * hmx_unpack_acc_f16); every stored 128 B unit is 128-byte aligned, i.e.
- * `dst_addr` is 128-byte aligned and `dst_stride % 32 == 0` (the residual
- * uses unaligned loads, so it has no alignment requirement). The stride is
- * separate from the width on purpose: the valid width may end mid-row while
- * every row still starts aligned -- the same split llama.cpp's chunk transfer
- * uses. Phase 1 is validated on hexagon-sim only; the wiring phase must
- * guarantee the dst alignment before this runs on device. */
+ * hmx_unpack_acc_f16). The destination row stride is separate from the width
+ * on purpose: the valid width may end mid-row while each row retains its
+ * physical stride. Residual reads use unaligned loads and have no alignment
+ * requirement. */
 void hmx_unpack_acc_f32(unsigned dst_addr, unsigned res_addr, unsigned has_res,
                         unsigned src_ar_addr, unsigned dst_rows,
                         unsigned dst_cols, unsigned dst_stride,
@@ -211,7 +210,8 @@ void hmx_unpack_acc_f32(unsigned dst_addr, unsigned res_addr, unsigned has_res,
                         unsigned block_j);
 /* Bulk form of the fused tail: `n_pairs` consecutive row-pairs of tile row
  * `tile_row` in one call, i.e. block_j = 0..n_pairs-1 on the same arguments.
- * The alignment preconditions are unchanged; out-of-range pairs stop the walk. */
+ * The destination alignment fallback described above is unchanged; out-of-range
+ * pairs stop the walk. */
 void hmx_unpack_acc_f32_bulk(unsigned dst_addr, unsigned res_addr,
                              unsigned has_res, unsigned src_ar_addr,
                              unsigned dst_rows, unsigned dst_cols,

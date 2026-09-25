@@ -13,6 +13,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
 class VtcmPoolTest : public ::testing::Test {
   void SetUp() override {
     vtcm_pool = HexagonAPI::Global()->getVtcmPool();
@@ -214,6 +218,101 @@ TEST_F(VtcmPoolTest, dual_alignment) {
   void *large = vtcm_pool->Allocate(two_k_block);
   ASSERT_NE(large, nullptr);
   vtcm_pool->Free(large, two_k_block);
+}
+
+TEST_F(VtcmPoolTest, requested_power_of_two_alignments) {
+  constexpr size_t bytes = 257;
+  for (size_t alignment = 1; alignment <= 2048; alignment *= 2) {
+    void *ptr = vtcm_pool->Allocate(bytes, alignment);
+    ASSERT_NE(ptr, nullptr) << "alignment=" << alignment;
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u)
+        << "alignment=" << alignment;
+    vtcm_pool->Free(ptr, bytes);
+  }
+
+  EXPECT_EQ(vtcm_pool->Allocate(bytes, 3), nullptr);
+  EXPECT_EQ(vtcm_pool->Allocate(bytes, 4096), nullptr);
+
+  void *large = vtcm_pool->Allocate(4096, 128);
+  ASSERT_NE(large, nullptr);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(large) % 2048, 0u);
+  vtcm_pool->Free(large, 4096);
+}
+
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+TEST_F(VtcmPoolTest, coalesce_counters_cover_all_four_cases) {
+  constexpr size_t blockBytes = 2048;
+  constexpr size_t blockCount = 8;
+  const auto before = vtcm_pool->getAccountingSnapshot();
+
+  std::vector<char *> blocks;
+  blocks.reserve(blockCount);
+  for (size_t i = 0; i < blockCount; ++i) {
+    void *ptr = vtcm_pool->Allocate(blockBytes);
+    ASSERT_NE(ptr, nullptr) << "allocation=" << i;
+    blocks.push_back(static_cast<char *>(ptr));
+  }
+  std::sort(blocks.begin(), blocks.end());
+  for (size_t i = 1; i < blocks.size(); ++i) {
+    ASSERT_EQ(blocks[i] - blocks[i - 1],
+              static_cast<ptrdiff_t>(blockBytes))
+        << "allocator did not produce a contiguous test run";
+  }
+
+  // The selected run is surrounded by live allocations. These frees therefore
+  // exercise the explicit cases rather than relying on free-list length deltas.
+  vtcm_pool->Free(blocks[2], blockBytes);  // none
+  vtcm_pool->Free(blocks[4], blockBytes);  // none
+  vtcm_pool->Free(blocks[3], blockBytes);  // both
+  vtcm_pool->Free(blocks[5], blockBytes);  // previous
+  vtcm_pool->Free(blocks[1], blockBytes);  // next
+
+  const auto after = vtcm_pool->getAccountingSnapshot();
+  EXPECT_EQ(after.coalesceNoneEvents - before.coalesceNoneEvents, 2u);
+  EXPECT_EQ(after.coalesceBothEvents - before.coalesceBothEvents, 1u);
+  EXPECT_EQ(after.coalescePreviousEvents - before.coalescePreviousEvents, 1u);
+  EXPECT_EQ(after.coalesceNextEvents - before.coalesceNextEvents, 1u);
+  EXPECT_EQ(after.coalesceEvents - before.coalesceEvents, 3u);
+  EXPECT_EQ(after.coalescedBlocks - before.coalescedBlocks, 4u);
+
+  vtcm_pool->Free(blocks[0], blockBytes);
+  vtcm_pool->Free(blocks[6], blockBytes);
+  vtcm_pool->Free(blocks[7], blockBytes);
+}
+#endif
+
+TEST_F(VtcmPoolTest, resident_alignment_uses_supported_powers_of_two) {
+  alignas(256) uint8_t source[256]{};
+  const uint64_t key = reinterpret_cast<uintptr_t>(source);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                sizeof(source), 3, source),
+            nullptr);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                sizeof(source), 4096, source),
+            nullptr);
+}
+
+TEST_F(VtcmPoolTest, resident_descriptor_mismatch_fails_closed) {
+  alignas(256) uint8_t source[256]{};
+  const uint64_t key = reinterpret_cast<uintptr_t>(source);
+  void *first = vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                    sizeof(source), 256, source);
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                sizeof(source), 256, source),
+            first);
+
+  // Same key, different requested bytes/alignment/kind: each must fail before
+  // a second block can be allocated under that key.
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                sizeof(source) + 1, 256, source),
+            nullptr);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
+                                sizeof(source), 128, source),
+            nullptr);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
+                                sizeof(source), 256, nullptr),
+            nullptr);
 }
 
 TEST_F(VtcmPoolTest, end_allocation_bug_fixed) {

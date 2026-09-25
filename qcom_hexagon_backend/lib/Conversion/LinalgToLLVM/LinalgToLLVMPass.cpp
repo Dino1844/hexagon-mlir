@@ -13,21 +13,21 @@
 
 #include "hexagon/Conversion/DMAToLLVM/Passes.h"
 #include "hexagon/Conversion/HexKLToLLVM/Passes.h"
-#include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
+#include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
 #include "hexagon/Conversion/HvxToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
-#include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
-#include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/Passes.h"
+#include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Transforms/Passes.h"
-#include "hexagon/Dialect/Hmx/Transforms/Passes.h"
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/Passes.h"
@@ -450,8 +450,8 @@ public:
       // Raising the pipeline-wide allocation alignment from the upstream
       // default 64 to 128 guarantees that precondition allocator-side, at
       // compile time, with no runtime check. Over-alignment is always safe;
-      // VTCM buffers are unaffected (ConvertToHexagonmem drops this attribute
-      // and hexagonmem.alloc carries its own alignment).
+      // VTCM allocations retain their explicit alignment when
+      // ConvertToHexagonmem lowers them to hexagonmem.alloc.
       passOpts.bufferAlignment = 128;
       pm.addPass(bufferization::createOneShotBufferizePass(passOpts));
       pm.addPass(createCSEPass());
@@ -495,9 +495,9 @@ public:
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createWeightResidentPass(weightResidentOpts));
       // The HMX tile level runs while the crouton buffers are still the ones
-      // bufferization allocated: the VTCM machinery below rewrites space-1 buffers
-      // for the HVX scratch path, and these belong to the region the runtime
-      // acquires instead (docs/hmx/hmx-system-design.md 2.B / 10.12).
+      // bufferization allocated: the VTCM machinery below rewrites space-1
+      // buffers for the HVX scratch path, and these belong to the region the
+      // runtime acquires instead (docs/hmx/hmx-system-design.md 2.B / 10.12).
       //
       // No interaction with `FormSCFThreadsPass` (above, before bufferization):
       // it selects the linalg ops that exist at that point, and both the HMX
@@ -535,6 +535,14 @@ public:
       pm.addNestedPass<func::FuncOp>(createInsertScratchArgPass(scratchOpts));
       pm.addNestedPass<func::FuncOp>(createMemoryOffsetsPass());
     }
+
+    // Analyze the allocation structure that survives every optional placement
+    // rewrite. In particular, scratch mode replaces VTCM allocations with views
+    // of an external argument; running first would publish a census for IR that
+    // no longer exists. The pass remains marker-gated and never changes v2 or
+    // launcher policy.
+    if (enableBufferization)
+      pm.addPass(mlir::hmx::createHmxVtcmAccountingPass());
 
     if (enableHexKL) {
       if (hexKLMode == "macro") {

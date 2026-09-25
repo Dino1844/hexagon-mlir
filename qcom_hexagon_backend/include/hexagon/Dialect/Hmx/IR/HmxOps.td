@@ -310,6 +310,10 @@ def Hmx_UnpackAccOp
     `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
     bounds-safe edge block. They describe the valid logical M/N portion of the
     tile; a tail leaf handles one row-pair and therefore requires `count == 1`.
+    The diagnostic output bridge may set `n_tile` to select one physical N
+    output tile while keeping `row`/`col` as the M tile and row-pair coordinate.
+    HmxToLLVM rejects coordinates whose widest supported byte displacement does
+    not fit its signed i32 address ABI.
   }];
 
   let arguments = (ins
@@ -321,7 +325,8 @@ def Hmx_UnpackAccOp
     Index:$col,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntNonNegative]>>:$n_tile
   );
   // Tensor form: the row-major matrix. Memref form (DPS): the same `dst` buffer
   // that was written, so the destination is an SSA value.
@@ -371,6 +376,10 @@ def Hmx_UnpackAccF32Op
     `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
     bounds-safe edge block. They describe the valid logical M/N portion of the
     tile; a tail leaf handles one row-pair and therefore requires `count == 1`.
+    The diagnostic output bridge may set `n_tile` to select one physical N
+    output tile while keeping `row`/`col` as the M tile and row-pair coordinate.
+    HmxToLLVM rejects coordinates whose widest supported byte displacement does
+    not fit its signed i32 address ABI.
     With a residual, only this valid intersection is read.
   }];
 
@@ -384,7 +393,8 @@ def Hmx_UnpackAccF32Op
     Optional<AnyTypeOf<[Non0RankedTensorOf<[F32]>, Non0RankedMemRefOf<[F32]>]>>:$residual,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols,
+    OptionalAttr<ConfinedAttr<I64Attr, [IntNonNegative]>>:$n_tile
   );
   // Tensor form: the row-major f32 matrix. Memref form (DPS): the same `dst`
   // buffer that was written, so the destination is an SSA value.

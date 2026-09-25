@@ -22,6 +22,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     HexagonWrapperGenerator,
     WrapperGeneratorStrings,
     create_timestamped_folder,
+    make_resident_scope_id,
 )
 from triton.backends.qcom_hexagon_backend.utils import (
     parse_return_types,
@@ -43,6 +44,7 @@ class TorchMLIRWrapperGeneratorStrings(WrapperGeneratorStrings):
 
         self.torch_mlir_code_body = """
 int main() {{
+{resident_scope_setup}
 {tensor_definition_str}
 {result_struct_init}
 {read_from_file_calls}
@@ -56,7 +58,15 @@ return 0;
 
 
 class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
-    def __init__(self, input_profs, iterations, func_name, output_profs, options: dict):
+    def __init__(
+        self,
+        input_profs,
+        iterations,
+        func_name,
+        output_profs,
+        options: dict,
+        resident_scope_id: tuple[int, int] | None = None,
+    ):
         super().__init__(
             input_profs,
             iterations,
@@ -64,6 +74,7 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
             output_profs,
             TorchMLIRWrapperGeneratorStrings(),
             options,
+            resident_scope_id,
         )
 
     def generate_llvm_function_signature(self):
@@ -105,6 +116,7 @@ class TorchMlirHexagonWrapperGenerator(HexagonWrapperGenerator):
         )
 
         code_body = self.common_strings.torch_mlir_code_body.format(
+            resident_scope_setup=self.generate_resident_scope_setup(),
             tensor_definition_str=self.generate_input_declarations(),
             input_wrapper_structs_init="",
             result_struct_init=self.generate_result_struct_init(),
@@ -225,12 +237,16 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
 
                 # Pass options to the wrapper generator.
                 # HexagonWrapperGenerator will create the call to WriteLWPOutput() if lwp is enabled.
+                resident_scope_id = make_resident_scope_id(
+                    kernel_obj_as_bytes, func_name_with_ciface
+                )
                 wrapper_generator = TorchMlirHexagonWrapperGenerator(
                     input_profs,
                     iterations,
                     func_name_with_ciface,
                     return_types,
                     options,
+                    resident_scope_id,
                 )
                 wrapper_generator.weight_prepack = weight_prepack
                 print("==> Wrapper generator correctly instanciated")

@@ -99,6 +99,7 @@ int main(int argc, char **argv) {
   mlir::hmx::registerHmxPartitionPass();
   mlir::hmx::registerWeightResidentPass();
   mlir::hmx::registerHmxWorkspaceResidentPass();
+  mlir::hmx::registerHmxVtcmAccountingPass();
   mlir::hexagon::registerDecomposeHexKLMatmulPass();
   mlir::hexagon::registerConvTilingPass();
   mlir::hexagon::registerDMAToLLVMPass();

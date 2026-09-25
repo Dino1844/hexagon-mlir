@@ -10,14 +10,26 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(hmx-partition),hmx-to-llvm)' | FileCheck %s --check-prefix=LLVM
 //===----------------------------------------------------------------------===//
 
+// CHECK: module attributes
+// CHECK-SAME: hmx.diagnostic_tail_partition
 // CHECK-LABEL: func.func @tail_looped
 // CHECK-DAG: hmx.pack_act
 // CHECK-DAG: hmx.pack_weight
 // CHECK-DAG: hmx.acc_clear
+// All four physical regions must compute before any output read-out; reversing
+// the region insertion order lets N=0 unpack before its accumulator is stored.
+// CHECK-COUNT-4: hmx.acc_read
 // CHECK-DAG: hmx.unpack_acc
 // CHECK-DAG: valid_rows = 1 : i64
 // CHECK-DAG: valid_cols = 1 : i64
+// Each physical N output tile is explicit; the original ranked descriptor is
+// retained and the lowering applies the static n_tile displacement.
+// CHECK-DAG: n_tile = 0 : i64
+// CHECK-DAG: n_tile = 1 : i64
+// CHECK-DAG: hmx.unpack_acc {{.*}} outs(%{{.*}} : memref<33x33xf16>)
 // CHECK-NOT: hmx.matmul
+// LLVM: module attributes
+// LLVM-SAME: hmx.diagnostic_tail_partition
 // LLVM-DAG: llvm.call @hmx_pack_act_tail_f16
 // LLVM-DAG: llvm.call @hmx_pack_weight_tail_f16
 // LLVM-DAG: llvm.call @hmx_unpack_acc_tail_f16

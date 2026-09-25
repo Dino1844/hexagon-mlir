@@ -5,6 +5,7 @@ add_mlir_dialect_library(HmxTransforms
   HmxPartitionPass.cpp
   WeightResidentPass.cpp
   HmxWorkspaceResidentPass.cpp
+  HmxVtcmAccountingPass.cpp
 
   DEPENDS
   HmxTransformsPassIncGen
@@ -15,6 +16,7 @@ add_mlir_dialect_library(HmxTransforms
   Hmx
   MLIRArithDialect
   MLIRBufferizationDialect
+  MLIRControlFlowDialect
   MLIRDestinationStyleOpInterface
   MLIRFuncDialect
   MLIRIR

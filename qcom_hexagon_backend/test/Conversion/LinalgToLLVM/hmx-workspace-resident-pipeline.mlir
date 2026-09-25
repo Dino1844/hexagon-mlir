@@ -21,19 +21,24 @@
 // once instead of being a per-launch workspace.
 // CHECK: hmx.weight_prepack =
 // The weight-residency entry is declared first, then the runtime entry that
-// pins a workspace buffer: key + bytes, no source (there is nothing to copy).
-// CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
-// CHECK: llvm.func @hexagon_runtime_workspace_resident_dsp(i64, i32) -> !llvm.ptr
+// pins a workspace buffer: key + bytes + alignment (there is nothing to copy
+// for a workspace).
+// CHECK: llvm.func @hexagon_runtime_weight_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_workspace_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
 
 // CHECK-LABEL: llvm.func @runtime_weight
+// The conversion-state allocation keeps its 256-byte alignment through the
+// resident ABI; ordinary HMX workspaces remain at their existing 128-byte
+// alignment.
+// CHECK-DAG: %[[STATE_ALIGN:.*]] = llvm.mlir.constant(256 : i32) : i32
 // One resident call per remaining per-launch VTCM workspace: the conversion
 // state, the activation and the output crouton array. The weight is not one of
 // them anymore.
-// CHECK: llvm.call @hexagon_runtime_workspace_resident_dsp
-// CHECK: llvm.call @hexagon_runtime_workspace_resident_dsp
-// CHECK: llvm.call @hexagon_runtime_workspace_resident_dsp
+// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp({{.*}}, {{.*}}, %[[STATE_ALIGN]])
+// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
+// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // The weight comes from the host pre-pack instead.
-// CHECK: llvm.call @hexagon_runtime_weight_resident_dsp
+// CHECK: llvm.call @hexagon_runtime_weight_resident_v2_dsp
 // No per-launch allocation or deallocation survives for any of them.
 // CHECK-NOT: hexagon_runtime_alloc_1d_dsp
 // CHECK-NOT: hexagon_runtime_free_1d_dsp

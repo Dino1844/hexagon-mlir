@@ -36,9 +36,16 @@ inline constexpr StringLiteral kHmxDecisionIdAttr = "hmx.decision_id";
 /// Internal, test-only IR marker. It is deliberately not a backend option:
 /// the normal attribution path never sets it, so production tail selection
 /// remains closed while diagnostic producer/consumer tests can exercise the
-/// full hmx-tail contract end to end.
+/// full hmx-tail contract end to end. The source linalg/hmx matmul carries the
+/// operation marker; the enclosing module receives the same UnitAttr as durable
+/// provenance for the n_tile attributes emitted after that matmul is erased.
 inline constexpr StringLiteral kHmxDiagnosticTailAttr =
     "hmx.diagnostic_tail_partition";
+
+/// Internal diagnostic output-bridge coordinate. It is an op attribute, not a
+/// backend option: when present, HmxToLLVM selects one physical N output tile
+/// from the original ranked descriptors. It is absent on the regular path.
+inline constexpr StringLiteral kHmxDiagnosticNTileAttr = "n_tile";
 
 /// The diagnostic guard is deliberately presence-and-type checked. A marker
 /// carrying a string/integer/other payload is malformed test IR, not an
@@ -46,6 +53,20 @@ inline constexpr StringLiteral kHmxDiagnosticTailAttr =
 inline bool isHmxDiagnosticTailMarker(Operation *op) {
   return op && op->hasAttr(kHmxDiagnosticTailAttr) &&
          isa<UnitAttr>(op->getAttr(kHmxDiagnosticTailAttr));
+}
+
+/// Publish the operation marker's module-scoped provenance. Reject a malformed
+/// existing value rather than replacing it, so a manually malformed diagnostic
+/// module cannot be silently repaired into an authorized lowering input.
+inline LogicalResult markHmxDiagnosticTailModule(ModuleOp module) {
+  if (Attribute marker = module->getAttr(kHmxDiagnosticTailAttr)) {
+    if (!isa<UnitAttr>(marker))
+      return module.emitError(
+          "hmx.diagnostic_tail_partition must be a unit attribute");
+    return success();
+  }
+  module->setAttr(kHmxDiagnosticTailAttr, UnitAttr::get(module.getContext()));
+  return success();
 }
 
 /// Canonical semantic plan vocabulary. The plan is the executable shape
@@ -67,7 +88,8 @@ inline constexpr StringLiteral kHmxReasonDynamicShape = "dynamic-shape";
 inline constexpr StringLiteral kHmxReasonUnsupportedDType = "unsupported-dtype";
 inline constexpr StringLiteral kHmxReasonMinRows = "min-rows";
 inline constexpr StringLiteral kHmxReasonTileAlignment = "tile-alignment";
-inline constexpr StringLiteral kHmxReasonUnsupportedLayout = "unsupported-layout";
+inline constexpr StringLiteral kHmxReasonUnsupportedLayout =
+    "unsupported-layout";
 inline constexpr StringLiteral kHmxReasonVtcmBudget = "vtcm-budget";
 
 inline bool isCanonicalHmxMatmulReason(StringRef reason) {
@@ -134,12 +156,11 @@ LogicalResult setHmxManifestWeightPolicy(ModuleOp module, StringRef function,
 /// Reconcile the final slot policies against the module's prepack declarations
 /// after the resident-weight pass has finished its classify/rewrite phase.
 LogicalResult reconcileHmxManifestWeightPolicies(ModuleOp module,
-                                                  bool prepackRuntimeWeights);
+                                                 bool prepackRuntimeWeights);
 
 /// Update the workspace/grid facts after the workspace-residency pass has made
 /// its final decision for a function.
-LogicalResult setHmxManifestWorkspaceClass(ModuleOp module,
-                                           StringRef function,
+LogicalResult setHmxManifestWorkspaceClass(ModuleOp module, StringRef function,
                                            StringRef workspaceClass,
                                            StringRef gridPolicy);
 

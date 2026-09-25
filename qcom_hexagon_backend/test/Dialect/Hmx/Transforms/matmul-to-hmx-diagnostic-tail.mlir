@@ -13,9 +13,13 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(matmul-to-hmx),one-shot-bufferize{bufferize-function-boundaries},func.func(hmx-partition),hmx-to-llvm)' | FileCheck %s --check-prefix=E2E
 //===----------------------------------------------------------------------===//
 
+// CHECK: module attributes
+// CHECK-SAME: hmx.diagnostic_tail_partition
 // CHECK-DAG: plan = "hmx-tail"
 // CHECK-DAG: grid_policy = "single-instance"
 // CHECK-DAG: tail_policy
+// E2E: module attributes
+// E2E-SAME: hmx.diagnostic_tail_partition
 // E2E-DAG: llvm.call @hmx_pack_act_tail_f16
 // E2E-DAG: llvm.call @hmx_pack_weight_tail_f16
 // E2E-DAG: llvm.call @hmx_mma_f16

@@ -1,4 +1,5 @@
-//===-- MatmulToHmxPass.cpp - linalg.matmul to hmx.matmul --------*- C++ -*-===//
+//===-- MatmulToHmxPass.cpp - linalg.matmul to hmx.matmul --------*- C++
+//-*-===//
 //
 // Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 // SPDX-License-Identifier: BSD-3-Clause.
@@ -13,14 +14,15 @@
 // followed by a worth-it question (`HmxTarget::planBridge`) asking how the
 // crouton bridge fits the VTCM pool -- whole when it fits, in M blocks when it
 // does not -- the same shape Triton's AccelerateMatmul uses.
-// There is no user-facing switch: a matmul either fits the engine's contract and
-// repays its bridge, or it is left alone.
+// There is no user-facing switch: a matmul either fits the engine's contract
+// and repays its bridge, or it is left alone.
 //
-// An op that does not fit is left completely untouched. "This op is not for HMX"
-// is an engine choice that the existing HVX and linalg paths already handle, not
-// a failure -- so this pass never errors. When the element types *are* the
-// engine's (f16) a remark says why the op was skipped, because a f16 matmul that
-// misses the tile grid is the one case a user would want to know about.
+// An op that does not fit is left completely untouched. "This op is not for
+// HMX" is an engine choice that the existing HVX and linalg paths already
+// handle, not a failure -- so this pass never errors. When the element types
+// *are* the engine's (f16) a remark says why the op was skipped, because a f16
+// matmul that misses the tile grid is the one case a user would want to know
+// about.
 //
 // A remark alone has no visible output on the production path, though, so the
 // end of the run also emits ONE warning on the module whenever a matmul was
@@ -28,12 +30,13 @@
 // refusal -- and, when that refusal was the pipeline's missing VTCM allocator,
 // naming the switch that closed the whole HMX path, not just one op.
 //
-// The engine reads croutons, so `hmx.matmul` takes crouton operands and this pass
-// is what bridges row-major producers to it with explicit `linalg.pack`s (and
-// bridges the result back with `linalg.unpack`s). Two consequences fall out of
-// keeping the layout in the type:
+// The engine reads croutons, so `hmx.matmul` takes crouton operands and this
+// pass is what bridges row-major producers to it with explicit `linalg.pack`s
+// (and bridges the result back with `linalg.unpack`s). Two consequences fall
+// out of keeping the layout in the type:
 //
-//   * a matmul chained off another matmul needs no bridge at all -- the read-out
+//   * a matmul chained off another matmul needs no bridge at all -- the
+//   read-out
 //     layout AR and the activation layout AH are the same permutation, so the
 //     types already match (see docs/hmx/hmx-system-design.md §4.1);
 //   * a constant weight folds: `fold-pack-unpack-constants` turns the pack of a
@@ -63,7 +66,6 @@
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include <mutex>
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -71,6 +73,7 @@
 #include <cstdlib>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #define DEBUG_TYPE "matmul-to-hmx"
@@ -96,7 +99,9 @@ bool isEmptyInit(Value init) {
     return true;
   // A zero fill is how the tests spell an accumulator initialiser.
   if (auto fill = init.getDefiningOp<linalg::FillOp>())
-    if (auto cst = fill.getDpsInputOperand(0)->get().getDefiningOp<arith::ConstantOp>())
+    if (auto cst = fill.getDpsInputOperand(0)
+                       ->get()
+                       .getDefiningOp<arith::ConstantOp>())
       if (auto scalar = dyn_cast<FloatAttr>(cst.getValue()))
         return scalar.getValue().isZero();
   if (auto cst = init.getDefiningOp<arith::ConstantOp>()) {
@@ -117,8 +122,17 @@ struct MatmulContract {
 
 std::string typeName(Type type);
 
-enum class ManifestShapeState { Static, PartiallyDynamic, Dynamic, Unavailable };
-enum class ManifestWeightSource { ArgumentSlot, CompileTimeConstant, InternalValue };
+enum class ManifestShapeState {
+  Static,
+  PartiallyDynamic,
+  Dynamic,
+  Unavailable
+};
+enum class ManifestWeightSource {
+  ArgumentSlot,
+  CompileTimeConstant,
+  InternalValue
+};
 
 struct ManifestFacts {
   ManifestShapeState shapeState = ManifestShapeState::Unavailable;
@@ -227,10 +241,9 @@ static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
     int dynamic = 0;
     for (int64_t extent : facts->dims)
       dynamic += extent < 0;
-    facts->shapeState =
-        dynamic == 0 ? ManifestShapeState::Static
-        : dynamic == 3 ? ManifestShapeState::Dynamic
-                       : ManifestShapeState::PartiallyDynamic;
+    facts->shapeState = dynamic == 0   ? ManifestShapeState::Static
+                        : dynamic == 3 ? ManifestShapeState::Dynamic
+                                       : ManifestShapeState::PartiallyDynamic;
   }
 
   Value source = op.getDpsInputOperand(1)->get();
@@ -310,12 +323,13 @@ public:
         if (!capability.supported()) {
           bool diagnosticTail =
               isHmxDiagnosticTailMarker(op.getOperation()) &&
-              capability.refusal == HmxTarget::ContractionRefusal::TileAlignment &&
+              capability.refusal ==
+                  HmxTarget::ContractionRefusal::TileAlignment &&
               capability.tailCandidate();
           if (diagnosticTail) {
             const HmxTarget::ContractionShape &shape = capability.shape;
-            auto paddedPlan = target.planBridge(
-                shape.mp, shape.np, shape.kp, vtcmBytesCommitted(op));
+            auto paddedPlan = target.planBridge(shape.mp, shape.np, shape.kp,
+                                                vtcmBytesCommitted(op));
             if (paddedPlan && !paddedPlan.blocked(shape.mp)) {
               decision.reason = MatmulReason::SelectedTail;
               decision.plan = paddedPlan;
@@ -412,10 +426,10 @@ InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
         decision.contract->outElem);
     if (capability.tailCandidate()) {
       const HmxTarget::ContractionShape &shape = capability.shape;
-      diag << " [candidate=hmx-tail, padded=(" << shape.mp << ", "
-           << shape.np << ", " << shape.kp << "), full=(" << shape.mf << ", "
-           << shape.nf << ", " << shape.kf << "), tail=(" << shape.mt << ", "
-           << shape.nt << ", " << shape.kt << ")]";
+      diag << " [candidate=hmx-tail, padded=(" << shape.mp << ", " << shape.np
+           << ", " << shape.kp << "), full=(" << shape.mf << ", " << shape.nf
+           << ", " << shape.kf << "), tail=(" << shape.mt << ", " << shape.nt
+           << ", " << shape.kt << ")]";
     }
   }
   return diag << " [reason=" << reasonCode(decision.reason) << "]";
@@ -487,7 +501,8 @@ static StringRef shapeStateName(ManifestShapeState state) {
 static DictionaryAttr makeDimensionAttr(MLIRContext *ctx, int64_t extent,
                                         StringRef symbol) {
   NamedAttrList fields;
-  fields.append("kind", StringAttr::get(ctx, extent >= 0 ? "static" : "dynamic"));
+  fields.append("kind",
+                StringAttr::get(ctx, extent >= 0 ? "static" : "dynamic"));
   if (extent >= 0)
     fields.append("value", IntegerAttr::get(IntegerType::get(ctx, 64), extent));
   else
@@ -534,14 +549,13 @@ static DictionaryAttr makeExecutionAttr(MLIRContext *ctx,
          "selected matmul has no bridge plan");
   bool tail = decision.reason == MatmulReason::SelectedTail;
   NamedAttrList fields;
-  fields.append("blocking",
-                StringAttr::get(ctx, !tail && decision.plan->blocked(
-                                              decision.contract->m)
-                                         ? "m_blocked"
-                                         : "whole"));
-  fields.append("block_m", IntegerAttr::get(
-                               i64, tail ? decision.contract->m
-                                         : decision.plan->blockM));
+  fields.append(
+      "blocking",
+      StringAttr::get(ctx, !tail && decision.plan->blocked(decision.contract->m)
+                               ? "m_blocked"
+                               : "whole"));
+  fields.append("block_m", IntegerAttr::get(i64, tail ? decision.contract->m
+                                                      : decision.plan->blockM));
   NamedAttrList counts;
   counts.append("pack_act_sites", IntegerAttr::get(i64, 0));
   counts.append("pack_weight_sites", IntegerAttr::get(i64, 0));
@@ -561,7 +575,7 @@ static DictionaryAttr makeWeightBindingAttr(MLIRContext *ctx,
     NamedAttrList reference;
     reference.append("function", StringAttr::get(ctx, decision.functionName));
     reference.append("slot", IntegerAttr::get(IntegerType::get(ctx, 64),
-                                               facts.argumentSlot));
+                                              facts.argumentSlot));
     fields.append("policy_ref", reference.getDictionary(ctx));
     break;
   }
@@ -583,15 +597,16 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
   bool hmx = decision.reason == MatmulReason::SelectedAligned ||
              decision.reason == MatmulReason::SelectedTail;
   bool tail = decision.reason == MatmulReason::SelectedTail;
-  StringRef plan = tail ? kHmxPlanHMXTail
-                        : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
+  StringRef plan =
+      tail ? kHmxPlanHMXTail : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
 
   NamedAttrList fields;
   fields.append("function", StringAttr::get(ctx, decision.functionName));
   fields.append("id", IntegerAttr::get(i64, decision.id));
   fields.append("plan", StringAttr::get(ctx, plan));
   fields.append("reason", StringAttr::get(ctx, reasonCode(decision.reason)));
-  fields.append("shape_state", StringAttr::get(ctx, shapeStateName(facts.shapeState)));
+  fields.append("shape_state",
+                StringAttr::get(ctx, shapeStateName(facts.shapeState)));
   if (facts.shapeState == ManifestShapeState::Unavailable)
     fields.append("logical", UnitAttr::get(ctx));
   else
@@ -605,29 +620,30 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
         decision.contract->m, decision.contract->n, decision.contract->k,
         decision.contract->lhsElem, decision.contract->rhsElem,
         decision.contract->outElem);
-    assert(((tail && capability.plan == HmxTarget::ContractionPlan::HMXTail) ||
-            (!tail && capability.plan == HmxTarget::ContractionPlan::FullHMX)) &&
-           "selected HMX record has the wrong contraction plan");
+    assert(
+        ((tail && capability.plan == HmxTarget::ContractionPlan::HMXTail) ||
+         (!tail && capability.plan == HmxTarget::ContractionPlan::FullHMX)) &&
+        "selected HMX record has the wrong contraction plan");
     const HmxTarget::ContractionShape &shape = capability.shape;
-    fields.append("padded",
-                  makeExtentAttr(ctx, shape.mp, shape.np, shape.kp));
+    fields.append("padded", makeExtentAttr(ctx, shape.mp, shape.np, shape.kp));
     fields.append("full", makeExtentAttr(ctx, shape.mf, shape.nf, shape.kf));
     fields.append("tail", makeExtentAttr(ctx, shape.mt, shape.nt, shape.kt));
-    fields.append("layout",
-                  StringAttr::get(ctx, "row-major-inner-contiguous"));
+    fields.append("layout", StringAttr::get(ctx, "row-major-inner-contiguous"));
     fields.append("workspace_class", StringAttr::get(ctx, "runtime-internal"));
-    fields.append("grid_policy",
-                  StringAttr::get(ctx, tail ? "single-instance"
-                                            : "legacy-runtime"));
+    fields.append("grid_policy", StringAttr::get(ctx, tail ? "single-instance"
+                                                           : "legacy-runtime"));
     fields.append("vtcm_accounting", StringAttr::get(ctx, "bridge-only"));
-    fields.append("vtcm_budget_bytes", IntegerAttr::get(i64, target.vtcmBudget));
-    fields.append("vtcm_before_bytes", IntegerAttr::get(i64, decision.vtcmBefore));
+    fields.append("vtcm_budget_bytes",
+                  IntegerAttr::get(i64, target.vtcmBudget));
+    fields.append("vtcm_before_bytes",
+                  IntegerAttr::get(i64, decision.vtcmBefore));
     fields.append("vtcm_bridge_peak_bytes",
                   IntegerAttr::get(i64, decision.vtcmPeak));
     if (tail) {
       NamedAttrList tailPolicy;
       tailPolicy.append("k", StringAttr::get(ctx, "zero-pad-both-operands"));
-      tailPolicy.append("mn", StringAttr::get(ctx, "padded-edge-tile-bounded-store"));
+      tailPolicy.append("mn",
+                        StringAttr::get(ctx, "padded-edge-tile-bounded-store"));
       fields.append("tail_policy", tailPolicy.getDictionary(ctx));
     }
     fields.append("execution", makeExecutionAttr(ctx, decision));
@@ -649,18 +665,17 @@ static Value padMatrix(RewriterBase &b, Location loc, Value value,
   if (!type.hasStaticShape() || type.getDimSize(0) > paddedRows ||
       type.getDimSize(1) > paddedCols)
     return {};
-  if (type.getDimSize(0) == paddedRows &&
-      type.getDimSize(1) == paddedCols) {
+  if (type.getDimSize(0) == paddedRows && type.getDimSize(1) == paddedCols) {
     SmallVector<int64_t> paddedShape = {paddedRows, paddedCols};
-    Value empty = tensor::EmptyOp::create(
-        b, loc, paddedShape, type.getElementType());
+    Value empty =
+        tensor::EmptyOp::create(b, loc, paddedShape, type.getElementType());
     SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(2));
-    SmallVector<utils::IteratorType> iterators(
-        2, utils::IteratorType::parallel);
+    SmallVector<utils::IteratorType> iterators(2,
+                                               utils::IteratorType::parallel);
     auto copy = linalg::GenericOp::create(
         b, loc, TypeRange{type}, ValueRange{value}, ValueRange{empty}, maps,
-        iterators, [](OpBuilder &bodyBuilder, Location bodyLoc,
-                      ValueRange args) {
+        iterators,
+        [](OpBuilder &bodyBuilder, Location bodyLoc, ValueRange args) {
           linalg::YieldOp::create(bodyBuilder, bodyLoc, args[0]);
         });
     return copy.getResult(0);
@@ -668,14 +683,14 @@ static Value padMatrix(RewriterBase &b, Location loc, Value value,
   SmallVector<int64_t> low = {0, 0};
   SmallVector<int64_t> high = {paddedRows - type.getDimSize(0),
                                paddedCols - type.getDimSize(1)};
-  auto paddedType = RankedTensorType::get({paddedRows, paddedCols},
-                                          type.getElementType());
-  Value zero = arith::ConstantOp::create(
-      b, loc, b.getZeroAttr(type.getElementType()));
-  return tensor::PadOp::create(
-             b, loc, paddedType, value,
-             getAsIndexOpFoldResult(b.getContext(), low),
-             getAsIndexOpFoldResult(b.getContext(), high), zero, false)
+  auto paddedType =
+      RankedTensorType::get({paddedRows, paddedCols}, type.getElementType());
+  Value zero =
+      arith::ConstantOp::create(b, loc, b.getZeroAttr(type.getElementType()));
+  return tensor::PadOp::create(b, loc, paddedType, value,
+                               getAsIndexOpFoldResult(b.getContext(), low),
+                               getAsIndexOpFoldResult(b.getContext(), high),
+                               zero, false)
       .getResult();
 }
 
@@ -693,9 +708,9 @@ static Value padMatrix(RewriterBase &b, Location loc, Value value,
 /// attribute: the engine reads and writes VTCM only.
 ///
 /// Declaring the placement here, instead of rewriting memory spaces after
-/// bufferization, is what keeps the later binding of these buffers to the region
-/// the runtime acquires a *type-compatible* edit. The tensor type itself carries
-/// no memory space, so nothing about the op signatures changes.
+/// bufferization, is what keeps the later binding of these buffers to the
+/// region the runtime acquires a *type-compatible* edit. The tensor type itself
+/// carries no memory space, so nothing about the op signatures changes.
 Value vtcmEmpty(RewriterBase &b, Location loc, RankedTensorType type) {
   return AllocCroutonOp::create(b, loc, type);
 }
@@ -720,9 +735,9 @@ static int64_t vtcmBytesCommitted(Operation *within) {
       return;
     bytes += type.getNumElements() * (type.getElementTypeBitWidth() / 8);
   });
-  // Resident constant weights are not `hmx.alloc_crouton`s here -- the residency
-  // declaration on the module is their single source of truth, so the budget
-  // this pass checks cannot drift from the one the runtime reserves.
+  // Resident constant weights are not `hmx.alloc_crouton`s here -- the
+  // residency declaration on the module is their single source of truth, so the
+  // budget this pass checks cannot drift from the one the runtime reserves.
   if (auto module = within->getParentOfType<ModuleOp>())
     if (auto resident =
             module->getAttrOfType<IntegerAttr>("hmx.weight_resident_bytes"))
@@ -731,16 +746,15 @@ static int64_t vtcmBytesCommitted(Operation *within) {
 }
 
 /// The AH/WH permutation applied at compile time. For an activation (a
-/// row-major [M, K] source, a [Mt, Kt, ...] crouton) element (t0, t1, j, col, h)
-/// of the crouton array is src[t0*32 + 2j + h][t1*32 + col]. For a weight the
-/// crouton is [Nt, Kt, ...] over a row-major [K, N] source (the engine's K runs
-/// along dim1), so the two tile axes are read transposed: element (t0=n_tile,
-/// t1=k_tile, j, col, h) is src[t1*32 + 2j + h][t0*32 + col]. See
+/// row-major [M, K] source, a [Mt, Kt, ...] crouton) element (t0, t1, j, col,
+/// h) of the crouton array is src[t0*32 + 2j + h][t1*32 + col]. For a weight
+/// the crouton is [Nt, Kt, ...] over a row-major [K, N] source (the engine's K
+/// runs along dim1), so the two tile axes are read transposed: element
+/// (t0=n_tile, t1=k_tile, j, col, h) is src[t1*32 + 2j + h][t0*32 + col]. See
 /// docs/hmx/hmx-weight-layout-plan.md §0. Either way a constant operand (a
 /// weight in inference, where W is baked in) never needs the runtime packer.
-static DenseElementsAttr prepackCrouton(DenseElementsAttr src,
-                                        RankedTensorType crouton,
-                                        bool isWeight) {
+static DenseElementsAttr
+prepackCrouton(DenseElementsAttr src, RankedTensorType crouton, bool isWeight) {
   auto srcType = cast<RankedTensorType>(src.getType());
   const int64_t cols = srcType.getDimSize(1);
   auto at = [&](int64_t k, int64_t n) {
@@ -753,12 +767,13 @@ static DenseElementsAttr prepackCrouton(DenseElementsAttr src,
       for (int64_t j = 0; j < hmx::layout::kCroutonPair; ++j)
         for (int64_t c = 0; c < hmx::layout::kCroutonCol; ++c)
           for (int64_t h = 0; h < hmx::layout::kCroutonHalf; ++h)
-            packed.push_back(
-                isWeight
-                    ? at(t1 * HmxTarget::tileEdge + hmx::layout::kCroutonHalf * j + h,
-                         t0 * HmxTarget::tileEdge + c)
-                    : at(t0 * HmxTarget::tileEdge + hmx::layout::kCroutonHalf * j + h,
-                         t1 * HmxTarget::tileEdge + c));
+            packed.push_back(isWeight
+                                 ? at(t1 * HmxTarget::tileEdge +
+                                          hmx::layout::kCroutonHalf * j + h,
+                                      t0 * HmxTarget::tileEdge + c)
+                                 : at(t0 * HmxTarget::tileEdge +
+                                          hmx::layout::kCroutonHalf * j + h,
+                                      t1 * HmxTarget::tileEdge + c));
   return DenseElementsAttr::get(crouton, packed);
 }
 
@@ -777,13 +792,14 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
   // encoding: the layout is a property of the engine's operands, and the
   // constant is only ever read by the copy below. Keeping it unannotated also
   // means no `arith.constant` has to be rewritten when the encoding is dropped.
-  auto plain = RankedTensorType::get(crouton.getShape(), crouton.getElementType());
+  auto plain =
+      RankedTensorType::get(crouton.getShape(), crouton.getElementType());
   Value packed =
       arith::ConstantOp::create(b, loc, prepackCrouton(dense, plain, isWeight));
   Value out = vtcmEmpty(b, loc, crouton);
   SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(crouton.getRank()));
-  SmallVector<utils::IteratorType> iterators(
-      crouton.getRank(), utils::IteratorType::parallel);
+  SmallVector<utils::IteratorType> iterators(crouton.getRank(),
+                                             utils::IteratorType::parallel);
   auto generic = linalg::GenericOp::create(
       b, loc, TypeRange{crouton}, ValueRange{packed}, ValueRange{out}, maps,
       iterators, [&](OpBuilder &bodyBuilder, Location l, ValueRange args) {
@@ -792,22 +808,22 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
   return generic.getResult(0);
 }
 
-/// The crouton bridge built out of the runtime's vectorised pack leaves, carried
-/// through a loop so the destination is a single buffer (a chain of DPS ops on
-/// one buffer would make one-shot bufferization insert a copy per tile).
+/// The crouton bridge built out of the runtime's vectorised pack leaves,
+/// carried through a loop so the destination is a single buffer (a chain of DPS
+/// ops on one buffer would make one-shot bufferization insert a copy per tile).
 ///
 /// Both crouton arrays have K in their second, contiguous dimension -- the
 /// activation is [Mt, Kt] and the weight [Nt, Kt] (see
 /// docs/hmx/hmx-weight-layout-plan.md §0) -- so the bridge walks the *outer*
 /// tile only and hands each op a `count` range that covers the whole K run.
 /// One ranged leaf call then packs every K tile of that outer tile with one
-/// offset-table load, instead of one call (and one table load) per crouton; when
-/// the K extent is a single tile the range degenerates to the old single call.
-/// The `(row, col)` handed to the leaf stay source-block coordinates -- (axis 0
-/// tile, axis 1 tile) -- never crouton-grid coordinates: an activation packs K
-/// along the source's column axis (its source block row is the outer tile), a
-/// weight packs K along the source's row axis (its source block column is the
-/// outer tile).
+/// offset-table load, instead of one call (and one table load) per crouton;
+/// when the K extent is a single tile the range degenerates to the old single
+/// call. The `(row, col)` handed to the leaf stay source-block coordinates --
+/// (axis 0 tile, axis 1 tile) -- never crouton-grid coordinates: an activation
+/// packs K along the source's column axis (its source block row is the outer
+/// tile), a weight packs K along the source's row axis (its source block column
+/// is the outer tile).
 ///
 /// This is the measurement-gated half of §10.13: the generic `linalg.pack`
 /// lowering synthesises element-wise moves, measured at 99.3% of the kernel's
@@ -844,15 +860,14 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
     // [0, Kt), n tile = i).
     Value out;
     if (isWeight) {
-      auto pack = hmx::PackWeightOp::create(b, loc, crouton, carried, src,
-                                             zero, i, count, IntegerAttr(),
-                                             IntegerAttr());
+      auto pack =
+          hmx::PackWeightOp::create(b, loc, crouton, carried, src, zero, i,
+                                    count, IntegerAttr(), IntegerAttr());
       setDecisionId(pack.getOperation(), decisionId);
       out = pack->getResult(0);
     } else {
-      auto pack = hmx::PackActOp::create(b, loc, crouton, carried, src, i,
-                                          zero, count, IntegerAttr(),
-                                          IntegerAttr());
+      auto pack = hmx::PackActOp::create(b, loc, crouton, carried, src, i, zero,
+                                         count, IntegerAttr(), IntegerAttr());
       setDecisionId(pack.getOperation(), decisionId);
       out = pack->getResult(0);
     }
@@ -914,19 +929,20 @@ bool isDenseInternal(Value v, int depth = 0) {
 /// selects the leaf: `hmx.unpack_acc_f32` (the fused tail) widens and adds the
 /// optional `residual` -- the original accumulator's C term -- in the same call
 /// instead of running separate DDR passes, and its `outType` is the f32 result.
-/// Without `fused` the leaf is `hmx.unpack_acc`, which writes row-major fp16 (the
-/// leaf is memoised in the runtime); a wider result is that fp16 image widened
-/// afterwards, exactly like the accumulator read-out itself.
+/// Without `fused` the leaf is `hmx.unpack_acc`, which writes row-major fp16
+/// (the leaf is memoised in the runtime); a wider result is that fp16 image
+/// widened afterwards, exactly like the accumulator read-out itself.
 ///
-/// The leaf walks the crouton row itself, so one call can cover a whole tile row
+/// The leaf walks the crouton row itself, so one call can cover a whole tile
+/// row
 /// (`count` = 16 row-pairs) and the loop is one iteration per 32 output rows,
 /// not per row-pair. Every destination row is still written as one sequential
 /// pass. Both forms share the loop so bufferization treats the destination the
 /// same way (a fresh internal buffer, copied out to the kernel output
 /// afterwards) -- which is what the allocator-side 128 B guarantee applies to.
 Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
-                       RankedTensorType outType, bool fused,
-                       int64_t decisionId, Value residual = {}) {
+                       RankedTensorType outType, bool fused, int64_t decisionId,
+                       Value residual = {}) {
   auto arType = cast<RankedTensorType>(ar.getType());
   Value dst = tensor::EmptyOp::create(b, loc, outType.getShape(),
                                       outType.getElementType());
@@ -947,13 +963,13 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
     if (fused) {
       auto unpack = hmx::UnpackAccF32Op::create(
           b, loc, outType, ar, arg, i, zero, residual, count, IntegerAttr(),
-          IntegerAttr());
+          IntegerAttr(), IntegerAttr());
       setDecisionId(unpack.getOperation(), decisionId);
       out = unpack->getResult(0);
     } else {
-      auto unpack = hmx::UnpackAccOp::create(
-          b, loc, outType, ar, arg, i, zero, count, IntegerAttr(),
-          IntegerAttr());
+      auto unpack =
+          hmx::UnpackAccOp::create(b, loc, outType, ar, arg, i, zero, count,
+                                   IntegerAttr(), IntegerAttr(), IntegerAttr());
       setDecisionId(unpack.getOperation(), decisionId);
       out = unpack->getResult(0);
     }
@@ -962,9 +978,9 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
   return loop.getResult(0);
 }
 
-/// Widens an fp16 tensor to fp32 the way the rest of this pipeline does elementwise
-/// work -- inside a `linalg.generic` -- rather than as a bare tensor-level
-/// `arith.extf`, which bufferization does not accept. Upstream's
+/// Widens an fp16 tensor to fp32 the way the rest of this pipeline does
+/// elementwise work -- inside a `linalg.generic` -- rather than as a bare
+/// tensor-level `arith.extf`, which bufferization does not accept. Upstream's
 /// ConversionToFp16Pass does the same thing for the same reason.
 Value widenToF32(OpBuilder &b, Location loc, Value src) {
   auto srcType = cast<RankedTensorType>(src.getType());
@@ -972,13 +988,13 @@ Value widenToF32(OpBuilder &b, Location loc, Value src) {
   Value empty = tensor::EmptyOp::create(b, loc, dstType.getShape(),
                                         dstType.getElementType());
   SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(srcType.getRank()));
-  SmallVector<utils::IteratorType> iterators(
-      srcType.getRank(), utils::IteratorType::parallel);
+  SmallVector<utils::IteratorType> iterators(srcType.getRank(),
+                                             utils::IteratorType::parallel);
   auto generic = linalg::GenericOp::create(
       b, loc, TypeRange{dstType}, ValueRange{src}, ValueRange{empty}, maps,
       iterators, [&](OpBuilder &bodyBuilder, Location l, ValueRange args) {
-        Value extended =
-            arith::ExtFOp::create(bodyBuilder, l, bodyBuilder.getF32Type(), args[0]);
+        Value extended = arith::ExtFOp::create(
+            bodyBuilder, l, bodyBuilder.getF32Type(), args[0]);
         linalg::YieldOp::create(bodyBuilder, l, extended);
       });
   return generic.getResult(0);
@@ -990,11 +1006,11 @@ Value widenToF32(OpBuilder &b, Location loc, Value src) {
 /// inside a `linalg.generic` so the rest of the pipeline can vectorize it.
 Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
   auto type = cast<RankedTensorType>(lhs.getType());
-  Value empty = tensor::EmptyOp::create(b, loc, type.getShape(),
-                                        type.getElementType());
+  Value empty =
+      tensor::EmptyOp::create(b, loc, type.getShape(), type.getElementType());
   SmallVector<AffineMap> maps(3, b.getMultiDimIdentityMap(type.getRank()));
-  SmallVector<utils::IteratorType> iterators(
-      type.getRank(), utils::IteratorType::parallel);
+  SmallVector<utils::IteratorType> iterators(type.getRank(),
+                                             utils::IteratorType::parallel);
   auto generic = linalg::GenericOp::create(
       b, loc, TypeRange{type}, ValueRange{lhs, rhs}, ValueRange{empty}, maps,
       iterators, [&](OpBuilder &bodyBuilder, Location l, ValueRange args) {
@@ -1005,8 +1021,8 @@ Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
 }
 
 /// The epilogue shared by the whole and the M-blocked forms: turn the engine's
-/// fp16 read-out `ar` (a crouton array over `outType`'s logical shape) back into
-/// a row-major tensor, widening and adding `residual` (the original
+/// fp16 read-out `ar` (a crouton array over `outType`'s logical shape) back
+/// into a row-major tensor, widening and adding `residual` (the original
 /// `linalg.matmul` C term) as needed. `canFuseTail` is the caller's
 /// `resultEscapesUnconsumed` answer: the fused tail is only measured good on a
 /// result that escapes unconsumed, so this keeps that narrow by construction.
@@ -1018,11 +1034,11 @@ static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
   if (outType.getElementType().isF32() && fusedTailLegal(outType) &&
       canFuseTail && (!residual || isDenseInternal(residual)))
     return unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
-                             residual);
+                            residual);
 
   auto f16Out = RankedTensorType::get(outType.getShape(), b.getF16Type());
-  Value result = unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false,
-                                  decisionId);
+  Value result =
+      unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false, decisionId);
   if (outType.getElementType().isF32())
     result = widenToF32(b, loc, result);
   if (residual)
@@ -1052,7 +1068,8 @@ Value emitBridgeAbove(RewriterBase &b, Location loc, Value src,
         continue;
       Operation *definedBy = src.getDefiningOp();
       if (definedBy && parent->isAncestor(definedBy))
-        break; /* the value is produced inside this loop: cannot hoist above it */
+        break; /* the value is produced inside this loop: cannot hoist above it
+                */
       insertBefore = parent;
     }
   }
@@ -1087,9 +1104,10 @@ static bool isLoopInvariant(Value v, Operation *op) {
   return inLoop;
 }
 
-static LogicalResult emitDiagnosticTailMatmul(
-    linalg::MatmulOp op, MatmulDecision &decision, const HmxTarget &target,
-    PatternRewriter &rewriter) {
+static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
+                                              MatmulDecision &decision,
+                                              const HmxTarget &target,
+                                              PatternRewriter &rewriter) {
   assert(decision.reason == MatmulReason::SelectedTail && decision.contract &&
          decision.plan && "diagnostic tail decision is incomplete");
   const MatmulContract &contract = *decision.contract;
@@ -1110,45 +1128,51 @@ static LogicalResult emitDiagnosticTailMatmul(
   Value paddedLhs = padMatrix(rewriter, loc, lhs, shape.mp, shape.kp);
   Value paddedRhs = padMatrix(rewriter, loc, rhs, shape.kp, shape.np);
   if (!paddedLhs || !paddedRhs)
-    return rewriter.notifyMatchFailure(op, "diagnostic tail requires static row-major operands");
+    return rewriter.notifyMatchFailure(
+        op, "diagnostic tail requires static row-major operands");
 
-  auto paddedLhsType = hmx::croutonLayoutType(RankedTensorType::get(
-      {shape.mp, shape.kp}, lhsType.getElementType()));
-  auto paddedRhsType = hmx::weightCroutonType(RankedTensorType::get(
-      {shape.np, shape.kp}, rhsType.getElementType()));
-  auto paddedF16Out = RankedTensorType::get({shape.mp, shape.np},
-                                             rewriter.getF16Type());
+  auto paddedLhsType = hmx::croutonLayoutType(
+      RankedTensorType::get({shape.mp, shape.kp}, lhsType.getElementType()));
+  auto paddedRhsType = hmx::weightCroutonType(
+      RankedTensorType::get({shape.np, shape.kp}, rhsType.getElementType()));
+  auto paddedF16Out =
+      RankedTensorType::get({shape.mp, shape.np}, rewriter.getF16Type());
   auto tailPlan = TailPlanAttr::get(
-      rewriter.getContext(),
-      {contract.m, contract.n, contract.k}, {shape.mp, shape.np, shape.kp},
-      {shape.mf, shape.nf, shape.kf}, {shape.mt, shape.nt, shape.kt},
-      "zero-pad-both-operands", "padded-edge-tile-bounded-store");
+      rewriter.getContext(), {contract.m, contract.n, contract.k},
+      {shape.mp, shape.np, shape.kp}, {shape.mf, shape.nf, shape.kf},
+      {shape.mt, shape.nt, shape.kt}, "zero-pad-both-operands",
+      "padded-edge-tile-bounded-store");
 
-  Value packedLhs = emitBridgeAbove(rewriter, loc, paddedLhs, paddedLhsType,
-                                    /*isWeight=*/false, op, /*hoist=*/false,
-                                    decision.id);
-  Value packedRhs = emitBridgeAbove(rewriter, loc, paddedRhs, paddedRhsType,
-                                    /*isWeight=*/true, op, /*hoist=*/false,
-                                    decision.id);
-  Value outEmpty = vtcmEmpty(rewriter, loc, hmx::croutonLayoutType(paddedF16Out));
-  auto matmul = hmx::MatmulOp::create(
-      rewriter, loc, hmx::croutonLayoutType(paddedF16Out), packedLhs, packedRhs,
-      outEmpty, tailPlan);
+  Value packedLhs =
+      emitBridgeAbove(rewriter, loc, paddedLhs, paddedLhsType,
+                      /*isWeight=*/false, op, /*hoist=*/false, decision.id);
+  Value packedRhs =
+      emitBridgeAbove(rewriter, loc, paddedRhs, paddedRhsType,
+                      /*isWeight=*/true, op, /*hoist=*/false, decision.id);
+  Value outEmpty =
+      vtcmEmpty(rewriter, loc, hmx::croutonLayoutType(paddedF16Out));
+  auto matmul =
+      hmx::MatmulOp::create(rewriter, loc, hmx::croutonLayoutType(paddedF16Out),
+                            packedLhs, packedRhs, outEmpty, tailPlan);
   matmul->setAttr(kHmxDiagnosticTailAttr, UnitAttr::get(rewriter.getContext()));
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  if (!module || failed(markHmxDiagnosticTailModule(module)))
+    return failure();
   setDecisionId(matmul.getOperation(), decision.id);
 
   bool empty = isEmptyInit(init);
   bool escapes = resultEscapesUnconsumed(op);
   // The normal epilogue bridge is deliberately left in the canonical loop form;
-  // hmx-partition's marked diagnostic path owns the full/edge rewrite and is the
-  // first consumer that gives its valid M/N extents to the unpack leaf.
+  // hmx-partition's marked diagnostic path owns the full/edge rewrite and is
+  // the first consumer that gives its valid M/N extents to the unpack leaf.
   Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
                               empty ? Value{} : init, escapes, decision.id);
   rewriter.replaceOp(op, result);
   return success();
 }
 
-/// `linalg.matmul` -> `hmx.matmul` on croutons, bridged in and out of row-major.
+/// `linalg.matmul` -> `hmx.matmul` on croutons, bridged in and out of
+/// row-major.
 struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
   MatmulToHmx(MLIRContext *ctx, HmxTarget target, AttributionTally *tally)
       : OpRewritePattern<linalg::MatmulOp>(ctx), target(target), tally(tally) {}
@@ -1255,12 +1279,12 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       bool hoistRhs =
           bInvariant && rhsBytes <= room - (hoistLhs ? lhsBytes : 0) - outBytes;
 
-      Value packedLhs = emitBridgeAbove(
-          rewriter, loc, lhs, hmx::croutonLayoutType(lhsType),
-          /*isWeight=*/false, op, hoistLhs, decision.id);
-      Value packedRhs = emitBridgeAbove(
-          rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
-          /*isWeight=*/true, op, hoistRhs, decision.id);
+      Value packedLhs =
+          emitBridgeAbove(rewriter, loc, lhs, hmx::croutonLayoutType(lhsType),
+                          /*isWeight=*/false, op, hoistLhs, decision.id);
+      Value packedRhs =
+          emitBridgeAbove(rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
+                          /*isWeight=*/true, op, hoistRhs, decision.id);
 
       // The accumulator is read out into VTCM: the engine has nowhere else to
       // write.
@@ -1302,9 +1326,9 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     bool hoistRhs =
         bInvariant && rhsBytes <= room - blockActBytes - blockArBytes;
 
-    Value packedRhs = emitBridgeAbove(
-        rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
-        /*isWeight=*/true, op, hoistRhs, decision.id);
+    Value packedRhs =
+        emitBridgeAbove(rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
+                        /*isWeight=*/true, op, hoistRhs, decision.id);
 
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     Value cM = arith::ConstantIndexOp::create(rewriter, loc, contract.m);
@@ -1313,8 +1337,8 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // The full output is carried and each block inserted into it, so a block
     // that does not escape still composes with its siblings. `init` is the C
     // term (or an undefined `tensor.empty`, which the blocks fully overwrite).
-    auto blockLoop = scf::ForOp::create(rewriter, loc, c0, cM, cBlock,
-                                        ValueRange{init});
+    auto blockLoop =
+        scf::ForOp::create(rewriter, loc, c0, cM, cBlock, ValueRange{init});
     {
       OpBuilder::InsertionGuard guard(rewriter);
       rewriter.setInsertionPointToStart(blockLoop.getBody());
@@ -1347,13 +1371,13 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
                                            blockOffsets, outSizes, oneStrides);
 
       Value outEmpty = vtcmEmpty(rewriter, loc, blockCroutonOut);
-      auto matmul = hmx::MatmulOp::create(
-          rewriter, loc, blockCroutonOut, packedLhs, packedRhs, outEmpty,
-          /*tail_plan=*/{});
+      auto matmul = hmx::MatmulOp::create(rewriter, loc, blockCroutonOut,
+                                          packedLhs, packedRhs, outEmpty,
+                                          /*tail_plan=*/{});
       setDecisionId(matmul.getOperation(), decision.id);
-      Value blockResult = emitEpilogue(rewriter, loc, matmul->getResult(0),
-                                       blockOutType, residual, escapes,
-                                       decision.id);
+      Value blockResult =
+          emitEpilogue(rewriter, loc, matmul->getResult(0), blockOutType,
+                       residual, escapes, decision.id);
 
       Value inserted =
           tensor::InsertSliceOp::create(rewriter, loc, blockResult, carried,
@@ -1481,17 +1505,18 @@ static bool isCheapF16Elementwise(linalg::GenericOp map) {
 }
 
 /// The crouton element (t0, t1, j, col, h) holds logical
-/// (t0*32 + 2j + h, t1*32 + col): axis 0 is the pair, axis 1 the stride. This is
-/// the map an operand indexing map is composed with when the operand stays
+/// (t0*32 + 2j + h, t1*32 + col): axis 0 is the pair, axis 1 the stride. This
+/// is the map an operand indexing map is composed with when the operand stays
 /// row-major.
 static AffineMap croutonToLogicalMap(MLIRContext *ctx) {
   AffineExpr t0 = getAffineDimExpr(0, ctx), t1 = getAffineDimExpr(1, ctx);
   AffineExpr j = getAffineDimExpr(2, ctx), col = getAffineDimExpr(3, ctx),
              h = getAffineDimExpr(4, ctx);
-  return AffineMap::get(5, 0,
-                        {t0 * HmxTarget::tileEdge + j * hmx::layout::kCroutonHalf + h,
-                         t1 * HmxTarget::tileEdge + col},
-                        ctx);
+  return AffineMap::get(
+      5, 0,
+      {t0 * HmxTarget::tileEdge + j * hmx::layout::kCroutonHalf + h,
+       t1 * HmxTarget::tileEdge + col},
+      ctx);
 }
 
 /// The logical 2D shape of a crouton array, or nullopt when the tensor does not
@@ -1515,13 +1540,14 @@ static bool rehostReachesReadout(Value v, RankedTensorType crouton) {
   if (Value readout = readoutBehind(v, loop, unpack))
     return hmx::sameCroutonEncoding(readout.getType(), crouton);
   auto map = v.getDefiningOp<linalg::GenericOp>();
-  if (!map || !isTransparentMap(map) || !logicalMatchesCrouton(v.getType(), crouton) ||
-      !v.hasOneUse())
+  if (!map || !isTransparentMap(map) ||
+      !logicalMatchesCrouton(v.getType(), crouton) || !v.hasOneUse())
     return false;
   // Only an f16 operand can be a crouton (the encoding is f16-only); the rest
   // are read through projections and cannot carry the read-out.
   return llvm::any_of(map.getDpsInputs(), [&](Value operand) {
-    return isF16Tensor(operand.getType()) && rehostReachesReadout(operand, crouton);
+    return isF16Tensor(operand.getType()) &&
+           rehostReachesReadout(operand, crouton);
   });
 }
 
@@ -1542,7 +1568,8 @@ static bool isRelabelMap(linalg::GenericOp g) {
 /// The value of a *splat* float tensor (an `arith.constant` dense splat or a
 /// `linalg.fill` of a scalar constant). Carrying such an operand through the
 /// crouton iteration space would read M*N values through a projection just to
-/// broadcast one scalar; it is materialised as a scalar in the map body instead.
+/// broadcast one scalar; it is materialised as a scalar in the map body
+/// instead.
 static std::optional<APFloat> splatScalar(Value v) {
   if (auto fill = v.getDefiningOp<linalg::FillOp>()) {
     Value scalar = fill.getDpsInputOperand(0)->get();
@@ -1618,10 +1645,10 @@ static bool chainIsCheapF16Only(Value v, RankedTensorType crouton,
 }
 
 /// Re-host `v` so its result is the rank-5 layout `target`, fusing the whole
-/// elementwise producer tree into one `linalg.generic`. Returns null when `v` is
-/// not an elementwise producer of that layout, in which case the caller falls
-/// back to a projection on this edge. `dead` collects the originals whose body
-/// was cloned (and the read-out loops that lost their last use).
+/// elementwise producer tree into one `linalg.generic`. Returns null when `v`
+/// is not an elementwise producer of that layout, in which case the caller
+/// falls back to a projection on this edge. `dead` collects the originals whose
+/// body was cloned (and the read-out loops that lost their last use).
 ///
 /// The caller (`FoldElementwiseIntoLayout`) only reaches here after
 /// `chainIsCheapF16Only` has vetted the whole tree, so in practice every
@@ -1630,7 +1657,8 @@ static bool chainIsCheapF16Only(Value v, RankedTensorType crouton,
 /// somehow gets here becomes a row-major projection leaf instead of crouton-
 /// order work -- never incorrect, only less fused.
 static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
-                             SmallVectorImpl<Operation *> &dead, int depth = 0) {
+                             SmallVectorImpl<Operation *> &dead,
+                             int depth = 0) {
   if (v.getType() == target)
     return v;
   // A guard against a diamond-shaped chain duplicating without bound; a deeper
@@ -1666,8 +1694,8 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
   enum Kind { Operand, Splat, Inline };
   struct Node {
     Kind kind = Operand;
-    bool crouton = false;       // Operand: already in the engine layout
-    unsigned slot = 0;          // Operand: index into `operands`
+    bool crouton = false; // Operand: already in the engine layout
+    unsigned slot = 0;    // Operand: index into `operands`
     std::optional<APFloat> value;
     Type type;                  // Splat element type
     linalg::GenericOp producer; // Inline
@@ -1684,8 +1712,8 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
       return std::nullopt;
 
     Node node;
-    auto addLeaf = [&](Value leaf, bool crouton, AffineMap projection)
-        -> unsigned {
+    auto addLeaf = [&](Value leaf, bool crouton,
+                       AffineMap projection) -> unsigned {
       node.kind = Operand;
       node.crouton = crouton;
       node.slot = operands.size();
@@ -1706,8 +1734,8 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
       dead.push_back(loop);
       return addLeaf(readout, /*crouton=*/true, AffineMap());
     }
-    // Strip broadcast/reshape relabels: a pure broadcast carries no computation,
-    // so its rank-5 copy is pure address arithmetic.
+    // Strip broadcast/reshape relabels: a pure broadcast carries no
+    // computation, so its rank-5 copy is pure address arithmetic.
     while (true) {
       auto relabel = value.getDefiningOp<linalg::GenericOp>();
       if (!relabel || !isRelabelMap(relabel))
@@ -1758,15 +1786,14 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
     return {};
 
   maps.push_back(b.getMultiDimIdentityMap(target.getRank()));
-  Location loc = v.getDefiningOp() ? v.getDefiningOp()->getLoc()
-                                   : b.getUnknownLoc();
-  // Only the engine's own layout lives in VTCM; the i1/i32/f32 intermediates are
-  // ordinary tensors and must not claim a VTCM buffer.
-  Value init =
-      target.getElementType().isF16()
-          ? vtcmEmpty(b, loc, target)
-          : tensor::EmptyOp::create(b, loc, target.getShape(),
-                                    target.getElementType());
+  Location loc =
+      v.getDefiningOp() ? v.getDefiningOp()->getLoc() : b.getUnknownLoc();
+  // Only the engine's own layout lives in VTCM; the i1/i32/f32 intermediates
+  // are ordinary tensors and must not claim a VTCM buffer.
+  Value init = target.getElementType().isF16()
+                   ? vtcmEmpty(b, loc, target)
+                   : tensor::EmptyOp::create(b, loc, target.getShape(),
+                                             target.getElementType());
   SmallVector<utils::IteratorType> iterators(target.getRank(),
                                              utils::IteratorType::parallel);
   auto laidOut = linalg::GenericOp::create(
@@ -1805,20 +1832,21 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
 /// A matmul chained off another matmul needs no bridge: the read-out layout AR
 ///
 /// Note on the shape check below: for a legal chain the grids always match --
-/// K of the consumer *is* N of the producer, and M is the same -- so the check is
-/// a structural assertion rather than a filter that can reject a valid chain.
-/// and the activation layout AH are the same permutation, so when the crouton
-/// grids line up the read-out array *is* a valid activation array, and the pack
-/// (plus the unpack it would consume) disappear.
+/// K of the consumer *is* N of the producer, and M is the same -- so the check
+/// is a structural assertion rather than a filter that can reject a valid
+/// chain. and the activation layout AH are the same permutation, so when the
+/// crouton grids line up the read-out array *is* a valid activation array, and
+/// the pack (plus the unpack it would consume) disappear.
 ///
 /// This is a pattern on the pack rather than logic inside the matmul rewrite
 /// because the greedy driver may visit the consumer before the producer: the
 /// bridge only exists after both rewrites have run.
 ///
 /// Verified on device with a same-input A/B (fixed seed, 128x128, folded vs
-/// unfolded): every element agrees (0 of 16384 differ, max delta 0.0). Comparing
-/// either side against a torch fp16 reference instead is misleading -- the engine
-/// accumulates in 37 bits, torch in fp16 -- which made this look broken twice.
+/// unfolded): every element agrees (0 of 16384 differ, max delta 0.0).
+/// Comparing either side against a torch fp16 reference instead is misleading
+/// -- the engine accumulates in 37 bits, torch in fp16 -- which made this look
+/// broken twice.
 struct FoldChainedPack : public OpRewritePattern<hmx::PackActOp> {
   using OpRewritePattern<hmx::PackActOp>::OpRewritePattern;
 
@@ -1829,9 +1857,9 @@ struct FoldChainedPack : public OpRewritePattern<hmx::PackActOp> {
     Value readout = readoutBehind(op.getSrc(), loop, unpack);
     if (!readout)
       return rewriter.notifyMatchFailure(op, "not a read-out");
-    // The layout contract lives in the dialect: AR, AH and WH are one layout, so
-    // "same crouton shape" is what makes a producer's read-out usable as this
-    // matmul's activation with no conversion.
+    // The layout contract lives in the dialect: AR, AH and WH are one layout,
+    // so "same crouton shape" is what makes a producer's read-out usable as
+    // this matmul's activation with no conversion.
     if (!hmx::sameCroutonEncoding(readout.getType(), op.getDst().getType()))
       return rewriter.notifyMatchFailure(op, "crouton grids differ");
 
@@ -1885,18 +1913,20 @@ struct FoldElementwiseIntoLayout : public OpRewritePattern<hmx::PackActOp> {
     SmallVector<Operation *> dead;
     Value laidOut = rehostAsCrouton(rewriter, op.getSrc(), crouton, dead);
     if (!laidOut)
-      return rewriter.notifyMatchFailure(op, "cannot re-host the elementwise chain");
+      return rewriter.notifyMatchFailure(
+          op, "cannot re-host the elementwise chain");
 
-    // The pack sat inside the tile loop that `packCroutonsWithLeaves` emits. With
-    // the pack gone that loop only carries the re-hosted value, and a
+    // The pack sat inside the tile loop that `packCroutonsWithLeaves` emits.
+    // With the pack gone that loop only carries the re-hosted value, and a
     // loop-carried buffer of a different space is exactly what makes
     // bufferization keep a space-0 copy: hand its result to the consumer and
     // drop the loop.
     scf::ForOp packLoop = op->getParentOfType<scf::ForOp>();
     rewriter.replaceOp(op, laidOut);
     if (packLoop && packLoop.getNumResults() == 1 &&
-        llvm::all_of(packLoop.getBody()->without_terminator(),
-                     [](Operation &inner) { return isMemoryEffectFree(&inner); }))
+        llvm::all_of(
+            packLoop.getBody()->without_terminator(),
+            [](Operation &inner) { return isMemoryEffectFree(&inner); }))
       rewriter.replaceOp(packLoop, laidOut);
 
     // `dead` is built inner-first (a re-hosted producer before the map that
@@ -1931,11 +1961,11 @@ static void dropCroutonEncodings(Operation *root) {
       if (auto dense = dyn_cast<DenseElementsAttr>(constant.getValue())) {
         auto tensor = dyn_cast<RankedTensorType>(dense.getType());
         if (tensor && tensor.getEncoding())
-          constant->setAttr(
-              "value",
-              DenseElementsAttr::getFromRawBuffer(
-                  RankedTensorType::get(tensor.getShape(), tensor.getElementType()),
-                  dense.getRawData()));
+          constant->setAttr("value",
+                            DenseElementsAttr::getFromRawBuffer(
+                                RankedTensorType::get(tensor.getShape(),
+                                                      tensor.getElementType()),
+                                dense.getRawData()));
       }
     }
     for (Value result : op->getResults())

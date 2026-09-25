@@ -26,6 +26,21 @@ using namespace mlir;
 using namespace mlir::hexagonmem;
 using namespace mlir::crouton;
 
+namespace {
+constexpr uint64_t kMaxAllocationAlignment = 2048;
+
+/// Keep the IR allocation contract identical to the runtime allocator's
+/// address-placement contract.  Zero, non-powers-of-two, and values above the
+/// 2048-byte hardware quantum cannot produce a valid aligned descriptor; they
+/// must fail before lowering rather than reaching a CHECK/abort in the device
+/// runtime.  This is a contract check, not a claim that an arbitrary runtime
+/// pointer is statically known to be non-null.
+bool isSupportedAllocationAlignment(uint64_t alignment) {
+  return alignment != 0 && alignment <= kMaxAllocationAlignment &&
+         (alignment & (alignment - 1)) == 0;
+}
+} // namespace
+
 /// Dialect creation, the instance will be owned by the context. This is the
 /// point of registration of custom operations for the dialect.
 void HexagonMemDialect::registerOperations() {
@@ -46,6 +61,9 @@ LogicalResult AllocOp::verify() {
           "Dynamic shapes are not supported for crouton allocations");
 
   } else if (auto memRefType = mlir::dyn_cast<MemRefType>(type)) {
+    if (!isSupportedAllocationAlignment(getAlignment()))
+      return emitOpError(
+          "alignment must be a power of two in [1, 2048]");
     // A resident-weight allocation is static but carries its source address as
     // one extra operand: the runtime needs that address as the residency key,
     // and unlike a dynamic size it does not participate in the shape (the

@@ -18,11 +18,11 @@
 // The runtime gets the address of the prepacked constant, which by now is an
 // LLVM global. No `hexagon_runtime_alloc_1d_dsp` for the weight: it is not
 // allocated per launch.
-// CHECK: llvm.func @hexagon_runtime_weight_resident_dsp(i64, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_weight_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
 // CHECK: llvm.mlir.global {{.*}} @__constant_2x2x16x32x2xf16
 // CHECK-LABEL: llvm.func @constant_weight
 // CHECK: llvm.mlir.addressof @__constant_2x2x16x32x2xf16
-// CHECK: llvm.call @hexagon_runtime_weight_resident_dsp
+// CHECK: llvm.call @hexagon_runtime_weight_resident_v2_dsp
 // The weight is filled once, by the runtime; the kernel emits no copy for it.
 // CHECK-NOT: hexagon_runtime_copy_dsp{{.*}}__constant
 module {

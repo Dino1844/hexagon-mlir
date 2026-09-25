@@ -7,8 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 // The hmx dialect's own transform passes: engine attribution, the tile level,
-// and weight residency. They live with the dialect so the HMX feature has one
-// home; `hmx-to-llvm` is a conversion and stays under Conversion/HmxToLLVM.
+// residency, and the internal VTCM accounting census. They live with the
+// dialect so the HMX feature has one home; `hmx-to-llvm` is a conversion and
+// stays under Conversion/HmxToLLVM.
 //===----------------------------------------------------------------------===//
 
 #ifndef HEXAGON_DIALECT_HMX_TRANSFORMS_PASSES_TD
@@ -146,10 +147,11 @@ def WeightResident : InterfacePass<"weight-resident", "mlir::FunctionOpInterface
     declares the total in the module attribute `hmx.weight_resident_bytes`.
 
     The buffer is not filled by the kernel. Its lowering emits one call to
-    `hexagon_runtime_weight_resident(src, bytes)`: the runtime allocates the
-    buffer on the first launch, copies the weight in once, pins it (the
-    per-launch deallocation is swallowed) and returns the same address on every
-    later launch. So the weight is packed into VTCM exactly once per process.
+    `hexagon_runtime_weight_resident_v2_dsp(key, bytes, alignment)`: the runtime
+    allocates the buffer on the first launch, copies the weight in once, pins
+    it (the per-launch deallocation is swallowed) and returns the same address
+    on every later launch. So the weight is packed into VTCM exactly once per
+    process.
 
     Must run after bufferization (the operand is a `memref.get_global`) and
     before `hmx-partition` (which needs the weight in VTCM).
@@ -198,8 +200,9 @@ def HmxWorkspaceResident : InterfacePass<"hmx-workspace-resident",
     A workspace has no compile-time contents -- the kernel refills it every
     launch -- so all it needs is a stable buffer. This pass tags each static
     VTCM `memref.alloc` with `hmx.workspace_resident` and drops its
-    deallocation. The lowering emits one `hexagon_runtime_workspace_resident`
-    call: the first launch allocates and pins the buffer, every later launch
+    deallocation. The lowering emits one
+    `hexagon_runtime_workspace_resident_v2_dsp(key, bytes, alignment)` call:
+    the first launch allocates and pins the buffer, every later launch
     gets the same address back with no allocation, no free and no copy.
 
     The key is `(hash(function symbol) << 32) | allocation index` with the top
@@ -219,6 +222,34 @@ def HmxWorkspaceResident : InterfacePass<"hmx-workspace-resident",
   }];
 
   let constructor = "mlir::hmx::createHmxWorkspaceResidentPass()";
+}
+
+def HmxVtcmAccounting : Pass<"hmx-vtcm-accounting"> {
+  let summary = "Record a raw full-kernel VTCM allocation-site census";
+
+  let description = [{
+    This diagnostic pass runs at module scope after HMX partition and
+    workspace residency, while VTCM allocations are still explicit. It is
+    inert unless the module carries the internal
+    `hmx.diagnostic_vtcm_accounting` unit marker. The result is the internal
+    `hmx.kernel_vtcm_accounting` dictionary, not a manifest field and not a
+    launcher contract.
+
+    The first accounting slice is intentionally a raw allocation-site census:
+    each distinct VTCM allocation site contributes its statically derivable
+    requested bytes once, split into transient, workspace-resident, and
+    weight-resident categories. It is not a live-range peak proof: it does not
+    resolve loop/branch lifetimes, allocator alignment/fragmentation, or free
+    cache retention. Dynamic, unsupported-backing, malformed-resident, and
+    escaping-resident cases are reported as incomplete and fail closed. An
+    optional second marker, `hmx.diagnostic_vtcm_liveness`, additionally emits
+    a separate `hmx.kernel_vtcm_live_range` diagnostic for the supported
+    single-invocation structured-SCF allocator-event subset. It is still not a
+    runtime allocator, grid, fragmentation, or free-cache proof. Exact
+    liveness and any future manifest schema remain separate work.
+  }];
+
+  let constructor = "mlir::hmx::createHmxVtcmAccountingPass()";
 }
 
 #endif // HEXAGON_DIALECT_HMX_TRANSFORMS_PASSES_TD
