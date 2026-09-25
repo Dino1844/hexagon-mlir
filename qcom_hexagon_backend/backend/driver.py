@@ -16,6 +16,7 @@ from triton.backends.qcom_hexagon_backend.triton_hexagon_launcher import (
 )
 from triton.backends.qcom_hexagon_backend.utils import make_profiled_return
 from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata_fields
+from triton.backends.qcom_hexagon_backend.utils import validate_hmx_record_json
 
 
 def getHexagonLauncherClass(device_type="dsp"):
@@ -30,7 +31,43 @@ def getHexagonLauncherClass(device_type="dsp"):
                 cst_key(key): value for key, value in src.signature.items()
             }
             self.launcher = TritonHexagonLauncher()
-            pass
+            # The record-only v3 child of a `hex.hmx.translation/v2` envelope,
+            # refreshed on every launch and readable through
+            # `hmx_record_diagnostic()`.  It is deliberately *not* a launcher
+            # input: a record authorizes no plan, no budget, no resident default
+            # and no launch grid, so the launcher never sees it.  `None` means
+            # the kernel was built with a v1 envelope.
+            self.hmx_record = None
+
+        def hmx_record_diagnostic(self):
+            """Return the validated record-only v3 child, or None.
+
+            The single reader of the retained record.  It exists so the record a
+            kernel was compiled with is inspectable from host tooling; it is not
+            a decision surface, and nothing in the launch path consults it.
+            """
+            return self.hmx_record
+
+        def _load_hmx_record(self, packed):
+            """Unpack and validate the v3 record child, if the envelope has one.
+
+            A malformed record fails closed here rather than being downgraded to
+            "no record": the driver is the only component that reads it, and a
+            silent drop would leave a caller believing a kernel has no
+            record-only evidence when in fact its evidence is unreadable.
+            """
+            record_json = packed["hmx_record"]
+            if not record_json:
+                return None
+            try:
+                validate_hmx_record_json(record_json)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"invalid record-only HMX v3 child in packed metadata: {exc}; "
+                    "clear TRITON_CACHE_DIR (tools/hexmlir/env.sh) and rebuild "
+                    "the kernel"
+                ) from exc
+            return record_json
 
         def __call__(self, *args, **kwargs):
             # args =  grid_0, grid_1, grid_2, stream, kernel.function,
@@ -58,6 +95,9 @@ def getHexagonLauncherClass(device_type="dsp"):
             compiled_enable_lwp = pack_metadata["enableLWP"]
             weight_prepack = pack_metadata["weight_prepack"]
             hmx_manifest = pack_metadata["hmx_manifest"]
+            # Validated for diagnostics, then deliberately not forwarded: the
+            # launcher keeps using the v2 execution child alone.
+            self.hmx_record = self._load_hmx_record(pack_metadata)
             num_fixed_args = 9
             inputs_with_constants = list(args[num_fixed_args:])
             inputs = [

@@ -234,6 +234,9 @@ def _packed_metadata(**overrides):
         "enableLWP": False,
         "weight_prepack": json.dumps(_WEIGHT),
         "hmx_manifest": json.dumps(_MANIFEST),
+        # A v1 envelope publishes no record child; the empty string is that one
+        # spelling, and it is the only way to get an absent record.
+        "hmx_record": "",
     }
     values.update(overrides)
     return values
@@ -459,6 +462,8 @@ class TranslationMetadataTest(unittest.TestCase):
         _UTILS.apply_translation_metadata(metadata, _envelope())
         self.assertEqual(json.loads(metadata["weight_prepack"]), _WEIGHT)
         self.assertEqual(json.loads(metadata["hmx_manifest"]), _MANIFEST)
+        # A v1 envelope publishes no record, and never a default one.
+        self.assertEqual(metadata["hmx_record"], "")
 
     def test_strict_weight_contract_accepts_a_valid_nonempty_entry(self):
         _UTILS.validate_weight_prepack(_VALID_WEIGHT)
@@ -467,10 +472,11 @@ class TranslationMetadataTest(unittest.TestCase):
         policy["reason"] = "eligible-aligned-f16"
         record = _hmx_record(weight_kind="argument-slot", policy=policy)
         manifest = _manifest([record], [policy])
-        weight_json, _ = _UTILS.parse_translation_metadata(
+        weight_json, _, record_json = _UTILS.parse_translation_metadata(
             _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
+        self.assertIsNone(record_json)
 
     def test_strict_weight_contract_rejects_malformed_entries(self):
         def contract_with(**changes):
@@ -556,10 +562,11 @@ class TranslationMetadataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching weight_prepack"):
             _UTILS.parse_translation_metadata(_envelope(manifest=manifest))
 
-        weight_json, _ = _UTILS.parse_translation_metadata(
+        weight_json, _, record_json = _UTILS.parse_translation_metadata(
             _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
+        self.assertIsNone(record_json)
 
     def test_cpp_serialized_manifest_round_trips_through_python(self):
         fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"
@@ -647,6 +654,10 @@ class TranslationMetadataTest(unittest.TestCase):
 
         del packed["hmx_manifest"]
         with self.assertRaisesRegex(RuntimeError, "hmx_manifest"):
+            _UTILS.require_pack_metadata_fields(packed)
+
+        del packed["hmx_record"]
+        with self.assertRaisesRegex(RuntimeError, "hmx_record"):
             _UTILS.require_pack_metadata_fields(packed)
 
 

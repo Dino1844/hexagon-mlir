@@ -35,6 +35,8 @@ createHmxWorkspaceResidentPass();
 
 std::unique_ptr<Pass> createHmxVtcmAccountingPass();
 
+std::unique_ptr<Pass> createHmxRecordV3Pass();
+
 } // namespace hmx
 } // namespace mlir
 

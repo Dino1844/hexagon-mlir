@@ -100,6 +100,7 @@ int main(int argc, char **argv) {
   mlir::hmx::registerWeightResidentPass();
   mlir::hmx::registerHmxWorkspaceResidentPass();
   mlir::hmx::registerHmxVtcmAccountingPass();
+  mlir::hmx::registerHmxRecordV3Pass();
   mlir::hexagon::registerDecomposeHexKLMatmulPass();
   mlir::hexagon::registerConvTilingPass();
   mlir::hexagon::registerDMAToLLVMPass();

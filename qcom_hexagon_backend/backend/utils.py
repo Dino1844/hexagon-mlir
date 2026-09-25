@@ -275,8 +275,11 @@ PACK_METADATA_REQUIRED = (
     "enableLWP",
     "weight_prepack",
     "hmx_manifest",
+    "hmx_record",
 )
 
+# The default translation envelope.  It carries the v2 execution manifest only;
+# the record-only v3 child belongs to `hex.hmx.translation/v2` below.
 TRANSLATION_METADATA_SCHEMA = "hex.hmx.translation/v1"
 # This is the wire identity of the current semantic manifest.  Keep the
 # version marker in the protocol value, rather than in Python symbol names.
@@ -284,6 +287,64 @@ HMX_MANIFEST_SCHEMA = "hex.hmx.kernel_manifest/v2"
 # Bump this semantic ABI token whenever the generated HMX plan/object contract
 # changes. It is deliberately independent of the manifest wire spelling.
 HMX_SHAPE_TAIL_ABI_VERSION = "shape-tail-abi-2026-09-25-resident-v2-aligned"
+
+# ---------------------------------------------------------------------------
+# Record-only v3 contract (hex.hmx.kernel_manifest/v3)
+# ---------------------------------------------------------------------------
+# A second, independent wire schema.  It records analysis facts, evidence and
+# four separate proof statuses; it is not an executable upgrade of v2 and it
+# grants no HMX/tail admission.  There is deliberately no `v2_to_v3` path here:
+# the C++ producer builds the document from the compile-time facts and the P1.5
+# diagnostic sidecars, and this module only consumes it.
+#
+# `hex.hmx.translation/v1` (the default) carries the v2 manifest only.
+# `hex.hmx.translation/v2` carries the byte-identical v2 execution manifest plus
+# a separate `hmx_record` v3 child.  The two envelopes are closed identities: a
+# v1 consumer rejects a v2 envelope and vice versa, and no code path "tries v2
+# and then guesses v3".
+HMX_RECORD_SCHEMA = "hex.hmx.kernel_manifest/v3"
+# `TRANSLATION_METADATA_SCHEMA` below is the v1 envelope; it is the historical
+# name of the default and stays the single spelling of that wire identity.
+HMX_TRANSLATION_V1_SCHEMA = TRANSLATION_METADATA_SCHEMA
+HMX_TRANSLATION_V2_SCHEMA = "hex.hmx.translation/v2"
+
+# The one spelling of "this envelope carries no record child".  A v1 envelope has
+# no `hmx_record` key at all, but packed metadata crosses a JSON boundary, so the
+# published value needs a name of its own rather than a bare `""` at each use.
+HMX_RECORD_ABSENT = ""
+
+# Fixed protocol values, not runtime switches.
+HMX_RECORD_MODE = "record-only"
+HMX_RECORD_ADMISSION = "not-authorized"
+HMX_RECORD_UNIT_BYTES = "bytes"
+HMX_RECORD_BASIS_REQUESTED = "compile-time-requested"
+HMX_RECORD_BASIS_ALLOCATOR = "allocator-model"
+HMX_RECORD_BASIS_OBSERVED = "runtime-observation"
+HMX_RECORD_OBSERVATION_SCOPE = "process-high-water"
+HMX_RECORD_GRID_POLICY = "single-instance"
+HMX_RECORD_GRID_REQUIRED_PRODUCT = 1
+HMX_RECORD_INVOCATIONS = 1
+HMX_RECORD_RESIDENT_SCOPE = "process-floor"
+# The record's one declared failure behavior.  The decision doc's illustrative
+# shape also listed `on_unproven_proof` and `on_descriptor_mismatch`; a
+# record-only document makes no such decision -- it never re-selects a plan and
+# never resolves a descriptor -- so publishing them would advertise a capability
+# the record does not have.  See HmxRecordV3.h for the same reasoning.
+HMX_RECORD_FALLBACK = {"on_malformed_record": "reject-v3-record"}
+HMX_RECORD_SHAPE_STATES = frozenset({"static", "partially-dynamic", "dynamic"})
+HMX_RECORD_SPECIALIZATIONS = frozenset({"upstream-static", "upstream-only"})
+# One total status would hide exactly the gaps the four axes exist to show.
+HMX_RECORD_PROOF_STATUSES = frozenset({"complete", "incomplete", "not-proven"})
+HMX_RECORD_PROOF_AXES = ("liveness", "allocator", "grid", "resident")
+# Bump when the C++ proof/observation producer's accepted evidence changes.  It is
+# part of the cache identity, so a producer that reads different sidecar facts
+# cannot reuse a previous build's objects.
+HMX_RECORD_PROOF_PRODUCER_ABI = "hmx-v3-proof-producer-abi-2026-09-26-v1"
+# The accounting mode of the default envelope.  v2 publishes bridge-only VTCM
+# facts and nothing else; the record-only mode is a different mode, not a
+# different spelling of this one.
+HMX_ACCOUNTING_MODE = "bridge-only"
+HMX_RECORD_ACCOUNTING_MODE = "v3-record-only"
 
 HMX_TILE_EDGE = 32
 HMX_PLANS = frozenset({"full-hmx", "hmx-tail", "hvx"})
@@ -1064,6 +1125,339 @@ def validate_hmx_manifest_json(manifest_json, field_name="hmx_manifest"):
     return validate_hmx_manifest(_json_object(manifest_json, field_name), field_name)
 
 
+# ---------------------------------------------------------------------------
+# Record-only v3 consumer
+# ---------------------------------------------------------------------------
+# Every check below is exact-field and closed-enum.  There is no "fill in a
+# default" path and no silent skip: a v3 record with an unknown field, an
+# unknown status, a wrong unit or a mismatched scope is rejected, because a
+# record-only document that nobody can interpret is worse than no record at all.
+
+
+def _require_bytes_or_null(value, path, *, allow_value):
+    """A capacity quantity: a proven non-negative count, or explicit unknown.
+
+    `None` is the only spelling of "unknown"; a missing key never stands in for
+    it, because that is how a `not-proven` fact would quietly become a `0`.
+    """
+    if value is None:
+        return
+    if not allow_value:
+        raise ValueError(
+            f"{path} is {value!r}, but a 'not-proven' fact must stay unknown"
+        )
+    _require_nonnegative_int(value, path)
+
+
+def _require_proof_status(value, path):
+    if not isinstance(value, str) or value not in HMX_RECORD_PROOF_STATUSES:
+        raise ValueError(f"{path} is not a canonical proof status: {value!r}")
+    return value
+
+
+def _validate_record_axis(value, path, axis):
+    _require_object(value, path)
+    if "kind" not in value:
+        raise ValueError(f"{path} is missing required field(s): ['kind']")
+    # Dispatch on `kind` first: the closed field set of an axis is a function of
+    # its kind, so the exact-field check has to come after it.
+    kind = value["kind"]
+    if kind == "static":
+        _require_exact_fields(value, path, ("kind", "value"))
+        _require_strict_int(value["value"], f"{path}.value", minimum=1)
+    elif kind == "dynamic":
+        # A dynamic axis names itself and carries no runtime guess.
+        _require_exact_fields(value, path, ("kind", "symbol"))
+        if value["symbol"] != axis:
+            raise ValueError(
+                f"{path}.symbol must name this axis ({axis!r}), got {value['symbol']!r}"
+            )
+    else:
+        raise ValueError(f"{path}.kind must be 'static' or 'dynamic', got {kind!r}")
+    return kind
+
+
+def _validate_record_shape_v3(value, path):
+    _require_exact_fields(value, path, ("state", "logical", "specialization"))
+    state = value["state"]
+    if state not in HMX_RECORD_SHAPE_STATES:
+        raise ValueError(f"{path}.state is not canonical: {state!r}")
+    if value["specialization"] not in HMX_RECORD_SPECIALIZATIONS:
+        raise ValueError(
+            f"{path}.specialization is not canonical: {value['specialization']!r}"
+        )
+    logical = _require_object(value["logical"], f"{path}.logical")
+    _require_exact_fields(logical, f"{path}.logical", ("m", "n", "k"))
+    kinds = {
+        axis: _validate_record_axis(logical[axis], f"{path}.logical.{axis}", axis)
+        for axis in ("m", "n", "k")
+    }
+    static_count = sum(kind == "static" for kind in kinds.values())
+    derived = (
+        "static" if static_count == 3
+        else "dynamic" if static_count == 0
+        else "partially-dynamic"
+    )
+    # The declared state must be the unique derivation of the three axes, and
+    # the specialization policy follows from the same three axes.
+    if state != derived:
+        raise ValueError(
+            f"{path}.state is {state!r} but the tagged axes derive {derived!r}"
+        )
+    expected = "upstream-static" if static_count == 3 else "upstream-only"
+    if value["specialization"] != expected:
+        raise ValueError(
+            f"{path}.specialization must be {expected!r} for a {derived!r} shape, "
+            f"got {value['specialization']!r}"
+        )
+    return value
+
+
+def _validate_record_scope_v3(value, path, function):
+    _require_exact_fields(value, path, ("function", "invocations", "grid", "resident"))
+    if value["function"] != function:
+        raise ValueError(
+            f"{path}.function must name the record's own function ({function!r}), "
+            f"got {value['function']!r}"
+        )
+    _require_strict_int(value["invocations"], f"{path}.invocations", minimum=1)
+    if value["invocations"] != HMX_RECORD_INVOCATIONS:
+        raise ValueError(
+            f"{path}.invocations must be {HMX_RECORD_INVOCATIONS}, got "
+            f"{value['invocations']!r}"
+        )
+    grid = _require_object(value["grid"], f"{path}.grid")
+    _require_exact_fields(grid, f"{path}.grid", ("policy", "required_product"))
+    if grid["policy"] != HMX_RECORD_GRID_POLICY:
+        raise ValueError(
+            f"{path}.grid.policy must be {HMX_RECORD_GRID_POLICY!r}, got "
+            f"{grid['policy']!r}"
+        )
+    _require_strict_int(grid["required_product"], f"{path}.grid.required_product", minimum=1)
+    if grid["required_product"] != HMX_RECORD_GRID_REQUIRED_PRODUCT:
+        raise ValueError(
+            f"{path}.grid.required_product must be {HMX_RECORD_GRID_REQUIRED_PRODUCT}, "
+            f"got {grid['required_product']!r}"
+        )
+    if value["resident"] != HMX_RECORD_RESIDENT_SCOPE:
+        raise ValueError(
+            f"{path}.resident must be {HMX_RECORD_RESIDENT_SCOPE!r}, got "
+            f"{value['resident']!r}"
+        )
+    return value
+
+
+def _validate_record_capacity_v3(value, path, unit, basis, quantities):
+    """One capacity block: pinned unit and basis, closed status, honest values."""
+    required = ("unit", "basis", "status") + tuple(quantities)
+    _require_exact_fields(value, path, required)
+    if value["unit"] != unit:
+        raise ValueError(f"{path}.unit must be {unit!r}, got {value['unit']!r}")
+    if value["basis"] != basis:
+        raise ValueError(f"{path}.basis must be {basis!r}, got {value['basis']!r}")
+    status = _require_proof_status(value["status"], f"{path}.status")
+    # The machine form of "never turn not-proven into 0": an unproven block may
+    # not carry a number at all, and a proven one may not leave a default.
+    for quantity in quantities:
+        _require_bytes_or_null(
+            value[quantity], f"{path}.{quantity}", allow_value=status != "not-proven"
+        )
+    return value
+
+
+def _validate_record_resources_v3(value, path):
+    _require_exact_fields(
+        value, path, ("requested", "allocator_aligned", "observed_high_water")
+    )
+    _validate_record_capacity_v3(
+        value["requested"],
+        f"{path}.requested",
+        HMX_RECORD_UNIT_BYTES,
+        HMX_RECORD_BASIS_REQUESTED,
+        (
+            "transient_requested_peak_bytes",
+            "resident_requested_bytes",
+            "modeled_requested_peak_bytes",
+        ),
+    )
+    _validate_record_capacity_v3(
+        value["allocator_aligned"],
+        f"{path}.allocator_aligned",
+        HMX_RECORD_UNIT_BYTES,
+        HMX_RECORD_BASIS_ALLOCATOR,
+        (
+            "transient_aligned_peak_bytes",
+            "resident_aligned_bytes",
+            "modeled_aligned_peak_bytes",
+        ),
+    )
+    observed = _require_object(value["observed_high_water"], f"{path}.observed_high_water")
+    _require_exact_fields(
+        observed,
+        f"{path}.observed_high_water",
+        ("unit", "basis", "status", "value_bytes", "scope", "source"),
+    )
+    if observed["unit"] != HMX_RECORD_UNIT_BYTES:
+        raise ValueError(
+            f"{path}.observed_high_water.unit must be {HMX_RECORD_UNIT_BYTES!r}"
+        )
+    if observed["basis"] != HMX_RECORD_BASIS_OBSERVED:
+        raise ValueError(
+            f"{path}.observed_high_water.basis must be {HMX_RECORD_BASIS_OBSERVED!r}"
+        )
+    status = _require_proof_status(
+        observed["status"], f"{path}.observed_high_water.status"
+    )
+    # A per-record high-water mark has no accepted join key, so the only
+    # permitted scope is the process aggregate.  Naming a narrower scope would
+    # be a claim the schema cannot support.
+    if observed["scope"] != HMX_RECORD_OBSERVATION_SCOPE:
+        raise ValueError(
+            f"{path}.observed_high_water.scope must be {HMX_RECORD_OBSERVATION_SCOPE!r}, "
+            f"got {observed['scope']!r}"
+        )
+    _require_bytes_or_null(
+        observed["value_bytes"],
+        f"{path}.observed_high_water.value_bytes",
+        allow_value=status != "not-proven",
+    )
+    if observed["source"] is not None:
+        _require_string(observed["source"], f"{path}.observed_high_water.source")
+    return value
+
+
+def _validate_record_proof_v3(value, path):
+    _require_exact_fields(value, path, ("status", "basis"))
+    status = _require_proof_status(value["status"], f"{path}.status")
+    if value["basis"] is None:
+        # `complete` with no basis is exactly the "masks a gap" case the
+        # four-axis contract exists to prevent.
+        if status == "complete":
+            raise ValueError(f"{path} is complete but names no basis")
+        return value
+    _require_string(value["basis"], f"{path}.basis")
+    return value
+
+
+def _validate_record_proofs_v3(value, path):
+    _require_exact_fields(value, path, HMX_RECORD_PROOF_AXES)
+    for axis in HMX_RECORD_PROOF_AXES:
+        _validate_record_proof_v3(value[axis], f"{path}.{axis}")
+    return value
+
+
+def _record_fingerprint_payload(record):
+    # The C++ producer hashes the complete record minus the digest, prefixed by
+    # the schema so a record can never be replayed under a different wire name.
+    payload = {"schema": HMX_RECORD_SCHEMA}
+    for key, value in record.items():
+        if key != "record_fingerprint":
+            payload[key] = value
+    return payload
+
+
+def compute_hmx_record_fingerprint(record):
+    """Compute the stable fingerprint for one validated v3 record."""
+    return canonical_json_sha256(_record_fingerprint_payload(record))
+
+
+def _validate_record_v3(entry, path):
+    _require_exact_fields(
+        entry,
+        path,
+        (
+            "function",
+            "id",
+            "plan",
+            "shape",
+            "scope",
+            "resources",
+            "proofs",
+            "fallback",
+            "record_fingerprint",
+        ),
+    )
+    function = _require_string(entry["function"], f"{path}.function")
+    record_id = _require_nonnegative_int(entry["id"], f"{path}.id")
+    if entry["plan"] not in HMX_PLANS:
+        raise ValueError(f"{path}.plan is not canonical: {entry['plan']!r}")
+    _validate_record_shape_v3(entry["shape"], f"{path}.shape")
+    _validate_record_scope_v3(entry["scope"], f"{path}.scope", function)
+    _validate_record_resources_v3(entry["resources"], f"{path}.resources")
+    _validate_record_proofs_v3(entry["proofs"], f"{path}.proofs")
+    # Read the one declared failure behavior rather than hardcoding it: a record
+    # that promised something else must be refused, not acted on.
+    _require_exact_fields(entry["fallback"], f"{path}.fallback", tuple(HMX_RECORD_FALLBACK))
+    for key, expected in HMX_RECORD_FALLBACK.items():
+        if entry["fallback"][key] != expected:
+            raise ValueError(
+                f"{path}.fallback.{key} must be {expected!r}, got "
+                f"{entry['fallback'][key]!r}; it is a protocol value, not a policy "
+                f"switch"
+            )
+    fingerprint = entry["record_fingerprint"]
+    if not isinstance(fingerprint, str) or _SHA256_FINGERPRINT_RE.fullmatch(fingerprint) is None:
+        raise ValueError(f"{path}.record_fingerprint must be a lowercase sha256 digest")
+    if fingerprint != compute_hmx_record_fingerprint(entry):
+        raise ValueError(
+            f"{path}.record_fingerprint does not match its canonical record content"
+        )
+    return {"path": path, "entry": entry, "function": function, "id": record_id}
+
+
+def validate_hmx_record_document(document, field_name="hmx_record"):
+    """Validate one record-only v3 document.
+
+    The document is a diagnostic record, not an executable contract: this
+    function proves that the record says what it means and that its digests are
+    intact.  It deliberately grants nothing -- no plan, no budget, no grid
+    constraint and no resident default can be read out of a record it accepted.
+    """
+    _require_object(document, field_name)
+    _require_exact_fields(
+        document, field_name, ("schema", "record_mode", "admission", "records")
+    )
+    if document["schema"] != HMX_RECORD_SCHEMA:
+        raise ValueError(
+            f"{field_name}.schema must be {HMX_RECORD_SCHEMA!r}, got "
+            f"{document['schema']!r}"
+        )
+    # Neither value is a runtime switch, and a consumer that accepted anything
+    # else would be accepting an admission-capable document.
+    if document["record_mode"] != HMX_RECORD_MODE:
+        raise ValueError(
+            f"{field_name}.record_mode must be {HMX_RECORD_MODE!r}, got "
+            f"{document['record_mode']!r}"
+        )
+    if document["admission"] != HMX_RECORD_ADMISSION:
+        raise ValueError(
+            f"{field_name}.admission must be {HMX_RECORD_ADMISSION!r}, got "
+            f"{document['admission']!r}"
+        )
+    records = document["records"]
+    if not isinstance(records, list):
+        raise ValueError(
+            f"{field_name}.records must be a list, got {type(records).__name__}"
+        )
+    seen = set()
+    for index, entry in enumerate(records):
+        info = _validate_record_v3(entry, f"{field_name}.records[{index}]")
+        key = (info["function"], info["id"])
+        if key in seen:
+            raise ValueError(
+                f"{field_name}.records[{index}] duplicates function-local id {info['id']}"
+            )
+        seen.add(key)
+    return document
+
+
+def validate_hmx_record_json(record_json, field_name="hmx_record"):
+    """Validate the JSON text of a v3 record child."""
+    return validate_hmx_record_document(
+        _json_object(record_json, field_name), field_name
+    )
+
+
 def enforce_hmx_launch_contract(
     manifest_json: str, launch_grid: tuple[int, int, int], field_name: str = "hmx_manifest"
 ):
@@ -1181,25 +1575,44 @@ def _validate_manifest_weight_prepack(manifest, weight_prepack):
             )
 
 
+# The two envelopes are closed identities, and each one carries exactly the
+# children its schema defines.  A v1 envelope has no record child; a v2 envelope
+# must have one, because a v3-capable envelope that structurally omits the child
+# is a malformed artifact rather than a "no record this run" signal.
+TRANSLATION_ENVELOPE_CHILDREN = {
+    HMX_TRANSLATION_V1_SCHEMA: ("schema", "weight_prepack", "hmx_manifest"),
+    HMX_TRANSLATION_V2_SCHEMA: (
+        "schema",
+        "weight_prepack",
+        "hmx_manifest",
+        "hmx_record",
+    ),
+}
+
+
 def parse_translation_metadata(metadata_json):
     """Unpack the C++ translation envelope into launcher-facing JSON strings.
 
-    The returned pair is ``(weight_prepack, hmx_manifest)``.  Both values stay
-    JSON text because the existing launcher contract consumes the former as a
-    string and the latter is consumed by host tooling/diagnostics.  No default
-    object is manufactured for a missing field: a stale or malformed envelope
-    is an actionable compilation error.
+    Returns ``(weight_prepack, hmx_manifest, hmx_record)``.  All three stay JSON
+    text because the existing launcher contract consumes the first as a string
+    and the other two are host-side consumers.  ``hmx_record`` is ``None`` for a
+    v1 envelope, which is the only way to get ``None`` here: no default record
+    object is manufactured for a missing child, because a stale or malformed
+    envelope is an actionable compilation error.
+
+    The envelope schema is dispatched on its declared value from a closed set.
+    Nothing here probes one schema and falls back to another: a v2 envelope
+    missing its v3 child, or a v1 envelope carrying one, is rejected outright.
     """
     envelope = _json_object(metadata_json, "translation metadata")
-    expected_schema = TRANSLATION_METADATA_SCHEMA
-    actual_schema = envelope.get("schema")
-    if actual_schema != expected_schema:
+    schema = envelope.get("schema")
+    if schema not in TRANSLATION_ENVELOPE_CHILDREN:
         raise ValueError(
-            "translation metadata.schema must be "
-            f"{expected_schema!r}, got {actual_schema!r}"
+            "translation metadata.schema must be one of "
+            f"{sorted(TRANSLATION_ENVELOPE_CHILDREN)}, got {schema!r}"
         )
     _require_exact_fields(
-        envelope, "translation metadata", ("schema", "weight_prepack", "hmx_manifest")
+        envelope, "translation metadata", TRANSLATION_ENVELOPE_CHILDREN[schema]
     )
 
     weight_prepack = envelope["weight_prepack"]
@@ -1208,18 +1621,31 @@ def parse_translation_metadata(metadata_json):
     validate_hmx_manifest(hmx_manifest)
     _validate_manifest_weight_prepack(hmx_manifest, weight_prepack)
 
-    # Re-encode only the two inner objects.  The envelope itself is an internal
-    # C++/Python transport detail and must not leak into either consumer.
+    # The v2 execution manifest is the execution authority in both envelopes and
+    # is re-encoded, not reinterpreted.  The v3 child is a sibling record: it is
+    # validated against its own closed contract and never merged into, derived
+    # from, or substituted for the v2 child.
+    hmx_record = None
+    if schema == HMX_TRANSLATION_V2_SCHEMA:
+        hmx_record = _canonical_json(
+            validate_hmx_record_document(envelope["hmx_record"])
+        )
+
+    # Re-encode only the inner objects.  The envelope itself is an internal
+    # C++/Python transport detail and must not leak into any consumer.
     return (
         _canonical_json(weight_prepack),
         _canonical_json(hmx_manifest),
+        hmx_record,
     )
 
 
 def apply_translation_metadata(metadata, metadata_json):
-    """Validate an envelope and publish its two independent fields."""
+    """Validate an envelope and publish its independent fields."""
     try:
-        weight_prepack, hmx_manifest = parse_translation_metadata(metadata_json)
+        weight_prepack, hmx_manifest, hmx_record = parse_translation_metadata(
+            metadata_json
+        )
     except ValueError as exc:
         raise RuntimeError(
             "invalid HMX translation metadata returned by the backend: "
@@ -1227,6 +1653,55 @@ def apply_translation_metadata(metadata, metadata_json):
         ) from exc
     metadata["weight_prepack"] = weight_prepack
     metadata["hmx_manifest"] = hmx_manifest
+    # `HMX_RECORD_ABSENT` for a v1 envelope, a validated JSON document for a v2
+    # one.  It is a diagnostic record, so the launcher must not read it to pick a
+    # plan, a budget, a resident default or a launch grid.
+    metadata["hmx_record"] = (
+        hmx_record if hmx_record is not None else HMX_RECORD_ABSENT
+    )
+
+
+def hmx_cache_identity(
+    envelope_schema=TRANSLATION_METADATA_SCHEMA,
+    manifest_schema=HMX_MANIFEST_SCHEMA,
+    accounting_mode=HMX_ACCOUNTING_MODE,
+    proof_producer_abi=HMX_RECORD_PROOF_PRODUCER_ABI,
+    semantic_hmx_abi=HMX_SHAPE_TAIL_ABI_VERSION,
+    options_hash="",
+):
+    """Return the wire-mode token mixed into the Triton object cache key.
+
+    Cache identity separates the envelope schema, the manifest schema, the
+    accounting mode, the proof/observation producer ABI, the semantic HMX ABI and
+    the effective backend options.  Changing any one of them must miss the cache,
+    so each is a separate field of the token rather than a concatenated blob a
+    rename could silently collapse.  A build that changes what a cached artifact
+    *means* therefore cannot reuse an entry written under the old meaning.
+
+    What this token deliberately does **not** do is separate the record-only
+    envelope from the production one.  Those two modes are chosen by an IR
+    attribute, and every parameter here is a build-time or per-kernel-source
+    input, so no value of this function can tell them apart.  Rather than let the
+    parameters imply a separation the key cannot deliver, the record-only mode is
+    kept out of the Triton object cache altogether -- see
+    ``backend/compiler.py::_reject_cacheable_record_only_module`` for the
+    mechanism and the reason.  The parameters exist so that a future mode which
+    *is* build-time visible (a v4 admission contract, say) has a place to land.
+    """
+    if envelope_schema not in TRANSLATION_ENVELOPE_CHILDREN:
+        raise ValueError(f"unknown translation envelope schema: {envelope_schema!r}")
+    if manifest_schema not in (HMX_MANIFEST_SCHEMA, HMX_RECORD_SCHEMA):
+        raise ValueError(f"unknown HMX manifest schema: {manifest_schema!r}")
+    return "|".join(
+        (
+            envelope_schema,
+            manifest_schema,
+            accounting_mode,
+            proof_producer_abi,
+            semantic_hmx_abi,
+            options_hash,
+        )
+    )
 
 
 def require_pack_metadata_fields(packed):
@@ -1259,6 +1734,10 @@ def validate_pack_metadata(packed):
     try:
         _validate_weight_prepack_json(packed["weight_prepack"])
         validate_hmx_manifest_json(packed["hmx_manifest"])
+        # `HMX_RECORD_ABSENT` is the v1-envelope spelling of "no record child"; a
+        # non-empty one must be a complete, self-consistent v3 document.
+        if packed["hmx_record"] != HMX_RECORD_ABSENT:
+            validate_hmx_record_json(packed["hmx_record"])
     except ValueError as exc:
         raise RuntimeError(
             f"invalid compiled kernel metadata: {exc}; clear "

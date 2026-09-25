@@ -544,6 +544,12 @@ public:
     if (enableBufferization)
       pm.addPass(mlir::hmx::createHmxVtcmAccountingPass());
 
+    // Finalize the record-only v3 document from the compile-time facts
+    // attribution published and the sidecars just produced.  Inert without the
+    // internal `hmx.diagnostic_v3_record` marker, so this changes nothing on the
+    // v2 path: the pass returns immediately when the marker is absent.
+    pm.addPass(mlir::hmx::createHmxRecordV3Pass());
+
     if (enableHexKL) {
       if (hexKLMode == "macro") {
         // Lower to HexKL macro API

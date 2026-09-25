@@ -252,4 +252,30 @@ def HmxVtcmAccounting : Pass<"hmx-vtcm-accounting"> {
   let constructor = "mlir::hmx::createHmxVtcmAccountingPass()";
 }
 
+def HmxRecordV3 : Pass<"hmx-v3-record"> {
+  let summary = "Finalize the record-only HMX v3 record document";
+
+  let description = [{
+    Finalizes the record-only `hex.hmx.kernel_manifest/v3` document that
+    attribution published from compile-time facts. It runs at module scope right
+    after the P1.5 VTCM accounting sidecars, so the requested-byte facts it can
+    prove are still available, and it is inert unless the module carries the
+    internal `hmx.diagnostic_v3_record` unit marker. That marker is deliberately
+    not a backend option, so the production path cannot be switched to the v3
+    envelope from a user-facing knob.
+
+    Finalization folds in only the facts the P1.5 sidecars prove, recomputes each
+    record fingerprint, and validates the closed v3 contract. Unknown capacity
+    stays `null` and an unproven axis stays `not-proven`; the pass never writes a
+    zero for something it did not measure. A document that cannot be proven is a
+    failure rather than a reduced document.
+
+    The result is a diagnostic record. It authorizes no HMX/tail plan, no
+    full-kernel budget and no launch-grid constraint; the v2 manifest remains
+    the execution authority.
+  }];
+
+  let constructor = "mlir::hmx::createHmxRecordV3Pass()";
+}
+
 #endif // HEXAGON_DIALECT_HMX_TRANSFORMS_PASSES_TD

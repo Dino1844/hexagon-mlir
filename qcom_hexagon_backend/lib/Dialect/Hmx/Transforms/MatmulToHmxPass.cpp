@@ -52,6 +52,7 @@
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxRecordV3.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
@@ -650,6 +651,42 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
     fields.append("weight_binding", makeWeightBindingAttr(ctx, decision));
   }
   return fields.getDictionary(ctx);
+}
+
+/// The record-only v3 skeleton for the same decision.
+///
+/// This is a *second producer over the same compile-time facts*, not a
+/// projection of `manifestRecord()`: it re-reads the decision and re-derives
+/// everything it publishes, and it shares no field name with the serialized v2
+/// contract.  A library call still gets a record when its operands are shaped
+/// -- the record publishes the compile-time outcome, not a reason -- while a
+/// fact the compile inputs do not carry produces no record instead of a guessed
+/// one.
+DictionaryAttr hmxRecordV3Skeleton(MLIRContext *ctx,
+                                   const MatmulDecision &decision) {
+  assert(decision.facts && "matmul decision has no semantic facts");
+  const ManifestFacts &facts = *decision.facts;
+  bool hmx = decision.reason == MatmulReason::SelectedAligned ||
+             decision.reason == MatmulReason::SelectedTail;
+  bool tail = decision.reason == MatmulReason::SelectedTail;
+  StringRef plan =
+      tail ? kHmxPlanHMXTail : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
+  if (facts.shapeState == ManifestShapeState::Unavailable)
+    return {};
+  Attribute skeleton = mlir::hmx::buildHmxRecordV3Skeleton(
+      ctx, decision.functionName, decision.id, plan,
+      ArrayRef<int64_t>(facts.dims, 3));
+  return dyn_cast_or_null<DictionaryAttr>(skeleton);
+}
+
+/// The publishable v3 skeletons for every decided matmul in one function.
+SmallVector<DictionaryAttr> hmxRecordV3Skeletons(MLIRContext *ctx,
+                                                 const AttributionTally &tally) {
+  SmallVector<DictionaryAttr> skeletons;
+  for (const MatmulDecision &decision : tally.records())
+    if (DictionaryAttr skeleton = hmxRecordV3Skeleton(ctx, decision))
+      skeletons.push_back(skeleton);
+  return skeletons;
 }
 
 /// Materialize the zero-padded row-major view consumed by a diagnostic tail
@@ -2048,6 +2085,14 @@ struct MatmulToHmxPass
       records.push_back(manifestRecord(&getContext(), decision, target));
     if (failed(addOrReplaceHmxManifestRecords(module, records)) ||
         failed(refreshHmxManifestBridgeCounts(module)))
+      return signalPassFailure();
+
+    // The record-only v3 document is produced from the same decisions through a
+    // separate builder, and is published only when the internal record-mode
+    // marker is present.  With the marker absent this is a no-op, so the v2
+    // manifest bytes and every launcher decision are untouched.
+    if (failed(publishHmxRecordV3(module, hmxRecordV3Skeletons(
+                                         &getContext(), tally))))
       return signalPassFailure();
 
     // The manifest and the diagnostics are two views of the same final records.

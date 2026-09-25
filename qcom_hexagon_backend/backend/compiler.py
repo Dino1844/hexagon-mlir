@@ -21,9 +21,13 @@ from triton._C.libtriton import ir, passes, qcom_hexagon_backend  # type: ignore
 from triton.backends.compiler import BaseBackend, GPUTarget
 from triton.backends.qcom_hexagon_backend.utils import parse_return_types
 from triton.backends.qcom_hexagon_backend.utils import (
+    HMX_ACCOUNTING_MODE,
+    HMX_MANIFEST_SCHEMA,
     HMX_SHAPE_TAIL_ABI_VERSION,
     PACK_METADATA_REQUIRED,
+    TRANSLATION_METADATA_SCHEMA,
     apply_translation_metadata,
+    hmx_cache_identity,
     validate_pack_metadata,
 )
 
@@ -80,11 +84,68 @@ def ttir_to_ttsharedir(mod: str, options):
         return Path(dst_path).read_text()
 
 
+# The internal, IR-borne request for the record-only v3 envelope.  It is a module
+# attribute rather than a backend option on purpose: nothing a user can pass
+# should be able to switch the wire envelope of a production compilation.
+HMX_RECORD_V3_MARKER = "hmx.diagnostic_v3_record"
+
+
+def _reject_cacheable_record_only_module(mod: str) -> None:
+    """Refuse a record-only module on any path that uses Triton's object cache.
+
+    The key fact, stated precisely because the rest of this depends on it.  The
+    Triton object cache is keyed by ``HexagonBackend.hash()``, the effective
+    options, and the Triton AST source.  The record-mode marker lives in the
+    *ttsharedir* module, which ``ttir_to_ttsharedir`` produces **downstream** of
+    every one of those inputs.  A downstream artifact is not a key input: no
+    part of the key contract promises that a marked module hashes differently from
+    its unmarked twin, and nothing here may rely on it doing so.
+
+    So the current absence of a collision is incidental, not structural.  It
+    happens to hold today because no production path can set the marker and the
+    direct-binding callers bypass this cache entirely -- and that is a property of
+    today's callers, not of the key.  If a marked module ever reached this
+    function, the two modes would share a cache entry, and because the record
+    child rides in the same packed metadata as the execution child, a v1 hit
+    would drop ``hmx_record`` silently.  It could not be caught afterwards
+    either: a cache hit does not re-run a stage, so no consumer ever sees the IR
+    that chose the envelope.
+
+    This refusal is what turns non-collision from an accident into a property, so
+    it is not to be relaxed on the reasoning that marked modules "cannot get
+    here".  They can: this check is the only thing saying so.
+
+    A key-based separation would need the mode to be a key input, and the only
+    Python-visible candidates are the target and the backend options -- an option
+    being exactly the user-facing switch this migration must not have.  The
+    record-only envelope therefore stays out of this cache, while remaining fully
+    implemented and reachable through the direct backend binding, which the MLIR
+    fixtures and host tests use.
+
+    Fail-closed by construction: there is no fallback that drops the marker and
+    quietly compiles a v1 kernel instead.
+    """
+    if not isinstance(mod, str) or HMX_RECORD_V3_MARKER not in mod:
+        return
+    raise RuntimeError(
+        f"refusing to compile a {HMX_RECORD_V3_MARKER!r} module through the Triton "
+        "object cache. The marker is applied to the ttsharedir module, downstream of "
+        "every Triton cache-key input (HexagonBackend.hash(), the effective options and "
+        "the Triton AST source), so it is not a key input: a marked module and its "
+        "unmarked twin would share one cache entry, and a v1 hit would drop the record "
+        "child without any error. Absence of that collision today is incidental to the "
+        "callers, not a property of the key. There is no backend option that makes the "
+        "key see it. Use the direct backend binding (translate_linalg_to_obj with "
+        "with_meta=true) for record-only diagnostics."
+    )
+
+
 # NOTE: This func has significant overlap with ttsharedir_to_obj(). This is intentional.
 # This is a stopgap solution to allow more control over compiling kernels for QNN custom ops.
 # When we later have a better way to pass compilation flags to ttsharedir_to_obj(),
 # this function can be deprecated- we'd use ttsharedir_to_obj() in all cases.
 def ttsharedir_to_llir(mod: str, options, metadata=None):
+    _reject_cacheable_record_only_module(mod)
     if metadata is None:
         metadata = {}
     context = ir.context()
@@ -104,6 +165,7 @@ def ttsharedir_to_llir(mod: str, options, metadata=None):
 
 
 def ttsharedir_to_obj(mod: str, options, metadata=None) -> bytes:
+    _reject_cacheable_record_only_module(mod)
     if metadata is None:
         metadata = {}
     context = ir.context()
@@ -183,10 +245,31 @@ class HexagonBackend(BaseBackend):
         of this hash; the semantic HMX shape/tail ABI token is mixed in as
         well. tools/hexmlir/env.sh partitions TRITON_CACHE_DIR on the
         libtriton.so identity for the compiled library.
+
+        The HMX wire identity is a first-class field of that key: the envelope
+        schema, the manifest schema, the accounting mode and the
+        proof/observation producer ABI all change what a cached artifact *means*,
+        not just how it was produced, so a build that changes one of them misses
+        the cache instead of reusing an entry written under the old meaning.
+
+        What this key does *not* do is separate the record-only envelope from the
+        production one.  Those modes are chosen by an IR attribute, and this
+        method has no per-source input, so no value of it can tell them apart.
+        The record-only mode is therefore kept out of this cache entirely -- see
+        ``_reject_cacheable_record_only_module`` for the mechanism and the
+        reason -- rather than pretending the key separates something it cannot.
         """
-        cache_identity = (
-            f"{HMX_SHAPE_TAIL_ABI_VERSION}-{self.target}-"
-            f"{self._parsed_options.hash()}"
+        cache_identity = "-".join(
+            (
+                hmx_cache_identity(
+                    envelope_schema=TRANSLATION_METADATA_SCHEMA,
+                    manifest_schema=HMX_MANIFEST_SCHEMA,
+                    accounting_mode=HMX_ACCOUNTING_MODE,
+                    semantic_hmx_abi=HMX_SHAPE_TAIL_ABI_VERSION,
+                    options_hash=self._parsed_options.hash(),
+                ),
+                str(self.target),
+            )
         )
         return hashlib.sha256(cache_identity.encode("utf-8")).hexdigest()
 

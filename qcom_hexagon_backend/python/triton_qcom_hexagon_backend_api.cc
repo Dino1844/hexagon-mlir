@@ -13,6 +13,7 @@
 #include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxRecordV3.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
@@ -416,7 +417,31 @@ static std::string buildTranslationMetadata(mlir::ModuleOp module) {
   auto layoutAttr = module->getAttrOfType<mlir::StringAttr>(
       "hmx.weight_prepack_layout");
 
-  std::string json = "{\"schema\":\"hex.hmx.translation/v1\",";
+  // `hex.hmx.translation/v1` is the default and stays byte-for-byte what it
+  // was.  `hex.hmx.translation/v2` is a *coordinated envelope migration*: it
+  // carries the very same v2 execution manifest plus a separate record-only v3
+  // child.  It is selected by the internal record-mode marker, never by a
+  // backend option, and a v3 failure rejects the compilation instead of
+  // silently reverting to the v1 envelope.
+  bool recordV3 = false;
+  if (failed(mlir::hmx::isHmxRecordV3Requested(module, recordV3)))
+    fail("malformed internal HMX record-mode marker on the translated module");
+  llvm::FailureOr<std::string> hmxRecord;
+  if (recordV3) {
+    hmxRecord = mlir::hmx::serializeHmxRecordV3Json(module);
+    if (failed(hmxRecord))
+      fail("HMX record-only v3 document is missing or malformed for the "
+           "translated module");
+  } else if (module->getAttr(mlir::hmx::kHmxRecordV3Attr)) {
+    fail("translated module carries an HMX v3 record without the record-mode "
+         "marker");
+  }
+
+  std::string json;
+  if (recordV3)
+    json = "{\"schema\":\"" + mlir::hmx::kHmxTranslationV2Schema.str() + "\",";
+  else
+    json = "{\"schema\":\"" + mlir::hmx::kHmxTranslationV1Schema.str() + "\",";
   json += "\"weight_prepack\":{\"layout\":";
   json += layoutAttr ? layoutAttr.getValue().str() : "null";
   json += ",\"weights\":";
@@ -426,6 +451,12 @@ static std::string buildTranslationMetadata(mlir::ModuleOp module) {
     fail("HMX manifest is missing or malformed for the translated module");
   json += "},\"hmx_manifest\":";
   json += manifest;
+  if (recordV3) {
+    // The v3 child is a separate object with a fixed field name.  It is never
+    // merged into, derived from, or substituted for the v2 child.
+    json += ",\"hmx_record\":";
+    json += *hmxRecord;
+  }
   json += "}";
   return json;
 }

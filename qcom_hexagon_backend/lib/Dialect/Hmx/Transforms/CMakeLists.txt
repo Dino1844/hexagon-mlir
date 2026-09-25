@@ -1,6 +1,8 @@
 add_mlir_dialect_library(HmxTransforms
   BufferizableOpInterfaceImpl.cpp
   HmxManifest.cpp
+  HmxRecordV3.cpp
+  HmxRecordV3Pass.cpp
   MatmulToHmxPass.cpp
   HmxPartitionPass.cpp
   WeightResidentPass.cpp
