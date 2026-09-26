@@ -9,6 +9,7 @@ address identity by accident.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -183,6 +184,112 @@ def test_split_coalesce_is_observed_not_promoted_to_a_model() -> None:
         assert token in source or token in read("src/VTCMPool.cpp"), token
 
 
+def test_per_event_address_padding_is_observed_and_never_a_model() -> None:
+    source = read("src/VTCMPool.cpp")
+    header = read("include/VTCMPool.h")
+    report = function_body(source, "int VtcmPool::writeAccountingReportLocked(")
+    record = function_body(
+        source, "void VtcmPool::recordAccountingEventLocked("
+    )
+
+    # The measurement is the free-list remainder of one placement, and the
+    # vocabulary is a closed scope rather than a "no padding" default.
+    assert "enum class AccountingPaddingScope" in header
+    assert "kNotApplicable = 0" in header
+    assert "kPerPlacement = 1" in header
+    assert "struct AccountingPadding" in header
+    for field in ("prefixBytes", "suffixBytes"):
+        assert field in header, field
+    for field in ("paddingScope", "addressPrefixBytes", "addressSuffixBytes"):
+        assert field in header, field
+
+    # The bytes come from the two placement helpers, not from a free-list delta
+    # and not from the request's alignment quantum.  The definitions are gated,
+    # so both preprocessor spellings share one body: slice between the two
+    # definitions rather than brace-counting across the `#else`.
+    end_signature = (
+        "char *VtcmPool::tryAllocateFromEnd(size_t nbytes, size_t alignment,\n"
+        "                                   AccountingPadding *padding) {"
+    )
+    best_fit_signature = (
+        "char *VtcmPool::allocateBestFit(size_t nbytes, size_t alignment,\n"
+        "                                AccountingPadding *padding) {"
+    )
+    end_placement = source[source.index(end_signature) :]
+    end_placement = end_placement[: end_placement.index("// Allocate using best-fit strategy")]
+    best_fit = source[source.index(best_fit_signature) :]
+    best_fit = best_fit[: best_fit.index("// Handle allocation failure")]
+    assert "padding->prefixBytes = prefixBytes" in end_placement
+    assert "padding->suffixBytes = 0" in end_placement
+    assert "padding->prefixBytes = prefix" in best_fit
+    assert "padding->suffixBytes = suffix" in best_fit
+    for body in (end_placement, best_fit):
+        assert "AccountingPaddingScope::kPerPlacement" in body
+        # The cumulative split ledger keeps its own exact inputs, so the two
+        # observations cannot drift apart.
+        assert "recordAccountingSplitLocked(" in body
+    assert "free_.size() - " not in best_fit
+    assert "numFreeBlocksBefore" not in source
+
+    # Only the one successful placement is attributed; a failure, a reuse, a
+    # free, or a cache record has no padding pointer to attribute.
+    allocate = source[source.index("char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment,\n                               bool residentAllocation, uint8_t residentKind,\n                               AccountingPadding *padding) {") :]
+    allocate = allocate[: allocate.index("// Try to allocate from end of last free block")]
+    assert "AccountingPadding placement;" in allocate
+    assert "tryAllocateFromEnd(nbytes, effectiveAlignment, &placement)" in allocate
+    assert "allocateBestFit(nbytes, effectiveAlignment, &placement)" in allocate
+    assert "&owner, &placement" in allocate
+    assert "padding != nullptr &&" in record
+    assert "padding->scope == AccountingPaddingScope::kPerPlacement" in record
+    assert "event.addressPrefixBytes = padding->prefixBytes" in record
+    assert "event.addressSuffixBytes = padding->suffixBytes" in record
+    # A resident placement is published by Resident, so the measurement travels
+    # out instead of being emitted twice.
+    assert "*padding = placement;" in allocate
+    assert "&padding);" in source
+
+    # The serialized names are the contract the host overlay validates.
+    for token in (
+        "address_prefix_bytes=%llu",
+        "address_suffix_bytes=%llu",
+        "address_padding_scope=%s",
+        "address_padding_basis=free-list-remainder-beside-placed-block",
+        "address_padding_model_status=not-proven",
+    ):
+        assert token in report, token
+    assert "paddingScopeName(event.paddingScope)" in report
+    assert 'return "per-placement";' in source
+    assert 'return "not-applicable";' in source
+
+    # What this observation must never become: a fragmentation, occupancy, or
+    # address-reuse claim.  The padding block itself carries only the declared
+    # basis and the permanent not-proven status, and no address.
+    padding_block = report[
+        report.index("address_prefix_bytes=%llu") : report.index(
+            "allocated_bytes_after=%llu"
+        )
+    ]
+    assert "not-proven" in padding_block
+    for forbidden in (
+        "complete",
+        "verified",
+        "reuse",
+        "occupancy",
+        "fragmentation",
+        "aligned_unit",
+    ):
+        assert forbidden not in padding_block, forbidden
+    assert "split_coalesce_model_status=not-proven" in report
+    assert "exact_peak_model_status=not-proven" in report
+    assert "full_kernel_occupancy_status=not-proven" in report
+    assert "address_padding_model_status=complete" not in source
+    assert "address_padding_fragmentation" not in source
+    assert "address_padding_occupancy" not in source
+    assert "address_padding_reuse" not in source
+    assert "%p" not in report
+    assert "0x" not in report
+
+
 def test_coalesce_cases_are_explicit_and_not_list_deltas() -> None:
     source = read("src/VTCMPool.cpp")
     header = read("include/VTCMPool.h")
@@ -219,6 +326,85 @@ def test_coalesce_cases_are_explicit_and_not_list_deltas() -> None:
         (False, True): 1,
         (True, True): 2,
     }
+
+
+def test_the_compiler_size_quantum_mirror_cannot_drift() -> None:
+    """The host compiler duplicates this pool's size quantum; pin the two.
+
+    `HmxVtcmAccountingPass` cannot call `VtcmPool::SizeAlignedCharge` -- that is
+    a DSP-side symbol behind the probe gate -- so it mirrors the three constants
+    to publish a size-aligned bound. A duplicated constant is only acceptable
+    while something proves the copies agree, because a silent divergence would
+    make the published bound describe a pool that does not exist: still no
+    crash, still no warning, just a capacity figure that is quietly wrong.
+    """
+    pool = read("src/VTCMPool.cpp")
+    compiler = (
+        ROOT / "lib" / "Dialect" / "Hmx" / "Transforms" /
+        "HmxVtcmAccountingPass.cpp"
+    ).read_text(encoding="utf-8")
+
+    # The runtime side, as the compiler must see it. The mapping is spelled out
+    # rather than derived from the names: the two sides deliberately do not share
+    # a naming scheme, and a derived mapping would silently pass if either name
+    # changed shape.
+    pairs = (
+        ("kSmallAlignment", "kRuntimeSizeQuantumSmall"),
+        ("kLargeAlignment", "kRuntimeSizeQuantumLarge"),
+        ("kLargeThreshold", "kRuntimeSizeQuantumLargeThreshold"),
+    )
+    for runtime_name, mirror_name in pairs:
+        declaration = re.search(
+            rf"constexpr size_t {runtime_name} = (\d+);", pool
+        )
+        assert declaration is not None, f"runtime no longer declares {runtime_name}"
+        runtime_value = int(declaration.group(1))
+        mirror = re.search(rf"{mirror_name} = (\d+);", compiler)
+        assert mirror is not None, f"compiler no longer mirrors {runtime_name}"
+        assert int(mirror.group(1)) == runtime_value, (
+            f"{runtime_name}: runtime charges {runtime_value} but the compiler "
+            f"mirror {mirror_name} says {int(mirror.group(1))}; the published "
+            f"size-aligned bound would describe a different pool"
+        )
+
+    # The rounding shape must match too, not just the constants: the runtime
+    # rounds up to the quantum, and a mirror that truncated would understate the
+    # bound and turn it into a false capacity claim.
+    assert "const int64_t quantum = nbytes >= kRuntimeSizeQuantumLargeThreshold" in compiler
+    assert "charge = (nbytes + (quantum - 1)) & ~(quantum - 1);" in compiler
+    # ...and it must refuse rather than clamp, so an unrepresentable request
+    # cannot be published as a zero-byte site.
+    assert "if (nbytes < 0)\n    return false;" in compiler
+
+
+def test_the_aligned_bound_is_not_published_as_a_capacity() -> None:
+    """The sidecar bound must be labelled a bound, and v3 must stay not-proven.
+
+    The aligned triple is an upper bound over an over-approximated live set. If
+    it were published as a plain byte count, a reader would take it as the peak
+    and derive a capacity from it -- which is exactly the claim the evidence
+    contract refuses to make.
+    """
+    compiler = (
+        ROOT / "lib" / "Dialect" / "Hmx" / "Transforms" /
+        "HmxVtcmAccountingPass.cpp"
+    ).read_text(encoding="utf-8")
+    for field in (
+        "transient_aligned_peak_bytes",
+        "resident_aligned_bytes",
+        "modeled_aligned_peak_bytes",
+        "aligned_charge_basis",
+    ):
+        assert f'fields.append("{field}"' in compiler, field
+    # Every aligned figure carries a status that says which kind of number it is.
+    assert 'kAlignedTransientStatus = "upper-bound-not-exact-peak"' in compiler
+    assert 'kAlignedResidentStatus = "exact-process-floor"' in compiler
+    assert 'kAlignedModeledStatus = "upper-bound-not-occupancy"' in compiler
+    # The two peaks are attributed independently: reusing the raw peak's sites
+    # for the aligned number would name the wrong program point.
+    assert "peak_aligned_site_id_status" in compiler
+    assert "peakAlignedSiteIds" in compiler
+    assert compiler.count("peak_aligned_site_ids") >= 1
 
 
 def test_resident_abi_is_labeled_without_changing_key_reuse() -> None:
@@ -406,6 +592,9 @@ def main() -> int:
         test_event_and_snapshot_units_are_not_conflated,
         test_free_cache_records_requested_and_charged_footprints,
         test_split_coalesce_is_observed_not_promoted_to_a_model,
+        test_per_event_address_padding_is_observed_and_never_a_model,
+        test_the_compiler_size_quantum_mirror_cannot_drift,
+        test_the_aligned_bound_is_not_published_as_a_capacity,
         test_coalesce_cases_are_explicit_and_not_list_deltas,
         test_resident_abi_is_labeled_without_changing_key_reuse,
         test_scope_and_content_gaps_are_machine_readable,

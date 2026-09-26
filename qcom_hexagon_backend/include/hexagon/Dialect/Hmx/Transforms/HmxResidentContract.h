@@ -237,6 +237,141 @@ struct HmxDiagnosticEventToken {
 inline constexpr StringLiteral kHmxDiagnosticEventTokenSchema =
     "hmx.vtcm-event-token/fnv1a128/v1";
 
+/// Schema of the per-*site* token, which is a different claim from the frame
+/// token above and must never be substituted for it.
+///
+/// The frame token (`kHmxDiagnosticEventTokenSchema`) names the observation
+/// frame: one principal, one module, one function, one source site, one
+/// invocation.  It deliberately excludes role and slot, because the frame is
+/// about the observation and not about an individual allocation inside it.
+///
+/// The site token names one canonical allocation site, so it must include the
+/// two facts that distinguish two allocations which share a source location:
+/// the reviewed semantic role and the checked resident slot.  Two allocations
+/// at the same file:line:col with different roles or different resident slots
+/// are different sites, and a token that ignored those components would give
+/// them one identity.
+///
+/// A distinct schema string is what makes the two tokens distinguishable at
+/// every consumer: a site token is not a frame token that happens to have more
+/// inputs, and a reader that is handed one where the other is expected can say
+/// so instead of comparing two unrelated words.
+inline constexpr StringLiteral kHmxDiagnosticSiteTokenSchema =
+    "hmx.vtcm-site-token/fnv1a128/v1";
+
+/// Per-op stamp naming the canonical site of one pool-backed allocation, and
+/// the module-level table of every stamped site.  Both are internal diagnostic
+/// records, not a manifest field and not a lowering contract on their own.
+inline constexpr StringLiteral kHmxVtcmSiteScopeAttr = "hmx.vtcm_site_scope";
+inline constexpr StringLiteral kHmxVtcmSiteScopesAttr =
+    "hmx.kernel_vtcm_site_scopes";
+inline constexpr StringLiteral kHmxVtcmSiteScopesSchema =
+    "hmx.vtcm-site-scopes/v1";
+
+/// Closed key set of an *eligible* per-op site stamp.  The set is exact: the
+/// lowering pass turns these words into runtime ABI constants, so a missing
+/// field would have to be defaulted and an extra field would be a promotion
+/// claim this ABI does not make.
+inline ArrayRef<StringLiteral> hmxDiagnosticSiteScopeKeys() {
+  static constexpr StringLiteral kKeys[] = {
+      "kind",
+      "schema",
+      "status",
+      "role",
+      "slot",
+      "source",
+      "function",
+      "function_id",
+      "site_id",
+      "accounting_scope_id",
+      "token_basis",
+      "token_bits",
+      "token_low",
+      "token_high",
+      "build_id_low",
+      "build_id_high",
+      "invocation_id",
+      "grid_product",
+  };
+  return kKeys;
+}
+
+/// Closed key set of the module-level site table.  `eligible` and `reason` are
+/// present on both shapes so a reader never has to infer which record it holds:
+/// the eligible shape carries the per-site array, the ineligible one carries a
+/// reason instead.
+inline ArrayRef<StringLiteral> hmxDiagnosticSiteScopesEligibleKeys() {
+  static constexpr StringLiteral kKeys[] = {
+      "kind",
+      "schema",
+      "status",
+      "eligible",
+      "mode",
+      "principal",
+      "module",
+      "function",
+      "function_id",
+      "accounting_scope_id",
+      "build_id_low",
+      "build_id_high",
+      "grid_product",
+      "invocation_id",
+      "immutable",
+      "token_basis",
+      "site_count",
+      "sites",
+      "performance_claimed",
+  };
+  return kKeys;
+}
+
+inline ArrayRef<StringLiteral> hmxDiagnosticSiteScopesIneligibleKeys() {
+  static constexpr StringLiteral kKeys[] = {
+      "kind",
+      "schema",
+      "status",
+      "eligible",
+      "mode",
+      "principal",
+      "module",
+      "function",
+      "function_id",
+      "accounting_scope_id",
+      "build_id_low",
+      "build_id_high",
+      "grid_product",
+      "invocation_id",
+      "immutable",
+      "token_basis",
+      "site_count",
+      "performance_claimed",
+      "reason",
+  };
+  return kKeys;
+}
+
+/// Closed key set of one entry in the `sites` array of an eligible table.  The
+/// `requested_bytes` field is the compiler's static request, not an observation;
+/// it is carried so a reader can tell a site whose size was proven from one
+/// whose extent only had a constant bound.
+inline ArrayRef<StringLiteral> hmxDiagnosticSiteScopesEntryKeys() {
+  static constexpr StringLiteral kKeys[] = {
+      "role",
+      "slot",
+      "source",
+      "function",
+      "function_id",
+      "site_id",
+      "token_basis",
+      "token_bits",
+      "token_low",
+      "token_high",
+      "requested_bytes",
+      "constant_bounded_extent",
+  };
+  return kKeys;
+}
+
 /// Wire kind of the `hmx.kernel_vtcm_event_context` sidecar. The producer
 /// (HmxVtcmAccountingPass) and the consumer (HmxToLLVMPass) must agree on this
 /// spelling exactly; a dictionary of any other kind is not an event-context
@@ -369,6 +504,73 @@ inline HmxDiagnosticEventToken diagnosticEventToken(
   add("invocation");
   add(std::to_string(invocationId));
   return {low, high};
+}
+
+/// Derive the opaque 128-bit *site* token from the canonical site tuple plus
+/// the one explicitly supported invocation ordinal.
+///
+/// This is deliberately a different function from `diagnosticEventToken`, not a
+/// wider version of it.  The frame token answers "which observation is this";
+/// the site token answers "which allocation site inside that observation is
+/// this".  Mixing them would make a frame token look like a site token (or the
+/// reverse) at a consumer that compares the pair, so role and slot are added
+/// here and the schema string differs.
+///
+/// The hash construction is the same length-delimited FNV-1a double-state
+/// scheme the rest of this header uses, so the two tokens have the same
+/// collision properties and the same domain separation.  As with the frame
+/// token, the caller performs the collision check and refuses a zero token;
+/// this helper is not a runtime identity oracle.
+inline HmxDiagnosticEventToken diagnosticSiteToken(
+    StringRef principal, StringRef module, StringRef function, StringRef site,
+    StringRef role, int64_t slot, uint64_t invocationId) {
+  uint64_t low = kHmxResidentHashOffset;
+  uint64_t high = kHmxResidentHashOffset ^ 0x9e3779b97f4a7c15ull;
+  auto add = [&](StringRef value) {
+    hashResidentPart(low, value);
+    hashResidentPart(high, value);
+  };
+  add(kHmxDiagnosticSiteTokenSchema);
+  add("scope");
+  add(principal);
+  add(module);
+  add("function");
+  add(function);
+  add("site");
+  add(site);
+  add("role");
+  add(role);
+  add("slot");
+  add(std::to_string(slot));
+  add("invocation");
+  add(std::to_string(invocationId));
+  return {low, high};
+}
+
+/// Runtime site-scope ABI: entry/leave symbols, version, and the two flag bits
+/// the compiler is allowed to set. These are the compiler's half; the runtime's
+/// half is `kAccountingSiteScopeVersion` and the two `kAccountingSiteScope*`
+/// flag bits in bin/runtime/include/VTCMPool.h, pinned to each other by
+/// bin/runtime/test/test_vtcm_site_scope_contract.py. Adding a bit here without a
+/// runtime meaning would let a kernel claim a scope the device does not
+/// implement.
+inline constexpr StringLiteral kHmxDiagnosticSiteScopeEnterFn =
+    "hexagon_runtime_vtcm_accounting_site_scope_enter_v1_dsp";
+inline constexpr StringLiteral kHmxDiagnosticSiteScopeLeaveFn =
+    "hexagon_runtime_vtcm_accounting_site_scope_leave_v1_dsp";
+inline constexpr uint32_t kHmxDiagnosticSiteScopeAbiVersion = 1;
+inline constexpr uint32_t kHmxDiagnosticSiteScopeFlagSingleInvocation = 1u << 0;
+inline constexpr uint32_t kHmxDiagnosticSiteScopeFlagGridOne = 1u << 1;
+
+/// True when `attr` is exactly the per-op stamp shape the lowering consumes. A
+/// stamp missing a word would have to be defaulted, and an extra word would be a
+/// promotion claim this ABI does not make, so both are schema violations rather
+/// than ignorable extras. The generic exact-key helper is reused on purpose: the
+/// check is the same shape as the frame context's, and a second implementation
+/// would be a second thing to keep correct.
+inline bool hasExactHmxDiagnosticSiteScopeKeys(DictionaryAttr attr,
+                                               ArrayRef<StringLiteral> expected) {
+  return hasExactHmxDiagnosticEventContextKeys(attr, expected);
 }
 
 inline uint64_t residentFunctionIdentity(StringRef principal,

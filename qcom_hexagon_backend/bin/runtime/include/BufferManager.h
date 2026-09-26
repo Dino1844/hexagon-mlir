@@ -70,6 +70,12 @@ public:
     uint64_t freeCacheDropBytes;
     uint64_t freeCacheEvictions;
     uint64_t freeCacheEvictionBytes;
+    // One allocation-failure eviction drops the whole VTCM-accounted cache, so
+    // a single event can evict several buffers at once. This cumulative *event*
+    // count is the only counterpart of the retained-ring
+    // `free_cache_evict_events`; the buffer/byte counters above are a different
+    // unit and can only bound it (one event evicts at least one buffer).
+    uint64_t freeCacheEvictionEvents;
     // Historical retained-cache high-water is separate from the pool's
     // charged-allocation high-water. Keeping both ledgers prevents a cache
     // retention number from being mistaken for full VTCM occupancy.
@@ -133,7 +139,8 @@ public:
           highWaterCachedBuffers_ = cachedBufferCount_;
         recordAccountingCacheEventLocked(
             VtcmPool::AccountingCacheEventKind::kRetain, requestedBytes,
-            allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment);
+            allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment,
+            ptr);
         validateAccountingStateLocked();
       }
 #endif
@@ -144,7 +151,8 @@ public:
       freeCacheDropBytes_ += bytes;
       recordAccountingCacheEventLocked(
           VtcmPool::AccountingCacheEventKind::kDrop, requestedBytes,
-          allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment);
+          allocatorInputBytes, sizeAlignedBytes, bytes, cacheKey.alignment,
+          ptr);
     }
 #endif
     // Otherwise `buf` is destroyed at the end of this scope and the block
@@ -179,7 +187,8 @@ public:
           --cachedBufferCount_;
         recordAccountingCacheEventLocked(
             VtcmPool::AccountingCacheEventKind::kHit, requestedBytes,
-            allocatorInputBytes, sizeAlignedBytes, bytes, key.alignment);
+            allocatorInputBytes, sizeAlignedBytes, bytes, key.alignment,
+            buf->GetPointer());
         validateAccountingStateLocked();
       }
 #else
@@ -233,9 +242,17 @@ public:
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
       validateAccountingStateLocked();
       if (evictedBuffers != 0) {
+        ++freeCacheEvictionEvents_;
+        // No owner block: `freeCache_` has already been cleared, so there is no
+        // single block this batch event is about. Nothing is lost by that --
+        // every evicted block is released through the pool's own free path,
+        // which records that block's site individually. This event stays a
+        // cache-level fact rather than borrowing one block's identity for the
+        // whole batch.
         recordAccountingCacheEventLocked(
             VtcmPool::AccountingCacheEventKind::kEvict, evictedRequestedBytes,
-            evictedAllocatorInputBytes, evictedSizeAlignedBytes, evictedBytes, 0);
+            evictedAllocatorInputBytes, evictedSizeAlignedBytes, evictedBytes, 0,
+            nullptr);
       }
 #endif
       buf = std::make_unique<HexagonBuffer>(std::forward<Args>(args)...);
@@ -362,16 +379,23 @@ private:
   VtcmPool *accountingPool_{nullptr};
 
   /// Cache state is process-scoped; the pool event deliberately does not
-  /// inherit the current function/allocation-site context.
+  /// inherit the *current* function/allocation-site context. It does carry the
+  /// owner retained with the block being retained or hit, which is the site that
+  /// allocated those bytes -- a different fact from "who is running now", and
+  /// the only one that makes the cached bytes attributable.
   void recordAccountingCacheEventLocked(
       VtcmPool::AccountingCacheEventKind kind, size_t requestedBytes,
       size_t allocatorInputBytes, size_t sizeAlignedBytes, size_t chargedBytes,
-      size_t requestedAlignment) const {
+      size_t requestedAlignment, void *ownerBlock) const {
     if (accountingPool_ != nullptr) {
+      // The pool resolves its own retained owner from the block pointer, so an
+      // unattributed block simply yields no owner and the event stays
+      // aggregate. That is deliberate: a block must not pick up an identity just
+      // because the free cache happens to be in its path.
       accountingPool_->recordAccountingCacheEvent(
           kind, requestedBytes, allocatorInputBytes, sizeAlignedBytes,
           chargedBytes, requestedAlignment, cachedVtcmBytes_,
-          cachedBufferCount_);
+          cachedBufferCount_, ownerBlock);
     }
   }
 
@@ -455,6 +479,7 @@ private:
   uint64_t freeCacheDropBytes_ = 0;
   uint64_t freeCacheEvictions_ = 0;
   uint64_t freeCacheEvictionBytes_ = 0;
+  uint64_t freeCacheEvictionEvents_ = 0;
   uint64_t highWaterCachedVtcmBytes_ = 0;
   uint64_t highWaterCachedBuffers_ = 0;
   size_t cachedBufferCount_ = 0;
@@ -471,7 +496,8 @@ BufferManager::getAccountingSnapshot() {
       freeCacheHitRequestedBytes_, freeCacheRetains_,
       freeCacheRetainedBytes_, freeCacheRetainRequestedBytes_,
       freeCacheDrops_,         freeCacheDropBytes_, freeCacheEvictions_,
-      freeCacheEvictionBytes_, highWaterCachedVtcmBytes_,
+      freeCacheEvictionBytes_, freeCacheEvictionEvents_,
+      highWaterCachedVtcmBytes_,
       highWaterCachedBuffers_, cachedBufferCount_, cachedBytes_,
       cachedVtcmBytes_, kMaxCachedBytes};
 }

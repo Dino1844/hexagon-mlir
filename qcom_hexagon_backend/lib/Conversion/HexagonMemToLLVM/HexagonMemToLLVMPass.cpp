@@ -16,6 +16,7 @@
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Conversion/ConvertToLLVM/ToLLVMInterface.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -188,6 +189,219 @@ computeTypeInfo(AllocDeallocOp op, ConversionPatternRewriter &rewriter,
   return {success(), isInVtcm, isCroutonType};
 }
 
+/// The per-site scope carried by one pool-backed allocation, read from the
+/// `hmx.vtcm_site_scope` stamp the accounting pass attached.
+///
+/// Every field is validated before a single op is created. A stamp that is
+/// present but malformed is a refusal, not a default: emitting a bracket with a
+/// zeroed word would attribute the allocation to a site nobody named, and
+/// skipping the bracket would silently shrink the scope the table published.
+struct SiteScopeBracket {
+  bool active{false};
+  uint64_t tokenLow{0};
+  uint64_t tokenHigh{0};
+  uint64_t accountingScopeId{0};
+  uint64_t invocationId{0};
+  uint64_t functionId{0};
+  uint64_t allocationSiteId{0};
+  uint64_t buildIdLow{0};
+  uint64_t buildIdHigh{0};
+};
+
+/// Read a stamped 64-bit word. MLIR prints `i64` in signed decimal, so the
+/// stored pattern is normalized to its unsigned value before it becomes a
+/// runtime constant; the two must be the same number on the device.
+static bool readSiteScopeWord(DictionaryAttr dict, StringRef name,
+                              uint64_t &value) {
+  Attribute attr = dict.get(name);
+  if (auto pair = dyn_cast_or_null<DictionaryAttr>(attr))
+    attr = pair.get("value");
+  auto integer = dyn_cast_or_null<IntegerAttr>(attr);
+  if (!integer || !integer.getType().isSignlessInteger(64))
+    return false;
+  value = integer.getValue().getZExtValue();
+  return true;
+}
+
+static FailureOr<SiteScopeBracket>
+readSiteScope(Operation *op, bool isPoolBacked) {
+  SiteScopeBracket bracket;
+  Attribute raw = op->getAttr(mlir::hmx::kHmxVtcmSiteScopeAttr);
+  if (!raw)
+    return bracket;
+  auto stamp = dyn_cast<DictionaryAttr>(raw);
+  if (!stamp)
+    return failure();
+  // The per-op stamp has exactly one closed shape: the producer only stamps
+  // when the module-level table is eligible, so there is no "ineligible stamp"
+  // to accept here. A stamp of any other shape -- missing a word, carrying an
+  // extra one, or holding the table's `reason` in place of an identity -- is a
+  // refusal, because each of those would have to be defaulted or ignored before
+  // a bracket could be built from it.
+  if (!mlir::hmx::hasExactHmxDiagnosticSiteScopeKeys(
+          stamp, mlir::hmx::hmxDiagnosticSiteScopeKeys())) {
+    op->emitError("hmx.vtcm_site_scope is not the closed per-site stamp shape");
+    return failure();
+  }
+  // The stamp is only meaningful for a pool-backed allocation. A DDR allocation
+  // never reaches the VTCM pool, so bracketing one would name a site the
+  // runtime never saw.
+  if (!isPoolBacked) {
+    op->emitError("hmx.vtcm_site_scope is attached to a non-pool-backed "
+                  "allocation");
+    return failure();
+  }
+  auto kind = stamp.getAs<StringAttr>("kind");
+  auto schema = stamp.getAs<StringAttr>("schema");
+  auto status = stamp.getAs<StringAttr>("status");
+  auto tokenBasis = stamp.getAs<StringAttr>("token_basis");
+  auto tokenBits = stamp.getAs<IntegerAttr>("token_bits");
+  auto role = stamp.getAs<StringAttr>("role");
+  auto source = stamp.getAs<StringAttr>("source");
+  auto function = stamp.getAs<StringAttr>("function");
+  auto gridProduct = stamp.getAs<IntegerAttr>("grid_product");
+  auto invocationId = stamp.getAs<IntegerAttr>("invocation_id");
+  if (!kind || kind.getValue() != "vtcm-site-scope" || !schema ||
+      schema.getValue() != mlir::hmx::kHmxVtcmSiteScopesSchema || !status ||
+      status.getValue() != "complete" || !tokenBasis ||
+      tokenBasis.getValue() != mlir::hmx::kHmxDiagnosticSiteTokenSchema ||
+      !tokenBits || !tokenBits.getType().isSignlessInteger(64) ||
+      tokenBits.getInt() != 128 || !role || role.getValue().empty() || !source ||
+      source.getValue().empty() || !function || function.getValue().empty() ||
+      !gridProduct || !gridProduct.getType().isSignlessInteger(64) ||
+      gridProduct.getInt() != 1 || !invocationId ||
+      !invocationId.getType().isSignlessInteger(64) ||
+      invocationId.getInt() != 1 ||
+      !readSiteScopeWord(stamp, "function_id", bracket.functionId) ||
+      !readSiteScopeWord(stamp, "site_id", bracket.allocationSiteId) ||
+      !readSiteScopeWord(stamp, "accounting_scope_id",
+                         bracket.accountingScopeId) ||
+      !readSiteScopeWord(stamp, "token_low", bracket.tokenLow) ||
+      !readSiteScopeWord(stamp, "token_high", bracket.tokenHigh) ||
+      !readSiteScopeWord(stamp, "build_id_low", bracket.buildIdLow) ||
+      !readSiteScopeWord(stamp, "build_id_high", bracket.buildIdHigh)) {
+    op->emitError("hmx.vtcm_site_scope is missing a required word or carries a "
+                  "value outside the site ABI");
+    return failure();
+  }
+  // The invocation ordinal is a scope fact rather than an identity, so it is
+  // validated from the typed attribute instead of through readSiteScopeWord. It
+  // still has to be stored: the zero check below is what refuses a scope with
+  // no invocation to spend, and it reads this field.
+  bracket.invocationId = static_cast<uint64_t>(invocationId.getInt());
+  if ((bracket.tokenLow == 0 && bracket.tokenHigh == 0) ||
+      bracket.accountingScopeId == 0 || bracket.functionId == 0 ||
+      bracket.allocationSiteId == 0 || bracket.invocationId == 0 ||
+      (bracket.buildIdLow == 0 && bracket.buildIdHigh == 0)) {
+    op->emitError("hmx.vtcm_site_scope carries a zero identity the site ABI "
+                  "refuses to bind");
+    return failure();
+  }
+  bracket.active = true;
+  return bracket;
+}
+
+/// Create the enter call that opens the bracket. It is emitted immediately
+/// before the pool allocation, at the allocation's own insertion point, so the
+/// runtime owner is current for exactly that call.
+static FailureOr<LLVM::LLVMFuncOp>
+getSiteScopeEnterFn(ModuleOp module, ConversionPatternRewriter &rewriter) {
+  MLIRContext *context = module.getContext();
+  SmallVector<Type> params{rewriter.getI32Type(), rewriter.getI32Type()};
+  // token low, token high, accounting scope, invocation, function, site, build
+  // low, build high: eight 64-bit words between the two 32-bit fields.
+  for (unsigned index = 0; index != 8; ++index)
+    params.push_back(rewriter.getI64Type());
+  params.push_back(rewriter.getI32Type());
+  FailureOr<LLVM::LLVMFuncOp> fn = LLVM::lookupOrCreateFn(
+      rewriter, module, mlir::hmx::kHmxDiagnosticSiteScopeEnterFn, params,
+      getVoidTy(context));
+  if (succeeded(fn))
+    // Side-effecting and opaque, so neither the CSE pass nor a later
+    // optimization may merge two brackets or drop one. The bracket is evidence:
+    // losing it would leave an allocation attributed to nothing.
+    (*fn)->setAttr("passthrough",
+                   rewriter.getArrayAttr({rewriter.getStringAttr("noinline"),
+                                          rewriter.getStringAttr("willreturn")}));
+  return fn;
+}
+
+static FailureOr<LLVM::LLVMFuncOp>
+getSiteScopeLeaveFn(ModuleOp module, ConversionPatternRewriter &rewriter) {
+  FailureOr<LLVM::LLVMFuncOp> fn = LLVM::lookupOrCreateFn(
+      rewriter, module, mlir::hmx::kHmxDiagnosticSiteScopeLeaveFn,
+      ArrayRef<Type>{}, getVoidTy(module.getContext()));
+  if (succeeded(fn))
+    (*fn)->setAttr("passthrough",
+                   rewriter.getArrayAttr({rewriter.getStringAttr("noinline"),
+                                          rewriter.getStringAttr("willreturn")}));
+  return fn;
+}
+
+static Value siteScopeI32(ConversionPatternRewriter &rewriter, Location loc,
+                          uint32_t value) {
+  return LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                  static_cast<int32_t>(value));
+}
+
+static Value siteScopeI64(ConversionPatternRewriter &rewriter, Location loc,
+                          uint64_t value) {
+  return LLVM::ConstantOp::create(
+      rewriter, loc, rewriter.getI64Type(),
+      IntegerAttr::get(rewriter.getI64Type(), APInt(64, value)));
+}
+
+/// Emit the enter half. No-op when the allocation is not stamped, which is the
+/// default path: production IR carries no stamp and gets no bracket.
+static LogicalResult
+emitSiteScopeEnter(ConversionPatternRewriter &rewriter, hexagonmem::AllocOp op,
+                   const SiteScopeBracket &bracket) {
+  if (!bracket.active)
+    return success();
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  FailureOr<LLVM::LLVMFuncOp> fn = getSiteScopeEnterFn(module, rewriter);
+  if (failed(fn))
+    return failure();
+  Location loc = op->getLoc();
+  SmallVector<Value> operands{
+      siteScopeI32(rewriter, loc, mlir::hmx::kHmxDiagnosticSiteScopeAbiVersion),
+      siteScopeI32(rewriter, loc,
+                   mlir::hmx::kHmxDiagnosticSiteScopeFlagSingleInvocation |
+                       mlir::hmx::kHmxDiagnosticSiteScopeFlagGridOne),
+      siteScopeI64(rewriter, loc, bracket.tokenLow),
+      siteScopeI64(rewriter, loc, bracket.tokenHigh),
+      siteScopeI64(rewriter, loc, bracket.accountingScopeId),
+      siteScopeI64(rewriter, loc, bracket.invocationId),
+      siteScopeI64(rewriter, loc, bracket.functionId),
+      siteScopeI64(rewriter, loc, bracket.allocationSiteId),
+      siteScopeI64(rewriter, loc, bracket.buildIdLow),
+      siteScopeI64(rewriter, loc, bracket.buildIdHigh),
+      siteScopeI32(rewriter, loc, 1)};
+  LLVM::CallOp::create(rewriter, loc, TypeRange{},
+                       FlatSymbolRefAttr::get(fn->getOperation()), operands);
+  return success();
+}
+
+/// Emit the leave half immediately after the allocation call, so the bracket
+/// closes on the allocation it names and the free -- which happens later and is
+/// attributed through the owner the runtime retained -- still sees the site.
+static LogicalResult
+emitSiteScopeLeave(ConversionPatternRewriter &rewriter, hexagonmem::AllocOp op,
+                   Operation *after) {
+  auto bracket = readSiteScope(op, /*isPoolBacked=*/true);
+  if (failed(bracket) || !bracket->active)
+    return success();
+  ModuleOp module = op->getParentOfType<ModuleOp>();
+  FailureOr<LLVM::LLVMFuncOp> fn = getSiteScopeLeaveFn(module, rewriter);
+  if (failed(fn))
+    return failure();
+  rewriter.setInsertionPointAfter(after);
+  LLVM::CallOp::create(rewriter, op->getLoc(), TypeRange{},
+                       FlatSymbolRefAttr::get(fn->getOperation()),
+                       ValueRange{});
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Lower hexagonmem::AllocOp
 //===----------------------------------------------------------------------===//
@@ -218,10 +432,24 @@ public:
 
     // Replace "hexagonmem.alloc" with "memref.alloc" for flat DDR allocations
     if (!isInVtcm && !isCroutonType) {
+      // A stamp on a DDR allocation is a producer disagreement, not a no-op: the
+      // site table only names pool-backed sites, so a stamp here means the two
+      // disagree about what this operation allocates.
+      if (op->hasAttr(mlir::hmx::kHmxVtcmSiteScopeAttr)) {
+        op.emitError("hmx.vtcm_site_scope is attached to a DDR allocation, "
+                     "which never reaches the VTCM pool");
+        return failure();
+      }
       rewriter.replaceOpWithNewOp<memref::AllocOp>(
           op, mlir::cast<MemRefType>(type));
       return success();
     }
+
+    // Read and fully validate the per-site stamp before creating anything, so a
+    // malformed stamp cannot leave a half-emitted bracket behind.
+    FailureOr<SiteScopeBracket> bracket = readSiteScope(op, isInVtcm);
+    if (failed(bracket))
+      return failure();
 
     // Keep the requested alignment on every VTCM allocation ABI.  The ordinary
     // allocator already accepts it, while resident entries use a distinct
@@ -260,9 +488,13 @@ public:
       Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
       Value residentAlignmentValue =
           getI32Constant(rewriter, loc, static_cast<int64_t>(alignment));
+      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
+        return failure();
       auto callOp = LLVM::CallOp::create(
           rewriter, loc, residentFn.value(),
           ValueRange({keyValue, bytesValue, residentAlignmentValue}));
+      if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
+        return failure();
 
       auto origMemRefType = mlir::cast<MemRefType>(type);
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
@@ -347,9 +579,13 @@ public:
       Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
       Value residentAlignmentValue =
           getI32Constant(rewriter, loc, static_cast<int64_t>(alignment));
+      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
+        return failure();
       auto callOp = LLVM::CallOp::create(
           rewriter, loc, residentFn.value(),
           ValueRange({src, bytesValue, residentAlignmentValue}));
+      if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
+        return failure();
 
       auto origMemRefType = mlir::cast<MemRefType>(type);
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
@@ -386,9 +622,14 @@ public:
           getI32Constant(rewriter, loc, getAllocationSize(croutonType));
       Value blockSizeValue =
           getI32Constant(rewriter, loc, DEFAULT_CROUTON_SIZE);
-      rewriter.replaceOpWithNewOp<LLVM::CallOp>(
-          op, funcOp.value(),
+      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
+        return failure();
+      auto croutonCall = LLVM::CallOp::create(
+          rewriter, loc, funcOp.value(),
           ValueRange({size, blockSizeValue, alignmentValue, isInVtcmValue}));
+      if (failed(emitSiteScopeLeave(rewriter, op, croutonCall)))
+        return failure();
+      rewriter.replaceOp(op, croutonCall->getResults());
     } else {
       auto origMemRefType = mlir::cast<MemRefType>(type);
       auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
@@ -405,9 +646,13 @@ public:
                                      /* sizeInBytes */ true);
       sizeAsI32 = LLVM::TruncOp::create(rewriter, loc,
                                         rewriter.getIntegerType(32), size);
+      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
+        return failure();
       mlir::LLVM::CallOp callOp = LLVM::CallOp::create(
           rewriter, loc, funcOp.value(),
           ValueRange({sizeAsI32, alignmentValue, isInVtcmValue}));
+      if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
+        return failure();
       // The runtime pointer-returning ABI enforces a non-null result contract
       // (allocation failure aborts before this point). Do not build a descriptor
       // from an unchecked null result.

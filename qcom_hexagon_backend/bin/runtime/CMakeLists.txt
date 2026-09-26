@@ -143,9 +143,26 @@ foreach (i IN LISTS HEXAGON_RUNTIME_SRC)
     set(BC_2_CPP ${src_name}_bc.cpp)
     get_filename_component(BASENAME ${src_name} NAME)
     # We need to make sure that CPLUS_INCLUDE_PATH is empty for successful compilation on Ubuntu 22 (as for Ubuntu 22 it contains the path of libstdc++'s headers files *for x86*)
+    #
+    # The depfile is mandatory, not cosmetic: the runtime headers carry the
+    # opt-in accounting structs by value between translation units.  With only
+    # `DEPENDS ${SRC_FILE}` a header edit left every other .bc untouched, so a
+    # capture could link two TUs that disagree on `AccountingSnapshot` layout
+    # and emit self-contradicting records (observed as VTCM_BUFFER_CACHE ring
+    # counters disagreeing with the VTCM_SNAPSHOT from the same report).
+    #
+    # The depfile path must be absolute.  The rule runs `cd`-ing into this
+    # directory, so a bare `${BC}.d` makes the compiler write the depfile next to
+    # the bitcode, while ninja resolves `depfile` against the *build root* and
+    # looks for a file that is not there.  Ninja then reports `deps not found`
+    # for the edge and silently drops every header dependency, which looks
+    # exactly like the bug this was meant to fix: touching a runtime header
+    # rebuilt nothing.  `${CMAKE_CURRENT_BINARY_DIR}/${BC}.d` is unambiguous from
+    # both sides.
     add_custom_command(OUTPUT ${BC}
-                     COMMAND env CPLUS_INCLUDE_PATH="" ${COMPILER} ${HEXAGON_INCLUDES} ${HEXAGON_FLAGS} -emit-llvm -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -c ${SRC_FILE} -o ${BC}
+                     COMMAND env CPLUS_INCLUDE_PATH="" ${COMPILER} ${HEXAGON_INCLUDES} ${HEXAGON_FLAGS} -emit-llvm -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -MMD -MF ${CMAKE_CURRENT_BINARY_DIR}/${BC}.d -c ${SRC_FILE} -o ${BC}
                      DEPENDS ${SRC_FILE}
+                     DEPFILE ${CMAKE_CURRENT_BINARY_DIR}/${BC}.d
                      VERBATIM)
     add_custom_command(OUTPUT ${BC_2_CPP}
                        COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/bitcode2array.py ${BC} ${BASENAME} ${BC_2_CPP}
@@ -176,8 +193,9 @@ foreach (i IN LISTS HEXAGON_HMX_SRC)
     add_custom_command(OUTPUT ${HMX_OBJ}
         COMMAND env CPLUS_INCLUDE_PATH="" ${HEXAGON_C_COMPILER} ${HEXAGON_INCLUDES} ${HEXAGON_FLAGS}
                 -I${CMAKE_CURRENT_SOURCE_DIR}/hmx/include
-                -mhmx -fPIC -fvisibility=default -c ${CMAKE_CURRENT_SOURCE_DIR}/${i} -o ${HMX_OBJ}
+                -mhmx -fPIC -fvisibility=default -MMD -MF ${HMX_OBJ}.d -c ${CMAKE_CURRENT_SOURCE_DIR}/${i} -o ${HMX_OBJ}
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${i}
+        DEPFILE ${HMX_OBJ}.d
         VERBATIM)
     list(APPEND HEXAGON_HMX_OBJS ${HMX_OBJ})
 endforeach()

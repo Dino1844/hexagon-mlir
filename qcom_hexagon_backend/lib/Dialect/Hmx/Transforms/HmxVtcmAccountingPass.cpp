@@ -14,10 +14,11 @@
 // scf.if/scf.for/scf.execute_region regions, statically sized allocations,
 // direct deallocation, and reviewed synchronous operations. A finite-CFG
 // scf.while is handled by the before/after fixpoint; unsupported while/CFG
-// shapes, carried or escaping allocation values, calls, DMA/unknown effects,
-// and incomplete site coverage fail closed. None of these results claims runtime
-// capacity, changes manifest v2, launcher behavior, allocation placement, or
-// production tail selection.
+// shapes, a region whose owner has no reviewed entry rule (a linalg structured
+// op's block arguments, for instance), carried or escaping allocation values,
+// calls, DMA/unknown effects, and incomplete site coverage fail closed. None of
+// these results claims runtime capacity, changes manifest v2, launcher
+// behavior, allocation placement, or production tail selection.
 //
 //===----------------------------------------------------------------------===//
 
@@ -126,6 +127,22 @@ constexpr StringLiteral kEvidenceContextScope =
 constexpr StringLiteral kEvidenceContextNotProven = "not-proven";
 constexpr StringLiteral kEvidenceContextAggregate = "aggregate";
 constexpr StringLiteral kRuntimeJoinNotIntegrated = "not-integrated";
+// Mirrors of the runtime pool's size quantum. These are duplicated on purpose so
+// the compiler can publish a size-aligned bound without linking the DSP library;
+// `test_vtcm_layer_b_contract.py` pins them against `VTCMPool.cpp` so the two
+// copies cannot drift apart unnoticed. Changing a number here is a change to the
+// runtime's charge, not just to a bound.
+constexpr int64_t kRuntimeSizeQuantumSmall = 128;
+constexpr int64_t kRuntimeSizeQuantumLarge = 2048;
+constexpr int64_t kRuntimeSizeQuantumLargeThreshold = 2048;
+// Status vocabulary for the size-aligned sidecar fields. The bound/exact split
+// is carried in the data rather than left for a reader to infer: a bound that
+// reads like a measurement is how an upper bound becomes a capacity claim.
+constexpr StringLiteral kAlignedTransientStatus = "upper-bound-not-exact-peak";
+constexpr StringLiteral kAlignedResidentStatus = "exact-process-floor";
+constexpr StringLiteral kAlignedModeledStatus = "upper-bound-not-occupancy";
+constexpr StringLiteral kAlignedChargeBasis =
+    "runtime-size-quantum-no-header-no-address-padding";
 constexpr StringLiteral kBuildIdExternallySupplied = "externally-supplied";
 constexpr StringLiteral kBuildIdNotPresent = "not-present";
 constexpr StringLiteral kBuildIdMalformed = "malformed-or-ambiguous";
@@ -206,6 +223,14 @@ struct AllocationSite {
   Operation *operation = nullptr;
   Value value;
   int64_t bytes = 0;
+  /// The same request after the runtime's *size* quantum, which is what the
+  /// pool actually charges for a block.  This is a pure function of `bytes` and
+  /// the two runtime constants; it carries no address padding and no header,
+  /// because neither exists in a pool block (see the
+  /// `allocator.no_in_pool_header_source_contract` matrix cell).  It is
+  /// therefore an upper bound on the charged bytes of this site and an *exact*
+  /// value for the resident part of the process floor.
+  int64_t alignedBytes = 0;
   bool resident = false;
   bool constantBoundedExtent = false;
 };
@@ -318,6 +343,21 @@ struct FunctionLivenessFacts {
   int64_t workspaceResidentBytes = 0;
   int64_t weightResidentBytes = 0;
   int64_t modeledRequestedPeakBytes = 0;
+  /// Size-aligned view of the same liveness result, published on the sidecar
+  /// only. `transientAlignedPeakBytes` is an upper bound on the transient pool
+  /// charge; `residentAlignedBytes` is *exact*, because every resident site
+  /// executes on every invocation and the runtime charges precisely
+  /// `alignSize(declaredBytes)` for it, so the sum is an identity rather than an
+  /// estimate. The v3 `allocator_aligned` block stays not-proven regardless:
+  /// a bound is not the split/coalesce/occupancy model that block would require.
+  int64_t transientAlignedPeakBytes = 0;
+  int64_t residentAlignedBytes = 0;
+  int64_t modeledAlignedPeakBytes = 0;
+  /// Canonical site IDs charged at the *aligned* peak, withheld unless the
+  /// identity is provable. Deliberately separate from `peakSiteIds`: the two
+  /// peaks are attained at different program points.
+  SmallVector<int64_t> peakAlignedSiteIds;
+  bool peakAlignedSiteIdsProven = false;
   /// Canonical static site IDs of the sites charged at the peak.  These come
   /// from the versioned `hmx.vtcm-static-identity/v1` site identity, never
   /// from a census walk ordinal; when a peak site has no provable canonical
@@ -350,6 +390,31 @@ static bool addBytes(int64_t &lhs, int64_t rhs) {
   if (rhs < 0 || lhs > std::numeric_limits<int64_t>::max() - rhs)
     return false;
   lhs += rhs;
+  return true;
+}
+
+/// The runtime's size quantum, mirrored here so the compiler can publish an
+/// aligned upper bound without linking the DSP-side pool.
+///
+/// This is a *duplication* of `VtcmPool`'s `alignSize`, and a duplication is
+/// only acceptable while something proves the two cannot drift:
+/// `bin/runtime/test/test_vtcm_layer_b_contract.py` pins these three constants
+/// and this function's shape against the runtime source.  The alternative --
+/// generating one header from the other -- would put a build-system coupling
+/// between the host compiler and the device runtime for three integer
+/// constants, which is a worse trade than a pinned duplicate.
+///
+/// Returns false on overflow or a negative request so a site that cannot be
+/// sized exactly is reported rather than silently clamped to zero.
+static bool sizeAlignedCharge(int64_t nbytes, int64_t &charge) {
+  if (nbytes < 0)
+    return false;
+  const int64_t quantum = nbytes >= kRuntimeSizeQuantumLargeThreshold
+                              ? kRuntimeSizeQuantumLarge
+                              : kRuntimeSizeQuantumSmall;
+  if (nbytes > std::numeric_limits<int64_t>::max() - (quantum - 1))
+    return false;
+  charge = (nbytes + (quantum - 1)) & ~(quantum - 1);
   return true;
 }
 
@@ -1087,10 +1152,21 @@ static void recordAllocation(Operation *operation, Accounting &accounting) {
       return;
     }
   }
-  accounting.sites.push_back({static_cast<unsigned>(accounting.sites.size()),
-                              operation, operation->getResult(0), size.bytes,
-                              weightResident || workspaceResident,
-                              size.constantBoundedExtent});
+  AllocationSite site;
+  site.id = static_cast<unsigned>(accounting.sites.size());
+  site.operation = operation;
+  site.value = operation->getResult(0);
+  site.bytes = size.bytes;
+  site.resident = weightResident || workspaceResident;
+  site.constantBoundedExtent = size.constantBoundedExtent;
+  // A site whose size cannot be rounded exactly is not admitted with a
+  // fabricated aligned value: `sizeAlignedCharge` failing means the request is
+  // negative or overflows, and either way the census is already incomplete.
+  if (!sizeAlignedCharge(size.bytes, site.alignedBytes)) {
+    accounting.complete = false;
+    return;
+  }
+  accounting.sites.push_back(site);
   if (weightResident) {
     if (!addBytes(accounting.weightResidentBytes, size.bytes))
       accounting.complete = false;
@@ -1174,9 +1250,14 @@ struct LivenessMaps {
 struct FlowState {
   std::set<unsigned> active;
   int64_t bytes = 0;
+  /// Sum of the *aligned* size of the same active set. Derived from `active`
+  /// in exactly the way `bytes` is, so it is another view of one lattice and
+  /// cannot disagree with it about which sites are live.
+  int64_t alignedBytes = 0;
 
   bool operator==(const FlowState &other) const {
-    return active == other.active && bytes == other.bytes;
+    return active == other.active && bytes == other.bytes &&
+           alignedBytes == other.alignedBytes;
   }
   bool operator!=(const FlowState &other) const { return !(*this == other); }
 };
@@ -1186,6 +1267,16 @@ struct FlowResult {
   std::string reason;
   int64_t peakTransientBytes = 0;
   std::set<unsigned> peakSiteIds;
+  /// Upper bound on the transient pool charge, from the same liveness lattice
+  /// as `peakTransientBytes` but with each site's request rounded up to the
+  /// runtime's size quantum. It is a bound and not an exact peak for two
+  /// independent reasons, and conflating them would overstate it: the active
+  /// set is a union-join over-approximation, and the quantum rounds each site
+  /// up. The site identity is tracked separately because the aligned maximum
+  /// can be attained at a *different* program point than the raw one.
+  int64_t peakAlignedTransientBytes = 0;
+  std::set<unsigned> peakAlignedSiteIds;
+  bool peakAlignedSiteIdsProven = false;
   int64_t deallocationSites = 0;
   std::set<unsigned> visitedSiteIds;
   /// Worklist iterations consumed.  A non-zero value is the fixpoint evidence
@@ -1206,14 +1297,18 @@ struct FlowResult {
 
 static bool refreshStateBytes(FlowState &state, const LivenessMaps &maps) {
   int64_t total = 0;
+  int64_t alignedTotal = 0;
   for (unsigned id : state.active) {
     auto found = maps.siteById.find(id);
     if (found == maps.siteById.end())
       return false;
     if (!addBytes(total, found->second->bytes))
       return false;
+    if (!addBytes(alignedTotal, found->second->alignedBytes))
+      return false;
   }
   state.bytes = total;
+  state.alignedBytes = alignedTotal;
   return true;
 }
 
@@ -1472,7 +1567,13 @@ private:
         out.push_back(lookup(value));
       return true;
     }
-    auto whileOp = cast<scf::WhileOp>(owner);
+    // Every other owner is reported, not read as a `scf.while`.  `scf.if`,
+    // `scf.execute_region` and `scf.for`'s non-body regions carry no
+    // entry-block arguments, so an owner left here comes from outside the
+    // reviewed set -- a linalg structured op's block arguments, for instance.
+    auto whileOp = dyn_cast<scf::WhileOp>(owner);
+    if (!whileOp)
+      return false;
     if (&whileOp.getBefore() == region) {
       for (Value value : whileOp.getInits())
         out.push_back(lookup(value));
@@ -1719,6 +1820,10 @@ public:
 
   const std::set<unsigned> &peakSiteIds() const { return flow.peakSiteIds; }
   int64_t peakBytes() const { return flow.peakTransientBytes; }
+  const std::set<unsigned> &peakAlignedSiteIds() const {
+    return flow.peakAlignedSiteIds;
+  }
+  int64_t peakAlignedBytes() const { return flow.peakAlignedTransientBytes; }
 
 private:
   void enqueue(Block *block) {
@@ -1777,6 +1882,16 @@ private:
   }
 
   void updatePeak(const FlowState &state) {
+    // The two peaks are tracked independently. The aligned maximum is generally
+    // attained at a different program point than the raw one, so reusing
+    // `peakSiteIds` here would attribute the raw peak's sites to the aligned
+    // number. Each keeps its own identity, and each identity is withheld when
+    // it cannot be proven.
+    if (state.alignedBytes > flow.peakAlignedTransientBytes) {
+      flow.peakAlignedTransientBytes = state.alignedBytes;
+      flow.peakAlignedSiteIds = state.active;
+      flow.peakAlignedSiteIdsProven = false;
+    }
     if (state.bytes <= flow.peakTransientBytes)
       return;
     flow.peakTransientBytes = state.bytes;
@@ -2245,10 +2360,51 @@ analyzeFunctionLiveness(func::FuncOp function,
   facts.peakSiteIds.erase(
       std::unique(facts.peakSiteIds.begin(), facts.peakSiteIds.end()),
       facts.peakSiteIds.end());
+  // The aligned peak gets its own attribution for the same reason, resolved
+  // against the same canonical identity and withheld on the same condition.
+  facts.transientAlignedPeakBytes = engine.peakAlignedBytes();
+  {
+    bool allCanonicalAligned = true;
+    for (unsigned id : engine.peakAlignedSiteIds()) {
+      const AllocationSite *site = maps.siteById.lookup(id);
+      auto canonical = canonicalSites.find(site->operation);
+      if (canonical == canonicalSites.end()) {
+        allCanonicalAligned = false;
+        break;
+      }
+      facts.peakAlignedSiteIds.push_back(static_cast<int64_t>(canonical->second));
+    }
+    facts.peakAlignedSiteIdsProven = allCanonicalAligned;
+    llvm::sort(facts.peakAlignedSiteIds);
+    facts.peakAlignedSiteIds.erase(
+        std::unique(facts.peakAlignedSiteIds.begin(),
+                    facts.peakAlignedSiteIds.end()),
+        facts.peakAlignedSiteIds.end());
+  }
+  // The resident aligned floor is a sum over resident sites, and it is exact
+  // rather than a bound: a resident block is charged `alignSize(bytes)` once
+  // and is never returned, and `declaredBytes` is the same number the lowering
+  // passes to the runtime. Only the *transient* half is a bound.
+  for (const AllocationSite &site : allSites) {
+    if (!site.resident)
+      continue;
+    if (!addBytes(facts.residentAlignedBytes, site.alignedBytes)) {
+      facts.complete = false;
+      facts.coverageComplete = false;
+      facts.reason = "integer-overflow";
+    }
+  }
   if (!addBytes(facts.modeledRequestedPeakBytes, facts.transientPeakBytes) ||
       !addBytes(facts.modeledRequestedPeakBytes,
                 facts.workspaceResidentBytes) ||
       !addBytes(facts.modeledRequestedPeakBytes, facts.weightResidentBytes)) {
+    facts.complete = false;
+    facts.coverageComplete = false;
+    facts.reason = "integer-overflow";
+  }
+  if (!addBytes(facts.modeledAlignedPeakBytes,
+                facts.transientAlignedPeakBytes) ||
+      !addBytes(facts.modeledAlignedPeakBytes, facts.residentAlignedBytes)) {
     facts.complete = false;
     facts.coverageComplete = false;
     facts.reason = "integer-overflow";
@@ -2362,6 +2518,39 @@ static DictionaryAttr buildLivenessAttr(ModuleOp module,
       }
       fields.append("constant_bounded_extent_sites",
                     IntegerAttr::get(i64, facts.constantBoundedSites));
+      // Size-aligned view of the same result. Published here, on the internal
+      // liveness sidecar, and *only* here: the v3 `allocator_aligned` block
+      // stays not-proven, because a size-aligned bound is not the
+      // split/coalesce/occupancy model that block would have to mean.
+      //
+      // `transient_aligned_peak_bytes` is an upper bound and says so in its own
+      // status field; `resident_aligned_bytes` is exact and says so too. Mixing
+      // the two into one undifferentiated number is the failure this avoids.
+      fields.append("transient_aligned_peak_bytes",
+                    IntegerAttr::get(i64, facts.transientAlignedPeakBytes));
+      fields.append("transient_aligned_peak_status",
+                    StringAttr::get(context, kAlignedTransientStatus));
+      fields.append("resident_aligned_bytes",
+                    IntegerAttr::get(i64, facts.residentAlignedBytes));
+      fields.append("resident_aligned_status",
+                    StringAttr::get(context, kAlignedResidentStatus));
+      fields.append("modeled_aligned_peak_bytes",
+                    IntegerAttr::get(i64, facts.modeledAlignedPeakBytes));
+      fields.append("modeled_aligned_peak_status",
+                    StringAttr::get(context, kAlignedModeledStatus));
+      fields.append("aligned_charge_basis",
+                    StringAttr::get(context, kAlignedChargeBasis));
+      if (facts.peakAlignedSiteIdsProven) {
+        fields.append("peak_aligned_site_id_status",
+                      StringAttr::get(context, kPeakSiteIdCanonical));
+        fields.append("peak_aligned_site_ids",
+                      DenseI64ArrayAttr::get(context, facts.peakAlignedSiteIds));
+      } else {
+        // Withheld for the same reason as the raw peak: a walk-order ordinal is
+        // not an identity. The bytes above do not depend on it.
+        fields.append("peak_aligned_site_id_status",
+                      StringAttr::get(context, kStatusNotProven));
+      }
       fields.append("fixpoint_rounds",
                     IntegerAttr::get(i64, facts.fixpointRounds));
       fields.append("revised_blocks",
@@ -2953,6 +3142,274 @@ static bool hasUnsupportedEventContextOperation(ModuleOp module) {
   return unsupported;
 }
 
+/// Read the two 64-bit words of an accepted explicit build identity, so a site
+/// stamp and the runtime echo can carry them as plain integers.  Returns false
+/// when the identity is a 128-bit integer attribute instead, in which case the
+/// caller publishes the 128-bit form and the two-word echo is not available.
+static bool readBuildIdWords(Attribute buildId, uint64_t &low, uint64_t &high) {
+  if (auto dictionary = dyn_cast_or_null<DictionaryAttr>(buildId)) {
+    auto lowAttr = dictionary.getAs<IntegerAttr>("low");
+    auto highAttr = dictionary.getAs<IntegerAttr>("high");
+    if (!lowAttr || !highAttr)
+      return false;
+    low = lowAttr.getValue().getZExtValue();
+    high = highAttr.getValue().getZExtValue();
+    return true;
+  }
+  return false;
+}
+
+/// True when `operation` is a pool-backed allocation the site-scope lowering can
+/// bracket: an ordinary VTCM allocation, a weight-resident one, or a
+/// workspace-resident one.  A DDR allocation is deliberately excluded -- it
+/// never reaches the VTCM pool, so attributing it to a VTCM site would be a
+/// claim about memory the runtime never saw.
+static bool isPoolBackedAllocation(Operation *operation) {
+  if (!isa<hexagonmem::AllocOp>(operation))
+    return false;
+  SizeResult size = getAllocationSize(operation);
+  return size.isVtcm;
+}
+
+/// Reject a site-scope scope that the enter/leave ABI could not bracket exactly.
+///
+/// The frame token already refuses calls, async, dynamic grids, and pointer
+/// escape, because a frame boundary that is not a single span per thread
+/// cannot own a token.  A per-*site* scope is bracketed around one allocation
+/// instead of around the whole function, so the same exclusions apply for the
+/// same reason plus one more: a site inside a loop or a conditional region
+/// would be entered more than once per invocation, and the ABI has exactly one
+/// invocation ordinal to spend.
+static bool hasUnsupportedSiteScopeOperation(ModuleOp module) {
+  bool unsupported = false;
+  module.walk([&](Operation *operation) {
+    if (auto function = dyn_cast<func::FuncOp>(operation);
+        function && function->hasAttr("async")) {
+      unsupported = true;
+      return;
+    }
+    if (isa<CallOpInterface>(operation) || isa<scf::ParallelOp>(operation) ||
+        isa<memref::ExtractAlignedPointerAsIndexOp>(operation)) {
+      unsupported = true;
+      return;
+    }
+    Dialect *dialect = operation->getDialect();
+    if (dialect &&
+        (dialect->getNamespace() == "async" || dialect->getNamespace() == "gpu")) {
+      unsupported = true;
+      return;
+    }
+  });
+  if (auto grid = module->getAttrOfType<IntegerAttr>("hmx.kernel_vtcm_grid"))
+    unsupported |= grid.getInt() != 1;
+  return unsupported;
+}
+
+/// Per-site facts published for one canonical allocation site.
+struct SiteScopeEntry {
+  const StaticSiteIdentity *site = nullptr;
+  HmxDiagnosticEventToken token{};
+};
+
+/// Build the module-level site table and stamp every canonical pool-backed
+/// allocation with its own closed record.
+///
+/// Eligibility is deliberately narrower than the frame context in one respect
+/// and wider in another.  It is wider because a frame needs exactly one site
+/// while this table is about *many* sites, each named individually.  It is
+/// narrower because every canonical site must be pool-backed: a site that the
+/// lowering could not bracket would either be missing from the table, which
+/// would silently shrink the scope, or be listed without a stamp, which would
+/// make the table claim an attribution nothing consumes.  Both are refusals.
+///
+/// On refusal the table is still published, in its closed ineligible shape with
+/// a reason, and *no* op is stamped.  A partial set of stamps would let a
+/// consumer believe the unmarked sites were not part of the scope.
+static DictionaryAttr
+buildSiteScopesAttr(ModuleOp module, const StaticIdentityResult &identity,
+                    const Accounting &accounting,
+                    SmallVectorImpl<SiteScopeEntry> &entries) {
+  MLIRContext *context = module.getContext();
+  auto i64 = IntegerType::get(context, 64);
+  entries.clear();
+
+  unsigned realFunctions = 0;
+  for (const StaticFunctionIdentity &function : identity.functions)
+    if (function.operation)
+      ++realFunctions;
+  const StaticSiteIdentity *single = nullptr;
+  unsigned canonicalSites = 0;
+  unsigned unbracketable = 0;
+  for (const StaticSiteIdentity &site : identity.sites) {
+    if (!site.siteIdValid)
+      continue;
+    ++canonicalSites;
+    single = &site;
+    if (!site.site || !site.site->operation ||
+        !isPoolBackedAllocation(site.site->operation))
+      ++unbracketable;
+  }
+
+  uint64_t buildLow = 0;
+  uint64_t buildHigh = 0;
+  const bool buildEcho = readBuildIdWords(identity.buildId, buildLow, buildHigh);
+  const auto gridAttr = module->getAttrOfType<IntegerAttr>("hmx.kernel_vtcm_grid");
+  const bool explicitGridOne = gridAttr && gridAttr.getInt() == 1;
+
+  std::string reason;
+  bool eligible = identity.status == StaticIdentityStatus::kComplete &&
+                  identity.principalStatus == "module-symbol" &&
+                  identity.scopeId != 0 && identity.buildId && buildEcho &&
+                  accounting.complete && realFunctions == 1 &&
+                  canonicalSites != 0 && unbracketable == 0 && explicitGridOne &&
+                  !hasUnsupportedSiteScopeOperation(module);
+  if (!eligible) {
+    if (identity.status != StaticIdentityStatus::kComplete)
+      reason = "static identity is not complete";
+    else if (identity.principalStatus != "module-symbol" || identity.scopeId == 0)
+      reason = "module/principal scope is not canonical";
+    else if (!identity.buildId)
+      reason = "explicit build identity is required for a site token";
+    else if (!buildEcho)
+      reason = "site scope requires an explicit low/high build identity";
+    else if (!accounting.complete)
+      reason = "allocation accounting is incomplete";
+    else if (!explicitGridOne)
+      reason = "explicit hmx.kernel_vtcm_grid=1 is required";
+    else if (realFunctions != 1)
+      reason = "site scopes require exactly one function";
+    else if (canonicalSites == 0)
+      reason = "site scopes require at least one canonical site";
+    else if (unbracketable != 0)
+      reason = "a canonical site is not a pool-backed allocation";
+    else
+      reason = "call, async, dynamic-grid, or pointer-escape scope is unsupported";
+  }
+
+  NamedAttrList fields;
+  fields.append("kind", StringAttr::get(context, "vtcm-site-scopes"));
+  fields.append("schema", StringAttr::get(context, kHmxVtcmSiteScopesSchema));
+  fields.append("status",
+                StringAttr::get(context, eligible ? "complete" : "not-proven"));
+  fields.append("eligible", BoolAttr::get(context, eligible));
+  fields.append("mode", StringAttr::get(context, "diagnostic-only"));
+  fields.append("principal", StringAttr::get(context, identity.principal));
+  fields.append("module", StringAttr::get(context, identity.module));
+  fields.append("function",
+                StringAttr::get(context, single ? single->function : ""));
+  fields.append("function_id",
+                single ? u64Attribute(context, single->functionId)
+                       : IntegerAttr::get(i64, 0));
+  fields.append("accounting_scope_id", u64Attribute(context, identity.scopeId));
+  fields.append("build_id_low", u64Attribute(context, buildLow));
+  fields.append("build_id_high", u64Attribute(context, buildHigh));
+  fields.append("grid_product", IntegerAttr::get(i64, 1));
+  fields.append("invocation_id", IntegerAttr::get(i64, 1));
+  fields.append("immutable", IntegerAttr::get(i64, eligible ? 1 : 0));
+  fields.append("token_basis",
+                StringAttr::get(context, kHmxDiagnosticSiteTokenSchema));
+  fields.append("site_count", IntegerAttr::get(i64, canonicalSites));
+  fields.append("performance_claimed", IntegerAttr::get(i64, 0));
+
+  if (!eligible) {
+    fields.append("reason", StringAttr::get(context, reason));
+    return DictionaryAttr::get(context, fields);
+  }
+
+  // A site token that collides with another site's token would make two sites
+  // indistinguishable at the runtime, which is the one thing the token exists
+  // to prevent.  The frame path already checks its own token for collisions;
+  // this is a separate domain and needs its own check.
+  std::map<std::pair<uint64_t, uint64_t>, const StaticSiteIdentity *> seen;
+  for (const StaticSiteIdentity &site : identity.sites) {
+    if (!site.siteIdValid || !site.source)
+      continue;
+    SiteScopeEntry entry;
+    entry.site = &site;
+    entry.token = diagnosticSiteToken(identity.principal, identity.module,
+                                      site.function, site.source->canonical,
+                                      site.role, site.slot,
+                                      /*invocationId=*/1);
+    if (entry.token.isZero()) {
+      module.emitError()
+          << "HMX VTCM site scope is not proven for this IR: site token for '"
+          << site.source->canonical << "' hashes to zero";
+      return {};
+    }
+    std::pair<uint64_t, uint64_t> tokenKey{entry.token.low, entry.token.high};
+    auto [position, inserted] = seen.emplace(tokenKey, &site);
+    if (!inserted) {
+      module.emitError()
+          << "HMX VTCM site scope is not proven for this IR: sites '"
+          << position->second->source->canonical << "' and '"
+          << site.source->canonical << "' derive the same site token";
+      return {};
+    }
+    entries.push_back(entry);
+  }
+
+  SmallVector<Attribute> siteAttrs;
+  for (const SiteScopeEntry &entry : entries) {
+    const StaticSiteIdentity &site = *entry.site;
+    NamedAttrList siteFields;
+    siteFields.append("role", StringAttr::get(context, site.role));
+    siteFields.append("slot", IntegerAttr::get(i64, site.slot));
+    siteFields.append("source",
+                      StringAttr::get(context, site.source->canonical));
+    siteFields.append("function", StringAttr::get(context, site.function));
+    siteFields.append("function_id", u64Attribute(context, site.functionId));
+    siteFields.append("site_id", u64Attribute(context, site.siteId));
+    siteFields.append("token_basis",
+                      StringAttr::get(context, kHmxDiagnosticSiteTokenSchema));
+    siteFields.append("token_bits", IntegerAttr::get(i64, 128));
+    siteFields.append("token_low", u64Attribute(context, entry.token.low));
+    siteFields.append("token_high", u64Attribute(context, entry.token.high));
+    siteFields.append("requested_bytes",
+                      IntegerAttr::get(i64, site.site->bytes));
+    siteFields.append(
+        "constant_bounded_extent",
+        IntegerAttr::get(i64, site.site->constantBoundedExtent ? 1 : 0));
+    siteAttrs.push_back(DictionaryAttr::get(context, siteFields));
+  }
+  fields.append("sites", ArrayAttr::get(context, siteAttrs));
+  return DictionaryAttr::get(context, fields);
+}
+
+/// Stamp one canonical site onto the allocation op that owns it.
+///
+/// The stamp is the only channel from the site table to the lowering pass, so
+/// it is a closed record carrying every word the runtime ABI needs.  A stamp
+/// left over from an earlier run is replaced rather than merged: two stamps on
+/// one op would mean two sites for one allocation, which is a refusal upstream.
+static void stampSiteScope(Operation *operation, const SiteScopeEntry &entry,
+                           uint64_t accountingScopeId, uint64_t buildLow,
+                           uint64_t buildHigh) {
+  MLIRContext *context = operation->getContext();
+  auto i64 = IntegerType::get(context, 64);
+  const StaticSiteIdentity &site = *entry.site;
+  NamedAttrList fields;
+  fields.append("kind", StringAttr::get(context, "vtcm-site-scope"));
+  fields.append("schema", StringAttr::get(context, kHmxVtcmSiteScopesSchema));
+  fields.append("status", StringAttr::get(context, "complete"));
+  fields.append("role", StringAttr::get(context, site.role));
+  fields.append("slot", IntegerAttr::get(i64, site.slot));
+  fields.append("source", StringAttr::get(context, site.source->canonical));
+  fields.append("function", StringAttr::get(context, site.function));
+  fields.append("function_id", u64Attribute(context, site.functionId));
+  fields.append("site_id", u64Attribute(context, site.siteId));
+  fields.append("accounting_scope_id", u64Attribute(context, accountingScopeId));
+  fields.append("token_basis", StringAttr::get(context, kHmxDiagnosticSiteTokenSchema));
+  fields.append("token_bits", IntegerAttr::get(i64, 128));
+  fields.append("token_low", u64Attribute(context, entry.token.low));
+  fields.append("token_high", u64Attribute(context, entry.token.high));
+  fields.append("build_id_low", u64Attribute(context, buildLow));
+  fields.append("build_id_high", u64Attribute(context, buildHigh));
+  fields.append("invocation_id", IntegerAttr::get(i64, 1));
+  fields.append("grid_product", IntegerAttr::get(i64, 1));
+  operation->setAttr(kHmxVtcmSiteScopeAttr,
+                     DictionaryAttr::get(context, fields));
+}
+
 static DictionaryAttr
 buildEventContextAttr(ModuleOp module, const StaticIdentityResult &identity,
                       const Accounting &accounting) {
@@ -3262,6 +3719,7 @@ struct HmxVtcmAccountingPass
     bool identityMarker = isHmxDiagnosticVtcmIdentityMarker(module);
     bool evidenceContextMarker =
         isHmxDiagnosticVtcmEvidenceContextMarker(module);
+    bool siteScopeMarker = isHmxDiagnosticVtcmSiteScopeMarker(module);
     if (module->hasAttr(kHmxDiagnosticVtcmAccountingAttr) &&
         !accountingMarker) {
       module.emitError(
@@ -3302,6 +3760,21 @@ struct HmxVtcmAccountingPass
       module.emitError(
           "hmx.diagnostic_vtcm_evidence_context requires "
           "hmx.diagnostic_vtcm_accounting");
+      return signalPassFailure();
+    }
+    if (module->hasAttr(kHmxDiagnosticVtcmSiteScopeAttr) && !siteScopeMarker) {
+      module.emitError(
+          "hmx.diagnostic_vtcm_site_scope must be a unit attribute");
+      return signalPassFailure();
+    }
+    // The per-site table is a strict refinement of the frame context: it names
+    // the same canonical identities the frame marker validates, and it
+    // additionally needs the accounting census that proves every one of them is
+    // a pool-backed allocation.  Requiring the whole chain keeps a site table
+    // from being published on top of identities the strict producer refused.
+    if (siteScopeMarker && !evidenceContextMarker) {
+      module.emitError("hmx.diagnostic_vtcm_site_scope requires "
+                       "hmx.diagnostic_vtcm_evidence_context");
       return signalPassFailure();
     }
     if (!accountingMarker)
@@ -3470,6 +3943,26 @@ struct HmxVtcmAccountingPass
                       buildEvidenceContextAttr(module, identity, accounting));
       module->setAttr(kHmxVtcmEventContextAttr,
                       buildEventContextAttr(module, identity, accounting));
+    }
+    if (siteScopeMarker) {
+      SmallVector<SiteScopeEntry> entries;
+      DictionaryAttr table =
+          buildSiteScopesAttr(module, identity, accounting, entries);
+      if (!table) {
+        // A token collision or a zero token is a hard refusal: two sites that
+        // share a token, or a token that is all zero, would make the runtime
+        // attribute an allocation to the wrong site.
+        return signalPassFailure();
+      }
+      module->setAttr(kHmxVtcmSiteScopesAttr, table);
+      uint64_t buildLow = 0;
+      uint64_t buildHigh = 0;
+      (void)readBuildIdWords(identity.buildId, buildLow, buildHigh);
+      if (table.getAs<BoolAttr>("eligible").getValue()) {
+        for (const SiteScopeEntry &entry : entries)
+          stampSiteScope(entry.site->site->operation, entry, identity.scopeId,
+                         buildLow, buildHigh);
+      }
     }
 
     // Preserve the diagnostic priority of the former two branches with one

@@ -299,6 +299,34 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 
 // -----
 
+// A region entry block with arguments whose owner is not one of the reviewed
+// structured operations has no reviewed incoming value.  `linalg.generic` and
+// `linalg.fill` are the two that reach a real HMX module, and the rule is about
+// the owner rather than about either dialect: the class is reported, never
+// assumed.  The pipeline fixture for the same class, and the proof that it used
+// to abort instead, is hmx-vtcm-liveness-unreviewed-region.mlir.
+// expected-error @+1 {{HMX VTCM structured liveness is not proven for this IR: region block argument has no reviewed incoming value}}
+module attributes {hmx.diagnostic_vtcm_accounting,
+                    hmx.diagnostic_vtcm_liveness} {
+  func.func @unreviewed_region_owner(%t: tensor<16x16xf16>) {
+    %init = tensor.empty() : tensor<16x16xf16>
+    %a = memref.alloc() : memref<16x16xf16, 1>
+    %e = memref.alloc() : memref<16x16xf16, 1>
+    %r = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>,
+                                         affine_map<(d0, d1) -> (d0, d1)>],
+                         iterator_types = ["parallel", "parallel"]}
+        ins(%t : tensor<16x16xf16>) outs(%init : tensor<16x16xf16>) {
+    ^bb0(%in: f16, %out: f16):
+      linalg.yield %in : f16
+    } -> tensor<16x16xf16>
+    memref.dealloc %a : memref<16x16xf16, 1>
+    memref.dealloc %e : memref<16x16xf16, 1>
+    return
+  }
+}
+
+// -----
+
 // expected-error @+1 {{HMX VTCM structured liveness is not proven for this IR: ambiguous or aliased deallocation origin}}
 module attributes {hmx.diagnostic_vtcm_accounting,
                     hmx.diagnostic_vtcm_liveness} {

@@ -459,6 +459,100 @@ def test_multi_scope_conflicts_and_process_boundaries_fail_closed() -> None:
         assert _matrix_cell(cell_id)["status"] == "not-proven"
 
 
+def test_pool_blocks_have_no_in_pool_header() -> None:
+    """Positive source fact, recorded on its own axis.
+
+    A VTCM pool block is a raw slice of one flat pool: the charged length is
+    the size-rounded payload, the release size is an out-of-band argument that
+    is verified against host-RAM bookkeeping before the block is returned, and
+    that bookkeeping lives in ordinary host containers.  This is deliberately a
+    *different* claim from ``header_accounting_status=not-proven``, which stays
+    unproven because a charge still does not predict a general allocator peak.
+    """
+    header = _read("include/VTCMPool.h")
+    pool = _read("src/VTCMPool.cpp")
+    capi = _read("src/HexagonCAPI.cpp")
+    manager = _read("include/BufferManager.h")
+
+    # The charge is the size-rounded payload, with nothing reserved in front.
+    align = _function_body(pool, "size_t alignSize(size_t nbytes)")
+    assert "eader" not in align
+    assert "nbytes = alignSize(nbytes);" in pool
+    assert "const size_t chargedBytes = nbytes == 0 ? 0 : alignSize(nbytes);" in pool
+
+    # Every release entry point takes the size as an out-of-band argument.
+    assert "void Free(void *ptr, size_t nbytes);" in header
+    assert "bool FreeResident(void *ptr, size_t nbytes);" in header
+    assert "bool freeResidentLocked(char *ptr, size_t nbytes);" in header
+    public_free = _function_body(
+        capi, "void hexagon_runtime_free_1d_dsp(void *ptr) {"
+    )
+    assert "nbytes" not in public_free
+    assert "HexagonAPI::Global()->Free(ptr)" in public_free
+
+    # ... and it is verified against host-side bookkeeping before release.
+    ordinary = _function_body(pool, "void VtcmPool::Free(void *ptr, size_t nbytes)")
+    assert ordinary.index("nbytes = alignSize(nbytes);") < ordinary.index(
+        "CHECK((it != allocations_.end())"
+    )
+    assert ordinary.index("CHECK((it != allocations_.end())") < ordinary.index(
+        "CHECK((it->second == nbytes)"
+    )
+    resident = _function_body(pool, "bool VtcmPool::freeResidentLocked(")
+    assert resident.index("nbytes != block.descriptor.bytes") < resident.index(
+        "VTCM resident free descriptor mismatch"
+    )
+    assert "chargedBytes != block.descriptor.chargedBytes" in resident
+    assert resident.index("VTCM resident free descriptor mismatch") < resident.index(
+        "return true"
+    )
+
+    # The bookkeeping itself is host RAM, and the manager recovers the size
+    # from it rather than from the block.
+    for container in (
+        "std::vector<std::pair<char *, size_t>> allocations_;",
+        "std::vector<std::pair<char *, size_t>> free_;",
+        "std::vector<ResidentBlock> resident_;",
+    ):
+        assert container in header
+    release = _function_body(manager, "void FreeHexagonBuffer(void *ptr)")
+    assert "bufferMap_.find(ptr)" in release
+    assert "buf->GetAllocatedBytes()" in release
+
+    # The only write the pool makes into a block is the caller's payload, at
+    # offset zero: no leading header bytes are reserved or written.
+    assert pool.count("std::memcpy") == 1
+    assert "std::memset" not in pool
+    fill = _function_body(
+        pool,
+        "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
+        "                         size_t alignment, const void *src) {",
+    )
+    assert "std::memcpy(ptr, src, nbytes);" in fill
+
+    # The matrix records the fact on its own field and its own cell; the
+    # header-inclusive allocator model keeps its own unproven status.
+    document = json.loads(
+        (PROBE / "boundary_matrix.json").read_text(encoding="utf-8")
+    )
+    contract = document["contract"]
+    assert (
+        contract["in_pool_header_absence"]
+        == "source-verified-absent-out-of-band-size-host-metadata"
+    )
+    assert contract["header_accounting_status"] == "not-proven"
+    cell = next(
+        cell
+        for cell in document["cells"]
+        if cell["id"] == "allocator.no_in_pool_header_source_contract"
+    )
+    assert cell["status"] == "pass"
+    assert cell["claim_scope"] == "source-contract"
+    assert cell["limitations"] == []
+    assert cell["next_evidence"] == []
+    assert _matrix_cell("allocator.header_split_exact_model")["status"] == "not-proven"
+
+
 def test_boundary_matrix_is_deterministic_and_explicitly_incomplete() -> None:
     command = [sys.executable, "-B", str(PROBE / "matrix_runner.py")]
     first = subprocess.run(
@@ -492,6 +586,10 @@ def test_boundary_matrix_is_deterministic_and_explicitly_incomplete() -> None:
     assert contract["resident_accounting_scope_binding"] == "not-proven"
     assert contract["address_alignment_in_report"] == "not-proven"
     assert contract["header_accounting_status"] == "not-proven"
+    assert (
+        contract["in_pool_header_absence"]
+        == "source-verified-absent-out-of-band-size-host-metadata"
+    )
     assert contract["split_coalesce_model_status"] == "not-proven"
     assert contract["grid_attribution"] == "not-bound-in-v1"
     assert contract["backend_option"] is False
@@ -499,6 +597,45 @@ def test_boundary_matrix_is_deterministic_and_explicitly_incomplete() -> None:
     assert contract["manifest_mutation"] is False
     assert contract["launcher_mutation"] is False
     assert contract["cache_envelope_mutation"] is False
+
+
+def test_per_event_address_padding_does_not_bump_the_event_abi() -> None:
+    header = _read("include/VTCMPool.h")
+    capi_header = _read("include/HexagonCAPI.h")
+    source = _read("src/VTCMPool.cpp")
+
+    # The per-event address padding is a report-level observation, so the
+    # event-context C ABI is untouched: no new entry parameter, and therefore
+    # no reason to reject a v1 producer that a v2 spelling would exclude.  The
+    # version stays 1 on all three sides rather than being bumped for a field
+    # the producer never sends.
+    assert "kAccountingEventContextVersion = 1" in header
+    assert "HEXAGON_RUNTIME_VTCM_EVENT_CONTEXT_VERSION = 1" in capi_header
+    assert "kAccountingEventContextVersion" in source
+    # The only event-context symbols are still the v1 pair: an "_v2" spelling
+    # would mean a caller could pass something this build ignores.
+    assert "hexagon_runtime_vtcm_accounting_event_context_enter_v2" not in capi_header
+    assert "hexagon_runtime_vtcm_accounting_event_context_leave_v2" not in capi_header
+
+    # The padding travels through the pool's own report, not the identity ABI.
+    report = _function_body(
+        source, "int VtcmPool::writeAccountingReportLocked("
+    )
+    for token in (
+        "address_prefix_bytes=%llu",
+        "address_suffix_bytes=%llu",
+        "address_padding_scope=%s",
+    ):
+        assert token in report, token
+    assert "AccountingPadding" in header
+    assert "AccountingPadding" in source
+    # A padding measurement is a placement fact, never an identity fact: the
+    # event keeps its process-scoped v1 semantics and cannot be joined to a
+    # function, site, or invocation by this field.
+    assert "event_identity_scope=process" in report
+    assert "function_id_status=not-bound" in report
+    assert "allocation_site_id_status=not-bound" in report
+    assert "event_scope_policy=process-only-v1" in report
 
 
 def test_probe_is_opt_in_and_v2_abi_is_unchanged() -> None:
@@ -527,7 +664,9 @@ if __name__ == "__main__":
     test_default_mode_and_truncation_are_explicit()
     test_alignment_and_charged_units_are_explicit()
     test_resident_content_and_address_reuse_remain_not_proven()
+    test_pool_blocks_have_no_in_pool_header()
     test_multi_scope_conflicts_and_process_boundaries_fail_closed()
     test_boundary_matrix_is_deterministic_and_explicitly_incomplete()
+    test_per_event_address_padding_does_not_bump_the_event_abi()
     test_probe_is_opt_in_and_v2_abi_is_unchanged()
     print("VTCM accounting identity source contract: PASS")

@@ -461,6 +461,68 @@ static LogicalResult insertDiagnosticEventContext(ModuleOp moduleOp) {
   return success();
 }
 
+/// Refuse a module that claims an eligible per-site scope table but never
+/// bracketed one allocation with it.
+///
+/// The site table is produced by the accounting pass and consumed by the
+/// hexagonmem lowering, which runs earlier in the pipeline. If the table says
+/// `eligible` and no bracket exists anywhere in the module, the two halves
+/// disagree: either the lowering never ran, or it ran on IR that no longer
+/// matched. Publishing the table anyway would let a host read a per-site
+/// attribution that the kernel never asked the device to make, so this is a hard
+/// error rather than a warning.
+///
+/// The frame context is deliberately untouched here: it is emitted by this pass
+/// itself, so it cannot disagree with itself.
+static LogicalResult verifySiteScopeBrackets(ModuleOp moduleOp) {
+  Attribute raw = moduleOp->getAttr(kHmxVtcmSiteScopesAttr);
+  if (!raw)
+    return success();
+  auto table = dyn_cast<DictionaryAttr>(raw);
+  if (!table) {
+    moduleOp.emitError("hmx.kernel_vtcm_site_scopes must be a dictionary");
+    return failure();
+  }
+  // `BoolAttr` is an optional-like wrapper: a *present* `eligible = false` is
+  // still truthy as an attribute. The flag therefore has to be read through
+  // getValue(), or every ineligible table would be validated as an eligible one.
+  auto eligible = table.getAs<BoolAttr>("eligible");
+  if (!eligible) {
+    moduleOp.emitError(
+        "hmx.kernel_vtcm_site_scopes requires a BoolAttr 'eligible'");
+    return failure();
+  }
+  if (!eligible.getValue()) {
+    // An ineligible table is a typed refusal. It must still be the closed
+    // ineligible shape, so a stale or foreign spelling cannot pass as "no
+    // claim" while carrying identity fields.
+    if (!hasExactHmxDiagnosticSiteScopeKeys(
+            table, hmxDiagnosticSiteScopesIneligibleKeys())) {
+      moduleOp.emitError("malformed ineligible hmx.kernel_vtcm_site_scopes");
+      return failure();
+    }
+    return success();
+  }
+  if (!hasExactHmxDiagnosticSiteScopeKeys(
+          table, hmxDiagnosticSiteScopesEligibleKeys())) {
+    moduleOp.emitError("malformed eligible hmx.kernel_vtcm_site_scopes");
+    return failure();
+  }
+  unsigned brackets = 0;
+  moduleOp.walk([&](LLVM::CallOp call) {
+    if (call.getCallee() == kHmxDiagnosticSiteScopeEnterFn)
+      ++brackets;
+  });
+  if (brackets == 0) {
+    moduleOp.emitError(
+        "eligible hmx.kernel_vtcm_site_scopes table has no "
+        "hexagon_runtime_vtcm_accounting_site_scope_enter_v1_dsp call: the "
+        "pool-backed allocations were never bracketed with their site scope");
+    return failure();
+  }
+  return success();
+}
+
 static bool issuesHmxEngineLeaves(Operation *fn) {
   bool found = false;
   fn->walk([&](Operation *op) {
@@ -1832,6 +1894,10 @@ struct HmxToLLVMPass : public ::impl::HmxToLLVMBase<HmxToLLVMPass> {
     // the marker-gated compiler sidecar selected one immutable function/site
     // and an explicit grid=1 invocation; ordinary kernels never acquire an
     // event context merely because they allocate VTCM.
+    if (failed(verifySiteScopeBrackets(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
     if (failed(insertDiagnosticEventContext(moduleOp))) {
       signalPassFailure();
       return;

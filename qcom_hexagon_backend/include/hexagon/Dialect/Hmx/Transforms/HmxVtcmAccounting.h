@@ -49,6 +49,14 @@ inline constexpr StringLiteral kHmxDiagnosticVtcmIdentityAttr =
 inline constexpr StringLiteral kHmxDiagnosticVtcmEvidenceContextAttr =
     "hmx.diagnostic_vtcm_evidence_context";
 
+/// Optional marker for the per-canonical-site scope table and the per-op site
+/// stamps.  This is an internal diagnostic guard, not a backend option, and it
+/// is deliberately narrower than the frame marker above: a frame needs one
+/// site, while this one needs every canonical site to be individually
+/// nameable, so it refuses rather than publishing a partial table.
+inline constexpr StringLiteral kHmxDiagnosticVtcmSiteScopeAttr =
+    "hmx.diagnostic_vtcm_site_scope";
+
 /// Internal, non-wire static site identity. A future launcher/runtime context
 /// ABI may consume this dictionary, but no current consumer is authorized to
 /// treat it as a manifest v2 field or as an observed allocation record.
@@ -132,6 +140,11 @@ inline bool isHmxDiagnosticVtcmIdentityMarker(ModuleOp module) {
 inline bool isHmxDiagnosticVtcmEvidenceContextMarker(ModuleOp module) {
   return module && module->hasAttr(kHmxDiagnosticVtcmEvidenceContextAttr) &&
          isa<UnitAttr>(module->getAttr(kHmxDiagnosticVtcmEvidenceContextAttr));
+}
+
+inline bool isHmxDiagnosticVtcmSiteScopeMarker(ModuleOp module) {
+  return module && module->hasAttr(kHmxDiagnosticVtcmSiteScopeAttr) &&
+         isa<UnitAttr>(module->getAttr(kHmxDiagnosticVtcmSiteScopeAttr));
 }
 
 } // namespace hmx

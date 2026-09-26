@@ -201,6 +201,19 @@ struct MatmulDecision {
   HmxTarget::ContractionPlan contractionPlan = HmxTarget::ContractionPlan::HVX;
   std::shared_ptr<ManifestFacts> facts;
   std::optional<HmxTarget::BridgePlan> plan;
+  /// The rewrite ran on `op`. The greedy driver dead-code-eliminates a matmul
+  /// whose result is unused *before* it offers the op to any pattern, so a
+  /// decision can outlive its operation: `op` dangles, and nothing may read it
+  /// once the driver returns. Record-only never rewrites, and needs no such
+  /// marker.
+  bool visited = false;
+
+  /// Whether the decision claims an `hmx.matmul` site, i.e. one of the two
+  /// reasons that describe an attribution rather than a refusal.
+  bool claimsHmxSite() const {
+    return reason == MatmulReason::SelectedAligned ||
+           reason == MatmulReason::SelectedTail;
+  }
 };
 
 static int64_t vtcmBytesCommitted(Operation *within);
@@ -271,11 +284,13 @@ static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
 
 /// The pass-scoped, per-op decision table. It is populated before the greedy
 /// driver starts, so a pattern that tries an op repeatedly still updates one
-/// record and the final manifest has one entry per original op.
+/// record and the final manifest has one entry per original op -- except for a
+/// matmul the driver removed before any pattern saw it, which has no entry
+/// because it has no site left to describe (`describes` below).
 class AttributionTally {
 public:
-  AttributionTally(func::FuncOp func, const HmxTarget &target,
-                   bool recordOnly) {
+  AttributionTally(func::FuncOp func, const HmxTarget &target, bool recordOnly)
+      : recordOnly(recordOnly) {
     int64_t nextId = 0;
     func.walk([&](linalg::MatmulOp op) {
       auto shapedType = [&](Value value) -> ShapedType {
@@ -369,9 +384,22 @@ public:
 
   ArrayRef<MatmulDecision> records() const { return decisions; }
 
+  /// Whether this decision still describes a matmul in the module, i.e. whether
+  /// the manifest, the v3 document and the diagnostics may speak about it. The
+  /// greedy driver removes a matmul whose result is unused before any pattern
+  /// sees it: such a decision has no site left (no `hmx.matmul`, no bridge, and
+  /// no record `restoreHmxManifestDecisionIds` could bind) and its operation
+  /// handle dangles, so it is described by nothing and read by nothing.
+  /// Record-only rewrites nothing, so every matmul it was given is still there
+  /// and every one of them is described.
+  bool describes(const MatmulDecision &decision) const {
+    return recordOnly || decision.visited;
+  }
+
 private:
   llvm::DenseMap<Operation *, size_t> byOp;
   SmallVector<MatmulDecision> decisions;
+  bool recordOnly = false;
 };
 
 /// The diagnostic view is intentionally a projection of the manifest record,
@@ -441,8 +469,11 @@ void emitDecisionDiagnostics(ModuleOp module, const HmxTarget &target,
   int64_t attributed = 0;
   SmallVector<const MatmulDecision *> reportable;
   for (const MatmulDecision &decision : tally.records()) {
-    if (decision.reason == MatmulReason::SelectedAligned ||
-        decision.reason == MatmulReason::SelectedTail) {
+    // A matmul the driver removed never reached a pattern, so there is no
+    // operation to anchor a remark to and nothing in the IR to report about.
+    if (!tally.describes(decision))
+      continue;
+    if (decision.claimsHmxSite()) {
       ++attributed;
       continue;
     }
@@ -595,8 +626,11 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
   auto i64 = IntegerType::get(ctx, 64);
   assert(decision.facts && "matmul decision has no semantic facts");
   const ManifestFacts &facts = *decision.facts;
-  bool hmx = decision.reason == MatmulReason::SelectedAligned ||
-             decision.reason == MatmulReason::SelectedTail;
+  // Only a decision that still describes a matmul in the module reaches here
+  // (see `AttributionTally::describes`), and attribution becomes true only when
+  // the rewrite runs, so an `hmx` record always carries the contract and the
+  // bridge plan the rewrite chose.
+  bool hmx = decision.claimsHmxSite();
   bool tail = decision.reason == MatmulReason::SelectedTail;
   StringRef plan =
       tail ? kHmxPlanHMXTail : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
@@ -666,8 +700,7 @@ DictionaryAttr hmxRecordV3Skeleton(MLIRContext *ctx,
                                    const MatmulDecision &decision) {
   assert(decision.facts && "matmul decision has no semantic facts");
   const ManifestFacts &facts = *decision.facts;
-  bool hmx = decision.reason == MatmulReason::SelectedAligned ||
-             decision.reason == MatmulReason::SelectedTail;
+  bool hmx = decision.claimsHmxSite();
   bool tail = decision.reason == MatmulReason::SelectedTail;
   StringRef plan =
       tail ? kHmxPlanHMXTail : (hmx ? kHmxPlanFullHMX : kHmxPlanHVX);
@@ -679,13 +712,16 @@ DictionaryAttr hmxRecordV3Skeleton(MLIRContext *ctx,
   return dyn_cast_or_null<DictionaryAttr>(skeleton);
 }
 
-/// The publishable v3 skeletons for every decided matmul in one function.
+/// The publishable v3 skeletons for every decided matmul in one function. The
+/// document describes the same sites as the v2 manifest, so a decision that is
+/// not described there is not described here either.
 SmallVector<DictionaryAttr> hmxRecordV3Skeletons(MLIRContext *ctx,
                                                  const AttributionTally &tally) {
   SmallVector<DictionaryAttr> skeletons;
   for (const MatmulDecision &decision : tally.records())
-    if (DictionaryAttr skeleton = hmxRecordV3Skeleton(ctx, decision))
-      skeletons.push_back(skeleton);
+    if (tally.describes(decision))
+      if (DictionaryAttr skeleton = hmxRecordV3Skeleton(ctx, decision))
+        skeletons.push_back(skeleton);
   return skeletons;
 }
 
@@ -1222,6 +1258,11 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
       return failure();
     }
     MatmulDecision &decision = (*tally)[op];
+    // The driver offers the op to a pattern only while it is still in the IR,
+    // so from here on the decision may be read (and its op remarked on) after
+    // the rewrite. A matmul it removed instead never gets here, and is never
+    // read.
+    decision.visited = true;
     // A marked tail candidate that does not fit the padded bridge budget is a
     // diagnostic refusal, never permission to retry the logical shape through
     // the full-HMX path.
@@ -2082,7 +2123,8 @@ struct MatmulToHmxPass
     SmallVector<DictionaryAttr> records;
     records.reserve(tally.records().size());
     for (const MatmulDecision &decision : tally.records())
-      records.push_back(manifestRecord(&getContext(), decision, target));
+      if (tally.describes(decision))
+        records.push_back(manifestRecord(&getContext(), decision, target));
     if (failed(addOrReplaceHmxManifestRecords(module, records)) ||
         failed(refreshHmxManifestBridgeCounts(module)))
       return signalPassFailure();

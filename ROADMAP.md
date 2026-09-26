@@ -103,6 +103,13 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
   不记录 raw address。
 - 建立 static site ↔ runtime event 的 join；若 join 不可证明，则 v3 明确
   aggregate-only，不生成 per-site observed。
+  - **2026-09-26 已闭合**：离线 join（`exp/hmx/vtcm_accounting_probe/site_join.py`）的**过度拒绝已修**——
+    按 report window 分窗，故意的小缓冲 `-2` probe 不再被当成截断报告（25 项契约测试全绿）；并**造出缺的那份
+    设备证据**：单站点、由编译器 `site_scope_enter` bracket 注册的 capture（`site_join_anchor.mlir` +
+    `run_probe.py` 的 `VTCM_SITE_JOIN=1` 模式），gate-ON 上机后
+    `{"status":"joined","windows_joined":[1,2],"windows_excluded":[],"bound_events":2}`，
+    文档 `logs/hmx/site_join_result.json`。`mode=diagnostic-only`、`observed_device=false`、
+    `performance_claimed=false`：它是**离线对账**，不是设备观测，也没有授权任何 admission。
 - 完成 resident key/content/process identity：同 key 不同 bytes/alignment/content、
   多 module/process、cold/warm reuse 必须有明确接受或 fail-closed 结论。
 - 建立 requested / allocator-aligned / charged / resident 的单位和关系模型，
@@ -180,7 +187,7 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 | P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
 
-> **当前状态（2026-09-26）**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 已包含在 `270f135`（`fork/hmx`）。当前 gate-OFF build 的 manual lit 为 `284 passed / 0 failed / 1 skipped`，host/source matrix 为 `13 pass / 14 not-proven / 0 fail`，probe/evidence host contracts 通过；两次 gate-ON remote-attested process-aggregate capture 均为 `6 pass / 10 not-proven / 0 fail`，当前 build 的 direct tail `95/95`、resident `1/1`（一次 transient 恢复），全部 `performance_claimed=false`。R-A/R-B 已 scoped PROMOTE；R-C v3 record-only producer/validator/envelope/direct-binding transport 已实现并通过 `291 passed / 0 failed / 1 skipped`、v3 pytest `76 passed + 85 subtests`；record-only marker 不进入 Triton object cache，production v2 path 不变，v4 与 production `hmx-tail` 仍未授权。
+> **当前状态（2026-09-26 晚，N1/N2/N3 收口后）**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 在 `270f135`，R-C v3 record-only migration 在 `098b2a0`（`fork/hmx`）。当前 manual lit **`301 passed / 0 failed / 1 skipped`**，边界矩阵 **29 格 `14 pass / 15 not-proven / 0 fail`**（`device_evidence_status=current`、`device_evidence_promotable=true`），probe host 测试 **108 passed**、runtime 源码契约 **9/9 PASS**；一份 remote-attested 设备 capture `logs/hmx/n123-a3-device-2026-09-26.log`（overlay `current`/`promotable`、0 validation error）导入 **13 recorded / 5 pass** 设备观测。R-A/R-B 已 scoped PROMOTE；v3 record-only 的**可达性**已定为永久设计边界（§6.5 勘误 7）；v4 与 production `hmx-tail` 仍未授权。**⚠️ 当前工作树有 15 个修改文件（+2214/−59）+ 14 个新文件未提交**（用户 2026-09-26 拍板"先不提交"），`tools/hexmlir/hexagon-mlir-local.patch` 尚未随之重生成。
 
 ---
 
@@ -255,6 +262,17 @@ P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specializat
 3. “清理后 lit 必须全绿”改为先记录基线、分类既存失败、为临时门设置退出条件，避免把未知失败伪装成完成。
 4. `hmx.stage/await` 已存在于 HMX dialect、partition pass 和对应 FileCheck 测试中；P3 可以复用该机制，但仍需为 reduction/normalization 定义新的数据依赖和正确性契约。
 5. 当前 `compiler.py` 仍明确标注 pass pipeline 动态化为 TODO；因此支持矩阵和 cost model 应先提供外部诊断/manifest，再逐步把 pipeline 选择从硬编码迁移出去。
+6. **2026-09-26 两处旧结论作废**：① 曾被当作"两个独立既有缺陷"的
+   **free-cache 计数自相矛盾**与 **frame `cleared owner with bound events` 拒真 capture**，
+   实为**同一根因**（runtime bitcode 构建缺头文件依赖 ⇒ `AccountingSnapshot` 跨 TU 两种布局）；
+   构建修好后两症状同时消失，**不要**再按"记账语义/设计规则问题"重推。② 真根因是
+   **裸相对 depfile 路径**（ninja 按 build root 解析 `DEPFILE` ⇒ `deps not found` ⇒ 丢掉全部头依赖），
+   `-MMD -MF`+`DEPFILE` 只是必要条件；不变式由 `bin/runtime/test/test_runtime_depfile_contract.py` 守。
+   另：`site_join.py` 原先无条件拒绝一切含 truncation 记录的 transcript，属 fail-closed 规则的**过度拒绝**，已按窗口收窄。
+7. **2026-09-26 两条已拍板、不再作为待办**（详见 `docs/state/STATE-OF-PLAY.md` §6 决策 13/14/15）：
+   `requireAllocationResult` 在真实 VTCM OOM 时 **abort 整个 PD** 为最终生产语义；
+   v3 record marker 位于所有 cache-key 输入下游 ⇒ **v3 只能经 direct backend binding / MLIR fixture 到达**，
+   普通 Triton 编译永远进不去，此为**永久设计边界**（cacheable 路径必须 loud reject），不再投入使其可达。
 
 ---
 

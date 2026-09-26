@@ -27,6 +27,8 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <set>
+#include <utility>
 #include <vector>
 
 //===----------------------------------------------------------------------===//
@@ -82,16 +84,53 @@ struct AccountingContextState {
   bool eventOwnerActive = false;
   uint64_t eventThreadOrdinal = 0;
   VtcmPool::AccountingEventContext eventContext{};
+  // Per-site registration. `siteOwnerActive` is separate from
+  // `siteRegistered` for the same reason `eventOwnerActive` is separate from
+  // `eventRegistered`: a report must not read a historical registration as a
+  // live binding.
+  bool siteRegistered = false;
+  bool siteOwnerActive = false;
+  uint64_t siteThreadOrdinal = 0;
+  VtcmPool::AccountingSiteScope siteScope{};
+  // Every distinct site token this process has ever registered, so the report
+  // can state how many sites the per-site evidence actually spans instead of
+  // implying a single one.
+  std::set<std::pair<uint64_t, uint64_t>> siteTokens{};
+  // An event was recorded that belongs to neither the frame nor any site. This
+  // is what closes the site window. It is deliberately *not* "an event happened":
+  // the frame has exactly one registration, but a function has as many sites as
+  // it has pool-backed allocations, and the events a granted site scope records
+  // are precisely the ones that scope exists to attribute. Counting those would
+  // make every site after the first one unregisterable, which is how a two-site
+  // capture silently degrades to one bound site and one aggregate.
+  bool siteSawUnattributedEvent = false;
 };
 
 AccountingContextState gAccountingContextState;
 std::mutex gAccountingPoolMutex;
+// Site-scope shape counters. They are file-scope relaxed atomics rather than
+// pool members on purpose: a scope is granted and closed from *static* entry
+// points that have no pool instance, and the event tally is bumped from inside
+// the pool-locked recording path, where taking the global context mutex would
+// invert the existing lock order. A relaxed atomic needs no lock and is only
+// ever read to publish a diagnostic count, so it is the shape that fits.
+std::atomic<uint64_t> gSiteScopesEntered{0};
+std::atomic<uint64_t> gSiteScopesLeaked{0};
+std::atomic<uint64_t> gSiteScopesWithMultipleEvents{0};
+std::atomic<uint64_t> gSiteScopeCurrentEvents{0};
 VtcmPool *gAccountingPool = nullptr;
 std::atomic<uint64_t> gNextAccountingThreadOrdinal{1};
 thread_local uint64_t tAccountingThreadOrdinal = 0;
 thread_local bool tAccountingEventContextActive = false;
 thread_local bool tAccountingEventContextPoisoned = false;
 thread_local VtcmPool::AccountingEventContext tAccountingEventContext{};
+// The per-site scope is a second, independent owner. It is kept in its own
+// thread-local pair and its own process registration rather than being folded
+// into the frame context: a frame token and a site token are different claims,
+// and merging them would make one of the two unnameable.
+thread_local bool tAccountingSiteScopeActive = false;
+thread_local bool tAccountingSiteScopePoisoned = false;
+thread_local VtcmPool::AccountingSiteScope tAccountingSiteScope{};
 constexpr uint8_t kAccountingScopeEnterKind = 8;
 
 struct AccountingContextSnapshot {
@@ -100,6 +139,13 @@ struct AccountingContextSnapshot {
   bool eventRegistered = false;
   bool eventOwnerActive = false;
   VtcmPool::AccountingEventContext eventContext{};
+  bool siteRegistered = false;
+  bool siteOwnerActive = false;
+  VtcmPool::AccountingSiteScope siteScope{};
+  // How many distinct site tokens this process has ever registered. Reported so
+  // a reader can see the actual width of the per-site evidence rather than
+  // inferring a single site from a single registration.
+  uint64_t siteDistinctSites = 0;
 };
 
 uint64_t currentAccountingThreadOrdinal() {
@@ -129,6 +175,29 @@ void clearAccountingEventContextTLS() {
   tAccountingEventContextPoisoned = false;
 }
 
+// A poisoned site scope attributes nothing, exactly like a poisoned frame
+// context. The frame owner is cleared too: a thread whose site registration was
+// refused must not keep a live frame binding either, or the two owners would
+// disagree about whether this thread currently holds a token.
+void poisonAccountingSiteScopeLocked() {
+  tAccountingSiteScope = {};
+  tAccountingSiteScopeActive = false;
+  tAccountingSiteScopePoisoned = true;
+  gAccountingContextState.siteOwnerActive = false;
+  gAccountingContextState.eventOwnerActive = false;
+}
+
+void poisonAccountingSiteScope() {
+  std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
+  poisonAccountingSiteScopeLocked();
+}
+
+void clearAccountingSiteScopeTLS() {
+  tAccountingSiteScope = {};
+  tAccountingSiteScopeActive = false;
+  tAccountingSiteScopePoisoned = false;
+}
+
 AccountingContextSnapshot readAccountingContext() {
   std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
   AccountingContextSnapshot snapshot;
@@ -139,6 +208,11 @@ AccountingContextSnapshot readAccountingContext() {
   snapshot.eventOwnerActive = gAccountingContextState.eventOwnerActive;
   if (snapshot.eventRegistered)
     snapshot.eventContext = gAccountingContextState.eventContext;
+  snapshot.siteRegistered = gAccountingContextState.siteRegistered;
+  snapshot.siteOwnerActive = gAccountingContextState.siteOwnerActive;
+  if (snapshot.siteRegistered)
+    snapshot.siteScope = gAccountingContextState.siteScope;
+  snapshot.siteDistinctSites = gAccountingContextState.siteTokens.size();
   return snapshot;
 }
 
@@ -155,6 +229,11 @@ AccountingContextSnapshot beginAccountingEvent(uint8_t kind) {
   snapshot.eventOwnerActive = gAccountingContextState.eventOwnerActive;
   if (snapshot.eventRegistered)
     snapshot.eventContext = gAccountingContextState.eventContext;
+  snapshot.siteRegistered = gAccountingContextState.siteRegistered;
+  snapshot.siteOwnerActive = gAccountingContextState.siteOwnerActive;
+  if (snapshot.siteRegistered)
+    snapshot.siteScope = gAccountingContextState.siteScope;
+  snapshot.siteDistinctSites = gAccountingContextState.siteTokens.size();
   return snapshot;
 }
 #endif
@@ -436,16 +515,125 @@ bool VtcmPool::registerAccountingEventContext(
 
 void VtcmPool::clearAccountingEventContext() {
   clearAccountingEventContextTLS();
-  // Keep the registration, the declared identity and every counter: leave ends
-  // the owner's lifetime, it does not rewrite history. Only the "an owner is
-  // active right now" fact is cleared, so the declaration can report a cleared
-  // scope instead of a live token binding.
-  std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
-  gAccountingContextState.eventOwnerActive = false;
+  // A frame that leaves with a site scope still open has lost the allocation
+  // that scope was naming: the frame is the only thing that keeps a site inside
+  // an observation, so the span is counted as leaked before the owner is
+  // dropped. The counter is a defect signal, not a statistic.
+  {
+    std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
+    if (gAccountingContextState.siteOwnerActive) {
+      gAccountingContextState.siteOwnerActive = false;
+      gSiteScopesLeaked.fetch_add(1, std::memory_order_relaxed);
+      gSiteScopeCurrentEvents.store(0, std::memory_order_relaxed);
+    }
+    // Keep the registration, the declared identity and every counter: leave ends
+    // the owner's lifetime, it does not rewrite history. Only the "an owner is
+    // active right now" fact is cleared, so the declaration can report a cleared
+    // scope instead of a live token binding.
+    gAccountingContextState.eventOwnerActive = false;
+  }
 }
 
 bool VtcmPool::hasAccountingEventContext() {
   return readAccountingContext().eventOwnerActive;
+}
+
+bool VtcmPool::registerAccountingSiteScope(const AccountingSiteScope &scope) {
+  const uint64_t threadOrdinal = currentAccountingThreadOrdinal();
+  // Every rejection path is a poison, not a silent no-op: a scope that was
+  // asked for and not granted must not leave the thread looking unattributed
+  // while a caller believes it is attributed.
+  if (scope.version != kAccountingSiteScopeVersion ||
+      (scope.flags & ~(kAccountingSiteScopeSingleInvocation |
+                       kAccountingSiteScopeGridOne)) != 0 ||
+      (scope.flags & (kAccountingSiteScopeSingleInvocation |
+                      kAccountingSiteScopeGridOne)) !=
+          (kAccountingSiteScopeSingleInvocation | kAccountingSiteScopeGridOne) ||
+      (scope.token.low == 0 && scope.token.high == 0) ||
+      scope.accountingScopeId == 0 || scope.invocationId == 0 ||
+      scope.functionId == 0 || scope.allocationSiteId == 0 ||
+      (scope.buildId.low == 0 && scope.buildId.high == 0)) {
+    poisonAccountingSiteScope();
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
+    // A site scope is strictly nested in the frame: the frame names the one
+    // observation, the site names one allocation inside it. Without a registered
+    // and owner-active frame on this thread there is no observation for the site
+    // to belong to, so the words would name a function nobody declared. The
+    // frame's own scope and function must also be the ones the site claims, or
+    // the two halves disagree about which function is being observed. This is a
+    // poison, like every other site refusal: a caller that asked for attribution
+    // must never be left believing it got it.
+    if (!gAccountingContextState.eventRegistered ||
+        !gAccountingContextState.eventOwnerActive ||
+        gAccountingContextState.eventThreadOrdinal != threadOrdinal ||
+        gAccountingContextState.eventContext.accountingScopeId !=
+            scope.accountingScopeId ||
+        gAccountingContextState.eventContext.functionId != scope.functionId ||
+        gAccountingContextState.eventContext.invocationId !=
+            scope.invocationId) {
+      poisonAccountingSiteScopeLocked();
+      return false;
+    }
+    // Not nestable. A second enter while one is active would make the free of
+    // the inner allocation ambiguous between the two sites, so it is refused
+    // rather than pushed on a stack.
+    if (gAccountingContextState.siteOwnerActive) {
+      poisonAccountingSiteScopeLocked();
+      return false;
+    }
+    // A site owner is a per-thread fact, so a second thread is refused outright.
+    if (gAccountingContextState.siteRegistered &&
+        gAccountingContextState.siteThreadOrdinal != threadOrdinal) {
+      poisonAccountingSiteScopeLocked();
+      return false;
+    }
+    // Unlike the frame context, a *different* site on this same thread is
+    // legitimate and is the whole point of this ABI: the compiler publishes a
+    // table of many canonical sites and each one is bracketed in turn. Only the
+    // nesting and cross-thread rules above are refusals; a new site simply
+    // becomes the current one, and the previous one is remembered as a distinct
+    // site the report counts. Copying the frame's "one immutable context" rule
+    // here made every site after the first a poison, which silently demoted all
+    // of them to aggregate -- a device capture with two sites bound nothing.
+    gAccountingContextState.siteScope = scope;
+    gAccountingContextState.siteThreadOrdinal = threadOrdinal;
+    gAccountingContextState.siteRegistered = true;
+    gAccountingContextState.siteTokens.emplace(scope.token.low, scope.token.high);
+    gAccountingContextState.siteOwnerActive = true;
+  }
+  gSiteScopesEntered.fetch_add(1, std::memory_order_relaxed);
+  // A fresh span starts its own tally, so the `multiple` verdict describes this
+  // bracket and not the one before it.
+  gSiteScopeCurrentEvents.store(0, std::memory_order_relaxed);
+  tAccountingSiteScope = scope;
+  tAccountingSiteScopeActive = true;
+  tAccountingSiteScopePoisoned = false;
+  return true;
+}
+
+void VtcmPool::clearAccountingSiteScope() {
+  clearAccountingSiteScopeTLS();
+  // Keep the registration, the declared identity, the distinct-site set and
+  // every counter. Leave ends the owner; it does not rewrite history.
+  {
+    std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
+    gAccountingContextState.siteOwnerActive = false;
+  }
+  // Closing a span is where its shape is decided, so this is the only place the
+  // `multiple` verdict can be reached. A scope that closed with more than one
+  // bound event under it was too wide to name a single allocation.
+  if (gSiteScopeCurrentEvents.load(std::memory_order_relaxed) > 1)
+    gSiteScopesWithMultipleEvents.fetch_add(1, std::memory_order_relaxed);
+  gSiteScopeCurrentEvents.store(0, std::memory_order_relaxed);
+}
+
+bool VtcmPool::hasAccountingSiteScope() {
+  std::lock_guard<std::mutex> lock(gAccountingContextState.mutex);
+  return gAccountingContextState.siteOwnerActive;
 }
 
 namespace {
@@ -525,6 +713,17 @@ const char *coalesceCaseName(uint8_t value) {
     return "next";
   case VtcmPool::AccountingCoalesceCase::kBoth:
     return "both";
+  default:
+    return "invalid";
+  }
+}
+
+const char *paddingScopeName(uint8_t scope) {
+  switch (static_cast<VtcmPool::AccountingPaddingScope>(scope)) {
+  case VtcmPool::AccountingPaddingScope::kNotApplicable:
+    return "not-applicable";
+  case VtcmPool::AccountingPaddingScope::kPerPlacement:
+    return "per-placement";
   default:
     return "invalid";
   }
@@ -711,7 +910,9 @@ void *VtcmPool::Allocate(size_t nbytes, size_t alignment,
     *chargedBytes = 0;
   void *ptr = nullptr;
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
-  ptr = allocateLocked(nbytes, alignment, false, 0);
+  // The ordinary allocation event is emitted inside allocateLocked, which is
+  // the only place that observes the placement, so it needs no copy here.
+  ptr = allocateLocked(nbytes, alignment, false, 0, nullptr);
 #else
   ptr = allocateLocked(nbytes, alignment);
 #endif
@@ -772,8 +973,9 @@ void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,
   }
 
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  AccountingPadding padding;
   char *ptr = allocateLocked(nbytes, alignment, true,
-                               static_cast<uint8_t>(kind));
+                               static_cast<uint8_t>(kind), &padding);
 #else
   char *ptr = allocateLocked(nbytes, alignment);
 #endif
@@ -788,10 +990,12 @@ void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,
   resident_.push_back(ResidentBlock{descriptor, ptr});
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
   // The allocator event is recorded after the resident vector is updated so
-  // the event's resident_bytes snapshot describes the completed operation.
+  // the event's resident_bytes snapshot describes the completed operation, and
+  // it carries the same placement padding the ordinary path reports.
   recordAccountingAllocationLocked(
       kAccountingResidentAllocation, nbytes, chargedBytes, chargedBytes, true,
-      static_cast<uint8_t>(kind), alignment, alignment);
+      static_cast<uint8_t>(kind), alignment, alignment, /*owner=*/nullptr,
+      &padding);
 #endif
 
   vtcmDebugLog(1, "[VTCM] Resident: ", fmtKB(nbytes), " @ 0x", std::hex,
@@ -826,7 +1030,8 @@ size_t VtcmPool::getResidentBytes() const {
 
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
 char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment,
-                               bool residentAllocation, uint8_t residentKind) {
+                               bool residentAllocation, uint8_t residentKind,
+                               AccountingPadding *padding) {
 #else
 char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment) {
 #endif
@@ -889,9 +1094,21 @@ char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment) {
 
   char *ptr = nullptr;
 
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  // Per-event padding belongs to the one placement that succeeds. Starting
+  // unattributed means a helper that finds no feasible block, or a request
+  // that fails after both helpers declined, leaves the event at
+  // "not applicable" instead of inheriting a stale measurement.
+  AccountingPadding placement;
+#endif
+
   // Small allocation: try END of last free block
   if (nbytes < kLargeThreshold) {
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+    ptr = tryAllocateFromEnd(nbytes, effectiveAlignment, &placement);
+#else
     ptr = tryAllocateFromEnd(nbytes, effectiveAlignment);
+#endif
 #if HEXMLIR_RT_DIAG
     if (ptr != nullptr) {
       vtcmDebugLog(2, "[VTCM]   Allocated from end of last block");
@@ -903,7 +1120,11 @@ char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment) {
 
   // Large allocation OR small allocation fallback: use best-fit
   if (ptr == nullptr) {
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+    ptr = allocateBestFit(nbytes, effectiveAlignment, &placement);
+#else
     ptr = allocateBestFit(nbytes, effectiveAlignment);
+#endif
   }
 
   if (ptr == nullptr) {
@@ -944,17 +1165,28 @@ char *VtcmPool::allocateLocked(size_t nbytes, size_t alignment) {
   rememberAccountingOwnerLocked(ptr, owner);
   // Resident allocation is recorded by Resident after it publishes the block;
   // regular allocation has no such post-state transition.
-  if (!residentAllocation)
+  if (residentAllocation) {
+    // Hand the measurement to that caller instead of emitting it here, so the
+    // resident event and the ordinary event attribute the same placement.
+    if (padding != nullptr)
+      *padding = placement;
+  } else {
     recordAccountingAllocationLocked(
         kAccountingAllocation, original_nbytes, nbytes, nbytes, true, 0,
-        alignment, effectiveAlignment, &owner);
+        alignment, effectiveAlignment, &owner, &placement);
+  }
 #endif
 
   return ptr;
 }
 
 // Try to allocate from end of last free block
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+char *VtcmPool::tryAllocateFromEnd(size_t nbytes, size_t alignment,
+                                   AccountingPadding *padding) {
+#else
 char *VtcmPool::tryAllocateFromEnd(size_t nbytes, size_t alignment) {
+#endif
   auto lastBlock = findLastFreeBlock(free_);
 
   if (lastBlock == free_.end() || lastBlock->second < nbytes)
@@ -973,6 +1205,13 @@ char *VtcmPool::tryAllocateFromEnd(size_t nbytes, size_t alignment) {
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
   const size_t prefixBytes =
       static_cast<size_t>(allocationAddress - blockAddress);
+  if (padding != nullptr) {
+    padding->scope = AccountingPaddingScope::kPerPlacement;
+    padding->prefixBytes = prefixBytes;
+    // End placement ends at the free block's end, so the suffix is zero by
+    // construction rather than by measurement.
+    padding->suffixBytes = 0;
+  }
   if (prefixBytes != 0)
     recordAccountingSplitLocked(prefixBytes, 0);
 #endif
@@ -986,7 +1225,12 @@ char *VtcmPool::tryAllocateFromEnd(size_t nbytes, size_t alignment) {
 }
 
 // Allocate using best-fit strategy
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+char *VtcmPool::allocateBestFit(size_t nbytes, size_t alignment,
+                                AccountingPadding *padding) {
+#else
 char *VtcmPool::allocateBestFit(size_t nbytes, size_t alignment) {
+#endif
   auto bestFit = findBestFit(free_, nbytes, alignment);
 
   if (bestFit == free_.end())
@@ -1000,6 +1244,11 @@ char *VtcmPool::allocateBestFit(size_t nbytes, size_t alignment) {
   const size_t prefix = static_cast<size_t>(ptr - bestFit->first);
   const size_t suffix = bestFit->second - prefix - nbytes;
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  if (padding != nullptr) {
+    padding->scope = AccountingPaddingScope::kPerPlacement;
+    padding->prefixBytes = prefix;
+    padding->suffixBytes = suffix;
+  }
   if (prefix != 0 || suffix != 0)
     recordAccountingSplitLocked(prefix, suffix);
 #endif
@@ -1346,6 +1595,17 @@ VtcmPool::AccountingSnapshot VtcmPool::getAccountingSnapshotLocked() const {
   snapshot.eventContext = contextSnapshot.eventContext;
   snapshot.eventContextBoundEvents = accountingEventContextBoundEvents_;
   snapshot.eventContextAggregateEvents = accountingEventContextAggregateEvents_;
+  snapshot.siteScopeRegistered = contextSnapshot.siteRegistered;
+  snapshot.siteScopeOwnerActive = contextSnapshot.siteOwnerActive;
+  snapshot.siteScope = contextSnapshot.siteScope;
+  snapshot.siteScopeBoundEvents = accountingSiteScopeBoundEvents_;
+  snapshot.siteScopeAggregateEvents = accountingSiteScopeAggregateEvents_;
+  snapshot.siteScopeDistinctSites = contextSnapshot.siteDistinctSites;
+  snapshot.siteFreeBoundEvents = accountingSiteFreeBoundEvents_;
+  snapshot.siteScopesEntered = gSiteScopesEntered.load(std::memory_order_relaxed);
+  snapshot.siteScopesLeaked = gSiteScopesLeaked.load(std::memory_order_relaxed);
+  snapshot.siteScopesWithMultipleEvents =
+      gSiteScopesWithMultipleEvents.load(std::memory_order_relaxed);
 
   // Count the event classes in the bounded ring. This is deliberately derived
   // from the recorded event kind, never from a cache key or an address. These
@@ -1389,6 +1649,14 @@ VtcmPool::AccountingOwner VtcmPool::currentAccountingOwner() const {
   owner.context = tAccountingEventContext;
   owner.threadOrdinal = currentAccountingThreadOrdinal();
   owner.bound = true;
+  // The site half is captured on this same thread at this same instant, and
+  // only when the site scope is itself unpoisoned. A poisoned site scope leaves
+  // `bound` false here, so the event keeps its frame attribution (which is
+  // still true) and simply carries no site claim.
+  if (tAccountingSiteScopeActive && !tAccountingSiteScopePoisoned) {
+    owner.siteScope = tAccountingSiteScope;
+    owner.siteBound = true;
+  }
   return owner;
 }
 
@@ -1429,7 +1697,8 @@ void VtcmPool::recordAccountingEventLocked(
     ResidentAbi residentAbi, size_t requestedAlignment,
     size_t effectiveAlignment, uint8_t coalesceCase,
     uint32_t coalescedBlocks, size_t cachedBytes, size_t cachedBuffers,
-    bool emitScopeEvent, const AccountingOwner *owner) {
+    bool emitScopeEvent, const AccountingOwner *owner,
+    const AccountingPadding *padding) {
   // A scope event is the first process-scoped event in a registered stream. It
   // is emitted lazily so registration remains resource-free and can precede
   // lazy HexagonAPI construction; it never carries a site join key.
@@ -1453,6 +1722,15 @@ void VtcmPool::recordAccountingEventLocked(
   event.chargedBytes = chargedBytes;
   event.requestedAlignment = requestedAlignment;
   event.effectiveAlignment = effectiveAlignment;
+  // Only the one successful placement carries a measurement; every other
+  // event keeps the default not-applicable scope and zero bytes, so a free, a
+  // reuse, a failure, or a cache record can never imply address padding.
+  if (padding != nullptr &&
+      padding->scope == AccountingPaddingScope::kPerPlacement) {
+    event.paddingScope = static_cast<uint8_t>(padding->scope);
+    event.addressPrefixBytes = padding->prefixBytes;
+    event.addressSuffixBytes = padding->suffixBytes;
+  }
   event.coalesceCase = coalesceCase;
   event.coalescedBlocks = coalescedBlocks;
   event.allocatedBytes = calcTotalAllocated(allocations_);
@@ -1493,6 +1771,87 @@ void VtcmPool::recordAccountingEventLocked(
     ++accountingEventContextAggregateEvents_;
   }
 
+  // The site binding is a second, independent check, and it is deliberately
+  // *not* the same predicate as the frame one above.
+  //
+  // An event about a block the kernel is *done with* carries the owner snapshot
+  // taken when that block was allocated, so it may legitimately outlive its
+  // span: the kernel frees the block after the leave has already run, and the
+  // free cache then keeps the block. Both are bound from the snapshot alone.
+  //
+  // That covers the pool frees *and* every free-cache transition, and that is
+  // the point: whether a release lands in the pool or in the cache is an
+  // allocator policy decision, and it must not change whether the bytes are
+  // attributable to the site that allocated them. Treating a cache retain as
+  // unattributable while a pool free is attributable would make the evidence
+  // depend on a cache size -- exactly the kind of accident this contract
+  // exists to remove.
+  //
+  // An *allocation* is the opposite case. It captures the live owner, so it can
+  // only be bound while this thread still holds the very same site scope: that
+  // is what stops a later allocation from picking up a stale site after a
+  // different site's leave.
+  //
+  // All cases still require the owner snapshot to have carried a site scope and
+  // the process registration to match it, and none requires the frame owner to
+  // be active -- a release after the frame leave is still attributable.
+  //
+  // The owner entry is keyed by the block and lives exactly as long as the
+  // block, so this cannot go stale: it is erased when the block is really
+  // freed. A block that was never site-attributed has no entry, is passed as a
+  // null owner, and its events stay aggregate.
+  const bool ownerRetainedEvent =
+      kind == kAccountingFree || kind == kAccountingResidentFree ||
+      kind == kAccountingFreeCacheRetain || kind == kAccountingFreeCacheHit ||
+      kind == kAccountingFreeCacheDrop || kind == kAccountingFreeCacheEvict;
+  // Split out from `ownerRetainedEvent` so the two published counters keep
+  // their distinct meanings: a *release* returns bytes to the pool, while a
+  // *cache transition* moves them between the live set and the cache. Folding
+  // them together would make `site_free_bound_events` describe something other
+  // than what its name says.
+  const bool ownerRetainedRelease =
+      kind == kAccountingFree || kind == kAccountingResidentFree;
+  const AccountingSiteScope activeSite =
+      tAccountingSiteScopeActive && !tAccountingSiteScopePoisoned
+          ? tAccountingSiteScope
+          : AccountingSiteScope{};
+  const bool sameThread =
+      owner != nullptr && owner->threadOrdinal == currentAccountingThreadOrdinal();
+  const bool liveScopeAgrees =
+      ownerRetainedEvent ||
+      ((activeSite.token.low != 0 || activeSite.token.high != 0) &&
+       owner != nullptr && owner->siteScope == activeSite);
+  event.siteScopeBound = owner != nullptr && owner->siteBound && sameThread &&
+                         contextSnapshot.siteRegistered &&
+                         owner->siteScope == contextSnapshot.siteScope &&
+                         liveScopeAgrees;
+  if (event.siteScopeBound) {
+    event.siteScope = owner->siteScope;
+    ++accountingSiteScopeBoundEvents_;
+    if (ownerRetainedRelease)
+      ++accountingSiteFreeBoundEvents_;
+    // A free-cache transition that actually bound is what makes the delayed
+    // cache owner a measured fact. Counting resolved-but-refused owners would
+    // overstate it, so the event's own verdict is the only thing counted.
+    switch (kind) {
+    case kAccountingFreeCacheRetain:
+    case kAccountingFreeCacheHit:
+    case kAccountingFreeCacheDrop:
+    case kAccountingFreeCacheEvict:
+      ++accountingSiteCacheBoundEvents_;
+      break;
+    default:
+      break;
+    }
+  } else {
+    ++accountingSiteScopeAggregateEvents_;
+  }
+  // Only a bound event says anything about the shape of the span that named it.
+  // An aggregate event is not evidence that the scope was too wide, so counting
+  // it toward `multiple` would turn a refusal into a shape defect.
+  if (event.siteScopeBound)
+    gSiteScopeCurrentEvents.fetch_add(1, std::memory_order_relaxed);
+
   size_t index = 0;
   if (accountingEventCount_ < kAccountingEventCapacity) {
     index = (accountingEventStart_ + accountingEventCount_) %
@@ -1511,7 +1870,7 @@ void VtcmPool::recordAccountingAllocationLocked(
     uint8_t kind, size_t requestedBytes, size_t sizeAlignedBytes,
     size_t chargedBytes, bool success, uint8_t residentKind,
     size_t requestedAlignment, size_t effectiveAlignment,
-    const AccountingOwner *owner) {
+    const AccountingOwner *owner, const AccountingPadding *padding) {
   const AccountingOwner currentOwner = currentAccountingOwner();
   const AccountingOwner *effectiveOwner = owner ? owner : &currentOwner;
   // Version 1 has no per-event site binding. The registered function/site
@@ -1533,7 +1892,7 @@ void VtcmPool::recordAccountingAllocationLocked(
       kind, requestedBytes,
       requestedBytes, sizeAlignedBytes, chargedBytes, residentKind,
       ResidentAbi::kV2, requestedAlignment, effectiveAlignment, 0, 0, 0, 0,
-      /*emitScopeEvent=*/true, effectiveOwner);
+      /*emitScopeEvent=*/true, effectiveOwner, padding);
 }
 
 void VtcmPool::recordAccountingReuseLocked(size_t requestedBytes,
@@ -1590,7 +1949,8 @@ void VtcmPool::recordAccountingScopeEvent() {
 void VtcmPool::recordAccountingCacheEvent(
     AccountingCacheEventKind kind, size_t requestedBytes,
     size_t allocatorInputBytes, size_t sizeAlignedBytes, size_t chargedBytes,
-    size_t requestedAlignment, size_t cachedBytes, size_t cachedBuffers) {
+    size_t requestedAlignment, size_t cachedBytes, size_t cachedBuffers,
+    void *ownerBlock) {
   uint8_t eventKind = 0;
   switch (kind) {
   case AccountingCacheEventKind::kRetain:
@@ -1609,11 +1969,28 @@ void VtcmPool::recordAccountingCacheEvent(
     return;
   }
   std::lock_guard<std::mutex> lock(mutex_);
+  // The delayed owner rides along on the cache event. A retained block is still
+  // charged to the pool and still has the site that allocated it recorded in
+  // `accountingOwners_`, so the retain is attributable to that site rather than
+  // to the process. A block that was never site-attributed has no entry, and
+  // the event then stays aggregate -- which is the point: a cache event with no
+  // owner is evidence of nothing and must not borrow one.
+  //
+  // This says the *bytes* belong to that site. It does not say a later hit
+  // returns the same contents, which is address reuse and stays unproven.
+  AccountingOwner owner = lookupAccountingOwnerLocked(ownerBlock);
+  const AccountingOwner *bound = owner.bound ? &owner : nullptr;
+  // The counter is *not* bumped here. Resolving an owner is not the same as the
+  // event binding: a cache transition that happens after its site scope has left
+  // resolves the owner fine and is still refused by the live-scope rule below,
+  // so counting it here would let the report claim a binding no event carries.
+  // The count follows the event's own verdict, in
+  // `recordAccountingEventLocked`.
   recordAccountingEventLocked(
       eventKind, requestedBytes,
       allocatorInputBytes, sizeAlignedBytes, chargedBytes, 0,
       ResidentAbi::kV2,
-      requestedAlignment, 0, 0, 0, cachedBytes, cachedBuffers);
+      requestedAlignment, 0, 0, 0, cachedBytes, cachedBuffers, true, bound);
 }
 
 int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
@@ -1681,6 +2058,13 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
           blockAccountingStatus) != 0)
     return kAccountingReportTruncated;
 
+  // Whether the free cache can attribute its bytes to a site is a measured
+  // fact, not a fixed label: it is only "owner-retained" once some cache
+  // transition actually carried an owner. Until then the honest answer is
+  // "aggregate", and a reader can tell the two apart.
+  const char *delayedCacheOwnerStatus =
+      accountingSiteCacheBoundEvents_ != 0 ? "owner-retained" : "aggregate";
+
   // This line is a versioned diagnostic contract, not a second accounting
   // stream and not a manifest field. It records the smallest scope we could
   // honestly describe and refuses the joins that the v1 event ABI cannot carry.
@@ -1691,7 +2075,7 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
           "observation_scope=one-immutable-principal-module-function-canonical-site-grid1-single-invocation "
           "observation_scope_status=not-proven "
           "frame_status=not-proven event_owner_status=aggregate "
-          "delayed_cache_owner_status=aggregate "
+          "delayed_cache_owner_status=%s "
           "context_registered=%u build_id_status=%s "
           "function_id_status=not-bound-in-v1 "
           "allocation_site_id_status=not-bound-in-v1 "
@@ -1717,6 +2101,7 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
           "pool_cache_combined_status=not-proven "
           "full_kernel_occupancy_status=not-proven "
           "performance_claimed=false\n",
+          delayedCacheOwnerStatus,
           snapshot.contextRegistered ? 1u : 0u,
           snapshot.contextRegistered ? "declared-process-only" : "unbound") != 0)
     return kAccountingReportTruncated;
@@ -1756,6 +2141,60 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
                 snapshot.eventContextBoundEvents),
             static_cast<unsigned long long>(
                 snapshot.eventContextAggregateEvents)) != 0)
+      return kAccountingReportTruncated;
+  }
+
+  // The per-site declaration is a new, additive record. It is emitted only when
+  // a site scope was actually registered, so a frame-only stream is byte for
+  // byte what it was before this ABI existed. Like the frame record above it is
+  // a *declaration*: the counters say how many events were ever bound, while
+  // the per-event `site_scope_status` fields say which ones this transcript
+  // actually retains.
+  if (snapshot.siteScopeRegistered) {
+    const char *siteStatus = snapshot.siteScopeOwnerActive
+                                 ? "registered-active"
+                                 : "registered-cleared";
+    const char *siteOwnerStatus = snapshot.siteScopeOwnerActive
+                                     ? "site-bound"
+                                     : "cleared-historical";
+    if (appendAccountingText(
+            buf, cap, &offset,
+            "VTCM_SITE_SCOPE schema=1 context_abi=accounting-site-v1 "
+            "mode=diagnostic-only context_status=%s owner_active=%u "
+            "token_basis=opaque site_token_bits=128 "
+            "site_token_low=%llu site_token_high=%llu "
+            "accounting_scope_id=%llu invocation_id=%llu function_id=%llu "
+            "allocation_site_id=%llu build_id_bits=128 build_id_low=%llu "
+            "build_id_high=%llu grid_product=1 site_owner_status=%s "
+            "distinct_sites=%llu site_scopes_entered=%llu "
+            "site_bound_events=%llu site_aggregate_events=%llu "
+            "site_free_bound_events=%llu site_scopes_leaked=%llu "
+            "site_scopes_with_multiple_events=%llu "
+            "free_attribution=owner-retained "
+            "delayed_cache_owner_status=%s "
+            "grid_scope_status=not-proven performance_claimed=false\n",
+            siteStatus, snapshot.siteScopeOwnerActive ? 1u : 0u,
+            static_cast<unsigned long long>(snapshot.siteScope.token.low),
+            static_cast<unsigned long long>(snapshot.siteScope.token.high),
+            static_cast<unsigned long long>(
+                snapshot.siteScope.accountingScopeId),
+            static_cast<unsigned long long>(snapshot.siteScope.invocationId),
+            static_cast<unsigned long long>(snapshot.siteScope.functionId),
+            static_cast<unsigned long long>(
+                snapshot.siteScope.allocationSiteId),
+            static_cast<unsigned long long>(snapshot.siteScope.buildId.low),
+            static_cast<unsigned long long>(snapshot.siteScope.buildId.high),
+            siteOwnerStatus,
+            static_cast<unsigned long long>(snapshot.siteScopeDistinctSites),
+            static_cast<unsigned long long>(snapshot.siteScopesEntered),
+            static_cast<unsigned long long>(snapshot.siteScopeBoundEvents),
+            static_cast<unsigned long long>(
+                snapshot.siteScopeAggregateEvents),
+            static_cast<unsigned long long>(snapshot.siteFreeBoundEvents),
+            static_cast<unsigned long long>(snapshot.siteScopesLeaked),
+            static_cast<unsigned long long>(
+                snapshot.siteScopesWithMultipleEvents),
+            delayedCacheOwnerStatus) != 0)
       return kAccountingReportTruncated;
   }
 
@@ -1886,6 +2325,10 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
         "size_aligned_bytes=%llu charged_bytes=%llu "
         "allocator_aligned_status=not-proven "
         "requested_alignment=%llu effective_alignment=%llu "
+        "address_prefix_bytes=%llu address_suffix_bytes=%llu "
+        "address_padding_scope=%s "
+        "address_padding_basis=free-list-remainder-beside-placed-block "
+        "address_padding_model_status=not-proven "
         "allocated_bytes_after=%llu free_bytes_after=%llu "
         "largest_free_bytes_after=%llu allocation_count_after=%llu "
         "free_block_count_after=%llu resident_bytes_after=%llu "
@@ -1906,6 +2349,9 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
         static_cast<unsigned long long>(event.chargedBytes),
         static_cast<unsigned long long>(event.requestedAlignment),
         static_cast<unsigned long long>(event.effectiveAlignment),
+        static_cast<unsigned long long>(event.addressPrefixBytes),
+        static_cast<unsigned long long>(event.addressSuffixBytes),
+        paddingScopeName(event.paddingScope),
         static_cast<unsigned long long>(event.allocatedBytes),
         static_cast<unsigned long long>(event.freeBytes),
         static_cast<unsigned long long>(event.largestFreeBytes),
@@ -1967,6 +2413,45 @@ int VtcmPool::writeAccountingReportLocked(char *buf, int cap) const {
       if (status != 0)
         return kAccountingReportTruncated;
     }
+    // The per-site fields are strictly additive and only appear when the event
+    // actually carries a site claim. A frame-only event keeps exactly the
+    // spelling it had before this ABI existed; an event recorded while a site
+    // scope was active but whose site binding did not hold is `aggregate`
+    // rather than silently absent, so "no site claim" and "a refused site
+    // claim" stay distinguishable.
+    //
+    // The state field is `event_site_scope_status`, not `site_scope_status`.
+    // Every VTCM_EVENT already carries a process-level `site_scope_status` from
+    // the v1 grammar -- the frozen `not-bound-in-v1` claim that v1 cannot bind a
+    // site -- and reusing that spelling emitted the same key twice on one line,
+    // which is not additive at all: a closed reader sees a duplicate field and
+    // the whole transcript is refused. The `event_` prefix is what the frame
+    // already does for the same reason (`event_context_status` alongside the v1
+    // `context_identity_scope`), so the site half now matches it.
+    if (event.siteScopeBound) {
+      status = appendAccountingText(
+          buf, cap, &offset,
+          " event_site_scope_status=bound site_token_bits=128 "
+          "site_token_low=%llu site_token_high=%llu "
+          "site_accounting_scope_id=%llu site_invocation_id=%llu "
+          "site_function_id=%llu site_allocation_site_id=%llu "
+          "site_build_id_bits=128 site_build_id_low=%llu site_build_id_high=%llu",
+          static_cast<unsigned long long>(event.siteScope.token.low),
+          static_cast<unsigned long long>(event.siteScope.token.high),
+          static_cast<unsigned long long>(
+              event.siteScope.accountingScopeId),
+          static_cast<unsigned long long>(event.siteScope.invocationId),
+          static_cast<unsigned long long>(event.siteScope.functionId),
+          static_cast<unsigned long long>(
+              event.siteScope.allocationSiteId),
+          static_cast<unsigned long long>(event.siteScope.buildId.low),
+          static_cast<unsigned long long>(event.siteScope.buildId.high));
+    } else if (snapshot.siteScopeRegistered) {
+      status = appendAccountingText(buf, cap, &offset,
+                                    " event_site_scope_status=aggregate");
+    }
+    if (status != 0)
+      return kAccountingReportTruncated;
     if (appendAccountingText(buf, cap, &offset, "\n") != 0)
       return kAccountingReportTruncated;
   }

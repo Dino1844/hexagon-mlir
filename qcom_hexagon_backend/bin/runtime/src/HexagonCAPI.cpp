@@ -274,6 +274,34 @@ void hexagon_runtime_vtcm_accounting_event_context_leave_v1_dsp(void) {
   VtcmPool::clearAccountingEventContext();
 }
 
+void hexagon_runtime_vtcm_accounting_site_scope_enter_v1_dsp(
+    uint32_t version, uint32_t flags, uint64_t tokenLow, uint64_t tokenHigh,
+    uint64_t accountingScopeId, uint64_t invocationId, uint64_t functionId,
+    uint64_t allocationSiteId, uint64_t buildIdLow, uint64_t buildIdHigh,
+    uint32_t gridProduct) {
+  // A grid that is not one has no per-site invocation to name, so the scope is
+  // released rather than registered. This mirrors the frame entry: the refusal
+  // is total, not a partial attribution.
+  if (gridProduct != 1) {
+    VtcmPool::clearAccountingSiteScope();
+    return;
+  }
+  VtcmPool::AccountingSiteScope scope{};
+  scope.version = version;
+  scope.flags = flags;
+  scope.token = {tokenLow, tokenHigh};
+  scope.accountingScopeId = accountingScopeId;
+  scope.invocationId = invocationId;
+  scope.functionId = functionId;
+  scope.allocationSiteId = allocationSiteId;
+  scope.buildId = {buildIdLow, buildIdHigh};
+  (void)VtcmPool::registerAccountingSiteScope(scope);
+}
+
+void hexagon_runtime_vtcm_accounting_site_scope_leave_v1_dsp(void) {
+  VtcmPool::clearAccountingSiteScope();
+}
+
 /// Return the diagnostic report without exposing a pointer or changing the
 /// allocator. Calling this entry point constructs the lazy runtime singleton,
 /// just like the other runtime entry points; probe callers normally invoke
@@ -319,6 +347,7 @@ int hexagon_runtime_vtcm_accounting_report(char *buf, int cap) {
       "free_cache_retain_requested_bytes=%llu "
       "free_cache_drops=%llu free_cache_drop_bytes=%llu "
       "free_cache_evictions=%llu free_cache_eviction_bytes=%llu "
+      "free_cache_eviction_events=%llu "
       "cached_vtcm_high_water_bytes=%llu cached_buffer_high_water=%llu "
       "pool_high_water_charged_bytes=%llu "
       "combined_occupancy_lower_bound_bytes=%llu "
@@ -345,6 +374,7 @@ int hexagon_runtime_vtcm_accounting_report(char *buf, int cap) {
       static_cast<unsigned long long>(cache.freeCacheDropBytes),
       static_cast<unsigned long long>(cache.freeCacheEvictions),
       static_cast<unsigned long long>(cache.freeCacheEvictionBytes),
+      static_cast<unsigned long long>(cache.freeCacheEvictionEvents),
       static_cast<unsigned long long>(cache.highWaterCachedVtcmBytes),
       static_cast<unsigned long long>(cache.highWaterCachedBuffers),
       static_cast<unsigned long long>(pool.highWaterAllocatedBytes),

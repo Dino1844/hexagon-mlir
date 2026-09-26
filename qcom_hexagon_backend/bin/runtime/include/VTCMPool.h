@@ -137,6 +137,42 @@ public:
     }
   };
 
+  /// Per-*site* scope ABI. This is a different claim from the frame context
+  /// above and is deliberately a separate registration: the frame names one
+  /// observation, this names one canonical allocation site inside it.
+  ///
+  /// The token here is a site token, derived with the site's role and resident
+  /// slot, and is not interchangeable with the frame token. The runtime treats
+  /// both as opaque and never derives either from an address.
+  ///
+  /// The build echo is a second, independent binding word. A site token that
+  /// matched while the build did not would mean the right site name was carried
+  /// by a kernel built from different IR, so both are compared exactly and a
+  /// mismatch poisons rather than binds.
+  static constexpr uint32_t kAccountingSiteScopeVersion = 1;
+  static constexpr uint32_t kAccountingSiteScopeSingleInvocation = 1u << 0;
+  static constexpr uint32_t kAccountingSiteScopeGridOne = 1u << 1;
+
+  struct AccountingSiteScope {
+    uint32_t version{0};
+    uint32_t flags{0};
+    AccountingDigest token{};
+    uint64_t accountingScopeId{0};
+    uint64_t invocationId{0};
+    uint64_t functionId{0};
+    uint64_t allocationSiteId{0};
+    /// Echo of the compiler's explicit build identity, in the producer's word
+    /// order. The runtime never interprets it; it only compares the pair.
+    AccountingDigest buildId{};
+
+    bool operator==(const AccountingSiteScope &other) const {
+      return version == other.version && flags == other.flags &&
+             token == other.token && accountingScopeId == other.accountingScopeId &&
+             invocationId == other.invocationId && functionId == other.functionId &&
+             allocationSiteId == other.allocationSiteId && buildId == other.buildId;
+    }
+  };
+
   /// Register one immutable process context for the accounting stream. An
   /// identical repeated registration succeeds; a different context fails
   /// closed. Registration is rejected after the first accounting event so a
@@ -173,6 +209,24 @@ public:
   /// when a historical registration is still recorded.
   static bool hasAccountingEventContext();
 
+  /// Register one immutable per-thread *site* scope. A repeated identical
+  /// registration is idempotent; a different scope, a registration from a
+  /// second thread, a registration after the first site-scoped event, or a
+  /// malformed record fails closed and poisons the thread.
+  ///
+  /// The scope is deliberately *not* nestable: a second enter while one is
+  /// active is a refusal, not a stack push. The compiler brackets exactly one
+  /// allocation per span, so a nested span would mean the two sites could not be
+  /// told apart at the free.
+  static bool registerAccountingSiteScope(const AccountingSiteScope &scope);
+  /// End the current allocation's per-thread site scope. Like the frame leave
+  /// this ends the owner and keeps the registration and the counters: a cleared
+  /// scope is evidence that an owner existed, not a reason to rewind a count.
+  static void clearAccountingSiteScope();
+  /// Whether this thread currently owns a site scope. False after leave, after
+  /// a rejected registration, and before the first enter.
+  static bool hasAccountingSiteScope();
+
   enum class AccountingCacheEventKind : uint8_t {
     kRetain = 1,
     kHit = 2,
@@ -187,16 +241,49 @@ public:
   /// the cache entry; `chargedBytes` is the actual backing-store charge. For a
   /// mixed-key eviction the latter two are aggregate values and the event is
   /// marked non-modelable in the serialized contract.
+  /// Record one free-cache transition. `ownerBlock` is the pool block the event
+  /// is about -- the buffer being retained, hit, dropped or evicted. The pool
+  /// resolves its own retained accounting owner from it; passing the pointer
+  /// rather than an owner keeps that type private and means the lookup happens
+  /// once, under the lock this function already takes. A null pointer, or a
+  /// block that was never site-attributed, leaves the event aggregate rather
+  /// than letting it borrow an identity it does not have.
   void recordAccountingCacheEvent(AccountingCacheEventKind kind,
                                   size_t requestedBytes,
                                   size_t allocatorInputBytes,
                                   size_t sizeAlignedBytes, size_t chargedBytes,
                                   size_t requestedAlignment, size_t cachedBytes,
-                                  size_t cachedBuffers);
+                                  size_t cachedBuffers,
+                                  void *ownerBlock = nullptr);
 
   /// Materialize the one scope-enter event when a context is registered after
   /// lazy pool construction. It is idempotent and emits no resource data.
   void recordAccountingScopeEvent();
+
+  /// Scope of the per-event address-padding fields, plus the exact free-list
+  /// remainder one placement left beside the block it created.
+  ///
+  /// This is an observation, not a model. Both byte values are measured from
+  /// the chosen free block's own boundaries and no address is kept, so the
+  /// record still says nothing about fragmentation, occupancy, or whether a
+  /// later allocation reused the same address range.
+  enum class AccountingPaddingScope : uint8_t {
+    /// The event placed no block -- a free, a reuse, a failure, a scope enter,
+    /// or a free-cache record -- so both byte fields are zero by construction
+    /// and carry no observation at all.
+    kNotApplicable = 0,
+    /// The event *is* the one placement that produced this block, and both
+    /// byte fields are exactly the padding that placement left in the free
+    /// list. "Padding" here is the leftover on each side of the block inside
+    /// the chosen free block, not the alignment quantum of the request.
+    kPerPlacement = 1,
+  };
+
+  struct AccountingPadding {
+    AccountingPaddingScope scope{AccountingPaddingScope::kNotApplicable};
+    size_t prefixBytes{0};
+    size_t suffixBytes{0};
+  };
 #endif
 
   /// Allocate (once) a resident buffer for `key`. On the first call the buffer
@@ -306,6 +393,31 @@ public:
     AccountingEventContext eventContext;
     uint64_t eventContextBoundEvents;
     uint64_t eventContextAggregateEvents;
+    /// Per-site registration, in the same shape as the frame pair above: a
+    /// historical registration plus a separate "an owner is active right now".
+    bool siteScopeRegistered;
+    bool siteScopeOwnerActive;
+    AccountingSiteScope siteScope;
+    uint64_t siteScopeBoundEvents;
+    uint64_t siteScopeAggregateEvents;
+    uint64_t siteFreeBoundEvents;
+    /// Number of distinct sites this process has ever bound. A second distinct
+    /// site on one thread is legal (that is the multi-site case) but it is
+    /// counted, so a report can say how wide the per-site evidence was.
+    uint64_t siteScopeDistinctSites;
+    /// Number of site scopes granted. Each one is meant to bracket exactly one
+    /// pool-backed allocation, so this is also the number of sites that were
+    /// asked for in a shape the runtime accepted.
+    uint64_t siteScopesEntered;
+    /// A scope that was still open when its frame left. The allocation it would
+    /// have named is then unattributable to anything, so the count is a defect
+    /// signal rather than a statistic: it must be zero in a well-formed capture.
+    uint64_t siteScopesLeaked;
+    /// A scope that recorded more than one event. The bracket is supposed to be
+    /// the tightest available -- enter, one allocation, leave -- so a second
+    /// event under one scope means the span was too wide to name a single site.
+    /// Counted, never used as a binding.
+    uint64_t siteScopesWithMultipleEvents;
     uint64_t scopeEvents;
     uint64_t freeCacheRetainEvents;
     uint64_t freeCacheHitEvents;
@@ -365,10 +477,12 @@ private:
 
   /// Locked allocator body, shared by Allocate and Resident. The extra
   /// resident bit exists only in the opt-in accounting build; the default
-  /// build keeps the original allocator ABI.
+  /// build keeps the original allocator ABI. `padding` likewise exists only in
+  /// that build: it receives the exact per-event address padding, and only when
+  /// this call performed the one successful placement.
 #ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
   char *allocateLocked(size_t nbytes, size_t alignment, bool residentAllocation,
-                       uint8_t residentKind);
+                       uint8_t residentKind, AccountingPadding *padding);
 #else
   char *allocateLocked(size_t nbytes, size_t alignment);
 #endif
@@ -408,6 +522,12 @@ private:
     size_t chargedBytes;
     size_t requestedAlignment;
     size_t effectiveAlignment;
+    // Exact free-list remainder of the one placement that produced this block.
+    // Meaningful only when `paddingScope` is kPerPlacement; see
+    // AccountingPaddingScope for the facts this deliberately does not claim.
+    uint8_t paddingScope;
+    size_t addressPrefixBytes;
+    size_t addressSuffixBytes;
     uint8_t coalesceCase;
     uint32_t coalescedBlocks;
     size_t allocatedBytes;
@@ -426,12 +546,22 @@ private:
     bool contextRegistered;
     AccountingEventContext eventContext;
     bool eventContextBound;
+    /// Additive per-site fields. Absent on every event recorded without an
+    /// active site scope, which keeps the frame-only stream byte-identical to
+    /// what it was before this ABI existed.
+    AccountingSiteScope siteScope;
+    bool siteScopeBound{false};
   };
 
   struct AccountingOwner {
     AccountingEventContext context;
     uint64_t threadOrdinal{0};
     bool bound{false};
+    /// The site scope captured on the same thread at the same moment as
+    /// `context`. Bound only when both were active, so an event can never carry
+    /// a frame token from one instant and a site token from another.
+    AccountingSiteScope siteScope;
+    bool siteBound{false};
   };
 
   std::array<AccountingEvent, kAccountingEventCapacity> accountingEvents_{};
@@ -462,6 +592,19 @@ private:
   size_t accountingMaxFreeBlockCount_{0};
   uint64_t accountingEventContextBoundEvents_{0};
   uint64_t accountingEventContextAggregateEvents_{0};
+  uint64_t accountingSiteScopeBoundEvents_{0};
+  uint64_t accountingSiteScopeAggregateEvents_{0};
+  /// Bound site events that are *releases*. A release inherits the site of
+  /// the block it frees, so this count is the part of the bound set that
+  /// outlived its own enter/leave span. It is published so a reader can tell
+  /// how much of the per-site evidence is allocation versus deallocation.
+  uint64_t accountingSiteFreeBoundEvents_{0};
+  /// Free-cache transitions that carried a site owner. This is what makes
+  /// `delayed_cache_owner_status` a measured fact rather than a fixed label:
+  /// while it is zero the cached bytes really are unattributable, and once it is
+  /// non-zero the report says so instead of continuing to call the whole
+  /// cache aggregate.
+  uint64_t accountingSiteCacheBoundEvents_{0};
   bool accountingScopeEventRecorded_{false};
   std::unordered_map<void *, AccountingOwner> accountingOwners_;
 
@@ -475,7 +618,8 @@ private:
       uint8_t kind, size_t requestedBytes, size_t sizeAlignedBytes,
       size_t chargedBytes, bool success, uint8_t residentKind,
       size_t requestedAlignment = 0, size_t effectiveAlignment = 0,
-      const AccountingOwner *owner = nullptr);
+      const AccountingOwner *owner = nullptr,
+      const AccountingPadding *padding = nullptr);
   void recordAccountingReuseLocked(size_t requestedBytes,
                                    size_t sizeAlignedBytes,
                                    size_t chargedBytes,
@@ -494,14 +638,25 @@ private:
       uint8_t coalesceCase, uint32_t coalescedBlocks, size_t cachedBytes,
       size_t cachedBuffers,
       bool emitScopeEvent = true,
-      const AccountingOwner *owner = nullptr);
+      const AccountingOwner *owner = nullptr,
+      const AccountingPadding *padding = nullptr);
   int writeAccountingReportLocked(char *buf, int cap) const;
   static uint32_t fragmentationPpmLocked(size_t totalFree, size_t largestFree);
 #endif
 
   // Allocation helpers. `nbytes` is the charged (legacy-rounded) block size.
+  // In the opt-in accounting build they also report the exact free-list
+  // remainder their placement leaves, so one event can carry its own address
+  // padding instead of only the process-wide split totals.
+#ifdef HEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE
+  char *tryAllocateFromEnd(size_t nbytes, size_t alignment,
+                           AccountingPadding *padding);
+  char *allocateBestFit(size_t nbytes, size_t alignment,
+                        AccountingPadding *padding);
+#else
   char *tryAllocateFromEnd(size_t nbytes, size_t alignment);
   char *allocateBestFit(size_t nbytes, size_t alignment);
+#endif
   void handleAllocationFailure(size_t nbytes);
   void logAllocationSuccess(char *ptr, size_t nbytes);
 

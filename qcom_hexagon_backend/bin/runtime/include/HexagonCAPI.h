@@ -117,6 +117,30 @@ void hexagon_runtime_vtcm_accounting_event_context_enter_v1(
 /// later invocation without its own enter call therefore remains aggregate.
 void hexagon_runtime_vtcm_accounting_event_context_leave_v1(void);
 
+/// Diagnostic-only per-thread *site* scope, bracketing exactly one pool-backed
+/// allocation. This is a separate, versioned ABI from the frame context above:
+/// the token is a site token (the site's role and resident slot are part of it),
+/// it is not interchangeable with the frame token, and neither is derived from
+/// an address.
+///
+/// `buildIdLow`/`buildIdHigh` echo the compiler's explicit build identity. The
+/// runtime compares the pair exactly and never interprets it; a build mismatch
+/// poisons the thread rather than binding, because a site name carried by a
+/// kernel built from different IR is not the same observation.
+///
+/// The scope is not nestable: a second enter while one is active fails closed.
+/// Like the frame entry, both entries return void and never change kernel
+/// control flow -- a rejected registration leaves the event stream aggregate.
+void hexagon_runtime_vtcm_accounting_site_scope_enter_v1(
+    uint32_t version, uint32_t flags, uint64_t tokenLow, uint64_t tokenHigh,
+    uint64_t accountingScopeId, uint64_t invocationId, uint64_t functionId,
+    uint64_t allocationSiteId, uint64_t buildIdLow, uint64_t buildIdHigh,
+    uint32_t gridProduct);
+/// Clear the current thread's site owner at the end of one allocation's span.
+/// A later allocation without its own enter call therefore remains aggregate,
+/// and the counters it already contributed are kept.
+void hexagon_runtime_vtcm_accounting_site_scope_leave_v1(void);
+
 /// Format the opt-in VTCM allocation/free accounting snapshot and bounded
 /// event log into `buf`. The report contains allocator sizes and counters,
 /// never raw addresses. With no registered context it remains the historical
