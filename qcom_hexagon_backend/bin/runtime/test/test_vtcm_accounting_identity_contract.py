@@ -11,13 +11,14 @@ must provide the values through the versioned context ABI.
 import json
 from pathlib import Path
 import re
-import subprocess
-import sys
 
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME = ROOT / "bin" / "runtime"
-PROBE = ROOT.parents[1] / "exp" / "hmx" / "vtcm_accounting_probe"
+# The claim ledger is part of the repository, not of the probe that checks it: a
+# test in the shipped tree must not depend on a directory outside the shipped
+# tree, or a fresh clone fails before it runs anything.
+MATRIX = ROOT / "test" / "VTcmAccounting"
 
 
 def _read(relative: str) -> str:
@@ -26,7 +27,7 @@ def _read(relative: str) -> str:
 
 def _matrix_cell(cell_id: str) -> dict:
     document = json.loads(
-        (PROBE / "boundary_matrix.json").read_text(encoding="utf-8")
+        (MATRIX / "boundary_matrix.json").read_text(encoding="utf-8")
     )
     return next(cell for cell in document["cells"] if cell["id"] == cell_id)
 
@@ -533,7 +534,7 @@ def test_pool_blocks_have_no_in_pool_header() -> None:
     # The matrix records the fact on its own field and its own cell; the
     # header-inclusive allocator model keeps its own unproven status.
     document = json.loads(
-        (PROBE / "boundary_matrix.json").read_text(encoding="utf-8")
+        (MATRIX / "boundary_matrix.json").read_text(encoding="utf-8")
     )
     contract = document["contract"]
     assert (
@@ -553,33 +554,26 @@ def test_pool_blocks_have_no_in_pool_header() -> None:
     assert _matrix_cell("allocator.header_split_exact_model")["status"] == "not-proven"
 
 
-def test_boundary_matrix_is_deterministic_and_explicitly_incomplete() -> None:
-    command = [sys.executable, "-B", str(PROBE / "matrix_runner.py")]
-    first = subprocess.run(
-        command, cwd=PROBE, check=True, capture_output=True, text=True
-    )
-    second = subprocess.run(
-        command, cwd=PROBE, check=True, capture_output=True, text=True
-    )
-    assert first.stdout == second.stdout
-    result = json.loads(first.stdout)
-    summary = result["summary"]
-    assert result["mode"] == "host-source"
-    assert result["device_used"] is False
-    assert summary["host_source_status"] == "pass"
-    assert summary["fail"] == 0
-    assert summary["pass"] > 0
-    assert summary["not-proven"] > 0
-    assert summary["evidence_status"] == "incomplete"
-    assert summary["total"] == len(result["cells"])
-    assert {cell["status"] for cell in result["cells"]} <= {
-        "pass",
-        "fail",
-        "not-proven",
-    }
-    assert all("declared_status" in cell for cell in result["cells"])
+def test_boundary_matrix_declares_its_own_limits() -> None:
+    """The ledger's declared contract, read directly from the ledger.
 
-    contract = result["contract"]
+    This used to shell out to the probe's `matrix_runner.py` and assert on the
+    runner's output. Two things were wrong with that. It made the repository's
+    test suite depend on a file outside the repository, so a fresh clone failed
+    before running anything; and it made a *declaration* verifiable only by
+    running the *checker*, when the declaration is a file in this repository and
+    can simply be read.
+
+    What is left here is the declaration: the contract block, and the fact that
+    every cell states its scope and carries no unearned evidence. The runner's
+    own determinism and output shape are properties of the runner, so they are
+    tested beside the runner.
+    """
+
+    document = json.loads(
+        (MATRIX / "boundary_matrix.json").read_text(encoding="utf-8")
+    )
+    contract = document["contract"]
     assert contract["event_scope_policy"] == "process-only-v1"
     assert contract["function_attribution"] == "declared-only"
     assert contract["allocation_site_attribution"] == "not-bound-in-v1"
@@ -596,7 +590,24 @@ def test_boundary_matrix_is_deterministic_and_explicitly_incomplete() -> None:
     assert contract["v3_producer"] is False
     assert contract["manifest_mutation"] is False
     assert contract["launcher_mutation"] is False
-    assert contract["cache_envelope_mutation"] is False
+    assert contract["probe_default"] == "off"
+    # A ledger that claimed completeness would be the failure mode, so the
+    # unknown has to be visible in the file rather than in a reader's defaults.
+    assert contract["status_vocabulary"] == ["pass", "fail", "not-proven"]
+    assert {cell["status"] for cell in document["cells"]} <= {
+        "pass",
+        "fail",
+        "not-proven",
+    }
+    assert any(cell["status"] == "not-proven" for cell in document["cells"])
+    for cell in document["cells"]:
+        assert cell["claim_scope"], cell["id"]
+        assert "limitations" in cell and "next_evidence" in cell, cell["id"]
+        # A cell that says `pass` with an empty limitations list and no next
+        # evidence is a cell that has to mean it; the two narrower scopes are
+        # where a claim is allowed to be complete.
+        if cell["status"] == "pass" and cell["claim_scope"] != "source-contract":
+            assert cell["limitations"] or cell["next_evidence"], cell["id"]
 
 
 def test_per_event_address_padding_does_not_bump_the_event_abi() -> None:
@@ -666,7 +677,7 @@ if __name__ == "__main__":
     test_resident_content_and_address_reuse_remain_not_proven()
     test_pool_blocks_have_no_in_pool_header()
     test_multi_scope_conflicts_and_process_boundaries_fail_closed()
-    test_boundary_matrix_is_deterministic_and_explicitly_incomplete()
+    test_boundary_matrix_declares_its_own_limits()
     test_per_event_address_padding_does_not_bump_the_event_abi()
     test_probe_is_opt_in_and_v2_abi_is_unchanged()
     print("VTCM accounting identity source contract: PASS")

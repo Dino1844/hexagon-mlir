@@ -1,0 +1,486 @@
+{
+  "schema": "hmx-vtcm-accounting-boundary-matrix/v1",
+  "title": "R-A.1 conservative VTCM accounting boundary matrix",
+  "contract": {
+    "runtime_report_schema": 1,
+    "identity_schema": 1,
+    "event_scope_schema": 1,
+    "event_scope_policy": "process-only-v1",
+    "aggregate_scope": "process",
+    "function_attribution": "declared-only",
+    "allocation_site_attribution": "not-bound-in-v1",
+    "resident_accounting_scope_binding": "not-proven",
+    "address_alignment_in_report": "not-proven",
+    "allocator_aligned_status": "not-proven",
+    "header_accounting_status": "not-proven",
+    "in_pool_header_absence": "source-verified-absent-out-of-band-size-host-metadata",
+    "split_coalesce_model_status": "not-proven",
+    "grid_attribution": "not-bound-in-v1",
+    "cold_warm_runtime_status": "not-proven-runtime",
+    "content_identity_status": "not-proven",
+    "probe_default": "off",
+    "backend_option": false,
+    "v3_producer": false,
+    "manifest_mutation": false,
+    "launcher_mutation": false,
+    "cache_envelope_mutation": false,
+    "status_vocabulary": [
+      "pass",
+      "fail",
+      "not-proven"
+    ],
+    "bounded_interval_status": "not-proven",
+    "bounded_interval_basis": "resident-aligned-floor + transient-aligned-upper-bound + free-cache-cap"
+  },
+  "cells": [
+    {
+      "id": "gate.default_off",
+      "axes": [
+        "probe-gate"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The accounting state and report entry points exist only behind the build-time opt-in, whose CMake default is OFF.",
+      "oracle": "gate_default_off",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "identity.process_aggregate_only",
+      "axes": [
+        "identity-scope",
+        "process-boundaries"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "The v1 event context proves only a process aggregate with declared metadata: the runtime clears the per-event function and allocation-site ids, so the identity record carries declared context metadata rather than a per-event join. Function and site reach an event only through the separately versioned accounting-site-v1 declaration, which is a different record with its own scope.",
+      "oracle": "process_aggregate_only",
+      "limitations": [
+        "The runtime clears function and allocation-site IDs on the v1 event context; the identity record is declared context metadata, not a per-event join.",
+        "The additive accounting-site-v1 record does bind site token, function and site id to an event while it is registered, and a single-site transcript joins offline -- so this cell is about the process-aggregate record, not about the site declaration. The aggregate itself still publishes site_scope_status=not-bound-in-v1, which is what keeps it aggregate."
+      ],
+      "next_evidence": [
+        "The single-site case is now computed offline over an attested capture (mode=diagnostic-only, observed_device=false, performance_claimed=false; exp/hmx/vtcm_accounting_probe/site_join.py). What is still missing before this identity cell can be more than aggregate-only is a multi-unit join: one observation process per function/module, or a versioned rule that lets a second function or site bind inside the same process.",
+        "Do not infer attribution from the declared context: the aggregate record stays aggregate until such a rule exists."
+      ]
+    },
+    {
+      "id": "wire.no_v3_producer_or_backend_option",
+      "axes": [
+        "wire-boundary",
+        "probe-gate"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The matrix contract declares no v3 producer and its host inputs expose no manifest, launcher, cache-envelope, or backend-option surface.",
+      "oracle": "wire_boundary_unchanged",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "probe.host_only_matrix",
+      "axes": [
+        "probe-gate",
+        "wire-boundary"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The matrix command imports no device runner and contains no networking or subprocess execution path.",
+      "oracle": "host_only_matrix",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "ordinary.cold_warm_source_paths",
+      "axes": [
+        "cold-warm",
+        "ordinary-resident",
+        "free-cache"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The source has distinct first-allocation and same-footprint cache-hit paths and records ordinary alloc/free plus cache events.",
+      "oracle": "ordinary_cold_warm_paths",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "ordinary.device_cold_warm",
+      "axes": [
+        "cold-warm",
+        "ordinary-resident",
+        "free-cache"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "A controlled cold process and warm same-process transition have not been imported as per-cell device evidence by this host matrix.",
+      "oracle": "device_cold_warm_unproven",
+      "limitations": [
+        "The frozen host matrix does not ingest device phase records. A separate device-log overlay now parses cold/warm phases, but this cell remains not-proven because v1 has no cross-process identity/join rule."
+      ],
+      "next_evidence": [
+        "Keep the device-log overlay separate from v1 and define an explicit process-pair join/reset protocol before promoting this observation."
+      ]
+    },
+    {
+      "id": "resident.source_lifetime_and_reuse",
+      "axes": [
+        "ordinary-resident",
+        "cold-warm"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Ordinary buffers return to BufferManager/VtcmPool, while exact resident descriptors reuse one pinned block and resident free records retirement without releasing it.",
+      "oracle": "resident_lifetime_paths",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "resident.same_key_descriptor_conflict",
+      "axes": [
+        "ordinary-resident",
+        "content-address-reuse"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "A resident key collision with a different kind, byte count, alignment, or charged size fails before allocation and does not fall back or allocate a second block.",
+      "oracle": "resident_descriptor_conflict",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "resident.device_lifetime",
+      "axes": [
+        "ordinary-resident",
+        "cold-warm"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "A device matrix has not yet proved ordinary versus resident high-water and lifetime across cold and repeated launches.",
+      "oracle": "resident_device_unproven",
+      "limitations": [
+        "The frozen host matrix does not ingest separate cold/repeated device snapshots. The device-log overlay observes resident counters, but v1 still has no cross-process resident identity or content proof."
+      ],
+      "next_evidence": [
+        "Retain the separate cold/repeated logs and define a versioned process/resident identity contract before promoting the observation."
+      ]
+    },
+    {
+      "id": "alignment.supported_source_contract",
+      "axes": [
+        "alignment",
+        "charged-units"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The ordinary and resident ABIs accept power-of-two alignment through 2048, so 128, 256, and 2048 are source-supported; invalid values fail closed.",
+      "oracle": "alignment_source_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "alignment.device_addresses",
+      "axes": [
+        "alignment"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "Actual device addresses for ordinary, weight-resident, and workspace-resident allocations at 128, 256, and 2048 are not established by this host/source result.",
+      "oracle": "device_alignment_unproven",
+      "limitations": [
+        "Source alone still proves nothing about a device address: the runtime report keeps address_alignment_status=not-proven. The address-free overlay is the ingest point for the alignment_128/256/2048 phases, and it records only that each ordinary, weight-resident, and workspace-resident pointer satisfied the requested-alignment modulo \u2014 no address value, no address reuse, and no charged-bytes or alignment semantics."
+      ],
+      "next_evidence": [
+        "Re-capture the three alignment phases whenever any of the four preflight fingerprint roles (probe_so, libtriton.so, linalg-hexagon-opt, libhmxapi.a) changes; physical address values, address reuse, and charged-bytes semantics stay not-proven."
+      ]
+    },
+    {
+      "id": "units.charged_bytes",
+      "axes": [
+        "charged-units",
+        "alignment"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Charged bytes are allocator-rounded bytes: 128-byte quantum below 2048 and 2048-byte quantum at/above 2048, independent of a stricter address alignment.",
+      "oracle": "charged_unit_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "cache.source_retain_hit_drop_evict",
+      "axes": [
+        "free-cache"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Retain, hit, drop, and allocation-failure eviction branches have explicit cumulative counters and bounded process events.",
+      "oracle": "free_cache_source_paths",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "cache.device_state_transitions",
+      "axes": [
+        "free-cache",
+        "cold-warm"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "The four free-cache transitions, especially allocation-failure eviction, are not all proven as deterministic device cells by the current matrix.",
+      "oracle": "device_cache_unproven",
+      "limitations": [
+        "The extended wrapper and separate overlay observe retain/hit/drop and a fixed allocation-failure eviction, but the frozen host matrix does not import per-transition device evidence; the fixed eviction pattern does not claim a successful retry."
+      ],
+      "next_evidence": [
+        "Keep the address-free transition overlay separate from v1 and define a complete cache-state observation/importer before promoting the cell."
+      ]
+    },
+    {
+      "id": "fragmentation.source_metrics",
+      "axes": [
+        "fragmentation"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Snapshots and events expose free bytes, largest free bytes, free-block count, and a deterministic parts-per-million fragmentation metric.",
+      "oracle": "fragmentation_source_metrics",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "fragmentation.device_peak_model",
+      "axes": [
+        "fragmentation",
+        "cold-warm"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "The source metrics are not a proven allocator model or a site-attributed peak predictor for real kernels.",
+      "oracle": "fragmentation_device_unproven",
+      "limitations": [
+        "fragmentation_ppm is now a closed function over the attested capture: it equals (totalFree - largestFree)/totalFree truncated to parts-per-million on all 351 retained event records and all 7 snapshots -- the capture's non-zero fragmentation values included -- the free-byte total evolves exactly as declared charges, and one fully declared free-list pattern (pool bytes, base residue, release targets) is predicted step for step by the host model, including a non-zero fragmentation window and a both-neighbour merge.",
+        "The trajectory is refused rather than guessed: largest free block, free-block count and therefore fragmentation over time depend on placement geometry and on which live block a free releases, and neither is a declared input -- nine frees in this capture have several live blocks with the matching charge, and only one of sixteen candidate pool-base residues is consistent with the observed placement padding -- so no per-step fragmentation trajectory, and hence no fragmentation peak for a real kernel, can be predicted.",
+        "The charged high-water peak is predicted exactly for the six report windows whose events are all present and refused for window 7, where 64 event sequences were dropped from the ring before any window published them; a site- or grid-attributed peak remains out of reach because v1 binds neither site nor grid identity to an event."
+      ],
+      "next_evidence": [
+        "Declare the released block's identity and the pool base alignment in the report ABI (the same prerequisite as allocator.header_split_exact_model), then compare per-step predicted and observed fragmentation across several controlled free-list patterns instead of one fixed pattern.",
+        "Capture with every event published before ring overwrite, and with a bound site/grid identity, before any peak -- including a site-attributed one -- is claimed: a peak needs both the complete trajectory and the attribution rule, and v1 has neither for sites."
+      ]
+    },
+    {
+      "id": "events.ring_drop_limit",
+      "axes": [
+        "truncation-drop"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "The 256-entry ring overwrites the oldest event, increments events_dropped, advances sequence monotonically, and marks event_log_status incomplete.",
+      "oracle": "event_ring_drop_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "events.report_truncation",
+      "axes": [
+        "truncation-drop"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Pool and final cache-line serialization return the explicit -2 truncation sentinel rather than returning a partial report as complete.",
+      "oracle": "report_truncation_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "events.device_drop_and_retry",
+      "axes": [
+        "truncation-drop"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "A device run has not yet forced ring overflow/drop or exercised small-buffer -2 followed by a larger retry.",
+      "oracle": "device_event_limits_unproven",
+      "limitations": [
+        "The extended gate-ON wrapper/device overlay now observes >256 events, dropped events, a -2 small-cap report, and a large-cap retry; the frozen host matrix still does not import these device records."
+      ],
+      "next_evidence": [
+        "Keep the event-limit overlay address-free and fingerprint-bound; promote it only through an explicit device-evidence importer, without changing v1 scope semantics."
+      ]
+    },
+    {
+      "id": "resident.content_address_reuse",
+      "axes": [
+        "content-address-reuse",
+        "process-boundaries"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "Content mutation and source-address reuse are not detected: exact key/descriptor reuse returns the old block without recopying or hashing content.",
+      "oracle": "resident_mutation_unproven",
+      "limitations": [
+        "The resident-v2 key is a process source address and the descriptor contains no content digest; changed bytes behind the same numeric key are observationally equivalent to the original object."
+      ],
+      "next_evidence": [
+        "A future contract must explicitly choose and version a content identity or immutable-object ownership rule; only then can a same-address changed-content case move beyond not-proven."
+      ]
+    },
+    {
+      "id": "scope.changed_context_and_resident_scope_conflicts",
+      "axes": [
+        "process-boundaries",
+        "identity-scope"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "Accounting context and resident-v2 scope are separate immutable process contracts; a changed value fails without replacing the first value.",
+      "oracle": "multi_scope_conflict_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "scope.multi_function_same_process",
+      "axes": [
+        "process-boundaries",
+        "identity-scope"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "Multiple functions or allocation sites in one process cannot be joined to individual accounting events.",
+      "oracle": "multi_function_unproven",
+      "limitations": [
+        "v1 forbids mid-process context switching of the event context, and VTCM_EVIDENCE keeps function_id_status=not-bound / site_scope_status=not-bound-in-v1 for the aggregate.",
+        "The site-scope declaration carries exactly one site, so a process whose bound events span two sites cannot be joined from a single declaration however the events are stamped; only the most recent registration is published."
+      ],
+      "next_evidence": [
+        "Use one observation process per function/site, or version a declaration that carries a per-site table rather than a single site; do not infer attribution from the declared context."
+      ]
+    },
+    {
+      "id": "scope.multi_module_same_process",
+      "axes": [
+        "process-boundaries",
+        "identity-scope"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "Accounting state has no module identity and therefore cannot attribute aggregate fields across modules linked into one process.",
+      "oracle": "multi_module_unproven",
+      "limitations": [
+        "The v1 context has build/function/site/scope fields but no module field; linked-module ownership is not part of the evidence contract."
+      ],
+      "next_evidence": [
+        "Run one module per observation process, or define a separately versioned module identity and aggregation rule before combining reports."
+      ]
+    },
+    {
+      "id": "scope.multi_process_isolation",
+      "axes": [
+        "process-boundaries"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "Separate-process reset/isolation and report join rules have not been exercised by the existing single-process device wrapper.",
+      "oracle": "multi_process_unproven",
+      "limitations": [
+        "The probe has one main process and no machine-readable parent/child process matrix or reset protocol."
+      ],
+      "next_evidence": [
+        "Launch isolated processes with stable build/scope IDs, verify counters restart independently, and define an external join key without carrying runtime addresses between processes."
+      ]
+    },
+    {
+      "id": "scope.resident_accounting_binding",
+      "axes": [
+        "process-boundaries",
+        "identity-scope",
+        "content-address-reuse"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "The 64-bit accounting scope ID is not bound to the independent 128-bit resident-v2 scope pair or to a specific resident key.",
+      "oracle": "resident_accounting_binding_unproven",
+      "limitations": [
+        "The runtime deliberately keeps the two scopes separate and does not compare, truncate, extend, or join them."
+      ],
+      "next_evidence": [
+        "Define an explicit versioned cross-scope/resident identity contract; until then keep resident key/content claims process-local and not-proven."
+      ]
+    },
+    {
+      "id": "allocator.no_in_pool_header_source_contract",
+      "axes": [
+        "allocator-blocks",
+        "allocator-headers",
+        "ordinary-resident"
+      ],
+      "status": "pass",
+      "claim_scope": "source-contract",
+      "claim": "A VTCM pool block carries no in-pool header: the charged length is the size-rounded payload with no reserved prefix, the deallocation size arrives as an out-of-band argument at every release entry point (the public free ABI does not even take one), it is verified against host-RAM bookkeeping before the block is released, and that bookkeeping lives in ordinary host containers rather than in pool bytes.",
+      "oracle": "no_in_pool_header_source_contract",
+      "limitations": [],
+      "next_evidence": []
+    },
+    {
+      "id": "allocator.header_split_exact_model",
+      "axes": [
+        "allocator-blocks",
+        "allocator-headers",
+        "split-coalesce"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "The runtime observes pool blocks, size-rounded charges, split/coalesce counters, and free-list state, but does not prove a complete header-inclusive allocator model or exact peak.",
+      "oracle": "allocator_model_unproven",
+      "limitations": [
+        "The bounded host-side model now replays the attested capture fixture exactly: charge fields, effective alignment, allocated/free/resident bytes and allocation count for all 351 retained event records plus every report-window checkpoint, after one declared re-anchor across the 64 event sequences the ring dropped before any window published them; this closes the arithmetic sub-model only and claims neither block geometry nor a peak.",
+        "Block geometry is underdetermined by declared inputs: placement depends on the pool base residue modulo the effective alignment, which the report keeps address_alignment_status=not-proven, and a v1 free carries no block identity, so nine frees in this capture have several live blocks with the matching charge -- free-block count, largest free block, split/coalesce outcome and address padding are therefore refused rather than modelled.",
+        "Reachability is not prediction: under exactly one of sixteen candidate residues the documented split/coalesce rule reaches every observed transition of the first contiguous event segment, yet several free-list states survive it, and software metadata/header overhead stays host-RAM bookkeeping outside the pool rather than a pool quantity the model can sum."
+      ],
+      "next_evidence": [
+        "Publish the pool base residue (or per-placement offsets relative to a declared base) and the released block's identity in the report ABI; only then can the existing split/coalesce, alignment-padding and failure rules run as a predictor and be compared with same-scope device snapshots.",
+        "Capture with every event published before ring overwrite (report window capacity at least the emitted event count), so the replay needs no re-anchor and an exact peak can be compared instead of refused."
+      ]
+    },
+    {
+      "id": "scope.grid_instance_join",
+      "axes": [
+        "grid",
+        "identity-scope",
+        "process-boundaries"
+      ],
+      "status": "not-proven",
+      "claim_scope": "identity-join",
+      "claim": "The v1 process report does not identify a grid instance or join a process high-water to a function, allocation site, or grid instance.",
+      "oracle": "grid_join_unproven",
+      "limitations": [
+        "There is no grid/instance field or per-event scope switch in accounting context v1; process aggregate values cannot be relabeled as grid=1 evidence."
+      ],
+      "next_evidence": [
+        "Add a separately versioned launch-instance identity and reset/join protocol, or run an explicitly grid=1 observation whose launcher scope is independently recorded."
+      ]
+    },
+    {
+      "id": "allocator.bounded_interval_over_process_high_water",
+      "axes": [
+        "allocator-blocks",
+        "free-cache",
+        "split-coalesce"
+      ],
+      "status": "not-proven",
+      "claim_scope": "device-observation",
+      "claim": "A two-sided bound on the process charged high-water follows from three separately established quantities -- the resident aligned floor (exact), the transient aligned peak (an upper bound over a union-joined live set), and the free cache's byte cap -- so resident_aligned <= high_water <= resident_aligned + transient_aligned_peak + kMaxCachedBytes. This is an interval, not a value: it is neither an exact peak nor an occupancy.",
+      "oracle": "allocator_bounded_interval_unproven",
+      "limitations": [
+        "Sound only when the accounting status is complete and every resident site has executed; a partial census makes both terms unsound.",
+        "The transient term is an upper bound twice over: the active set is a union-join over-approximation, and the size quantum rounds each site up.",
+        "Carries no fragmentation, split/coalesce geometry or address-padding information, so it cannot be read as an occupancy figure.",
+        "The upper bound assumes the free cache never exceeds kMaxCachedBytes, which is a cache-capacity fact rather than a measurement of this kernel."
+      ],
+      "next_evidence": [
+        "Compare the interval against same-scope device snapshots for kernels whose resident and transient terms are both proven.",
+        "Only after that comparison, consider publishing the interval as an admission input; publishing it earlier would turn a bound into a capacity claim."
+      ]
+    }
+  ]
+}

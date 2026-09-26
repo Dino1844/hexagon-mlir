@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hmx-vtcm-accounting-boundary-matrix:v1",
+  "title": "R-A.1 VTCM accounting boundary matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "title",
+    "contract",
+    "cells"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hmx-vtcm-accounting-boundary-matrix/v1"
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtime_report_schema",
+        "identity_schema",
+        "event_scope_schema",
+        "event_scope_policy",
+        "aggregate_scope",
+        "function_attribution",
+        "allocation_site_attribution",
+        "resident_accounting_scope_binding",
+        "address_alignment_in_report",
+        "allocator_aligned_status",
+        "header_accounting_status",
+        "in_pool_header_absence",
+        "split_coalesce_model_status",
+        "grid_attribution",
+        "cold_warm_runtime_status",
+        "content_identity_status",
+        "probe_default",
+        "backend_option",
+        "v3_producer",
+        "manifest_mutation",
+        "launcher_mutation",
+        "cache_envelope_mutation",
+        "status_vocabulary",
+        "bounded_interval_status",
+        "bounded_interval_basis"
+      ],
+      "properties": {
+        "runtime_report_schema": {
+          "const": 1
+        },
+        "identity_schema": {
+          "const": 1
+        },
+        "event_scope_schema": {
+          "const": 1
+        },
+        "event_scope_policy": {
+          "const": "process-only-v1"
+        },
+        "aggregate_scope": {
+          "const": "process"
+        },
+        "function_attribution": {
+          "const": "declared-only"
+        },
+        "allocation_site_attribution": {
+          "const": "not-bound-in-v1"
+        },
+        "resident_accounting_scope_binding": {
+          "const": "not-proven"
+        },
+        "address_alignment_in_report": {
+          "const": "not-proven"
+        },
+        "allocator_aligned_status": {
+          "const": "not-proven"
+        },
+        "header_accounting_status": {
+          "const": "not-proven"
+        },
+        "in_pool_header_absence": {
+          "const": "source-verified-absent-out-of-band-size-host-metadata"
+        },
+        "split_coalesce_model_status": {
+          "const": "not-proven"
+        },
+        "grid_attribution": {
+          "const": "not-bound-in-v1"
+        },
+        "cold_warm_runtime_status": {
+          "const": "not-proven-runtime"
+        },
+        "content_identity_status": {
+          "const": "not-proven"
+        },
+        "probe_default": {
+          "const": "off"
+        },
+        "backend_option": {
+          "const": false
+        },
+        "v3_producer": {
+          "const": false
+        },
+        "manifest_mutation": {
+          "const": false
+        },
+        "launcher_mutation": {
+          "const": false
+        },
+        "cache_envelope_mutation": {
+          "const": false
+        },
+        "status_vocabulary": {
+          "const": [
+            "pass",
+            "fail",
+            "not-proven"
+          ]
+        },
+        "bounded_interval_status": {
+          "const": "not-proven"
+        },
+        "bounded_interval_basis": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/cell"
+      }
+    }
+  },
+  "$defs": {
+    "cell": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "axes",
+        "status",
+        "claim_scope",
+        "claim",
+        "oracle",
+        "limitations",
+        "next_evidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+        },
+        "axes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "alignment",
+              "allocator-blocks",
+              "allocator-headers",
+              "charged-units",
+              "cold-warm",
+              "content-address-reuse",
+              "free-cache",
+              "fragmentation",
+              "grid",
+              "identity-scope",
+              "ordinary-resident",
+              "probe-gate",
+              "process-boundaries",
+              "split-coalesce",
+              "truncation-drop",
+              "wire-boundary"
+            ]
+          }
+        },
+        "status": {
+          "enum": [
+            "pass",
+            "fail",
+            "not-proven"
+          ]
+        },
+        "claim_scope": {
+          "enum": [
+            "source-contract",
+            "device-observation",
+            "identity-join"
+          ]
+        },
+        "claim": {
+          "type": "string",
+          "minLength": 1
+        },
+        "oracle": {
+          "type": "string",
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "limitations": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "next_evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "not-proven"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "limitations": {
+                "minItems": 1
+              },
+              "next_evidence": {
+                "minItems": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "pass"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "claim_scope": {
+                "const": "source-contract"
+              },
+              "limitations": {
+                "maxItems": 0
+              },
+              "next_evidence": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

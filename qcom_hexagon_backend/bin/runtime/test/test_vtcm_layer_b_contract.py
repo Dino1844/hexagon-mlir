@@ -15,7 +15,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME = ROOT / "bin" / "runtime"
-PROBE = ROOT.parents[1] / "exp" / "hmx" / "vtcm_accounting_probe"
+# The claim ledger is part of the repository; see test/VTcmAccounting/README.md.
+MATRIX = ROOT / "test" / "VTcmAccounting"
 
 
 def read(relative: str) -> str:
@@ -574,7 +575,7 @@ def test_boundary_matrix_marks_new_gaps_not_proven() -> None:
     import json
 
     document = json.loads(
-        (PROBE / "boundary_matrix.json").read_text(encoding="utf-8")
+        (MATRIX / "boundary_matrix.json").read_text(encoding="utf-8")
     )
     cells = {cell["id"]: cell for cell in document["cells"]}
     for cell_id in ("allocator.header_split_exact_model", "scope.grid_instance_join"):

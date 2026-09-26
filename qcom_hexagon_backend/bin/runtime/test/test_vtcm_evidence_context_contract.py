@@ -16,7 +16,6 @@ import re
 
 ROOT = Path(__file__).resolve().parents[3]
 RUNTIME = ROOT / "bin" / "runtime"
-PROBE = ROOT.parents[1] / "exp" / "hmx" / "vtcm_accounting_probe"
 
 
 def read(relative: str) -> str:
@@ -122,27 +121,13 @@ def test_pool_and_cache_high_waters_are_separate_ledgers() -> None:
     assert "full-kernel occupancy" in capi
 
 
-def test_probe_requires_context_but_does_not_add_production_surface() -> None:
-    wrapper = (PROBE / "wrapper_vtcm_accounting.cpp").read_text(encoding="utf-8")
-    driver = (PROBE / "run_probe.py").read_text(encoding="utf-8")
-    context = (PROBE / "evidence_context.py").read_text(encoding="utf-8")
-    assert "VTCM_EVIDENCE_CONTEXT" in wrapper
-    assert "observation_scope=one-immutable-principal-module-function-canonical-site-grid1-single-invocation" in wrapper
-    assert "cache_owner=aggregate" in wrapper
-    assert "combined_pool_cache_high_water=not-proven" in wrapper
-    assert "event_owner_status=aggregate" in wrapper
-    assert "delayed_cache_owner_status=aggregate" in wrapper
-    assert "VTCM_EVIDENCE_CONTEXT" in driver
-    assert "SCHEMA = \"hmx-vtcm-evidence-context/v1\"" in context
-    assert "per_event_identity_sound" in context
-    assert "resident_scope_id" in context
-    assert "workspace_overwrite_proof" in context
-    assert "packed_weight_source_view" in context
-    assert "combined_lower_bound_bytes" in context
-    assert "performance_claimed" in context
-    assert "hex.hmx.kernel_manifest" not in context
-    assert "import subprocess" not in context
-    assert "from triton" not in context
+# The probe contract check (wrapper / driver / evidence-context builder) used to
+# live here. Every assertion in it was about experiment scaffolding under
+# `exp/hmx/vtcm_accounting_probe/`, so keeping it here made the repository's test
+# suite depend on a directory outside the repository -- a fresh clone failed before
+# running anything, and the check would bit-rot whenever the probe changed shape.
+# It now lives beside what it checks, in
+# `exp/hmx/vtcm_accounting_probe/test_probe_contract.py`.
 
 
 if __name__ == "__main__":
@@ -150,7 +135,6 @@ if __name__ == "__main__":
         test_marker_and_schema_are_explicit_and_non_wire,
         test_runtime_context_line_refuses_unsound_joins,
         test_pool_and_cache_high_waters_are_separate_ledgers,
-        test_probe_requires_context_but_does_not_add_production_surface,
     )
     for test in tests:
         test()
