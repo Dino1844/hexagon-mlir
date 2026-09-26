@@ -424,8 +424,13 @@ static int64_t vtcmBytesCommitted(func::FuncOp func) {
   });
   // Resident constant weights are `hexagonmem.alloc`s (or already lowered),
   // never `memref.alloc`s, so the resident declaration is the only place their
-  // footprint is visible here. Reading the same module attribute the
-  // attribution checked keeps one budget for both levels.
+  // footprint is visible here. This pass runs after `WeightResidentPass`, which
+  // created them, so the attribute exists. `matmul-to-hmx` cannot read it --
+  // it runs first, and the weight is still an `hmx.alloc_crouton` there -- so
+  // this is the tile-level image of the *partitioning* budget rather than of
+  // `matmul-to-hmx::vtcmBytesCommitted`, which measures a different thing: one
+  // contraction's own working set. Both are needed and they are not the same
+  // number, which is why neither pass can stand in for the other.
   if (auto module = func->getParentOfType<ModuleOp>())
     if (auto resident =
             module->getAttrOfType<IntegerAttr>("hmx.weight_resident_bytes"))

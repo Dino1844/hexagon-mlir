@@ -43,12 +43,14 @@
 //   * the fmtKB()/fmtPct() arguments of the alloc/free log lines are evaluated
 //     eagerly (they run snprintf) even though VTCM_DEBUG defaults to 0.
 //
-// Gate those diagnostics behind an explicit opt-in: a debug build defines
-// HEXMLIR_RUNTIME_DEBUG (e.g. -DHEXMLIR_RUNTIME_DEBUG) and keeps every check
-// and log; the release device build does not, so the work is compiled out. This
-// changes no allocator behavior -- the real guards (the CHECK()s over an
-// unallocated / wrong-size / already-free pointer, and the free-list overlap
-// tests in coalesceAndAddToFreeList) run unconditionally.
+// Gate those diagnostics behind an explicit opt-in: a debug build enables the
+// CMake option of the same name (-DHEXMLIR_RUNTIME_DEBUG=ON in
+// bin/runtime/CMakeLists.txt, which is what puts HEXMLIR_RUNTIME_DEBUG on the
+// bitcode command line) and keeps every check and log; the release device build
+// does not, so the work is compiled out. This changes no allocator behavior --
+// the real guards (the CHECK()s over an unallocated / wrong-size / already-free
+// pointer, and the free-list overlap tests in coalesceAndAddToFreeList) run
+// unconditionally.
 //===----------------------------------------------------------------------===//
 #ifdef HEXMLIR_RUNTIME_DEBUG
 #define HEXMLIR_RT_DIAG 1

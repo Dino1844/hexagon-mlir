@@ -808,13 +808,33 @@ static int64_t vtcmBytesCommitted(Operation *within) {
       return;
     bytes += type.getNumElements() * (type.getElementTypeBitWidth() / 8);
   });
-  // Resident constant weights are not `hmx.alloc_crouton`s here -- the
-  // residency declaration on the module is their single source of truth, so the
-  // budget this pass checks cannot drift from the one the runtime reserves.
-  if (auto module = within->getParentOfType<ModuleOp>())
-    if (auto resident =
-            module->getAttrOfType<IntegerAttr>("hmx.weight_resident_bytes"))
-      bytes += resident.getInt();
+  // This is *this dot's* budget and nothing more: the crouton arrays earlier
+  // attributions in this function committed, plus -- through
+  // `HmxTarget::planBridge`, whose `croutonBytes(m, n, k)` includes the `k * n`
+  // term and whose M-blocking path subtracts `weightBytes` explicitly -- this
+  // contraction's own working set, weight included.
+  //
+  // A weight that will be made resident across the whole kernel is *not*
+  // accounted here, and cannot be: residency is decided by
+  // `WeightResidentPass`, which runs after this pass because it needs the
+  // `hmx.matmul` this pass creates. So the two facts cannot be combined here
+  // even in principle. An earlier version of this function read
+  // `hmx.weight_resident_bytes` and claimed the module declaration was "their
+  // single source of truth, so the budget this pass checks cannot drift from
+  // the one the runtime reserves". That read was dead on the production path --
+  // the attribute is written later, so the term was always zero -- and the claim
+  // was the opposite of what the ordering guarantees. The weight's crouton array
+  // is an `hmx.alloc_crouton` here, so adding the declaration on top of the walk
+  // would also have counted the same weight twice once the attribute did exist.
+  //
+  // The persistent total is checked where it is decided, in
+  // `WeightResidentPass`, before it commits a resident buffer. What a refusal
+  // costs depends on the weight's source and the pass says which: a runtime
+  // argument weight keeps the per-launch device-side pack, and a constant weight
+  // has no such fallback -- after bufferization it is a `memref.get_global` the
+  // engine cannot read, so its VTCM buffer is the only legal form and the
+  // residency pass rejects the module instead. Neither outcome is decided here,
+  // and neither revises the plan this function made.
   return bytes;
 }
 

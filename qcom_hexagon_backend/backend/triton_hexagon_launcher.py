@@ -567,13 +567,6 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         # sharing the diagnostic/runtime workspace before any device access.
         enforce_hmx_launch_contract(hmx_manifest, launch_grid)
 
-        # Crash-triage override (rowmax plan §12, temporary): swap the freshly
-        # compiled kernel .o for a caller-supplied one (binary-bisection of the
-        # device crash without rebuilding the compiler).
-        _ov = os.environ.get("FA_O_OVERRIDE")
-        if _ov:
-            kernel_obj_as_bytes = Path(_ov).read_bytes()
-            print(f"==> FA_O_OVERRIDE active: {_ov} ({len(kernel_obj_as_bytes)} B)")
         resident_scope_id = make_resident_scope_id(kernel_obj_as_bytes, func_name)
         # Getting the input metadata for effective wrapper codegen.
         input_profs = profile_triton_inputs(inputs)

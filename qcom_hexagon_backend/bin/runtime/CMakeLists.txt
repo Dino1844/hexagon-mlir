@@ -70,21 +70,6 @@ else()
 endif()
 set(HEXAGON_FLAGS -O2 -Wall -mv${BITCODE_ARCH} -mhvx -mhvx-qfloat)
 
-# TEMPORARY A/B KNOBS (delete with the causal-split scaffold). The DSP-side
-# runtime cannot be steered by environment variables (the FastRPC user PD does
-# not inherit the launching shell's env -- verified on device), so the causal
-# split is done at build level. Pass a comma list of the two disable defines:
-#   -DHEXMLIR_AB_DISABLE=NO_POWER_VOTE           -> power vote compiled out
-#   -DHEXMLIR_AB_DISABLE=NO_POWER_VOTE,NO_VTCM_CACHE -> both out
-if(HEXMLIR_AB_DISABLE)
-  foreach(_ab ${HEXMLIR_AB_DISABLE})
-    string(REPLACE "," ";" _ab_list "${_ab}")
-    foreach(_name ${_ab_list})
-      list(APPEND HEXAGON_FLAGS "-DHEXMLIR_AB_${_name}")
-    endforeach()
-  endforeach()
-  message(STATUS "A/B disable defines: ${HEXAGON_FLAGS}")
-endif()
 # BRINGUP probe (exp/hmx/bringup_probe): record per-step timings of the one-shot
 # HexagonAPI bring-up. Off by default so the shipping runtime bitcode is
 # unchanged; build the probe with -DHEXMLIR_BRINGUP_PROBE=ON. The probe wrapper
@@ -103,6 +88,19 @@ option(HEXMLIR_VTCM_ACCOUNTING_PROBE "Record VTCM allocation accounting diagnost
 if(HEXMLIR_VTCM_ACCOUNTING_PROBE)
   list(APPEND HEXAGON_FLAGS -DHEXMLIR_RUNTIME_VTCM_ACCOUNTING_PROBE)
   message(STATUS "VTCM accounting probe enabled: ${HEXAGON_FLAGS}")
+endif()
+
+# Runtime diagnostics: the per-alloc/free VTCM invariant scans and log lines
+# that src/VTCMPool.cpp gates behind HEXMLIR_RUNTIME_DEBUG. The bitcode is built
+# at -O2 without -DNDEBUG, so without this define every `#ifndef NDEBUG` check in
+# the runtime is live in production and sits on the per-launch path. Default OFF
+# keeps the shipping runtime bitcode unchanged; build with
+# -DHEXMLIR_RUNTIME_DEBUG=ON for a diagnostic build. Behavior is identical
+# either way -- only the diagnostics come back.
+option(HEXMLIR_RUNTIME_DEBUG "Enable runtime VTCM allocation diagnostics" OFF)
+if(HEXMLIR_RUNTIME_DEBUG)
+  list(APPEND HEXAGON_FLAGS -DHEXMLIR_RUNTIME_DEBUG)
+  message(STATUS "Runtime diagnostics enabled: ${HEXAGON_FLAGS}")
 endif()
 
 # NOTE: the HMX leaves (src/HMXAPI.c, src/HMXLayout.c) are NOT built as bitcode

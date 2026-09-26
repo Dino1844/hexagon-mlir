@@ -117,5 +117,15 @@ def main() -> None:
     print("VTCM event-context ABI constants source contract: PASS")
 
 
+def test_event_abi_constants_source_contract() -> None:
+    """The assertions above, under pytest.
+
+    Without this the file collects zero tests, so the whole contract is a
+    no-op in the pytest style while still passing as a script.  Both styles must
+    run the same assertions, so this delegates rather than restating them.
+    """
+    main()
+
+
 if __name__ == "__main__":
     main()

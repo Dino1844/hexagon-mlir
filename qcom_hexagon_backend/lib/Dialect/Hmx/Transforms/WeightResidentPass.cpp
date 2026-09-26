@@ -47,10 +47,42 @@
 //
 // Residency is declared once, in the module attribute
 // `hmx.weight_resident_bytes` (the aggregate of the per-buffer byte counts the
-// pass computes). Both static VTCM-budget readers (`matmul-to-hmx`,
-// `hmx-partition`) consult it, and the runtime receives the same number on the
-// lowering's call, so the static budget and the resident footprint cannot
-// drift apart.
+// pass computes), and the runtime receives the same number on the lowering's
+// call, so the declared footprint and what the device reserves cannot drift
+// apart.
+//
+// The two static VTCM budgets are checked by two different passes, at the two
+// points where the information exists, and they are not the same question:
+//
+//   * `matmul-to-hmx` admits one contraction. Its budget is that contraction's
+//     own working set plus the crouton arrays earlier attributions in the same
+//     function committed. It cannot include a resident total, because this pass
+//     runs after it -- it needs the `hmx.matmul` that pass creates -- so the
+//     ordering makes that combination impossible rather than merely late.
+//   * This pass creates a buffer that occupies VTCM for the whole kernel, so it
+//     checks the persistent total here, before it commits. What happens on a
+//     refusal depends on which of the two sources above it is, because only one
+//     of them has a fallback:
+//
+//       - A runtime weight keeps the per-launch `hmx.pack_weight` bridge, which
+//         is this pass's existing way of declining a weight (a non-pinnable view
+//         takes the same route). The contraction is untouched, so the cost is
+//         the prepack optimisation for that weight and nothing else.
+//       - A constant weight has no such route: the resident VTCM buffer is the
+//         only form its operand can legally take, because `hmx.mma` requires
+//         its weight in VTCM and the operand it replaces is a DDR
+//         `memref.get_global`. Refusing to pin it is reported as an error
+//         instead, because the alternative is a module that fails verification
+//         later with a message about memory space rather than about the pool.
+//
+//     In neither case is the contraction refused: `matmul-to-hmx` admitted it
+//     before this pass ran, and nothing here revisits that decision.
+//
+// An earlier design had `matmul-to-hmx` read this attribute too and called it
+// "their single source of truth". That read was dead on the production path, so
+// the guarantee it was cited for did not exist; and the weight's crouton array
+// is an `hmx.alloc_crouton` at that point, so it would also have counted the
+// same weight twice once the attribute did exist.
 //
 //===----------------------------------------------------------------------===//
 
@@ -59,6 +91,7 @@
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -395,6 +428,33 @@ static void appendPrepackEntry(ModuleOp module, StringRef entry) {
   module->setAttr(kPrepackAttr, StringAttr::get(module.getContext(), merged));
 }
 
+/// The module's declared resident footprint, read under the same rules the
+/// writer applies: absent means nothing is resident yet (zero), present means a
+/// non-negative i64. A declared value that is negative or not an i64 is
+/// *rejected* rather than read as a smaller number, so a guard built on this can
+/// never be satisfied by a wrapped or corrupt aggregate. Shared with
+/// `addCheckedResidentBytes` on purpose -- the guard and the writer must not be
+/// able to disagree about what the aggregate means.
+static FailureOr<int64_t> residentBytesDeclared(ModuleOp module) {
+  auto declared = module->getAttrOfType<IntegerAttr>(kResidentBytesAttr);
+  if (!declared)
+    return int64_t{0};
+  if (!declared.getType().isInteger(64) || declared.getInt() < 0)
+    return module.emitError("resident byte aggregate is missing or malformed");
+  return declared.getInt();
+}
+
+/// `a + b`, rejecting an overflow rather than wrapping into a smaller number.
+/// The resident footprint is an exact requested-byte descriptor, so every sum
+/// that feeds the budget is checked: a wrapped total is a total that would
+/// *admit* something the pool cannot hold.
+static FailureOr<int64_t> checkedResidentAdd(ModuleOp module, int64_t a,
+                                             int64_t b) {
+  if (a < 0 || b < 0 || a > std::numeric_limits<int64_t>::max() - b)
+    return module.emitError("VTCM byte total overflows int64");
+  return a + b;
+}
+
 static void addCompatibilityResidentBytes(ModuleOp module, int64_t bytes) {
   int64_t total = bytes;
   if (auto existing = module->getAttrOfType<IntegerAttr>(kResidentBytesAttr))
@@ -410,16 +470,15 @@ static void addCompatibilityResidentBytes(ModuleOp module, int64_t bytes) {
 static LogicalResult addCheckedResidentBytes(ModuleOp module, int64_t bytes) {
   if (bytes < 0)
     return module.emitError("resident byte aggregate cannot be negative");
-  int64_t total = bytes;
-  if (auto existing = module->getAttrOfType<IntegerAttr>(kResidentBytesAttr)) {
-    if (!existing.getType().isInteger(64) || existing.getInt() < 0 ||
-        existing.getInt() > std::numeric_limits<int64_t>::max() - total)
-      return module.emitError("resident byte aggregate overflows int64");
-    total += existing.getInt();
-  }
+  FailureOr<int64_t> existing = residentBytesDeclared(module);
+  if (failed(existing))
+    return failure();
+  FailureOr<int64_t> total = checkedResidentAdd(module, bytes, *existing);
+  if (failed(total))
+    return failure();
   module->setAttr(
       kResidentBytesAttr,
-      IntegerAttr::get(IntegerType::get(module.getContext(), 64), total));
+      IntegerAttr::get(IntegerType::get(module.getContext(), 64), *total));
   return success();
 }
 
@@ -447,6 +506,127 @@ static LogicalResult verifyResidentByteAggregate(ModuleOp module) {
     return module.emitError(
         "resident byte aggregate disagrees with resident descriptors");
   return success();
+}
+
+/// VTCM bytes the function's own static allocations already hold. After
+/// bufferization the space-1 crouton arrays (`hmx.alloc_crouton`'s tile-level
+/// image) are `memref.alloc`s, so this is the same walk, over the same ops, as
+/// the allocation half of `HmxPartitionPass::vtcmBytesCommitted` -- one pool,
+/// one set of allocations, so the three readers of it cannot drift apart. The
+/// tensor-level `hmx.alloc_crouton` walk `matmul-to-hmx` uses is not available
+/// here: this pass runs after bufferization.
+///
+/// Computed fresh at each admission rather than cached, because the answer
+/// moves under the loop: a runtime weight that becomes resident has its pack
+/// array erased, so a cached total would keep charging for a buffer that is gone
+/// and would refuse later weights for a transient that no longer exists.
+static int64_t transientVtcmBytes(func::FuncOp func) {
+  int64_t bytes = 0;
+  func.walk([&](memref::AllocOp alloc) {
+    auto type = dyn_cast<MemRefType>(alloc.getType());
+    if (!type || !type.hasStaticShape() ||
+        type.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE)
+      return;
+    Type elem = type.getElementType();
+    if (!elem.isIntOrFloat())
+      return;
+    bytes += type.getNumElements() * (elem.getIntOrFloatBitWidth() / 8);
+  });
+  return bytes;
+}
+
+/// The answer to the one question this pass has to ask before it commits a
+/// resident buffer: does the persistent footprint still fit the pool?
+///
+/// `hexagonmem` VTCM is a single pool of `HmxTarget::defaultVtcmBudget` bytes,
+/// shared by the crouton arrays, the accumulators and every resident weight, and
+/// the device's `requireAllocationResult` is fail-closed -- an allocation that
+/// does not fit aborts the whole PD at load time. So a residency whose overrun
+/// is visible right here used to compile cleanly and abort the process on the
+/// device. Deciding here is what turns that into a compile-time outcome.
+///
+/// The total is the three sets of bytes that are all live at once once the
+/// buffer exists: the function's transient VTCM allocations, the resident
+/// footprint committed so far, and the buffer being committed.
+struct ResidentVtcmAdmission {
+  int64_t transient = 0; ///< VTCM bytes the function's own allocations hold.
+  int64_t resident = 0;  ///< Resident bytes committed before this buffer.
+  int64_t requested = 0; ///< The buffer about to be committed.
+  int64_t total = 0;     ///< transient + resident + requested.
+  int64_t budget = 0;    ///< `HmxTarget::defaultVtcmBudget`.
+  bool admitted = false; ///< `total < budget`; see the boundary note below.
+};
+
+/// The only place the resident capacity question is answered. Both creation
+/// sites ask it, so the boundary, the budget and the arithmetic cannot differ
+/// between a constant and a runtime weight.
+///
+/// The budget is `HmxTarget::defaultVtcmBudget`, the same constant the other
+/// static readers fall back to (`HmxPartitionPass` uses it whenever its own
+/// `vtcm-budget` option is unset). This pass has no budget option to narrow it
+/// with, and adding one is deliberately out of scope: a third way to spell the
+/// pool size is one more thing that can disagree with the device.
+///
+/// Two properties are the reason the guard lives here and not upstream:
+///
+///   * It is *conservative*, on purpose. The transient walk counts a runtime
+///     weight's own pack array, which dies the moment the resident copy is what
+///     the engine reads. So this can decline a residency that would in fact
+///     have fitted. That is the safe direction to be wrong in: the cost is
+///     losing the prepack optimisation for that one weight, never losing HMX.
+///   * It can only decline *residency*. The contraction was admitted by
+///     `matmul-to-hmx` before this pass ran, and nothing here revisits that
+///     decision, so a residency refusal can never travel backwards and refuse a
+///     contraction that was already accepted.
+static FailureOr<ResidentVtcmAdmission>
+admitResidentVtcm(func::FuncOp func, ModuleOp module, int64_t addedBytes,
+                  int64_t bytes) {
+  // A negative request is malformed rather than small, and it would make every
+  // sum below look like it fits, so it is rejected before it is used.
+  if (bytes < 0)
+    return module.emitError("resident weight byte count is negative");
+  ResidentVtcmAdmission admission;
+  admission.budget = HmxTarget::defaultVtcmBudget;
+  admission.requested = bytes;
+  admission.transient = transientVtcmBytes(func);
+  // `hmx.weight_resident_bytes` holds what *earlier* functions committed -- this
+  // pass is a per-function pass that writes the attribute only when it ends --
+  // so it and `addedBytes` are disjoint and sum to the footprint so far.
+  FailureOr<int64_t> declared = residentBytesDeclared(module);
+  if (failed(declared))
+    return failure();
+  FailureOr<int64_t> resident = checkedResidentAdd(module, *declared, addedBytes);
+  if (failed(resident))
+    return failure();
+  admission.resident = *resident;
+  FailureOr<int64_t> withTransient =
+      checkedResidentAdd(module, admission.resident, admission.transient);
+  if (failed(withTransient))
+    return failure();
+  FailureOr<int64_t> total =
+      checkedResidentAdd(module, *withTransient, admission.requested);
+  if (failed(total))
+    return failure();
+  admission.total = *total;
+  // Strict `<`, the same boundary `HmxTarget::planBridge` refuses at
+  // (`footprint >= room` refuses): the budget is a pool size, so a total exactly
+  // equal to it leaves no room for the allocation's own 128 B alignment.
+  admission.admitted = admission.total < admission.budget;
+  return admission;
+}
+
+/// The decline, spelled once so a reader can tell it from a weight that was
+/// never eligible. `slot` is the residency key the descriptors use, so the
+/// message points at the thing to look for in the IR.
+static InFlightDiagnostic describeVtcmRefusal(MatmulOp op, int64_t slot,
+                                              const ResidentVtcmAdmission &a) {
+  InFlightDiagnostic diag = op.emitRemark();
+  diag << "resident weight for argument slot " << slot << " declined: "
+       << a.requested << " bytes would make the persistent VTCM total "
+       << a.total << " bytes, over the " << a.budget << " byte budget ("
+       << "transient " << a.transient << " + resident " << a.resident
+       << " + this buffer); the weight keeps its per-launch pack bridge";
+  return diag;
 }
 
 /// Follow a chain of layout-only views to the underlying function argument.
@@ -1497,6 +1677,37 @@ struct WeightResidentPass
             }
           }
           if (!resident) {
+            // --- Capacity gate. ---
+            //
+            // Unlike a runtime weight, a constant has nowhere to fall back to:
+            // its only legal form *is* the resident VTCM buffer, because the
+            // operand it replaces is a DDR `memref.get_global` and `hmx.mma`
+            // requires its weight in VTCM. Leaving it there is not a degraded
+            // kernel, it is a module that fails verification three passes later
+            // with `'hmx.mma' op wt must be in VTCM` -- a message that names
+            // neither the budget nor the residency. Inventing a per-launch copy
+            // here would be a new mechanism, so the overrun is reported at the
+            // point that knows the numbers and compilation stops. The
+            // contraction is still not what is being refused: nothing below
+            // revisits the `hmx.matmul`, and `matmul-to-hmx` already admitted
+            // it upstream.
+            FailureOr<ResidentVtcmAdmission> admission =
+                admitResidentVtcm(func, module, addedBytes, bytes);
+            if (failed(admission))
+              return signalPassFailure();
+            if (!admission->admitted) {
+              op.emitError()
+                  << "resident weight @"
+                  << source.getSymName() << " needs " << admission->requested
+                  << " bytes but the persistent VTCM total would be "
+                  << admission->total << " bytes, over the "
+                  << admission->budget << " byte budget (transient "
+                  << admission->transient << " + resident "
+                  << admission->resident
+                  << " + this buffer); a constant weight has no per-launch "
+                     "fallback, so the module cannot be lowered";
+              return signalPassFailure();
+            }
             auto vtcmType =
                 MemRefType::get(type.getShape(), type.getElementType(),
                                 AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
@@ -1712,6 +1923,33 @@ struct WeightResidentPass
               op.emitError("strict resident weight site identity is zero");
               return signalPassFailure();
             }
+          }
+          // --- Capacity gate. ---
+          //
+          // A runtime weight has a real fallback, so this is a decline and not a
+          // failure: `continue` at this point is the pass's existing way of
+          // keeping the per-launch bridge (the same state a non-pinnable view
+          // takes), and it is clean here because nothing has been rewritten yet
+          // -- the pack loop, its crouton array and its deallocation are all
+          // still intact, and `hmx.weight_prepack` is appended further down, so
+          // a declined slot is simply absent from the contract and keeps
+          // packing on the device. The contraction is untouched: the `hmx.matmul`
+          // below still reads the crouton array the bridge fills, so HMX is not
+          // lost, only the prepack optimisation for this one weight.
+          //
+          // A remark rather than an error even under the strict resident
+          // contract, which turns every *other* decline in this pass into a
+          // failure. Those declines mean the pass cannot certify a provenance
+          // it was asked to certify; running out of pool is a legitimate
+          // outcome of a correct pipeline, and a legitimate outcome must not
+          // stop a kernel that is otherwise fine.
+          FailureOr<ResidentVtcmAdmission> admission =
+              admitResidentVtcm(func, module, addedBytes, bytes);
+          if (failed(admission))
+            return signalPassFailure();
+          if (!admission->admitted) {
+            describeVtcmRefusal(op, slot, *admission);
+            continue;
           }
           rewriter.setInsertionPoint(op);
           // The residency key: the argument's aligned pointer. It is passed as
