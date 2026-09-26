@@ -50,8 +50,8 @@ Triton → TTIR → triton-shared / Linalg
 | 稳态 vs llama.cpp 手写（WR 默认开） | **S1 1.13× / S2 0.92× / S3 0.58×**（S2/S3 已快过手写） |
 | FlashAttention | 稳态 **32.4 → 17.4 ms（1.86×，f32 激活 ABI）**；仓库 FA 测试 **18312 → 8184 µs**（NUM_THREADS 4→1）；评审引述 39.4 → 18.1 ms 未复测 |
 | 常用算子 | `vec_add` 快手写 4.8×、`matmul` 1.15×、softmax/rms_norm 见 `docs/results/op-steady-state-2026-09-21.md` |
-| host 门 | full manual lit **240：239 过 / 0 失败 / 1 skip**（`vector_size.mlir` 的 `REQUIRES`；P1.5 alignment/resident-v2 slice 后重跑） |
-| 仓库状态 | inner `HEAD=26bbba0`（P1.3c 已提交并 push 到 `fork/hmx`）；当前 P1.5 census/liveness slice 未提交，按要求未重生成 stored patch |
+| host 门 | **本页不复述数字**——lit / host / probe / 边界矩阵的实测值与其复算命令只在 `docs/state/STATE-OF-PLAY.md §4.1` 写一次，本页只引用 |
+| 仓库状态 | 内层 `hmx` 分支 `HEAD=09de68d`（`26bbba0` 之后 **6** 个 commit：`270f135 098b2a0 3924c79 615e10e 80a28f2 09de68d`）；`git status --short` 只剩未跟踪的 `logs/`，**源码工作树干净**；stored patch 四份已于 2026-09-26 19:05 重生成（全量 **306 文件 / 460 hunk**；三份 hmx 204 + env 5 + upstream-fixes 251 = 460） |
 
 ---
 
@@ -61,7 +61,24 @@ Triton → TTIR → triton-shared / Linalg
 2. **融合是保守白名单**：仅 all-parallel、单入单出、全 f16、add/sub/mul/div、常量 splat、单一使用者；reduction / mask·cmpi·select / exp·log·sqrt / 类型转换 / max·min / 多用户 producer 一律不进（有设备测量依据：mask/phi/exp 链搬进 crouton 序可能慢 ~10×）。⇒ FA 中只有 QK·PV 两个 dot 有机会走 HMX，softmax 链仍是断点，做不到整块 attention 融合。
 3. **前端仍是实验性入口**：实际走 `triton-shared-opt --triton-to-linalg-experimental`；已有 v1 文档支持矩阵（`docs/codegen/triton-support-matrix.md`），但前端自动查询、按 shape 的策略选择、cost model、HMX/HVX/HexKL 统一决策器仍未接入（`compiler.py` 自注需重构为动态 pass pipeline）。
 4. **单资源 ≠ 并行扩展**：Triton grid 并行 ≠ HMX engine 并行；多线程最终在 runtime HMX lock 处串行化（线程路径已四次证伪），workspace-resident 明确要求 single-instance（grid>1 需自担风险，opt-in）。
-5. **成熟度**：R1（maxnum legalize）等上游 LLVM Hexagon 后端 RA bug 待修 ⇒ 默认 OFF；triage env 门保留待退役；full manual lit 当前 0 红、1 个 `REQUIRES` skip；`docs/`、`tools/`、`AGENTS.md` 在工作区侧无版本控制。
+5. **成熟度**：R1（maxnum legalize）等上游 LLVM Hexagon 后端 RA bug 待修 ⇒ 默认 OFF；临时门/红测的完整清单见 **§2.1**；
+   full manual lit 当前 **0 红 / 1 个 skip**（活的数字与复算命令见 `docs/state/STATE-OF-PLAY.md §4.1`）；`docs/`、`tools/`、`AGENTS.md` 在工作区侧无版本控制。
+
+### 2.1 红测与临时门的 inventory（M1.4 的交付物，只登记一次）
+
+> **规则**：任何红测或临时门必须在此有 **owner + 退出条件**；没有就不许加。红/绿复算：`docs/state/STATE-OF-PLAY.md §4.1`。
+
+| 项 | 现状 | owner | 退出条件 |
+|---|---|---|---|
+| `qcom_hexagon_backend/test/Conversion/LinalgToLLVM/vector_size.mlir` — **唯一的 lit skip** | `// REQUIRES: do-not-run-because-flaky-test-that-needs-being-investigated`。**上游自带**：`git diff main -- <file>` 为空，`git log main -- <file>` 只有上游的初始 commit，本地从未改过 ⇒ **本 fork 无 owner**。manual runner 不解析 `REQUIRES`，按**文件**记为 skip | **无（上游）** | 接受现状。触发条件：上游把它恢复为可跑且通过 ⇒ 删掉 `REQUIRES` 行并把本行移出 inventory；本 fork 若要在该文件上做工作 ⇒ **先给上游开 issue 并在此登记 owner**，不得单方面删 `REQUIRES` |
+| `enableMaxnumLegalize`（R1）+ 3 个子旋钮 | 默认 **OFF**，等上游 LLVM Hexagon RA bug 修好；真机在 hexmem 路径 + ≥[512,128] maxnum tile 上 5/5 崩（本仓侧根因与已 cherry-pick 的上游 PR #204660 见 `docs/hmx/fa-crash-resolved.md`） | 本仓（等上游） | 上游 RA 修复后上机 A/B ⇒ 改默认 |
+| `enableVectorRowReduce`（R2，vror butterfly） | 默认 OFF；host 查证其 pattern 在 FA/softmax 生产管线里**零命中**（+7% 属噪声，已 revert） | 本仓 | 若将来 FA/softmax 管线出现独立行归约再评估，否则按"不达标即关闭"保持关闭 |
+| `HEXAGON_EPI_LOG` | env 门，默认关（`python/triton_qcom_hexagon_backend_api.cc`） | 本仓 | FA/rowmax 调查收口后删除 |
+| `HEXAGON_PTR_LOG` | env 门，默认关；**在 LLIR 里插 `hexagon_runtime_dbg_log_ptr` 调用**，用来命名 FA 崩溃背后那个坏指针 | 本仓 | 同上。⚠️ 配对的 runtime 导出 `hexagon_runtime_dbg_log_ptr`（`bin/runtime/src/HexagonCAPI.cpp`）**自身无 env 门**（直接写 `rt_trc.txt`），但只有本门打开、LLIR 里插了调用才会被调到 |
+| `HEXAGON_ASM_DUMP` / `HEXAGON_ASM_TO_OBJ` / `HEXAGON_ASM_DUMP_FILE` | env 门，默认关，**dump 汇编**（纯诊断件，与 HMX workarounds 无关） | 本仓（长期） | 无退出计划：只观测、默认关 |
+| `HEXMLIR_RUNTIME_TRACE` | **编译期宏，不是 env 门**（`bin/runtime/{src/HexagonCAPI.cpp,multithreading/AsyncRuntime.cpp}` 的 `#ifdef`），默认不定义 | 本仓 | 同上 |
+| `HEXMLIR_RUNTIME_DEBUG` | **CMake 选项**（`bin/runtime/CMakeLists.txt`，默认 OFF），恢复 `VTCMPool` 的 per-alloc/free 不变量扫描与日志 | 本仓（长期） | 无退出计划：默认关、行为不变，是诊断件不是 workaround |
+| 已删除、不要重建的插桩 | `FA_O_OVERRIDE`（把编译出的 kernel `.o` 换成任意文件——**它在 launch 契约已强制之后替换 kernel 对象，是交付物里的活洞，已删**）、`FA_PIN_VREG`/`FA_GUARD`/`FA_PTR_LOG` env 门、barrier 插桩（emitter 与 runtime stub 均无） | — | 复活任一项都要先在本表登记 owner 与理由 |
 
 ---
 
@@ -74,7 +91,7 @@ Triton → TTIR → triton-shared / Linalg
 | M1.1 | **决策系统 / kernel manifest**（评审差距①） | 每个 matmul 报告：是否走 HMX、为何没走、VTCM 用量、是否 blocking、pack/unpack 次数。现有 remark/warning 收敛为**结构化 manifest + 诊断接口**；先保留现有 remark/warning 作为兼容输出 | 标准批可一键打印 manifest；字段与 pass 内判定一一对应；manifest 缺失或字段不一致使测试失败 |
 | M1.2 | **Triton 支持矩阵**（差距②） | 明确四档：可编译 / 可 HMX / 仅 HVX / 拒绝；落成文档 + 测试矩阵，替代"散落在 pass 条件里" | 矩阵每格有对应测试；新 kernel 能 5 分钟查到归宿 |
 | M1.3 | **记档项按触发执行** | 先建立缺失状态文档，记录布局生命周期、BufferManager 五入口、预算归属、resident 内容校验的现状和触发条件；再按文档中的触发条件实施，不把未存在的 `STATE §7.8/§7.9` 当作已批准设计 | 每个记档项都有源码证据、设计决议、lit 锁和设备验证记录 |
-| M1.4 | **清理与退役** | 先复现并分类 `return_alloc_from_loop`；只有确认是既存且与本线无关时才 XFAIL。对 `HEXAGON_EPI_LOG`、`HEXAGON_PTR_LOG`、`HEXAGON_ASM_DUMP` 等环境门逐项标明用途、默认值、移除条件 | `run_lit_all` 的结果可复现；每个红测/临时门都有 issue、owner 和退出条件 |
+| M1.4 | **清理与退役** | 先复现并分类 `return_alloc_from_loop`；只有确认是既存且与本线无关时才 XFAIL。对 `HEXAGON_EPI_LOG`、`HEXAGON_PTR_LOG`、`HEXAGON_ASM_DUMP` 等环境门逐项标明用途、默认值、移除条件 | `run_lit_all` 的结果可复现；**每个红测/临时门都在 §2.1 的 inventory 里有 owner 和退出条件** |
 
 ### 阶段二 · 形状与类型扩展（P1 — 解锁可用面）
 
@@ -90,7 +107,7 @@ Triton → TTIR → triton-shared / Linalg
 
 > **M2.5 版本决策（2026-09-25）**：v2 `hex.hmx.kernel_manifest/v2` 继续逐字保持 bridge-only；v3 是新的 record-only wire schema，禁止从 v2 自动转换，需 coordinated envelope/cache/launcher migration，但不授权 production budget、`hmx-tail` 或 grid 决策；v4 延后到 full-kernel runtime evidence 完成后，才评审 production admission/budget gating。v3 不阻断已有 bridge-budgeted `full-hmx`，但阻断依赖 full-kernel facts 的 tail/cost-model 决策。当前已有两次 gate-ON、remote-attested process-aggregate probe capture（每次 `6 pass / 10 not-proven / 0 fail`，新 cache phases 与 `RESULT: PASS`），以及当前 gate-OFF build 上 direct tail `95/95` + resident `1/1`；一般 identity/content/allocator/full-occupancy 轴仍不是 v3 admission 证据。正式契约见 [`docs/hmx/hmx-v3-manifest-decision.md`](../docs/hmx/hmx-v3-manifest-decision.md)。
 
-> **P1.5 promotion evidence（2026-09-26）**：commit `270f135`；manual lit `284 passed / 0 failed / 1 skipped`（285 tests），host/source matrix `13 pass / 14 not-proven / 0 fail`，probe/evidence host contracts `50 + 19` tests 通过。两次 gate-ON probe capture 均有四artifact manifest 与 remote attestation `match=true`，每次 `6 pass / 10 not-proven / 0 fail`；当前 gate-OFF `libtriton.so=68b0a38c…`、`linalg-hexagon-opt=6b7df7c7…`、`libhmxapi.a=71c20e3c…` 上 direct tail `95/95`、resident `1/1`，一次 launch transient 恢复。独立 reviewer 已给出 **R-A/R-B scoped PROMOTE**；用户已批准启动 R-C v3 record-only migration。`observed_high_water`、`resident`、完整 allocator/full-occupancy 等未证明轴仍不得改写为 complete，production `hmx-tail`/v4 仍未授权。
+> **P1.5 promotion evidence（2026-09-26）**：commit `270f135`；**该轮当时的** manual lit `284 passed / 0 failed / 1 skipped`（285 tests）——⚠️ 这是历史快照，**活的门数字只看 `docs/state/STATE-OF-PLAY.md §4.1`**（此后 `09de68d` 等 commit 又增了 lit 文件，今天不是 284）。同一轮的 host/source matrix `13 pass / 14 not-proven / 0 fail`、probe/evidence host contracts `50 + 19` tests 通过，同理是快照。两次 gate-ON probe capture 均有四artifact manifest 与 remote attestation `match=true`，每次 `6 pass / 10 not-proven / 0 fail`；该轮 gate-OFF `libtriton.so=68b0a38c…`、`linalg-hexagon-opt=6b7df7c7…`、`libhmxapi.a=71c20e3c…` 上 direct tail `95/95`、resident `1/1`，一次 launch transient 恢复。独立 reviewer 已给出 **R-A/R-B scoped PROMOTE**；用户已批准启动 R-C v3 record-only migration。`observed_high_water`、`resident`、完整 allocator/full-occupancy 等未证明轴仍不得改写为 complete，production `hmx-tail`/v4 仍未授权。
 
 ### M2.5-R：Evidence-before-manifest（当前唯一主线）
 
@@ -163,7 +180,12 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 - **前端**：`triton-to-linalg-experimental` → 支持矩阵 + 明确诊断；`compiler.py` pass pipeline 动态化（其自注 TODO）；
 - **上机纪律**：同构建 A/B、`libtriton.so` 与 `libhmxapi.a` **双指纹**、设备锁、判据 `max(3×CV,15%)`；
 - **流程**：每个行为改动过 **architecture-review + ai-slop-cleaner 双评审**（先例：`b947063`），writer/reviewer 分离；
-- **补丁**：P0.2 基线 stored patch 已校验；P0.3 commit `ca679fd` 已 push，但 stored patch 仍未重生成。当前差异以 doctor 输出为准，不得为消除门红灯自动改 patch。
+- **补丁**：P0.2 基线 stored patch 已校验；P0.3 commit `ca679fd` 已 push。stored patch 已随工作树多次重生成：
+  当前四份同为 `2026-09-26 19:05`，全量 `tools/hexmlir/hexagon-mlir-local.patch` = **306 文件 / 460 hunk**，
+  三份按用途 = **hmx 204 + env 5 + upstream-fixes 251 = 460 hunk**（三份合计 == 全量，无损）；四份都过 `git apply --check --reverse`。
+  `tools/run_tests.sh doctor` 的 `local patch matches branch diff vs main` 为 OK。**当前差异以 doctor 那一行为准**；
+  ⚠️ `doctor` 的**总计数随环境变**（手机不可达时 `phone reachable` FAIL）——不要引用 `15/0` 这类总数。
+  不得为消除门红灯自动改 patch。
 
 ---
 
@@ -187,7 +209,14 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 | P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
 
-> **当前状态（2026-09-26 晚，N1/N2/N3 收口后）**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 在 `270f135`，R-C v3 record-only migration 在 `098b2a0`（`fork/hmx`）。当前 manual lit **`301 passed / 0 failed / 1 skipped`**，边界矩阵 **29 格 `14 pass / 15 not-proven / 0 fail`**（`device_evidence_status=current`、`device_evidence_promotable=true`），probe host 测试 **108 passed**、runtime 源码契约 **9/9 PASS**；一份 remote-attested 设备 capture `logs/hmx/n123-a3-device-2026-09-26.log`（overlay `current`/`promotable`、0 validation error）导入 **13 recorded / 5 pass** 设备观测。R-A/R-B 已 scoped PROMOTE；v3 record-only 的**可达性**已定为永久设计边界（§6.5 勘误 7）；v4 与 production `hmx-tail` 仍未授权。**⚠️ 当前工作树有 15 个修改文件（+2214/−59）+ 14 个新文件未提交**（用户 2026-09-26 拍板"先不提交"），`tools/hexmlir/hexagon-mlir-local.patch` 尚未随之重生成。
+> **当前状态（按 `git log` / `git status` 复核，2026-09-26 晚）**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 在 `270f135`，R-C v3 record-only migration 在 `098b2a0`（`fork/hmx`）。
+> **`HEAD=09de68d`，`26bbba0` 之后 6 个 commit**（`270f135 098b2a0 3924c79 615e10e 80a28f2 09de68d`）；
+> **源码工作树干净**（`git status --short` 只剩未跟踪的 `logs/`）——原先"15 个修改文件 + 14 个新文件未提交"的状态**已不存在**，
+> 那批改动已全部落成上述 commit，且 stored patch 已重生成（见 §5 补丁条与本文件顶部表）。
+> **门数字（manual lit / 边界矩阵 / probe host 测试 / runtime 源码契约）一律见 `docs/state/STATE-OF-PLAY.md §4.1`，本页不复述**——
+> 本页历史段落里出现的旧数字都是**当时那轮的快照**，不是现状。边界矩阵仍为 29 格、15 格 `not-proven` 是**设计**（设备证据永不改写 `declared_status`）。
+> 一份 remote-attested 设备 capture `logs/hmx/n123-a3-device-2026-09-26.log`（overlay `current`/`promotable`、0 validation error）导入 **13 recorded / 5 pass** 设备观测。
+> R-A/R-B 已 scoped PROMOTE；v3 record-only 的**可达性**已定为永久设计边界（§6.5 勘误 7）；v4 与 production `hmx-tail` 仍未授权。
 
 ---
 
@@ -278,8 +307,10 @@ P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specializat
 
 ## 附 · 评审勘误（2026-09-23，本 fork 事实更新）
 
-1. 评审时"工作树不干净、仍有未提交的 crash-triage 改动"→ **P0.2 已解决**：`b947063` 之后又有 P0 manifest commit `4410d12`；当前 P0.3 仍按用户要求未提交，且已完成独立复审。
-2. 评审引"184 个 lit"→ 当前 P0.3 full manual lit 为 **198（197 过 / 0 失败 / 1 `REQUIRES` skip）**。
+1. 评审时"工作树不干净、仍有未提交的 crash-triage 改动"→ **已解决且已过期**：P0 manifest commit `4410d12` 之后，
+   P0.3 也已提交（`ca679fd`）；到 2026-09-26 晚 `HEAD=09de68d`、工作树干净（见顶部表与 §5）。原文"当前 P0.3 仍按用户要求未提交"作废。
+2. 评审引"184 个 lit"→ **2026-09-23 当时的** P0.3 full manual lit 为 198（197 过 / 0 失败 / 1 `REQUIRES` skip）。
+   ⚠️ 这是快照，**不要引用**——本页所有 lit 数字都只是历史，活的数字见 `docs/state/STATE-OF-PLAY.md §4.1`。
 3. 上游 README 的 "Matrix Processing (experimental) via HexKL" → 本 fork 主线是 **`hmx` 方言**；hexkl 路径依 ADR-001 保持 inert。
 4. FlashAttention 39.4 → 18.1 ms 为评审引述，未本轮复测；本页表内数字以我方同构建 A/B 记录为准。
 
