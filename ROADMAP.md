@@ -51,7 +51,7 @@ Triton → TTIR → triton-shared / Linalg
 | FlashAttention | 稳态 **32.4 → 17.4 ms（1.86×，f32 激活 ABI）**；仓库 FA 测试 **18312 → 8184 µs**（NUM_THREADS 4→1）；评审引述 39.4 → 18.1 ms 未复测 |
 | 常用算子 | `vec_add` 快手写 4.8×、`matmul` 1.15×、softmax/rms_norm 见 `docs/results/op-steady-state-2026-09-21.md` |
 | host 门 | **本页不复述数字**——lit / host / probe / 边界矩阵的实测值与其复算命令只在 `docs/state/STATE-OF-PLAY.md §4.1` 写一次，本页只引用 |
-| 仓库状态 | 内层 `hmx` 分支 `HEAD=09de68d`（`26bbba0` 之后 **6** 个 commit：`270f135 098b2a0 3924c79 615e10e 80a28f2 09de68d`）；`git status --short` 只剩未跟踪的 `logs/`，**源码工作树干净**；stored patch 四份已于 2026-09-26 19:05 重生成（全量 **306 文件 / 460 hunk**；三份 hmx 204 + env 5 + upstream-fixes 251 = 460） |
+| 仓库状态 | **本页不复述 HEAD、工作树形状与 patch 计数**——理由见 §5 补丁条的"为什么不能复述"。事实只有三处：`git rev-parse HEAD`、`git status --short`、`tools/run_tests.sh doctor` 的 `local patch matches branch diff vs main` 那一行。**本页只写要求，不写读数**：① 工作树除未跟踪 `logs/` 外干净；② 四份 stored patch 与 `git diff main` **逐字节**一致（不是 hunk 数相等就算）；③ 三份按用途之和 == 全量（无损） |
 
 ---
 
@@ -109,10 +109,15 @@ Triton → TTIR → triton-shared / Linalg
 
 > **P1.5 promotion evidence（2026-09-26）**：commit `270f135`；**该轮当时的** manual lit `284 passed / 0 failed / 1 skipped`（285 tests）——⚠️ 这是历史快照，**活的门数字只看 `docs/state/STATE-OF-PLAY.md §4.1`**（此后 `09de68d` 等 commit 又增了 lit 文件，今天不是 284）。同一轮的 host/source matrix `13 pass / 14 not-proven / 0 fail`、probe/evidence host contracts `50 + 19` tests 通过，同理是快照。两次 gate-ON probe capture 均有四artifact manifest 与 remote attestation `match=true`，每次 `6 pass / 10 not-proven / 0 fail`；该轮 gate-OFF `libtriton.so=68b0a38c…`、`linalg-hexagon-opt=6b7df7c7…`、`libhmxapi.a=71c20e3c…` 上 direct tail `95/95`、resident `1/1`，一次 launch transient 恢复。独立 reviewer 已给出 **R-A/R-B scoped PROMOTE**；用户已批准启动 R-C v3 record-only migration。`observed_high_water`、`resident`、完整 allocator/full-occupancy 等未证明轴仍不得改写为 complete，production `hmx-tail`/v4 仍未授权。
 
-### M2.5-R：Evidence-before-manifest（当前唯一主线）
+### M2.5-R：Evidence-before-manifest（**manifest/v3 这条线的主线，不是全项目唯一主线**）
 
 **研究结论**：先冻结事实语义和证据，不先冻结 manifest wire schema。v3 只能在
 identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚一个阶段。
+
+> **范围（2026-09-27 修正）**：本页原先称本节为"当前唯一主线"。**该说法不成立。**
+> M3.1（统一 cost model，见下）有**独立的门与独立的证据链**，两条线各自可推进、
+> 互不阻塞；把 M2.5-R 写成唯一主线会让 M3.1 的产出无处安放。
+> 归并视图见 `docs/state/ROADMAP-SYNTHESIS-2026-09-27.md`。
 
 #### R-A：Identity / Allocator 轨道
 
@@ -163,9 +168,10 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 
 | # | 工作项 | 内容 | 验收 |
 |---|---|---|---|
-| M3.1 | **统一 cost model** | 用 M/N/K × dtype × VTCM 余量 × 线程数 × pack 成本，选择 HMX / HVX / HexKL / DMA / fusion——替代"pass 顺序 + 硬编码阈值" | 同构建 A/B：选择器 ≥ 现状启发式；误判可从 manifest 追溯 |
+| M3.1 | ~~**统一 cost model**~~ → **已退役（2026-09-28）** | 不建"HMX vs HVX 选择器"：引擎选择 = **能力谓词 + VTCM 预算**（`HmxTarget::queryContraction` + `planBridge`），能上就上 HMX，否则保持 IR 不动；**0 行生产代码改动** | **出口条件作废**。代码归档 `exp/_history/`（未删除），结案/负结果见 `docs/history/hmx/m3.1-cost-model-closure-2026-09-28.md`，方案见 `docs/state/M3.1-RETIREMENT-PLAN-2026-09-28.md`。⚠️ 勘误："S1 1.60× 残差"是时钟伪影（用了没测过的 1385；真值 ≈2.08 GHz），真值 S1 闭合 1.1% |
 | M3.2 | **削 per-launch 固定税**（STATE 优先级①） | bring-up ≈1.5 ms 对短工作负载致命 ⇒ 会话/op-batch 级常驻与复用 | `Perf(N)=A+B/N` 的 B 显著下降；S3 类短形状提升 > max(3×CV,15%) |
 | M3.3 | **HVX×HMX 共调度** | 按 `hmx-hvx-co-scheduling` 的机制草案实现（引擎不让出线程是前提约束） | FA/混合 kernel 中两引擎重叠有实测收益才合入 |
+| M3.4 | **HMX 引擎指令形状：group call 深度** | 我们的 codegen 每 crouton 发一次 `hmx_mma`（`n_crontons=1`），走的是**延迟**路径；参照实现发一次最多 N 个 crouton 的深 group 调用，走**吞吐**路径。叶子级实测：延迟与吞吐速率相差 3.25×（`logs/hmx/engine-throughput-2026-09-27.log`）。**不是决策项，是 codegen 优化项** | ⚠️ **硬前提未确认：group call 的读出落在 N-tile 0**（"N-tile j 怎么单独读出"未解决），**在此之前幅度不可实现、不得据以下结论改代码**。前提闭合后才可开工，验收 = 同构建 A/B 超过 `max(3×CV,15%)`，且 A/B 只在同一 `libtriton.so`+`libhmxapi.a` 指纹内成立 |
 
 ### 阶段四 · 跨算子融合（P3 — 差距⑤，最高价值最难）
 
@@ -180,11 +186,19 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 - **前端**：`triton-to-linalg-experimental` → 支持矩阵 + 明确诊断；`compiler.py` pass pipeline 动态化（其自注 TODO）；
 - **上机纪律**：同构建 A/B、`libtriton.so` 与 `libhmxapi.a` **双指纹**、设备锁、判据 `max(3×CV,15%)`；
 - **流程**：每个行为改动过 **architecture-review + ai-slop-cleaner 双评审**（先例：`b947063`），writer/reviewer 分离；
-- **补丁**：P0.2 基线 stored patch 已校验；P0.3 commit `ca679fd` 已 push。stored patch 已随工作树多次重生成：
-  当前四份同为 `2026-09-26 19:05`，全量 `tools/hexmlir/hexagon-mlir-local.patch` = **306 文件 / 460 hunk**，
-  三份按用途 = **hmx 204 + env 5 + upstream-fixes 251 = 460 hunk**（三份合计 == 全量，无损）；四份都过 `git apply --check --reverse`。
-  `tools/run_tests.sh doctor` 的 `local patch matches branch diff vs main` 为 OK。**当前差异以 doctor 那一行为准**；
-  ⚠️ `doctor` 的**总计数随环境变**（手机不可达时 `phone reachable` FAIL）——不要引用 `15/0` 这类总数。
+- **补丁**：P0.2 基线 stored patch 已校验；P0.3 commit `ca679fd` 已 push。四份 stored patch 由**同一个脚本**产出（`split_patch.py` 同时写全量 + 三份拆分，不再有手工维护的第二份），全部对 `main` 取 diff（**不是** `HEAD`——工作已 commit 在 `hmx` 分支上，裸 `git diff` 只会给出工作树增量，patch 会静默丢掉整个改动集）。
+  **本页不写读数，只写要求与复算命令**，三条要求各自有命令：
+
+  | 要求 | 复算命令 |
+  |---|---|
+  | 四份与 `git diff main` 逐字节一致 | `tools/run_tests.sh doctor` → `local patch matches branch diff vs main` 须为 **OK** |
+  | 三份之和 == 全量（无损拆分） | `python3 tools/hexmlir/split_patch.py` 末行 `total: N hunks (full patch has N hunks)`；不等即打印 `SPLIT IS NOT LOSSLESS` 并**非零退出** |
+  | hunk 数可加总 | `grep -c '^@@ ' tools/hexmlir/hexagon-mlir-local.patch` |
+
+  > **为什么这一页不能写读数**：写在 tracked 文件里的 HEAD、hunk 数、门结果是**派生态**，而**写下它的那次 commit 本身就会让它失效**。`054b24c` 正是活样本：它把 HEAD 从 `26bbba0` 改成 `09de68d`、并断言 doctor 的 patch 行为 OK，而该 commit 自己（19:52）落在最后一次 patch 重生成（19:05）之后，断言当场变假。所以本页只留**要求**（可长期成立）与**命令**（随时可复算），读数一律现查现引。
+  > ⚠️ **重生成的触发条件是"刚 commit 过"，不是"工作树脏"**——恰恰相反，commit 落地那一刻工作树是**干净**的，任何"脏了就重生成"的直觉都会漏掉这一次。动了 `hexagon-mlir/` 就重跑 `split_patch.py`；**先改文档/代码，最后一条命令再 regenerates patch**。
+  > ⚠️ 三份是**按 hunk 切**的，同一文件会出现多个 `diff --git` header 块，所以 `grep -c '^diff --git'` 不是文件数；**只有 hunk 数可加总**。
+  > ⚠️ `doctor` 的**总计数随环境变**（手机不可达时 `phone reachable` FAIL）——只引用 patch 那一行，不要引用 `15/0` 这类总数。
   不得为消除门红灯自动改 patch。
 
 ---
@@ -206,15 +220,13 @@ identity、liveness、allocator 和 tail oracle 都闭合后生成；v4 再晚�
 |---|---|---|---|
 | P0 | manifest + 支持矩阵 + 记档收口 + 清理 | 可解释、可维护、门真绿 | P0.2 manifest 已完成；P0.3 支持矩阵已在 `ca679fd` 提交并 push |
 | P1 | 动态 shape/tail + dtype 契约 + 大 shape 记账 | 任意 shape、更多 dtype 可用 | 部分已落（M 分块 ✅） |
-| P2 | cost model + 固定税 + 共调度 | 决策不再靠 pass 顺序与硬阈值 | 规划中 |
+| P2 | ~~cost model~~（M3.1 已退役）+ 固定税 + 共调度 | 决策 = 能力+预算（不再是"pass 顺序 + 硬阈值"）；剩余价值在**固定税**与**共调度** | M3.1 **退役**（2026-09-28，见 `docs/state/M3.1-RETIREMENT-PLAN-2026-09-28.md`）；**M3.2（削固定税）/ M3.3（共调度）是 P2 剩余、未动**；M3.4 前提未闭合 |
 | P3 | reduction/attention 融合 | 从"dot 走 HMX"到"block 走 HMX" | 机制就绪（stage/await 值边 ✅），待实现 |
 
-> **当前状态（按 `git log` / `git status` 复核，2026-09-26 晚）**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 在 `270f135`，R-C v3 record-only migration 在 `098b2a0`（`fork/hmx`）。
-> **`HEAD=09de68d`，`26bbba0` 之后 6 个 commit**（`270f135 098b2a0 3924c79 615e10e 80a28f2 09de68d`）；
-> **源码工作树干净**（`git status --short` 只剩未跟踪的 `logs/`）——原先"15 个修改文件 + 14 个新文件未提交"的状态**已不存在**，
-> 那批改动已全部落成上述 commit，且 stored patch 已重生成（见 §5 补丁条与本文件顶部表）。
+> **当前状态**：P0.2/P0.3 与 P1.2/P1.3c 已分别提交并 push；P1.5 evidence slice 在 `270f135`，R-C v3 record-only migration 在 `098b2a0`（`fork/hmx`）。
+> **HEAD、工作树形状、patch 计数、门数字一律现查**（`git rev-parse HEAD` / `git status --short` / `doctor` / `docs/state/STATE-OF-PLAY.md §4.1`）——本页只写**要求**，理由见 §5 补丁条"为什么这一页不能写读数"。
 > **门数字（manual lit / 边界矩阵 / probe host 测试 / runtime 源码契约）一律见 `docs/state/STATE-OF-PLAY.md §4.1`，本页不复述**——
-> 本页历史段落里出现的旧数字都是**当时那轮的快照**，不是现状。边界矩阵仍为 29 格、15 格 `not-proven` 是**设计**（设备证据永不改写 `declared_status`）。
+> 本页历史段落里出现的旧数字都是**当时那轮的快照**，不是现状。边界矩阵的格数与 `not-proven` 计数见 §4.1；**"设备证据永不改写 `declared_status`"是设计**（这一条不随轮次变，故写在这里）。
 > 一份 remote-attested 设备 capture `logs/hmx/n123-a3-device-2026-09-26.log`（overlay `current`/`promotable`、0 validation error）导入 **13 recorded / 5 pass** 设备观测。
 > R-A/R-B 已 scoped PROMOTE；v3 record-only 的**可达性**已定为永久设计边界（§6.5 勘误 7）；v4 与 production `hmx-tail` 仍未授权。
 
@@ -274,7 +286,7 @@ P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specializat
                                   → P3.3 attention block fusion
 ```
 
-允许并行：P0.2 与 P0.3；P1.4 与 P1.5；P2.2 与 P2.3。禁止并行：manifest 与 cost model、shape ABI 与 tail implementation、tail implementation 与 dynamic specialization、VTCM accounting 与任何依赖其预算的 cost model。
+允许并行：P0.2 与 P0.3；P1.4 与 P1.5；P2.2 与 P2.3。禁止并行：shape ABI 与 tail implementation、tail implementation 与 dynamic specialization。（cost model 相关禁止项随 M3.1 退役于 2026-09-28 删除。）
 
 ### 6.4 统一验收门
 
@@ -308,7 +320,7 @@ P1.1 shape/tail ABI 设计 → P1.2 tail IR/runtime → P1.3 dynamic specializat
 ## 附 · 评审勘误（2026-09-23，本 fork 事实更新）
 
 1. 评审时"工作树不干净、仍有未提交的 crash-triage 改动"→ **已解决且已过期**：P0 manifest commit `4410d12` 之后，
-   P0.3 也已提交（`ca679fd`）；到 2026-09-26 晚 `HEAD=09de68d`、工作树干净（见顶部表与 §5）。原文"当前 P0.3 仍按用户要求未提交"作废。
+   P0.3 也已提交（`ca679fd`）；工作树自那以后保持干净（现查 `git status --short`，见顶部表与 §5）。原文"当前 P0.3 仍按用户要求未提交"作废。
 2. 评审引"184 个 lit"→ **2026-09-23 当时的** P0.3 full manual lit 为 198（197 过 / 0 失败 / 1 `REQUIRES` skip）。
    ⚠️ 这是快照，**不要引用**——本页所有 lit 数字都只是历史，活的数字见 `docs/state/STATE-OF-PLAY.md §4.1`。
 3. 上游 README 的 "Matrix Processing (experimental) via HexKL" → 本 fork 主线是 **`hmx` 方言**；hexkl 路径依 ADR-001 保持 inert。
