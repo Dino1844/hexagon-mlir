@@ -46,6 +46,17 @@ namespace hmx {
 inline constexpr StringLiteral kHmxResidentProvenanceAttr =
     "hmx.resident_provenance";
 
+/// The resident/prepack marker strings.  They are wire spellings on the
+/// op/module attributes shared by the producer passes, the HexagonMem
+/// conversion, and the host-facing API; one home keeps a one-sided rename from
+/// silently dropping the contract.
+inline constexpr StringLiteral kHmxWeightResidentAttr = "hmx.weight_resident";
+inline constexpr StringLiteral kHmxWorkspaceResidentAttr =
+    "hmx.workspace_resident";
+inline constexpr StringLiteral kHmxWeightPrepackAttr = "hmx.weight_prepack";
+inline constexpr StringLiteral kHmxWeightPrepackLayoutAttr =
+    "hmx.weight_prepack_layout";
+
 /// Stable hash domain for compiler-derived resident identities.  Keep this
 /// independent from `hmx.kernel_vtcm_identity`'s accounting schema: evolving
 /// the diagnostic census must not silently redefine an existing resident key.

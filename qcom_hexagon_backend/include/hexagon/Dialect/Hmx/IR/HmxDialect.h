@@ -19,6 +19,7 @@
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "hexagon/Dialect/Hmx/IR/HmxCroutonLayout.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "llvm/ADT/StringRef.h"
 
 //===----------------------------------------------------------------------===//

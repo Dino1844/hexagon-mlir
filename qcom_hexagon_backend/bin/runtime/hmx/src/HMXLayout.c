@@ -36,8 +36,6 @@
 
 #include "HMXAPI.h"
 
-#define HMX_BLOCK_BYTES 128u
-
 /* Scatter offsets for one 128 B block, one per scatter halfword: element n
  * (0..31) is the even row's column n at byte 4n, element 32+n the odd row's at
  * byte 4n+2. The pair (2j, 2j+1) therefore fills byte 128*j of the crouton. */
@@ -80,7 +78,7 @@ static inline __attribute__((always_inline)) void hmx__pack_32x32(
 
   if (ncols == 0) {
     const HVX_Vector z = Q6_V_vzero();
-    for (unsigned j = 0; j < 16u; ++j)
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j)
       *(HVX_Vector *)(uintptr_t)(dst + j * HMX_BLOCK_BYTES) = z;
     return;
   }
@@ -95,14 +93,14 @@ static inline __attribute__((always_inline)) void hmx__pack_32x32(
         (const uint8_t *)(uintptr_t)(src + (r0_base * src_stride + c0) * 2u);
     if (src_stride == HMX_TILE_COLS) {
       /* The two rows are adjacent, so one 128 B load already holds the pair. */
-      for (unsigned j = 0; j < 16u; ++j) {
+      for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
         hmx__pack_scatter(dst + j * HMX_BLOCK_BYTES,
                           *(const HVX_UVector *)(const void *)p0, offs);
         p0 += 2u * row_bytes;
       }
       return;
     }
-    for (unsigned j = 0; j < 16u; ++j) {
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
       const HVX_Vector v0 = *(const HVX_UVector *)(const void *)p0;
       const HVX_Vector v1 =
           *(const HVX_UVector *)(const void *)(p0 + row_bytes);
@@ -118,7 +116,7 @@ static inline __attribute__((always_inline)) void hmx__pack_32x32(
    * (the mask keeps only the first `ncols` halfwords of each row). */
   const HVX_VectorPred keep = Q6_Q_vsetq_R(2u * ncols);
   const HVX_Vector zero = Q6_V_vzero();
-  for (unsigned j = 0; j < 16u; ++j) {
+  for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
     const unsigned r0 = r0_base + 2u * j;
     const unsigned r1 = r0 + 1u;
     HVX_Vector v0 = zero;
@@ -188,7 +186,7 @@ static inline __attribute__((always_inline)) void hmx__pack_2tiles(
     const unsigned row_bytes = src_stride * 2u;
     const uint8_t *p =
         (const uint8_t *)(uintptr_t)(src + (r0_base * src_stride + c0) * 2u);
-    for (unsigned j = 0; j < 16u; ++j) {
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
       const unsigned base = dst + j * HMX_BLOCK_BYTES;
       Q6_vscatter_RMVhV((size_t)(uintptr_t)base, 4095u, off_e,
                         *(const HVX_UVector *)(const void *)p);
@@ -279,7 +277,7 @@ static inline __attribute__((always_inline)) void hmx__pack_32x32_f32(
 
   if (ncols == 0) {
     const HVX_Vector z = Q6_V_vzero();
-    for (unsigned j = 0; j < 16u; ++j)
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j)
       *(HVX_Vector *)(uintptr_t)(dst + j * HMX_BLOCK_BYTES) = z;
     return;
   }
@@ -289,7 +287,7 @@ static inline __attribute__((always_inline)) void hmx__pack_32x32_f32(
    * `cols` become zero before the conversion. */
   const HVX_Vector zero = Q6_V_vzero();
   const HVX_VectorPred keep = Q6_Q_vsetq_R(ncols * 4u);
-  for (unsigned j = 0; j < 16u; ++j) {
+  for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
     const unsigned r0 = r0_base + 2u * j;
     const unsigned r1 = r0 + 1u;
     HVX_Vector v0 = zero;

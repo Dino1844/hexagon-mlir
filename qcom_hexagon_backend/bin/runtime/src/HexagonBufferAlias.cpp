@@ -24,7 +24,7 @@ HexagonBufferAlias::HexagonBufferAlias(HexagonBuffer &buffer, size_t nbytes)
   uint8_t *basePtr = reinterpret_cast<uint8_t *>(origBuffer->GetPointer());
   for (int i = 0; i < croutonTable.size(); i++) {
     croutonTable[i] = basePtr;
-    basePtr += 2048;
+    basePtr += CROUTON_SIZE;
   }
 }
 

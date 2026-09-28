@@ -7,7 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The one home for the crouton's physical shape. `#hmx.crouton`'s parameters
+// The one home for the engine's leaf physical constants. `#hmx.crouton`'s parameters
 // (HmxAttrs.td) are aliases of these, the passes and the runtime-leaf lowering
 // read them from here, and the host prepack contract is built from them -- so a
 // change to the engine's tile can only be made in one place.
@@ -44,6 +44,11 @@ constexpr int64_t kCroutonHalf = 2;
 /// One crouton as an element count and as a byte count (f16).
 constexpr int64_t kCroutonElements = kCroutonPair * kCroutonCol * kCroutonHalf;
 constexpr int64_t kCroutonBytes = kCroutonElements * 2;
+
+/// The conversion-state block the bias registers load from: 256 B, the
+/// runtime's `HMX_BIAS_BYTES`. The registers address it by low byte, so this
+/// is also its required alignment.
+constexpr int64_t kConvStateBytes = 256;
 
 } // namespace layout
 } // namespace hmx

@@ -36,6 +36,8 @@ extern "C" {
 #define HMX_TILE_ROWS 32u
 #define HMX_TILE_COLS 32u
 #define HMX_BIAS_BYTES 256u /* one bias register set */
+#define HMX_BLOCK_BYTES 128u /* one HVX scatter block = one row pair */
+#define HMX_BLOCK_PAIRS (HMX_TILE_ROWS / 2u) /* blocks per crouton */
 
 /* ---- environment --------------------------------------------------------- */
 /* The HMX environment is the runtime's, not the kernel's: HexagonAPI acquires and

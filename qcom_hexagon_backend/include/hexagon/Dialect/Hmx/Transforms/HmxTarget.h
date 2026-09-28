@@ -28,6 +28,7 @@
 #define HEXAGON_DIALECT_HMX_TRANSFORMS_HMXTARGET_H
 
 #include "hexagon/Dialect/Hmx/IR/HmxCroutonLayout.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include <algorithm>
 #include <cstdint>
@@ -82,7 +83,7 @@ struct HmxTarget {
   /// the whole of the engine's capability today. A second shape (a quantized
   /// operands contract, say) belongs here as another query, not as another pass.
   static bool isContractionOperand(Type elem) {
-    return elem.isF16() || elem.isF32();
+    return dtype::isAdmittedFloat(elem);
   }
 
   /// The shape-level plan selected by the capability query. `HMXTail` is a
@@ -136,7 +137,7 @@ struct HmxTarget {
                                       Type lhsElem, Type rhsElem,
                                       Type outElem) const {
     if (!isContractionOperand(lhsElem) || !isContractionOperand(rhsElem) ||
-        (!outElem.isF16() && !outElem.isF32()))
+        (!dtype::isAdmittedFloat(outElem)))
       return {ContractionRefusal::UnsupportedDType, ContractionPlan::HVX, {}};
     if (m <= minRows)
       return {ContractionRefusal::MinRows, ContractionPlan::HVX, {}};

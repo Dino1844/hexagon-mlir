@@ -35,8 +35,6 @@
     }                                                                          \
   } while (0)
 
-constexpr int kHexagonAllocAlignment = 2048;
-
 inline void CheckFailed(const char *expr, const char *file, int line,
                         const std::string &msg = "") {
   std::cerr << "Error: " << expr << " failed at " << file << ":" << line;

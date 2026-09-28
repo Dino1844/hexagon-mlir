@@ -26,6 +26,7 @@
 #include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxVtcmAccounting.h"
 #include "hexagon/Dialect/Hmx/Transforms/Passes.h"
@@ -76,8 +77,8 @@ namespace hmx {
 
 namespace {
 
-constexpr StringLiteral kWeightResidentAttr = "hmx.weight_resident";
-constexpr StringLiteral kWorkspaceResidentAttr = "hmx.workspace_resident";
+constexpr StringLiteral kWeightResidentAttr = kHmxWeightResidentAttr;
+constexpr StringLiteral kWorkspaceResidentAttr = kHmxWorkspaceResidentAttr;
 constexpr StringLiteral kWeightResidentBytesAttr = "hmx.weight_resident_bytes";
 
 constexpr StringLiteral kKeyKind = "kind";
@@ -197,10 +198,6 @@ static StringRef staticIdentityStatus(StaticIdentityStatus status) {
   }
   llvm_unreachable("unknown static identity status");
 }
-
-// The runtime's crouton descriptor names one 2 KiB HMX tile; keep this in
-// sync with CROUTON_SIZE rather than inferring bytes from the tensor shape.
-constexpr int64_t kCroutonBytes = 2048;
 
 static IntegerAttr u64Attribute(MLIRContext *context, uint64_t value) {
   return IntegerAttr::get(IntegerType::get(context, 64), APInt(64, value));
@@ -511,9 +508,9 @@ static SizeResult getCroutonSize(crouton::CroutonType type) {
     return {};
   int64_t elements = type.getNumElements();
   if (elements <= 0 ||
-      elements > std::numeric_limits<int64_t>::max() / kCroutonBytes)
+      elements > std::numeric_limits<int64_t>::max() / layout::kCroutonBytes)
     return {true, false, 0};
-  return {true, true, elements * kCroutonBytes};
+  return {true, true, elements * layout::kCroutonBytes};
 }
 
 static SizeResult getAllocationSize(Operation *operation) {
@@ -784,9 +781,9 @@ static bool validGlobalSource(Operation *operation,
     return false;
   MemRefType globalType = global.getType();
   return globalType.hasStaticShape() && globalType.getLayout().isIdentity() &&
-         globalType.getElementType().isF16() && residentType.hasStaticShape() &&
-         residentType.getLayout().isIdentity() &&
-         residentType.getElementType().isF16() &&
+         dtype::isCroutonElement(globalType.getElementType()) &&
+         residentType.hasStaticShape() && residentType.getLayout().isIdentity() &&
+         dtype::isCroutonElement(residentType.getElementType()) &&
          globalType.getShape() == residentType.getShape() &&
          globalType.getElementType() == residentType.getElementType();
 }
@@ -809,7 +806,7 @@ static bool validAddressSource(Operation *operation,
       extract->getParentOfType<func::FuncOp>() != function)
     return false;
   auto sourceType = dyn_cast<BaseMemRefType>(source.getType());
-  return sourceType && sourceType.getElementType().isF16();
+  return sourceType && dtype::isCroutonElement(sourceType.getElementType());
 }
 
 static bool validResidentTag(Operation *operation, StringRef attrName,
@@ -895,7 +892,7 @@ static bool readU64(DictionaryAttr dict, StringRef name, uint64_t &value) {
 
 static bool exactResidentType(MemRefType type) {
   return type && type.hasStaticShape() && type.getLayout().isIdentity() &&
-         type.getElementType().isF16();
+         dtype::isCroutonElement(type.getElementType());
 }
 
 static bool validRuntimeWeightSourceView(Operation *operation,
@@ -985,11 +982,12 @@ static bool validRuntimeWeightSourceView(Operation *operation,
     return reject("runtime weight source_view argument kind disagrees");
   if (auto ranked = dyn_cast<MemRefType>(argument.getType())) {
     if (!ranked.hasStaticShape() || ranked.getRank() != 2 ||
-        !ranked.getElementType().isF16() || !ranked.getLayout().isIdentity() ||
+        !dtype::isCroutonElement(ranked.getElementType()) ||
+        !ranked.getLayout().isIdentity() ||
         ranked.getShape() != ArrayRef<int64_t>{k, wholeN})
       return reject("ranked runtime weight argument shape/layout is not exact");
   } else if (auto unranked = dyn_cast<UnrankedMemRefType>(argument.getType())) {
-    if (!unranked.getElementType().isF16())
+    if (!dtype::isCroutonElement(unranked.getElementType()))
       return reject("unranked runtime weight argument element type is not f16");
   } else {
     return reject("runtime weight argument is not a memref");

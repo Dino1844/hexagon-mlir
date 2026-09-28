@@ -465,7 +465,7 @@ public:
     // identifies the resident. Only the call and the lookup remain in the
     // prologue.
     if (auto workspace =
-            op->getAttrOfType<DictionaryAttr>("hmx.workspace_resident")) {
+            op->getAttrOfType<DictionaryAttr>(mlir::hmx::kHmxWorkspaceResidentAttr)) {
       auto keyAttr = workspace.getAs<IntegerAttr>("key");
       auto bytesAttr = workspace.getAs<IntegerAttr>("bytes");
       if (!keyAttr || !bytesAttr) {
@@ -518,7 +518,7 @@ public:
     // and swallowed by the pool), so the only per-launch cost left is the call.
     // Two sources: the address of a prepacked compile-time global, or the data
     // pointer of the runtime function argument the host has pre-packed.
-    if (auto resident = op->getAttrOfType<DictionaryAttr>("hmx.weight_resident")) {
+    if (auto resident = op->getAttrOfType<DictionaryAttr>(mlir::hmx::kHmxWeightResidentAttr)) {
       auto bytesAttr = resident.getAs<IntegerAttr>("bytes");
       if (!bytesAttr) {
         op.emitError("resident weight is missing its byte count");

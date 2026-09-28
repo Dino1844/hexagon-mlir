@@ -49,7 +49,7 @@ void hmx_mma_f16(unsigned act_addr, unsigned wt_addr, unsigned n_croutons) {
    * organization), [6:2] input channel stop = 31. Weight Rt: [31:7] dW =
    * distance to the last 128 B vector, [6:0] reserved = all 1s. */
   unsigned act_rt = (2047u) | ((n_croutons - 1u) << 11);
-  unsigned wt_rt = ((16u * n_croutons - 1u) << 7) | 0x7Fu;
+  unsigned wt_rt = ((HMX_BLOCK_PAIRS * n_croutons - 1u) << 7) | 0x7Fu;
   Q6_activation_hf_mxmem_RR_deep(act_addr, act_rt);
   Q6_weight_hf_mxmem_RR(wt_addr, wt_rt);
 }

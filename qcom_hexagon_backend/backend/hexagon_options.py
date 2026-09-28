@@ -172,10 +172,6 @@ class HexagonOptions:
     # By default, loops are instrumented along with the function body.
     # To turn off loop level instrumentation, set it to True.
     disableLWPLoop: bool = False
-    # By default, outer loop and nested sibling loops at LWPloopDepth 1 are instrumented.
-    # Increasing LWPloopDepth may cause overhead.
-    LWPloopDepth: int = 1
-
     # By default, delete all artifacts pushed to device for this kernel's execution after it runs.
     # This solely applies to execution on the standalone launcher.
     deviceCleanup: bool = True

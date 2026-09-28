@@ -76,6 +76,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
@@ -114,11 +115,6 @@ namespace hmx {
 
 namespace {
 
-/// The conversion state block is 256 B, and the bias registers address it with
-/// the low eight bits, so it has to be 256-byte aligned.
-constexpr int64_t kConvStateBytes = 256;
-constexpr int64_t kConvStateAlignment = 256;
-
 /// `pipeline-depth` selecting the unstaged serial tile loop: no staging
 /// rewrite, the activation bridge and its array kept as ordinary memory. It is
 /// the A/B arm that reproduces the pre-pipeline codegen; the staged emitter
@@ -141,51 +137,6 @@ constexpr int64_t kSerialPipelineDepth = 3;
 /// the A/B arms and stage whatever the shape is, and `3` never reaches the
 /// staged emitter.
 constexpr int64_t kStageMinKTiles = 32;
-
-enum class PipelineReason {
-  None,
-  SerialRequested,
-  NoRowMajorBridge,
-  ExtraActivationReader,
-  InvalidStagingGeometry,
-  EmptyStagingGrid,
-  StagingGridMismatch,
-  ShallowK,
-  VtcmBudget,
-  TileCount,
-  PipelinerFailed,
-  TailPeeledEdge,
-};
-
-StringRef pipelineReasonCode(PipelineReason reason) {
-  switch (reason) {
-  case PipelineReason::None:
-    return {};
-  case PipelineReason::SerialRequested:
-    return "serial-requested";
-  case PipelineReason::NoRowMajorBridge:
-    return "no-row-major-bridge";
-  case PipelineReason::ExtraActivationReader:
-    return "extra-activation-reader";
-  case PipelineReason::InvalidStagingGeometry:
-    return "invalid-staging-geometry";
-  case PipelineReason::EmptyStagingGrid:
-    return "empty-staging-grid";
-  case PipelineReason::StagingGridMismatch:
-    return "staging-grid-mismatch";
-  case PipelineReason::ShallowK:
-    return "shallow-k";
-  case PipelineReason::VtcmBudget:
-    return "vtcm-budget";
-  case PipelineReason::TileCount:
-    return "tile-count";
-  case PipelineReason::PipelinerFailed:
-    return "pipeliner-failed";
-  case PipelineReason::TailPeeledEdge:
-    return "tail-peeled-edge";
-  }
-  llvm_unreachable("unknown HMX pipeline reason");
-}
 
 struct PipelineDecision {
   int64_t requestedDepth = 0;
@@ -295,8 +246,8 @@ LogicalResult recordPipelineDecision(MatmulOp op,
     }
     if (failed(setHmxManifestPipelineDecision(
             module, func.getName(), *id, decision.requestedDepth,
-            decision.staged ? "staged" : "serial", decision.depth,
-            pipelineReasonCode(decision.reason))))
+            decision.staged ? kHmxPipelineStaged : kHmxPipelineSerial,
+            decision.depth, pipelineReasonCode(decision.reason))))
       return failure();
   }
   if (hasPipelineRemark(decision.reason)) {
@@ -1397,7 +1348,7 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   auto srcType = dyn_cast<MemRefType>(bridge->src.getType());
   if (!actType || !wtType || !srcType || srcType.getRank() != 2 ||
       !srcType.hasStaticShape() ||
-      !(srcType.getElementType().isF16() || srcType.getElementType().isF32()))
+      !(dtype::isAdmittedFloat(srcType.getElementType())))
     return declineStageLoop(op, requestedDepth,
                             PipelineReason::InvalidStagingGeometry);
 
@@ -1496,7 +1447,8 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   // between pack and mma, and no second row in flight.
   auto scratchType = MemRefType::get(
       {1, Kt, layout::kCroutonPair, layout::kCroutonCol, layout::kCroutonHalf},
-      rewriter.getF16Type(), AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
+      dtype::croutonElementType(rewriter.getContext()), AffineMap{},
+      hexagon::VTCM_ADDRESS_SPACE);
 
   // The static ring: `depth` (slot, status) pairs, one per in-flight tile, plus
   // the one scratch. All allocated once here and released once after the
@@ -1718,11 +1670,11 @@ struct HmxPartitionPass
     // The identity conversion state is kernel-level setup, so it is created
     // once for the whole function. It is an ordinary space-1 block: the VTCM
     // machinery below places it next to the crouton arrays.
-    auto biasType = MemRefType::get({kConvStateBytes}, rewriter.getI8Type(),
+    auto biasType = MemRefType::get({layout::kConvStateBytes}, rewriter.getI8Type(),
                                     AffineMap{}, hexagon::VTCM_ADDRESS_SPACE);
     auto bias = memref::AllocOp::create(
         rewriter, loc, biasType, ValueRange{},
-        rewriter.getI64IntegerAttr(kConvStateAlignment));
+        rewriter.getI64IntegerAttr(layout::kConvStateBytes));
     BiasInitOp::create(rewriter, loc, bias);
 
     for (MatmulOp op : matmuls) {

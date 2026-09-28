@@ -116,9 +116,10 @@ constexpr StringLiteral kPlanFullHMX = kHmxPlanFullHMX;
 constexpr StringLiteral kPlanHMXTail = kHmxPlanHMXTail;
 constexpr StringLiteral kPlanHVX = kHmxPlanHVX;
 
-constexpr StringLiteral kShapeStateStatic = "static";
-constexpr StringLiteral kShapeStatePartiallyDynamic = "partially-dynamic";
-constexpr StringLiteral kShapeStateDynamic = "dynamic";
+constexpr StringLiteral kShapeStateStatic = kHmxShapeStateStatic;
+constexpr StringLiteral kShapeStatePartiallyDynamic =
+    kHmxShapeStatePartiallyDynamic;
+constexpr StringLiteral kShapeStateDynamic = kHmxShapeStateDynamic;
 
 /// `upstream-static` means the specialization happened before the object was
 /// built; `upstream-only` means it did not and the record keeps the dynamic
@@ -126,8 +127,10 @@ constexpr StringLiteral kShapeStateDynamic = "dynamic";
 constexpr StringLiteral kSpecializationUpstreamStatic = "upstream-static";
 constexpr StringLiteral kSpecializationUpstreamOnly = "upstream-only";
 
-constexpr StringLiteral kKindStatic = "static";
-constexpr StringLiteral kKindDynamic = "dynamic";
+// A dimension `kind` shares the static/dynamic tokens with shape_state and must
+// agree with it, so both names resolve to the same wire vocabulary.
+constexpr StringLiteral kKindStatic = kHmxShapeStateStatic;
+constexpr StringLiteral kKindDynamic = kHmxShapeStateDynamic;
 
 /// Versioned mapping from the P1.5 structured liveness sidecar onto the v3
 /// `liveness` proof.  The basis names the sidecar fact that was consumed, so a

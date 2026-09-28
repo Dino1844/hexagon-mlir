@@ -89,7 +89,7 @@ namespace {
 
 /// Per-buffer residency record on the allocation. `key` is the runtime map key,
 /// `bytes` the buffer size; the lowering reads both to build the resident call.
-constexpr const char *kResidentAttr = "hmx.workspace_resident";
+constexpr StringLiteral kResidentAttr = kHmxWorkspaceResidentAttr;
 constexpr const char *kResidentKeyAttr = "key";
 constexpr const char *kResidentBytesAttr = "bytes";
 
@@ -271,7 +271,7 @@ struct HmxWorkspaceResidentPass
     const std::string function = func.getSymName().str();
     func.walk([&](memref::AllocOp alloc) {
       // The weight path already pinned its buffers; leave them to it.
-      if (alloc->hasAttr("hmx.weight_resident"))
+      if (alloc->hasAttr(kHmxWeightResidentAttr))
         return;
       auto type = dyn_cast<MemRefType>(alloc.getType());
       if (!type || type.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE)
@@ -480,8 +480,8 @@ struct HmxWorkspaceResidentPass
     std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
     if (module->hasAttr("hmx.kernel_manifest") &&
         failed(setHmxManifestWorkspaceClass(
-            module, func.getSymName(), "resident-single-instance",
-            "single-instance")))
+            module, func.getSymName(), kHmxWorkspaceResidentSingleInstance,
+            kHmxGridSingleInstance)))
       return signalPassFailure();
   }
 };

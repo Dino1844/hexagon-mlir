@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 
 #include "mlir/IR/Builders.h"
@@ -105,35 +106,42 @@ constexpr StringLiteral kPlanFullHMX = kHmxPlanFullHMX;
 constexpr StringLiteral kPlanHMXTail = kHmxPlanHMXTail;
 constexpr StringLiteral kPlanHVX = kHmxPlanHVX;
 
-constexpr StringLiteral kWorkspaceRuntimeInternal = "runtime-internal";
+constexpr StringLiteral kWorkspaceRuntimeInternal = kHmxWorkspaceRuntimeInternal;
 constexpr StringLiteral kWorkspaceResidentSingleInstance =
-    "resident-single-instance";
-constexpr StringLiteral kGridSingleInstance = "single-instance";
-constexpr StringLiteral kGridLegacyRuntime = "legacy-runtime";
-constexpr StringLiteral kBridgeOnlyAccounting = "bridge-only";
-constexpr StringLiteral kRowMajorInnerContiguous = "row-major-inner-contiguous";
-constexpr StringLiteral kTailKPolicy = "zero-pad-both-operands";
-constexpr StringLiteral kTailMNPolicy = "padded-edge-tile-bounded-store";
+    kHmxWorkspaceResidentSingleInstance;
+constexpr StringLiteral kGridSingleInstance = kHmxGridSingleInstance;
+constexpr StringLiteral kGridLegacyRuntime = kHmxGridLegacyRuntime;
+constexpr StringLiteral kBridgeOnlyAccounting = kHmxVtcmAccountingBridgeOnly;
+constexpr StringLiteral kRowMajorInnerContiguous =
+    kHmxLayoutRowMajorInnerContiguous;
+constexpr StringLiteral kTailKPolicy = kHmxTailKPolicy;
+constexpr StringLiteral kTailMNPolicy = kHmxTailMNPolicy;
 constexpr int64_t kMinimumHmxRows = 4;
 
-constexpr StringLiteral kWeightResidentPrepack = "resident-prepack";
-constexpr StringLiteral kWeightDevicePack = "device-pack";
-constexpr StringLiteral kWeightEligibleAlignedF16 = "eligible-aligned-f16";
-constexpr StringLiteral kWeightEligibleB2NSlice = "eligible-b2-n-slice";
-constexpr StringLiteral kWeightTailConsumer = "tail-consumer";
-constexpr StringLiteral kWeightF32Source = "f32-source";
-constexpr StringLiteral kWeightUnprovenOffset = "unproven-offset";
-constexpr StringLiteral kWeightIncompatibleConsumers = "incompatible-consumers";
-constexpr StringLiteral kWeightPrepackDisabled = "prepack-disabled";
+constexpr StringLiteral kWeightResidentPrepack = kHmxWeightResidentPrepack;
+constexpr StringLiteral kWeightDevicePack = kHmxWeightDevicePack;
+constexpr StringLiteral kWeightEligibleAlignedF16 = kHmxWeightEligibleAlignedF16;
+constexpr StringLiteral kWeightEligibleB2NSlice = kHmxWeightEligibleB2NSlice;
+constexpr StringLiteral kWeightTailConsumer = kHmxWeightTailConsumer;
+constexpr StringLiteral kWeightF32Source = kHmxWeightF32Source;
+constexpr StringLiteral kWeightUnprovenOffset = kHmxWeightUnprovenOffset;
+constexpr StringLiteral kWeightIncompatibleConsumers =
+    kHmxWeightIncompatibleConsumers;
+constexpr StringLiteral kWeightPrepackDisabled = kHmxWeightPrepackDisabled;
 
 bool isCanonicalPipelineReason(StringRef reason) {
-  return reason == "serial-requested" || reason == "no-row-major-bridge" ||
-         reason == "extra-activation-reader" ||
-         reason == "invalid-staging-geometry" ||
-         reason == "empty-staging-grid" || reason == "staging-grid-mismatch" ||
-         reason == "shallow-k" || reason == "vtcm-budget" ||
-         reason == "tile-count" || reason == "pipeliner-failed" ||
-         reason == "tail-peeled-edge";
+  static constexpr PipelineReason kReasons[] = {
+      PipelineReason::SerialRequested,       PipelineReason::NoRowMajorBridge,
+      PipelineReason::ExtraActivationReader, PipelineReason::InvalidStagingGeometry,
+      PipelineReason::EmptyStagingGrid,      PipelineReason::StagingGridMismatch,
+      PipelineReason::ShallowK,              PipelineReason::VtcmBudget,
+      PipelineReason::TileCount,             PipelineReason::PipelinerFailed,
+      PipelineReason::TailPeeledEdge,
+  };
+  for (PipelineReason candidate : kReasons)
+    if (reason == pipelineReasonCode(candidate))
+      return true;
+  return false;
 }
 
 bool isCanonicalWorkspaceClass(StringRef value) {
@@ -226,13 +234,13 @@ std::optional<PlanKind> parsePlan(StringRef value) {
 }
 
 std::optional<ShapeState> parseShapeState(StringRef value) {
-  if (value == "static")
+  if (value == kHmxShapeStateStatic)
     return ShapeState::Static;
-  if (value == "partially-dynamic")
+  if (value == kHmxShapeStatePartiallyDynamic)
     return ShapeState::PartiallyDynamic;
-  if (value == "dynamic")
+  if (value == kHmxShapeStateDynamic)
     return ShapeState::Dynamic;
-  if (value == "unavailable")
+  if (value == kHmxShapeStateUnavailable)
     return ShapeState::Unavailable;
   return std::nullopt;
 }
@@ -334,13 +342,13 @@ LogicalResult validateDtypes(ModuleOp module, DictionaryAttr record,
   if (isHmxPlan(plan)) {
     for (StringRef field : {kKeyLhsElem, kKeyRhsElem, kKeyOutElem}) {
       StringRef value = stringField(dtypes, field).getValue();
-      if (value != "f16" && value != "f32")
+      if (value != kHmxDTypeF16 && value != kHmxDTypeF32)
         return emitManifestError(
             module, report,
             Twine("HMX manifest dtype must be f16 or f32: ") + field.str());
     }
     StringAttr crouton = stringField(dtypes, kKeyCrouton);
-    if (!crouton || crouton.getValue() != "f16")
+    if (!crouton || crouton.getValue() != kHmxDTypeF16)
       return emitManifestError(module, report,
                                "HMX manifest crouton dtype must be f16");
   } else if (dtypes.get(kKeyCrouton)) {
@@ -363,7 +371,7 @@ LogicalResult parseLogicalShape(ModuleOp module, DictionaryAttr record,
   }
 
   if (logical && isNone(logical)) {
-    if (stateAttr && stateAttr.getValue() != "unavailable")
+    if (stateAttr && stateAttr.getValue() != kHmxShapeStateUnavailable)
       return emitManifestError(module, report,
                                "HMX manifest unavailable logical shape "
                                "requires shape_state=unavailable");
@@ -416,7 +424,7 @@ LogicalResult parseLogicalShape(ModuleOp module, DictionaryAttr record,
     if (!kind)
       return emitManifestError(module, report,
                                "HMX manifest dimension has no kind");
-    if (kind.getValue() == "static") {
+    if (kind.getValue() == kHmxShapeStateStatic) {
       if (failed(rejectUnknownFields(module, dimension,
                                      {StringRef("kind"), StringRef("value")},
                                      report, "dimension")))
@@ -430,7 +438,7 @@ LogicalResult parseLogicalShape(ModuleOp module, DictionaryAttr record,
             module, report, "HMX manifest static dimension must be positive");
       staticValues.push_back(value);
       ++staticCount;
-    } else if (kind.getValue() == "dynamic") {
+    } else if (kind.getValue() == kHmxShapeStateDynamic) {
       if (failed(rejectUnknownFields(module, dimension,
                                      {StringRef("kind"), StringRef("symbol")},
                                      report, "dimension")))
@@ -607,15 +615,16 @@ LogicalResult validatePipeline(ModuleOp module, DictionaryAttr pipeline,
     return emitManifestError(module, report,
                              "HMX manifest has a partial pipeline decision");
   StringAttr selected = stringField(pipeline, kKeyPipelineSelected);
-  if (selected.getValue() != "serial" && selected.getValue() != "staged")
+  if (selected.getValue() != kHmxPipelineSerial &&
+      selected.getValue() != kHmxPipelineStaged)
     return emitManifestError(module, report,
                              "HMX manifest has an invalid pipeline selection");
   int64_t requested =
       cast<IntegerAttr>(pipeline.get(kKeyPipelineRequested)).getInt();
   int64_t depth = cast<IntegerAttr>(pipeline.get(kKeyPipelineDepth)).getInt();
   if (requested < 0 || depth < 0 ||
-      (selected.getValue() == "serial" && depth != 0) ||
-      (selected.getValue() == "staged" && depth == 0))
+      (selected.getValue() == kHmxPipelineSerial && depth != 0) ||
+      (selected.getValue() == kHmxPipelineStaged && depth == 0))
     return emitManifestError(module, report,
                              "HMX manifest has an invalid pipeline depth");
   if (pipeline.get(kKeyPipelineReason) &&
@@ -683,8 +692,8 @@ LogicalResult validateExecution(ModuleOp module, DictionaryAttr record,
                              "HMX manifest has a partial blocking decision");
   if (hasBlocking) {
     StringAttr blocking = stringField(execution, kKeyBlocking);
-    if (!blocking ||
-        (blocking.getValue() != "whole" && blocking.getValue() != "m_blocked"))
+    if (!blocking || (blocking.getValue() != kHmxBlockingWhole &&
+                      blocking.getValue() != kHmxBlockingMBlocked))
       return emitManifestError(module, report,
                                "HMX manifest has invalid execution blocking");
     if (!hasI64(execution, kKeyBlockM))
@@ -696,8 +705,8 @@ LogicalResult validateExecution(ModuleOp module, DictionaryAttr record,
           module, report, "HMX manifest execution block_m must be positive");
     if (logical.state == ShapeState::Static && logical.staticShape) {
       int64_t m = (*logical.staticShape)[0];
-      if ((blocking.getValue() == "whole" && blockM != m) ||
-          (blocking.getValue() == "m_blocked" &&
+      if ((blocking.getValue() == kHmxBlockingWhole && blockM != m) ||
+          (blocking.getValue() == kHmxBlockingMBlocked &&
            (blockM >= m || m % blockM != 0)))
         return emitManifestError(
             module, report,
@@ -816,7 +825,7 @@ LogicalResult validateWeightBinding(ModuleOp module, DictionaryAttr record,
   if (!kind)
     return emitManifestError(module, report,
                              "HMX manifest weight_binding has no kind");
-  if (kind.getValue() == "argument-slot") {
+  if (kind.getValue() == kHmxWeightKindArgumentSlot) {
     if (failed(rejectUnknownFields(
             module, value, {StringRef(kKeyKind), StringRef(kKeyPolicyRef)},
             report, "weight binding")))
@@ -836,8 +845,8 @@ LogicalResult validateWeightBinding(ModuleOp module, DictionaryAttr record,
       return emitManifestError(module, report,
                                "HMX manifest argument weight slot is negative");
     binding = WeightBindingRef{function.getValue(), slot};
-  } else if (kind.getValue() == "compile-time-constant" ||
-             kind.getValue() == "internal-value") {
+  } else if (kind.getValue() == kHmxWeightKindCompileTimeConstant ||
+             kind.getValue() == kHmxWeightKindInternalValue) {
     if (failed(rejectUnknownFields(module, value, {StringRef(kKeyKind)}, report,
                                    "weight binding")))
       return failure();
@@ -1220,7 +1229,7 @@ std::string computePlanFingerprint(DictionaryAttr record,
   if (dictionaryField(record, kKeyWeightBinding)) {
     auto binding = dictionaryField(record, kKeyWeightBinding);
     StringAttr kind = stringField(binding, kKeyKind);
-    if (kind && kind.getValue() == "argument-slot") {
+    if (kind && kind.getValue() == kHmxWeightKindArgumentSlot) {
       auto ref = dictionaryField(binding, kKeyPolicyRef);
       if (ref && stringField(ref, kKeyFunction) && hasI64(ref, kKeySlot)) {
         std::optional<DictionaryAttr> policy = findWeightPolicy(
@@ -1452,7 +1461,7 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
             }
           }
           if (summaries[index].plan != PlanKind::FullHMX || !aligned ||
-              !dtypesValue || dtypesValue.getValue() != "f16")
+              !dtypesValue || dtypesValue.getValue() != kHmxDTypeF16)
             return emitManifestError(module, reportErrors,
                                      "resident-prepack is only valid for "
                                      "aligned exact-f16 HMX consumers");
@@ -1604,11 +1613,12 @@ LogicalResult mlir::hmx::setHmxManifestPipelineDecision(
       readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true);
   if (failed(current))
     return failure();
-  if (selected != "serial" && selected != "staged")
+  if (selected != kHmxPipelineSerial && selected != kHmxPipelineStaged)
     return emitManifestError(module, true,
                              "invalid HMX pipeline selection in manifest");
-  if (requested < 0 || depth < 0 || (selected == "serial" && depth != 0) ||
-      (selected == "staged" && depth == 0))
+  if (requested < 0 || depth < 0 ||
+      (selected == kHmxPipelineSerial && depth != 0) ||
+      (selected == kHmxPipelineStaged && depth == 0))
     return emitManifestError(module, true,
                              "invalid HMX pipeline depth in manifest");
   if (!reason.empty() && !isCanonicalPipelineReason(reason))
@@ -1680,7 +1690,7 @@ LogicalResult mlir::hmx::bindHmxManifestWeightSlot(ModuleOp module,
   reference.append(kKeyFunction, StringAttr::get(ctx, function));
   reference.append(kKeySlot, IntegerAttr::get(IntegerType::get(ctx, 64), slot));
   NamedAttrList binding;
-  binding.append(kKeyKind, StringAttr::get(ctx, "argument-slot"));
+  binding.append(kKeyKind, StringAttr::get(ctx, kHmxWeightKindArgumentSlot));
   binding.append(kKeyPolicyRef, reference.getDictionary(ctx));
   NamedAttrList fields(record);
   fields.set(kKeyWeightBinding, binding.getDictionary(ctx));
@@ -1790,7 +1800,8 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
     std::optional<int64_t> logicalN;
   };
   std::map<std::string, PrepackInfo> prepackedSlots;
-  if (auto prepack = module->getAttrOfType<StringAttr>("hmx.weight_prepack")) {
+  if (auto prepack =
+          module->getAttrOfType<StringAttr>(kHmxWeightPrepackAttr)) {
     auto parsed = json::parse(prepack.getValue());
     if (!parsed)
       return emitManifestError(module, true,
@@ -1844,7 +1855,7 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
       continue;
     DictionaryAttr binding = dictionaryField(record, kKeyWeightBinding);
     if (!binding ||
-        stringField(binding, kKeyKind).getValue() != "argument-slot")
+        stringField(binding, kKeyKind).getValue() != kHmxWeightKindArgumentSlot)
       continue;
     DictionaryAttr reference = dictionaryField(binding, kKeyPolicyRef);
     StringAttr function = stringField(reference, kKeyFunction);
@@ -1862,10 +1873,10 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
       info.hasTail = true;
     DictionaryAttr dtypes = dictionaryField(record, kKeyDtypes);
     StringAttr rhs = stringField(dtypes, kKeyRhsElem);
-    if (rhs && rhs.getValue() != "f16")
+    if (rhs && rhs.getValue() != kHmxDTypeF16)
       info.hasF32 = true;
     StringAttr state = stringField(record, kKeyShapeState);
-    if (!state || state.getValue() != "static")
+    if (!state || state.getValue() != kHmxShapeStateStatic)
       info.hasNonStatic = true;
     std::array<int64_t, 3> shape{};
     if (auto logical = dictionaryField(record, kKeyLogical)) {

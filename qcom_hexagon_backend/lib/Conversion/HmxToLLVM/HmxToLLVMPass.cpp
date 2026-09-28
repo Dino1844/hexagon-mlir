@@ -22,6 +22,7 @@
 #include "hexagon/Conversion/HmxToLLVM/HmxExternalFnNames.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxVtcmAccounting.h"
@@ -1147,7 +1148,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                                         "crouton destination",
                                         /*rowMajor=*/false)))
         return failure();
-      bool srcIsF32 = srcType.getElementType().isF32();
+      bool srcIsF32 = dtype::isF32(srcType.getElementType());
       auto fn = getVoidLeaf(module,
                             srcIsF32 ? getPackActTailF32FnName()
                                      : getPackActTailF16FnName(),
@@ -1186,7 +1187,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
     // The source's element type picks the leaf: an f32 source is quantised to
     // the engine's fp16 inside the pack, so it has its own entry rather than a
     // narrowing op of its own ahead of the pack.
-    bool srcIsF32 = srcType.getElementType().isF32();
+    bool srcIsF32 = dtype::isF32(srcType.getElementType());
     auto fn = getVoidLeaf(
         module,
         srcIsF32 ? (bulk ? getPackActF32BulkFnName() : getPackActF32FnName())
@@ -1259,7 +1260,7 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                                         "crouton destination",
                                         /*rowMajor=*/false)))
         return failure();
-      bool srcIsF32 = srcType.getElementType().isF32();
+      bool srcIsF32 = dtype::isF32(srcType.getElementType());
       auto fn = getVoidLeaf(module,
                             srcIsF32 ? getPackWeightTailF32FnName()
                                      : getPackWeightTailF16FnName(),
@@ -1295,7 +1296,7 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     SmallVector<Type> argTys(7, i32Ty);
     if (bulk)
       argTys.push_back(i32Ty);
-    bool srcIsF32 = srcType.getElementType().isF32();
+    bool srcIsF32 = dtype::isF32(srcType.getElementType());
     auto fn = getVoidLeaf(
         module,
         srcIsF32

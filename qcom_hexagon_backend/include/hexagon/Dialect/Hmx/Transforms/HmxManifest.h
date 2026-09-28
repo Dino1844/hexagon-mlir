@@ -22,6 +22,7 @@
 #include "mlir/IR/Operation.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/ErrorHandling.h"
 #include <mutex>
 #include <string>
 
@@ -101,6 +102,121 @@ inline bool isCanonicalHmxMatmulReason(StringRef reason) {
          reason == kHmxReasonTileAlignment ||
          reason == kHmxReasonUnsupportedLayout ||
          reason == kHmxReasonVtcmBudget;
+}
+
+/// Canonical execution/plan wire vocabulary.  These are values on the
+/// manifest's JSON boundary, produced by the attribution, partition, and
+/// workspace passes and accepted by the validator below.  A one-sided rename
+/// would otherwise drift silently because nothing binds the two spellings
+/// mechanically.
+inline constexpr StringLiteral kHmxPipelineSerial = "serial";
+inline constexpr StringLiteral kHmxPipelineStaged = "staged";
+
+inline constexpr StringLiteral kHmxPipelineReasonSerialRequested =
+    "serial-requested";
+inline constexpr StringLiteral kHmxPipelineReasonNoRowMajorBridge =
+    "no-row-major-bridge";
+inline constexpr StringLiteral kHmxPipelineReasonExtraActivationReader =
+    "extra-activation-reader";
+inline constexpr StringLiteral kHmxPipelineReasonInvalidStagingGeometry =
+    "invalid-staging-geometry";
+inline constexpr StringLiteral kHmxPipelineReasonEmptyStagingGrid =
+    "empty-staging-grid";
+inline constexpr StringLiteral kHmxPipelineReasonStagingGridMismatch =
+    "staging-grid-mismatch";
+inline constexpr StringLiteral kHmxPipelineReasonShallowK = "shallow-k";
+inline constexpr StringLiteral kHmxPipelineReasonVtcmBudget = "vtcm-budget";
+inline constexpr StringLiteral kHmxPipelineReasonTileCount = "tile-count";
+inline constexpr StringLiteral kHmxPipelineReasonPipelinerFailed =
+    "pipeliner-failed";
+inline constexpr StringLiteral kHmxPipelineReasonTailPeeledEdge =
+    "tail-peeled-edge";
+
+inline constexpr StringLiteral kHmxBlockingWhole = "whole";
+inline constexpr StringLiteral kHmxBlockingMBlocked = "m_blocked";
+
+inline constexpr StringLiteral kHmxDTypeF16 = "f16";
+inline constexpr StringLiteral kHmxDTypeF32 = "f32";
+
+inline constexpr StringLiteral kHmxWeightKindArgumentSlot = "argument-slot";
+inline constexpr StringLiteral kHmxWeightKindCompileTimeConstant =
+    "compile-time-constant";
+inline constexpr StringLiteral kHmxWeightKindInternalValue = "internal-value";
+
+inline constexpr StringLiteral kHmxShapeStateStatic = "static";
+inline constexpr StringLiteral kHmxShapeStatePartiallyDynamic =
+    "partially-dynamic";
+inline constexpr StringLiteral kHmxShapeStateDynamic = "dynamic";
+inline constexpr StringLiteral kHmxShapeStateUnavailable = "unavailable";
+
+inline constexpr StringLiteral kHmxWorkspaceRuntimeInternal = "runtime-internal";
+inline constexpr StringLiteral kHmxWorkspaceResidentSingleInstance =
+    "resident-single-instance";
+inline constexpr StringLiteral kHmxGridSingleInstance = "single-instance";
+inline constexpr StringLiteral kHmxGridLegacyRuntime = "legacy-runtime";
+
+inline constexpr StringLiteral kHmxLayoutRowMajorInnerContiguous =
+    "row-major-inner-contiguous";
+inline constexpr StringLiteral kHmxVtcmAccountingBridgeOnly = "bridge-only";
+
+inline constexpr StringLiteral kHmxWeightResidentPrepack = "resident-prepack";
+inline constexpr StringLiteral kHmxWeightDevicePack = "device-pack";
+inline constexpr StringLiteral kHmxWeightEligibleAlignedF16 =
+    "eligible-aligned-f16";
+inline constexpr StringLiteral kHmxWeightEligibleB2NSlice = "eligible-b2-n-slice";
+inline constexpr StringLiteral kHmxWeightTailConsumer = "tail-consumer";
+inline constexpr StringLiteral kHmxWeightF32Source = "f32-source";
+inline constexpr StringLiteral kHmxWeightUnprovenOffset = "unproven-offset";
+inline constexpr StringLiteral kHmxWeightIncompatibleConsumers =
+    "incompatible-consumers";
+inline constexpr StringLiteral kHmxWeightPrepackDisabled = "prepack-disabled";
+
+/// Canonical pipeline reason vocabulary.  `pipelineReasonCode` is the one home
+/// for the wire spelling of each reason, and the validator accepts exactly the
+/// codes this function produces rather than a second hand-written list.
+enum class PipelineReason {
+  None,
+  SerialRequested,
+  NoRowMajorBridge,
+  ExtraActivationReader,
+  InvalidStagingGeometry,
+  EmptyStagingGrid,
+  StagingGridMismatch,
+  ShallowK,
+  VtcmBudget,
+  TileCount,
+  PipelinerFailed,
+  TailPeeledEdge,
+};
+
+inline StringRef pipelineReasonCode(PipelineReason reason) {
+  switch (reason) {
+  case PipelineReason::None:
+    return {};
+  case PipelineReason::SerialRequested:
+    return kHmxPipelineReasonSerialRequested;
+  case PipelineReason::NoRowMajorBridge:
+    return kHmxPipelineReasonNoRowMajorBridge;
+  case PipelineReason::ExtraActivationReader:
+    return kHmxPipelineReasonExtraActivationReader;
+  case PipelineReason::InvalidStagingGeometry:
+    return kHmxPipelineReasonInvalidStagingGeometry;
+  case PipelineReason::EmptyStagingGrid:
+    return kHmxPipelineReasonEmptyStagingGrid;
+  case PipelineReason::StagingGridMismatch:
+    return kHmxPipelineReasonStagingGridMismatch;
+  case PipelineReason::ShallowK:
+    return kHmxPipelineReasonShallowK;
+  case PipelineReason::VtcmBudget:
+    return kHmxPipelineReasonVtcmBudget;
+  case PipelineReason::TileCount:
+    return kHmxPipelineReasonTileCount;
+  case PipelineReason::PipelinerFailed:
+    return kHmxPipelineReasonPipelinerFailed;
+  case PipelineReason::TailPeeledEdge:
+    return kHmxPipelineReasonTailPeeledEdge;
+  }
+  llvm_unreachable("unknown HMX pipeline reason");
 }
 
 /// Shared lock for passes that read or write module-level HMX state while

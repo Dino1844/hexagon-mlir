@@ -24,6 +24,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Transforms/Transforms.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -92,8 +93,8 @@ llvm::SmallVector<AllocInfo, 8> collectAllocInfos(mlir::func::FuncOp func) {
     // rewritten into a view of the per-instance buffer. This covers the weight
     // path and the per-launch workspace that opted into the same residency
     // (hmx-workspace-resident).
-    if (op->hasAttr("hmx.weight_resident") ||
-        op->hasAttr("hmx.workspace_resident"))
+    if (op->hasAttr(hmx::kHmxWeightResidentAttr) ||
+        op->hasAttr(hmx::kHmxWorkspaceResidentAttr))
       return;
     if (auto memRefType =
             llvm::dyn_cast<mlir::MemRefType>(op->getResult(0).getType()))

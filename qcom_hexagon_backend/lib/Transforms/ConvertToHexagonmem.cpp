@@ -14,6 +14,7 @@
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Transforms/Passes.h"
 #include "mlir/Conversion/Passes.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
@@ -73,8 +74,8 @@ struct AllocConverter : public OpRewritePattern<memref::AllocOp> {
     // not of the memref dialect, so it has to survive this rewrite: the
     // `hexagonmem.alloc` the lowering sees carries the same tag the marking
     // pass put on the `memref.alloc`.
-    if (Attribute tag = op->getAttr("hmx.workspace_resident"))
-      alloc->setAttr("hmx.workspace_resident", tag);
+    if (Attribute tag = op->getAttr(hmx::kHmxWorkspaceResidentAttr))
+      alloc->setAttr(hmx::kHmxWorkspaceResidentAttr, tag);
     rewriter.replaceOp(op, alloc.getResult());
     return success();
   }

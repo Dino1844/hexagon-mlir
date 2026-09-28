@@ -89,6 +89,7 @@
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
@@ -135,7 +136,7 @@ namespace {
 /// runtime path names the function argument slot. The lowering reads this
 /// dictionary; the module attribute below is its aggregate for the static
 /// budget readers.
-constexpr const char *kResidentAttr = "hmx.weight_resident";
+constexpr StringLiteral kResidentAttr = kHmxWeightResidentAttr;
 constexpr const char *kResidentKeyGlobal = "global";
 constexpr const char *kResidentKeyAddress = "address";
 constexpr const char *kResidentKeyBytes = "bytes";
@@ -145,10 +146,10 @@ constexpr const char *kResidentBytesAttr = "hmx.weight_resident_bytes";
 
 /// JSON array of the runtime weights the host must pre-pack: each entry names
 /// the function, the argument slot, the logical shape and the crouton shape.
-constexpr const char *kPrepackAttr = "hmx.weight_prepack";
+constexpr StringLiteral kPrepackAttr = kHmxWeightPrepackAttr;
 
 /// The module attribute carrying the permutation the host must apply.
-constexpr const char *kPrepackLayoutAttr = "hmx.weight_prepack_layout";
+constexpr StringLiteral kPrepackLayoutAttr = kHmxWeightPrepackLayoutAttr;
 
 /// The crouton permutation the compiler applies, as a JSON coefficient map. A
 /// weight grid is [Nt, Kt, 16, 32, 2] with logical [N, K], so a physical index
@@ -325,7 +326,7 @@ static bool validGlobalWeightSource(memref::GlobalOp source,
   MemRefType sourceType = source.getType();
   return sourceType.getShape() == residentType.getShape() &&
          sourceType.getElementType() == residentType.getElementType() &&
-         sourceType.getElementType().isF16() &&
+         dtype::isCroutonElement(sourceType.getElementType()) &&
          sourceType.getLayout().isIdentity();
 }
 
@@ -775,7 +776,7 @@ makeRuntimeSourceView(MLIRContext *context, Value source,
                       BlockArgument argument, const WeightSlice *slice) {
   auto type = dyn_cast<MemRefType>(source.getType());
   if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
-      !type.getElementType().isF16())
+      !dtype::isCroutonElement(type.getElementType()))
     return std::nullopt;
 
   SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());
@@ -879,11 +880,12 @@ static LogicalResult validateRuntimeSourceView(DictionaryAttr sourceView,
     return reject();
   if (auto ranked = dyn_cast<MemRefType>(argument.getType())) {
     if (!ranked.hasStaticShape() || ranked.getRank() != 2 ||
-        !ranked.getElementType().isF16() || !ranked.getLayout().isIdentity() ||
+        !dtype::isCroutonElement(ranked.getElementType()) ||
+        !ranked.getLayout().isIdentity() ||
         ranked.getShape() != ArrayRef<int64_t>{k, wholeN})
       return reject();
   } else if (auto unranked = dyn_cast<UnrankedMemRefType>(argument.getType())) {
-    if (!unranked.getElementType().isF16())
+    if (!dtype::isCroutonElement(unranked.getElementType()))
       return reject();
   } else {
     return reject();
@@ -1000,7 +1002,7 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
                             Operation *anchor, int64_t *slotOut,
                             DictionaryAttr *sourceViewOut = nullptr) {
   auto srcMemref = dyn_cast<MemRefType>(src.getType());
-  if (!srcMemref || !srcMemref.getElementType().isF16())
+  if (!srcMemref || !dtype::isCroutonElement(srcMemref.getElementType()))
     return anchor->emitError(
         "strict resident runtime weight source must be an f16 memref view");
 
@@ -1040,7 +1042,7 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
   auto unrankedArgument = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (argumentType) {
     if (!argumentType.hasStaticShape() || argumentType.getRank() != 2 ||
-        !argumentType.getElementType().isF16() ||
+        !dtype::isCroutonElement(argumentType.getElementType()) ||
         !argumentType.getLayout().isIdentity())
       return anchor->emitError(
           "strict resident runtime weight argument has no exact ranked "
@@ -1059,7 +1061,8 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
           "argument shape");
     }
   } else if (!unrankedArgument || slice || !srcMemref ||
-             !srcMemref.getElementType().isF16() || srcMemref.getRank() != 2) {
+             !dtype::isCroutonElement(srcMemref.getElementType()) ||
+             srcMemref.getRank() != 2) {
     return anchor->emitError(
         "strict resident runtime weight argument has no exact ranked "
         "row-major shape/stride");
@@ -1233,13 +1236,13 @@ validateExistingWeightResident(Operation *operation,
           "strict runtime resident weight has an invalid crouton type");
     const int64_t logicalK = hmx::weightKTiles(type) * hmx::layout::kTileEdge;
     const int64_t logicalN = hmx::weightNTiles(type) * hmx::layout::kTileEdge;
-    if (!sourceType || !sourceType.getElementType().isF16() ||
+    if (!sourceType || !dtype::isCroutonElement(sourceType.getElementType()) ||
         argument.getOwner() != &parentFunction.getBody().front())
       return anchor->emitError(
           "strict runtime resident weight is not an entry f16 argument");
     if (argumentType) {
       if (!argumentType.hasStaticShape() || argumentType.getRank() != 2 ||
-          !argumentType.getElementType().isF16() ||
+          !dtype::isCroutonElement(argumentType.getElementType()) ||
           !argumentType.getLayout().isIdentity() ||
           argumentType.getDimSize(0) != logicalK ||
           argumentType.getDimSize(1) != logicalN)
@@ -1847,7 +1850,8 @@ struct WeightResidentPass
         // The manifest records the argument binding even when the source is f32
         // or otherwise not eligible for resident prepack; the policy pass then
         // gives that slot the canonical device-pack reason.
-        if (!srcMemref || !srcMemref.getElementType().isF16()) {
+        if (!srcMemref ||
+            !dtype::isCroutonElement(srcMemref.getElementType())) {
           if (strictResidentContract) {
             op.emitError("strict resident runtime weight source must be f16");
             return signalPassFailure();

@@ -12,6 +12,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "mlir/Bytecode/BytecodeOpInterface.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/Utils/StaticValueUtils.h"
@@ -71,7 +72,7 @@ LogicalResult AllocOp::verify() {
     // op form that may name a dynamic-arity operand it does not consume.
     int64_t expectedDims = memRefType.getNumDynamicDims();
     if (auto resident =
-            (*this)->getAttrOfType<DictionaryAttr>("hmx.weight_resident"))
+            (*this)->getAttrOfType<DictionaryAttr>(hmx::kHmxWeightResidentAttr))
       if (resident.get("address"))
         expectedDims += 1;
     if (static_cast<int64_t>(getDynamicSizes().size()) != expectedDims)

@@ -10,6 +10,7 @@
 #include "hexagon/Common/Common.h"
 
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -46,10 +47,6 @@ namespace {
 constexpr int64_t kCroutonDims[3] = {layout::kCroutonPair, layout::kCroutonCol,
                                      layout::kCroutonHalf};
 
-/// The conversion-state block the bias registers are loaded from: 256 B, which
-/// is also the HMX_BIAS_BYTES the runtime uses.
-constexpr int64_t kConvStateBytes = 256;
-
 LogicalResult verifyVtcm(Operation *op, Value v, StringRef name) {
   auto memrefType = dyn_cast<MemRefType>(v.getType());
   if (!memrefType)
@@ -71,7 +68,7 @@ LogicalResult verifyCroutonArray(Operation *op, Value v, StringRef name) {
     return op->emitOpError() << name << " must be in VTCM (memory space "
                              << hexagon::VTCM_ADDRESS_SPACE << ")";
 
-  if (!memrefType.getElementType().isF16())
+  if (!dtype::isCroutonElement(memrefType.getElementType()))
     return op->emitOpError() << name << " must have f16 elements";
 
   if (!memrefType.hasStaticShape() || memrefType.getRank() != 5)
@@ -112,7 +109,7 @@ LogicalResult verifyConvState(Operation *op, Value v, StringRef name) {
   auto memrefType = cast<MemRefType>(v.getType());
   if (!memrefType.getElementType().isInteger(8) ||
       !memrefType.hasStaticShape() || memrefType.getRank() != 1 ||
-      memrefType.getDimSize(0) != kConvStateBytes)
+      memrefType.getDimSize(0) != layout::kConvStateBytes)
     return op->emitOpError() << name
                              << " must be the 256-byte conversion state: "
                                 "memref<256xi8> in VTCM";
@@ -494,9 +491,10 @@ LogicalResult UnpackAccF32Op::verify() {
     if (failed(verifyCroutonArray(op, getSrc(), "src")))
       return failure();
   } else if (auto tensor = dyn_cast<RankedTensorType>(getSrc().getType())) {
-    if (!tensor.getElementType().isF16() || !tensor.hasStaticShape() ||
-        tensor.getRank() != 5 || tensor.getDimSize(2) != 16 ||
-        tensor.getDimSize(3) != 32 || tensor.getDimSize(4) != 2)
+    if (!tensor.hasStaticShape() || tensor.getRank() != 5 ||
+        tensor.getDimSize(2) != kCroutonDims[0] ||
+        tensor.getDimSize(3) != kCroutonDims[1] ||
+        tensor.getDimSize(4) != kCroutonDims[2])
       return op->emitOpError()
              << "src must be a crouton tensor: [., ., 16, 32, 2] x f16";
   } else {
@@ -505,10 +503,12 @@ LogicalResult UnpackAccF32Op::verify() {
   if (failed(verifyCroutonDirection(op, getSrc(), getDst(), "src", "dst")))
     return failure();
 
-  auto isF32Matrix = [&](Value v, StringRef name) -> LogicalResult {
+  // The f32 element type is the ODS operand constraint; only the shape ODS
+  // cannot express is checked here.
+  auto isStaticRank2Matrix = [&](Value v, StringRef name) -> LogicalResult {
     auto shaped = dyn_cast<ShapedType>(v.getType());
-    if (!shaped || !shaped.getElementType().isF32()) {
-      op->emitOpError() << name << " must have f32 elements";
+    if (!shaped) {
+      op->emitOpError() << name << " must be a shaped type";
       return failure();
     }
     if (auto memref = dyn_cast<MemRefType>(v.getType())) {
@@ -529,7 +529,7 @@ LogicalResult UnpackAccF32Op::verify() {
     }
     return success();
   };
-  if (failed(isF32Matrix(getDst(), "dst")))
+  if (failed(isStaticRank2Matrix(getDst(), "dst")))
     return failure();
 
   // The residual is an elementwise add into the result: same type, same shape.
@@ -561,8 +561,8 @@ LogicalResult StageOp::verify() {
   // lowering threads to the DMA, so a tile cut out of a wider matrix is just a
   // strided view; nothing beyond "static rank-2 f16/f32" is needed here.
   auto srcType = dyn_cast<MemRefType>(getSrc().getType());
-  if (!srcType || srcType.getRank() != 2 || !srcType.hasStaticShape() ||
-      !(srcType.getElementType().isF16() || srcType.getElementType().isF32()))
+  // The f16/f32 element type is the ODS operand constraint.
+  if (!srcType || srcType.getRank() != 2 || !srcType.hasStaticShape())
     return op->emitOpError()
            << "src must be a static rank-2 f16/f32 memref (row-major source)";
 
@@ -573,9 +573,6 @@ LogicalResult StageOp::verify() {
   if (failed(verifyVtcm(op, getDst(), "dst")))
     return failure();
   auto dstType = cast<MemRefType>(getDst().getType());
-  if (!dstType.getElementType().isF16() && !dstType.getElementType().isF32())
-    return op->emitOpError()
-           << "dst must be a static VTCM f16/f32 slot: memref<32xKxelem, 1>";
   if (dstType.getElementType() != srcType.getElementType())
     return op->emitOpError()
            << "dst element type must match the source element type";
@@ -606,8 +603,6 @@ LogicalResult AwaitOp::verify() {
     return failure();
 
   auto dstType = cast<MemRefType>(getDst().getType());
-  if (!dstType.getElementType().isF16() && !dstType.getElementType().isF32())
-    return op->emitOpError() << "dst must have f16 or f32 elements";
 
   // The result is the slot itself: that value edge is what the compute side
   // consumes, so it must describe the same buffer.

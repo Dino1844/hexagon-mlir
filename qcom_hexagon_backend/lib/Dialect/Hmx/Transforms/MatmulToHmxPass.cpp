@@ -51,6 +51,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxRecordV3.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
@@ -238,7 +239,7 @@ static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
     if (type)
       destination = typeName(type.getElementType());
     else
-      destination = "unavailable";
+      destination = kHmxShapeStateUnavailable.str();
   };
   recordType(lhs, facts->lhsElem);
   recordType(rhs, facts->rhsElem);
@@ -519,13 +520,13 @@ std::string typeName(Type type) {
 static StringRef shapeStateName(ManifestShapeState state) {
   switch (state) {
   case ManifestShapeState::Static:
-    return "static";
+    return kHmxShapeStateStatic;
   case ManifestShapeState::PartiallyDynamic:
-    return "partially-dynamic";
+    return kHmxShapeStatePartiallyDynamic;
   case ManifestShapeState::Dynamic:
-    return "dynamic";
+    return kHmxShapeStateDynamic;
   case ManifestShapeState::Unavailable:
-    return "unavailable";
+    return kHmxShapeStateUnavailable;
   }
   llvm_unreachable("unknown manifest shape state");
 }
@@ -533,8 +534,8 @@ static StringRef shapeStateName(ManifestShapeState state) {
 static DictionaryAttr makeDimensionAttr(MLIRContext *ctx, int64_t extent,
                                         StringRef symbol) {
   NamedAttrList fields;
-  fields.append("kind",
-                StringAttr::get(ctx, extent >= 0 ? "static" : "dynamic"));
+  fields.append("kind", StringAttr::get(ctx, extent >= 0 ? kHmxShapeStateStatic
+                                                         : kHmxShapeStateDynamic));
   if (extent >= 0)
     fields.append("value", IntegerAttr::get(IntegerType::get(ctx, 64), extent));
   else
@@ -560,7 +561,7 @@ static DictionaryAttr makeDTypesAttr(MLIRContext *ctx,
   fields.append("rhs", StringAttr::get(ctx, facts.rhsElem));
   fields.append("out", StringAttr::get(ctx, facts.outElem));
   if (hmx)
-    fields.append("crouton", StringAttr::get(ctx, "f16"));
+    fields.append("crouton", StringAttr::get(ctx, kHmxDTypeF16));
   return fields.getDictionary(ctx);
 }
 
@@ -584,8 +585,8 @@ static DictionaryAttr makeExecutionAttr(MLIRContext *ctx,
   fields.append(
       "blocking",
       StringAttr::get(ctx, !tail && decision.plan->blocked(decision.contract->m)
-                               ? "m_blocked"
-                               : "whole"));
+                               ? kHmxBlockingMBlocked
+                               : kHmxBlockingWhole));
   fields.append("block_m", IntegerAttr::get(i64, tail ? decision.contract->m
                                                       : decision.plan->blockM));
   NamedAttrList counts;
@@ -603,7 +604,7 @@ static DictionaryAttr makeWeightBindingAttr(MLIRContext *ctx,
   NamedAttrList fields;
   switch (facts.weightSource) {
   case ManifestWeightSource::ArgumentSlot: {
-    fields.append("kind", StringAttr::get(ctx, "argument-slot"));
+    fields.append("kind", StringAttr::get(ctx, kHmxWeightKindArgumentSlot));
     NamedAttrList reference;
     reference.append("function", StringAttr::get(ctx, decision.functionName));
     reference.append("slot", IntegerAttr::get(IntegerType::get(ctx, 64),
@@ -612,10 +613,11 @@ static DictionaryAttr makeWeightBindingAttr(MLIRContext *ctx,
     break;
   }
   case ManifestWeightSource::CompileTimeConstant:
-    fields.append("kind", StringAttr::get(ctx, "compile-time-constant"));
+    fields.append("kind",
+                  StringAttr::get(ctx, kHmxWeightKindCompileTimeConstant));
     break;
   case ManifestWeightSource::InternalValue:
-    fields.append("kind", StringAttr::get(ctx, "internal-value"));
+    fields.append("kind", StringAttr::get(ctx, kHmxWeightKindInternalValue));
     break;
   }
   return fields.getDictionary(ctx);
@@ -663,11 +665,15 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
     fields.append("padded", makeExtentAttr(ctx, shape.mp, shape.np, shape.kp));
     fields.append("full", makeExtentAttr(ctx, shape.mf, shape.nf, shape.kf));
     fields.append("tail", makeExtentAttr(ctx, shape.mt, shape.nt, shape.kt));
-    fields.append("layout", StringAttr::get(ctx, "row-major-inner-contiguous"));
-    fields.append("workspace_class", StringAttr::get(ctx, "runtime-internal"));
-    fields.append("grid_policy", StringAttr::get(ctx, tail ? "single-instance"
-                                                           : "legacy-runtime"));
-    fields.append("vtcm_accounting", StringAttr::get(ctx, "bridge-only"));
+    fields.append("layout",
+                  StringAttr::get(ctx, kHmxLayoutRowMajorInnerContiguous));
+    fields.append("workspace_class",
+                  StringAttr::get(ctx, kHmxWorkspaceRuntimeInternal));
+    fields.append("grid_policy",
+                  StringAttr::get(ctx, tail ? kHmxGridSingleInstance
+                                            : kHmxGridLegacyRuntime));
+    fields.append("vtcm_accounting",
+                  StringAttr::get(ctx, kHmxVtcmAccountingBridgeOnly));
     fields.append("vtcm_budget_bytes",
                   IntegerAttr::get(i64, target.vtcmBudget));
     fields.append("vtcm_before_bytes",
@@ -676,9 +682,8 @@ DictionaryAttr manifestRecord(MLIRContext *ctx, const MatmulDecision &decision,
                   IntegerAttr::get(i64, decision.vtcmPeak));
     if (tail) {
       NamedAttrList tailPolicy;
-      tailPolicy.append("k", StringAttr::get(ctx, "zero-pad-both-operands"));
-      tailPolicy.append("mn",
-                        StringAttr::get(ctx, "padded-edge-tile-bounded-store"));
+      tailPolicy.append("k", StringAttr::get(ctx, kHmxTailKPolicy));
+      tailPolicy.append("mn", StringAttr::get(ctx, kHmxTailMNPolicy));
       fields.append("tail_policy", tailPolicy.getDictionary(ctx));
     }
     fields.append("execution", makeExecutionAttr(ctx, decision));
@@ -878,7 +883,7 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
   if (!cst)
     return {};
   auto dense = dyn_cast<DenseElementsAttr>(cst.getValue());
-  if (!dense || !dense.getType().getElementType().isF16())
+  if (!dense || !dtype::isCroutonElement(dense.getType().getElementType()))
     return {};
 
   // The prepacked constant carries the physical rank-5 *shape* but not the
@@ -1124,7 +1129,7 @@ Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
 static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
                           RankedTensorType outType, Value residual,
                           bool canFuseTail, int64_t decisionId) {
-  if (outType.getElementType().isF32() && fusedTailLegal(outType) &&
+  if (dtype::isF32(outType.getElementType()) && fusedTailLegal(outType) &&
       canFuseTail && (!residual || isDenseInternal(residual)))
     return unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
                             residual);
@@ -1132,7 +1137,7 @@ static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
   auto f16Out = RankedTensorType::get(outType.getShape(), b.getF16Type());
   Value result =
       unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false, decisionId);
-  if (outType.getElementType().isF32())
+  if (dtype::isF32(outType.getElementType()))
     result = widenToF32(b, loc, result);
   if (residual)
     result = addInto(b, loc, result, residual);
@@ -1233,8 +1238,7 @@ static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
   auto tailPlan = TailPlanAttr::get(
       rewriter.getContext(), {contract.m, contract.n, contract.k},
       {shape.mp, shape.np, shape.kp}, {shape.mf, shape.nf, shape.kf},
-      {shape.mt, shape.nt, shape.kt}, "zero-pad-both-operands",
-      "padded-edge-tile-bounded-store");
+      {shape.mt, shape.nt, shape.kt}, kHmxTailKPolicy, kHmxTailMNPolicy);
 
   Value packedLhs =
       emitBridgeAbove(rewriter, loc, paddedLhs, paddedLhsType,
@@ -1535,11 +1539,11 @@ static Value readoutBehind(Value v, scf::ForOp &bridgeLoop,
 //   * a single-use producer is re-hosted; a shared one is left alone.
 
 /// f16 is the only element type the crouton encoding admits, so only an f16
-/// tensor can be a layout operand. `Type::isF16()` is the element type query;
-/// a `RankedTensorType` is never itself f16, hence the explicit unwrap.
+/// tensor can be a layout operand. `dtype::isCroutonElement` is the element
+/// type query; a `RankedTensorType` is never itself f16, hence the unwrap.
 static bool isF16Tensor(Type type) {
   auto tensor = dyn_cast<RankedTensorType>(type);
-  return tensor && tensor.getElementType().isF16();
+  return tensor && dtype::isCroutonElement(tensor.getElementType());
 }
 
 /// An elementwise map that commutes with the layout: the whole propagation
@@ -1581,17 +1585,17 @@ static bool isCheapF16Elementwise(linalg::GenericOp map) {
     return false;
   for (Value operand : map.getDpsInputs()) {
     auto tensor = dyn_cast<RankedTensorType>(operand.getType());
-    if (!tensor || !tensor.getElementType().isF16())
+    if (!tensor || !dtype::isCroutonElement(tensor.getElementType()))
       return false;
   }
   for (Value init : map.getDpsInits()) {
     auto tensor = dyn_cast<RankedTensorType>(init.getType());
-    if (!tensor || !tensor.getElementType().isF16())
+    if (!tensor || !dtype::isCroutonElement(tensor.getElementType()))
       return false;
   }
   for (Value result : map->getResults()) {
     auto tensor = dyn_cast<RankedTensorType>(result.getType());
-    if (!tensor || !tensor.getElementType().isF16())
+    if (!tensor || !dtype::isCroutonElement(tensor.getElementType()))
       return false;
   }
   for (Operation &inner : map.getRegion().front().without_terminator()) {
@@ -1677,7 +1681,7 @@ static std::optional<APFloat> splatScalar(Value v) {
   }
   if (auto cst = v.getDefiningOp<arith::ConstantOp>())
     if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
-      if (dense.isSplat() && dense.getType().getElementType().isF32())
+      if (dense.isSplat() && dtype::isF32(dense.getType().getElementType()))
         return dense.getSplatValue<APFloat>();
   return std::nullopt;
 }
@@ -1721,13 +1725,13 @@ static bool chainIsCheapF16Only(Value v, RankedTensorType crouton,
   }
   if (splatScalar(v)) {
     auto tensor = dyn_cast<RankedTensorType>(v.getType());
-    return tensor && tensor.getElementType().isF16();
+    return tensor && dtype::isCroutonElement(tensor.getElementType());
   }
   if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
     if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
       if (dense.isSplat()) {
         auto tensor = dyn_cast<RankedTensorType>(v.getType());
-        return tensor && tensor.getElementType().isF16();
+        return tensor && dtype::isCroutonElement(tensor.getElementType());
       }
     return false;
   }
@@ -1888,7 +1892,7 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
       v.getDefiningOp() ? v.getDefiningOp()->getLoc() : b.getUnknownLoc();
   // Only the engine's own layout lives in VTCM; the i1/i32/f32 intermediates
   // are ordinary tensors and must not claim a VTCM buffer.
-  Value init = target.getElementType().isF16()
+  Value init = dtype::isCroutonElement(target.getElementType())
                    ? vtcmEmpty(b, loc, target)
                    : tensor::EmptyOp::create(b, loc, target.getShape(),
                                              target.getElementType());

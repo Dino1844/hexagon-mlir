@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
@@ -261,7 +262,7 @@ LogicalResult CroutonLayoutAttr::verifyEncoding(
     return emitError() << "hmx.crouton expects a rank-5 crouton array, got "
                           "rank "
                        << shape.size();
-  if (!elementType.isF16())
+  if (!dtype::isCroutonElement(elementType))
     return emitError() << "hmx.crouton expects f16 elements, got "
                        << elementType;
   if (shape[2] != kCroutonPair || shape[3] != kCroutonCol ||
@@ -325,7 +326,7 @@ RankedTensorType mlir::hmx::croutonLayoutType(RankedTensorType logical) {
       {m / CroutonLayoutAttr::kTile, n / CroutonLayoutAttr::kTile,
        CroutonLayoutAttr::kCroutonPair, CroutonLayoutAttr::kCroutonCol,
        CroutonLayoutAttr::kCroutonHalf},
-      Float16Type::get(logical.getContext()), encoding);
+      dtype::croutonElementType(logical.getContext()), encoding);
 }
 
 //===----------------------------------------------------------------------===//

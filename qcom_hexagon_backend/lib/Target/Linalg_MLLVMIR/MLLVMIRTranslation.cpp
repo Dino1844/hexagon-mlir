@@ -117,10 +117,12 @@ void setLinalgToLLVMOptions(
   options.enableConversionToFp16 =
       !arch_kwargs.at("enableConversionToFp16").compare(TRUE);
   // Tolerant read: several probe scripts build a partial options map, and a new
-  // gate must not turn their missing key into a throw. Absent = off.
+  // gate must not turn their missing key into a throw. Absent = the declared
+  // default (on), so a partial map behaves like production instead of silently
+  // dropping the optimization.
   auto weightResident = arch_kwargs.find("enableWeightResident");
   options.enableWeightResident =
-      weightResident != arch_kwargs.end() &&
+      weightResident == arch_kwargs.end() ||
       !weightResident->second.compare(TRUE);
   // Tolerant read for the same reason: absent = 0 (auto).
   auto hmxPipelineDepth = arch_kwargs.find("enableHmxPipelineDepth");

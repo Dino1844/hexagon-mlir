@@ -14,6 +14,7 @@
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxRecordV3.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
@@ -406,16 +407,16 @@ static void validatePrepackAttributes(mlir::ModuleOp module) {
     if (!parsed || (array ? !parsed->getAsArray() : !parsed->getAsObject()))
       fail("malformed HMX prepack JSON: " + name.str());
   };
-  validate("hmx.weight_prepack", /*array=*/true);
-  validate("hmx.weight_prepack_layout", /*array=*/false);
+  validate(mlir::hmx::kHmxWeightPrepackAttr, /*array=*/true);
+  validate(mlir::hmx::kHmxWeightPrepackLayoutAttr, /*array=*/false);
 }
 
 static std::string buildTranslationMetadata(mlir::ModuleOp module) {
   validatePrepackAttributes(module);
   auto weightAttr = module->getAttrOfType<mlir::StringAttr>(
-      "hmx.weight_prepack");
+      mlir::hmx::kHmxWeightPrepackAttr);
   auto layoutAttr = module->getAttrOfType<mlir::StringAttr>(
-      "hmx.weight_prepack_layout");
+      mlir::hmx::kHmxWeightPrepackLayoutAttr);
 
   // `hex.hmx.translation/v1` is the default and stays byte-for-byte what it
   // was.  `hex.hmx.translation/v2` is a *coordinated envelope migration*: it
@@ -507,8 +508,8 @@ std::vector<std::vector<char>> translateLinalgToObj(
       fail("translated module is missing a valid HMX manifest; request "
            "with_meta=true for the versioned envelope");
     validatePrepackAttributes(mods[0]);
-    if (auto prepack =
-            mods[0]->getAttrOfType<mlir::StringAttr>("hmx.weight_prepack")) {
+    if (auto prepack = mods[0]->getAttrOfType<mlir::StringAttr>(
+            mlir::hmx::kHmxWeightPrepackAttr)) {
       llvm::StringRef value = prepack.getValue();
       if (!value.empty() && value != "[]")
         fail("translated module contains a runtime weight-prepack contract; "
@@ -1034,7 +1035,8 @@ std::string translateLinalgToLLVMIR(
       fail("translated module is missing a valid HMX manifest; request "
            "metadata for the versioned envelope");
     if (auto prepack =
-            mod->getAttrOfType<mlir::StringAttr>("hmx.weight_prepack")) {
+            mod->getAttrOfType<mlir::StringAttr>(
+                mlir::hmx::kHmxWeightPrepackAttr)) {
       llvm::StringRef value = prepack.getValue();
       if (!value.empty() && value != "[]")
         fail("translated module contains a runtime weight-prepack contract; "
