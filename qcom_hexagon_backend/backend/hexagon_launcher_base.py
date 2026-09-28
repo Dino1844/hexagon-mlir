@@ -78,11 +78,31 @@ struct FuncResult
         self.call_lwp = """WriteLWPOutput("{path}/{fname}.json");\n"""
 
         self.func_call_and_benchmarking = """
-uint64_t avg_time_us = benchmark_time_us({iterations}, [&]() {{
+uint64_t avg_time_us = 0, avg_pcycles = 0;
+benchmark_time_and_pcycles({iterations}, [&]() {{
     {function_call}
-}});
+}}, &avg_time_us, &avg_pcycles);
 TestReport tr("{func_name}", avg_time_us, "us", Result::Pass, "{save_path}");
 tr.save();
+// The processor-cycle average, from the SAME pass as the microsecond one above.
+// APPENDED to the same report file rather than printed: the device's stdout is
+// not captured by the executor, so a printf here is silently lost -- the
+// Test_Info block that reaches the host comes from TestReport::save() writing
+// this file, and hexagon_executor prints the file's whole contents. The line is
+// additive and contains no "Result", so get_test_result() (which returns the
+// first line containing "Result") is unaffected.
+//
+// Why it has to come from the same pass: C15:14 stops while the DSP is
+// clock-gated (HAP_perf.h:79) while the 19.2 MHz qtimer behind Perf does not, so
+// the ratio between the two is a property of the run, not a constant of the part
+// -- measured 2.10-2.15 GHz in a tight leaf loop and 1.10-1.15 GHz inside a full
+// matmul on one build. Any microsecond measurement that gets converted to cycles
+// needs this number from its own run; see
+// docs/hmx/hmx-perf-findings-2026-09-27.md 1.
+{{
+  FILE *pcf = fopen("{save_path}", "a");
+  if (pcf) {{ fprintf(pcf, "PerfPcycles:%llu\\n", (unsigned long long)avg_pcycles); fclose(pcf); }}
+}}
 """
 
         # Codegen string for the Headers in the generated CPP file.

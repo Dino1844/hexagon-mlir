@@ -19,7 +19,7 @@ from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata_fie
 from triton.backends.qcom_hexagon_backend.utils import validate_hmx_record_json
 
 
-def getHexagonLauncherClass(device_type="dsp"):
+def getHexagonLauncherClass():
     class HexagonLauncher:
         def __init__(self, src, metadata):
             if not hasattr(self, "_initialized"):
@@ -162,8 +162,10 @@ class HexagonDriver(DriverBase):
     def __init__(self, device_type="dsp"):
         self.utils = HexagonUtils()
         self.backend = "HEXAGON"
+        # Kept as driver state (upstream reads it); it is deliberately *not*
+        # threaded into getHexagonLauncherClass, which never used it.
         self.device_type = device_type
-        instance = getHexagonLauncherClass(device_type)
+        instance = getHexagonLauncherClass()
         instance._initialized = True
         self.launcher_cls = instance
         # Dummy executable/binary set, since there is no binary for our usecase.

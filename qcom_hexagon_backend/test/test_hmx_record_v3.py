@@ -746,6 +746,34 @@ class CppRoundTripTest(unittest.TestCase):
             marked_envelope["weight_prepack"], unmarked_envelope["weight_prepack"]
         )
 
+    def test_the_v1_envelope_key_set_is_pinned_too(self):
+        """The v2 arm is pinned at `sorted(envelope)` above; v1 was not.
+
+        `_require_exact_fields` rejects any envelope carrying a key the host
+        does not know, so a fourth key added to the v1 emitter would leave the
+        host suite green and fail in production at `parse_translation_metadata`
+        -- with a message that blames the publisher for a decision the host made.
+        Pinning both arms keeps that asymmetry from coming back, and it is
+        checked against a C++-produced envelope rather than a hand-written dict,
+        which is the only way the producer's literal is actually exercised.
+        """
+        marked, unmarked = self._sources()
+        v1_envelope = json.loads(self._translate(unmarked))
+        v2_envelope = json.loads(self._translate(marked))
+        self.assertEqual(
+            sorted(v1_envelope), ["hmx_manifest", "schema", "weight_prepack"]
+        )
+        self.assertEqual(
+            sorted(v2_envelope),
+            ["hmx_manifest", "hmx_record", "schema", "weight_prepack"],
+        )
+        # And the closed shape is enforced, not merely documented: one extra key
+        # on either arm is refused rather than ignored.
+        for envelope in (v1_envelope, v2_envelope):
+            polluted = dict(envelope, surprise=1)
+            with self.assertRaisesRegex(ValueError, "surprise"):
+                _UTILS.parse_translation_metadata(json.dumps(polluted))
+
     def test_every_v3_record_agrees_with_the_v2_plan_it_describes(self):
         """Plan agreement, cross-checked rather than co-located.
 
@@ -1157,9 +1185,9 @@ class CacheBoundaryTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _reject_cacheable_record_only_module(f"module attributes {{{marker}}} {{}}")
         # A mention in a string literal is not the module attribute; the guard is
-        # a text screen, so the *producer* also checks the parsed attribute and
-        # this is the documented outer bound of the check.
-        self.assertIsNotNone(marker)
+        # a text screen, so the *producer* also checks the parsed attribute.  The
+        # three calls above are the whole assertion -- the outer bound of this
+        # check is the producer's parsed-attribute test, not anything here.
 
     def test_a_v1_envelope_packs_with_the_named_absent_spelling(self):
         from test_hmx_manifest_metadata import _MANIFEST, _WEIGHT  # noqa: PLC0415
@@ -1194,21 +1222,43 @@ class CacheBoundaryTest(unittest.TestCase):
             HexagonBackend.pack_metadata(object(), metadata)
 
 
+class _RecordingLauncher:
+    """Stands in for ``TritonHexagonLauncher`` and records how it was called."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _exec_kernel(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return "launched"
+
+
 class DriverRecordTest(unittest.TestCase):
     """The driver may read the record; the launcher must not."""
 
     @staticmethod
-    def _launcher_class():
+    def _launcher():
+        """A real ``HexagonLauncher`` instance, built without ``__init__``.
+
+        ``__init__`` needs a triton ``ASTSource`` and builds a
+        ``TritonHexagonLauncher``; neither is available or wanted on the host.
+        ``object.__new__`` gives a genuine instance, so the methods under test
+        are reached as *bound* methods with a real ``self`` -- which is how the
+        driver reaches them.  An earlier version of this class held the *class*
+        and called the unbound function with ``self=None``; that only passed
+        because ``_load_hmx_record`` never reads ``self``, so the launch path
+        was untested and the ``None`` read as a two-argument signature.
+        """
         from triton.backends.qcom_hexagon_backend.driver import (  # noqa: PLC0415
             getHexagonLauncherClass,
         )
 
-        return getHexagonLauncherClass()
+        return object.__new__(getHexagonLauncherClass())
 
-    def test_a_v1_envelope_leaves_no_record(self):
+    @staticmethod
+    def _packed(**overrides):
         from test_hmx_manifest_metadata import _MANIFEST, _WEIGHT  # noqa: PLC0415
 
-        launcher = self._launcher_class()
         packed = {
             "return_types": [],
             "name": "matmul_kernel",
@@ -1217,50 +1267,81 @@ class DriverRecordTest(unittest.TestCase):
             "enableMultiThreading": False,
             "enableThreadedDispatch": False,
             "enableLWP": False,
+            # Required by `require_pack_metadata_fields` on the launch path;
+            # the driver's own structural contract is checked separately.
+            "num_warps": 4,
+            "num_ctas": 1,
+            "shared": 0,
+            "cluster_dims": [],
             "weight_prepack": json.dumps(_WEIGHT),
             "hmx_manifest": json.dumps(_MANIFEST),
             "hmx_record": "",
         }
-        self.assertIsNone(launcher._load_hmx_record(None, packed))
+        packed.update(overrides)
+        return packed
+
+    def _call_args(self, packed):
+        """The positional tuple ``CompiledKernel.run`` hands to ``__call__``."""
+        return (1, 1, 1, None, "kernel_llir", packed, None, None, None)
+
+    def test_it_is_a_real_instance_not_a_class(self):
+        # Guards the mistake this class used to make: a test that reaches the
+        # method through the class never runs the code the driver runs.
+        import inspect  # noqa: PLC0415
+
+        launcher = self._launcher()
+        self.assertFalse(inspect.isclass(launcher))
+        self.assertIsNotNone(launcher._load_hmx_record.__self__)
+
+    def test_a_v1_envelope_leaves_no_record(self):
+        launcher = self._launcher()
+        self.assertIsNone(launcher._load_hmx_record(self._packed()))
 
     def test_a_v2_envelope_record_is_validated_and_kept(self):
-        from test_hmx_manifest_metadata import _MANIFEST, _WEIGHT  # noqa: PLC0415
-
-        launcher = self._launcher_class()
-        packed = {
-            "return_types": [],
-            "name": "matmul_kernel",
-            "iterations": 1,
-            "scratch": 0,
-            "enableMultiThreading": False,
-            "enableThreadedDispatch": False,
-            "enableLWP": False,
-            "weight_prepack": json.dumps(_WEIGHT),
-            "hmx_manifest": json.dumps(_MANIFEST),
-            "hmx_record": json.dumps(_DOCUMENT),
-        }
+        launcher = self._launcher()
+        packed = self._packed(hmx_record=json.dumps(_DOCUMENT))
         self.assertEqual(
-            json.loads(launcher._load_hmx_record(None, packed)), _DOCUMENT
+            json.loads(launcher._load_hmx_record(packed)), _DOCUMENT
         )
         # A malformed record is an actionable error, not a silent "no record".
         packed["hmx_record"] = json.dumps(_bad(plan="full-hmx"))
         with self.assertRaisesRegex(RuntimeError, "hmx_record"):
-            launcher._load_hmx_record(None, packed)
+            launcher._load_hmx_record(packed)
 
-    def test_the_launch_call_does_not_receive_the_record(self):
+    def test_a_malformed_record_stops_the_launch(self):
+        """Fail-closed has to happen on the launch path, not only in a helper."""
+        launcher = self._launcher()
+        launcher.launcher = _RecordingLauncher()
+        launcher.input_type_list = {}
+        packed = self._packed(hmx_record=json.dumps(_bad(plan="full-hmx")))
+        with self.assertRaisesRegex(RuntimeError, "hmx_record"):
+            launcher(*self._call_args(packed))
+        # The launcher must not have been reached: a record is evidence, and
+        # unreadable evidence is not a reason to run the kernel.
+        self.assertEqual(launcher.launcher.calls, [])
+
+    def test_the_launch_call_receives_the_manifest_but_never_the_record(self):
+        """The boundary, checked by what the launcher is actually handed."""
+        launcher = self._launcher()
+        launcher.launcher = _RecordingLauncher()
+        launcher.input_type_list = {}
+        packed = self._packed(hmx_record=json.dumps(_DOCUMENT))
+        launcher(*self._call_args(packed))
+        self.assertEqual(len(launcher.launcher.calls), 1)
+        _, kwargs = launcher.launcher.calls[0]
+        self.assertIn("hmx_manifest", kwargs)
+        self.assertNotIn("hmx_record", kwargs)
+        # The driver kept the validated record for its own diagnostic read.
+        self.assertEqual(launcher.hmx_record_diagnostic(), packed["hmx_record"])
+
+    def test_the_launcher_api_cannot_carry_a_record(self):
         import inspect  # noqa: PLC0415
 
-        from triton.backends.qcom_hexagon_backend import driver  # noqa: PLC0415
-        from triton.backends.qcom_hexagon_backend import triton_hexagon_launcher  # noqa: PLC0415
+        from triton.backends.qcom_hexagon_backend import (  # noqa: PLC0415
+            triton_hexagon_launcher,
+        )
 
-        source = inspect.getsource(driver.getHexagonLauncherClass())
-        # The launch call forwards the v2 execution child and nothing else: the
-        # record is read for diagnostics and stays on the driver.
-        call = source[source.index("self.launcher._exec_kernel("):]
-        self.assertIn("hmx_manifest=hmx_manifest", call)
-        self.assertNotIn("hmx_record=", call)
-        # And the launcher has no parameter that could carry a record even if a
-        # future caller tried.
+        # Even if a future caller tried, there is no parameter to carry it.
         parameters = inspect.signature(
             triton_hexagon_launcher.TritonHexagonLauncher._exec_kernel
         ).parameters

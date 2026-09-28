@@ -88,9 +88,6 @@ sys.exit({_PROBE_OK})
 """
 
 _COLLECTED = re.compile(r"^(?P<nodeid>\S+::\S+)\s*$")
-_SUMMARY = re.compile(
-    r"(?P<count>\d+) (?P<word>passed|failed|error|errors|skipped|xfailed|subtests?)"
-)
 
 
 @dataclass
@@ -378,6 +375,27 @@ def main() -> int:
                 f"red under pytest (rc={report.isolated.returncode})"
             )
 
+    # ---- the whole-suite verdict is part of the gate ----------------------
+    #
+    # Pass 3 is the only pass that can observe cross-file interference, which is
+    # the defect this runner exists to eliminate, so its result cannot be printed
+    # and then discarded: a batch that is red while every file is green *alone* is
+    # exactly the order-dependent failure, and it used to report PASS.  Recorded as
+    # its own verdict rather than folded into a file, because in that case no single
+    # file is at fault and blaming one would send the reader to the wrong place.
+    batch_problems: list[str] = []
+    if batch.returncode != 0:
+        green_in_isolation = all(reports[p].green for p in files)
+        batch_problems.append(
+            f"whole-suite pytest is red (rc={batch.returncode})"
+            + (
+                " while every file is green in isolation: cross-file interference"
+                " (module-level state, sys.path, or sys.modules shadowing)"
+                if green_in_isolation
+                else ""
+            )
+        )
+
     # ---- report ----------------------------------------------------------
     width = max(len(report.rel) for report in reports.values())
     print(f"{'file'.ljust(width)}  {'script':>8}  {'pytest':>8}  {'tests':>5}  verdict")
@@ -400,11 +418,22 @@ def main() -> int:
     green = [r for r in reports.values() if r.green]
     print(f"{len(green)}/{len(files)} files green in both styles, {total_tests} tests")
     print(f"whole-suite pytest: {_parse_summary(batch.output) or f'rc={batch.returncode}'}")
-    if failures:
-        print(f"\nFAILED: {failures} file(s) are not green in both styles", file=sys.stderr)
-        for report in reports.values():
-            for problem in report.problems:
-                print(f"  {report.rel}: {problem}", file=sys.stderr)
+    if failures or batch_problems:
+        if failures:
+            print(
+                f"\nFAILED: {failures} file(s) are not green in both styles",
+                file=sys.stderr,
+            )
+            for report in reports.values():
+                for problem in report.problems:
+                    print(f"  {report.rel}: {problem}", file=sys.stderr)
+        for problem in batch_problems:
+            print(f"  FAIL  {problem}", file=sys.stderr)
+        if batch_problems:
+            print(
+                f"\nFAILED: {len(batch_problems)} whole-suite problem(s)",
+                file=sys.stderr,
+            )
         return 1
     print("PASS")
     return 0

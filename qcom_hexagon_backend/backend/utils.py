@@ -180,7 +180,7 @@ def profile_inputs(inputs):
             )
             scalar_index += 1
         else:
-            raise ValueError(f"Unsupported input type {type(inp.__name__)}")
+            raise ValueError(f"Unsupported input type {type(inp).__name__}")
     return profiled
 
 
@@ -348,6 +348,14 @@ HMX_RECORD_ACCOUNTING_MODE = "v3-record-only"
 
 HMX_TILE_EDGE = 32
 HMX_PLANS = frozenset({"full-hmx", "hmx-tail", "hvx"})
+# The host's counterpart of `kMinimumHmxRows` in
+# lib/Dialect/Hmx/Transforms/HmxManifest.cpp.  The compiler refuses to *emit* an
+# HMX plan with logical M <= this; the host used to accept one, so a stale or
+# hand-edited cached artifact could declare a shape the compiler would never
+# publish and still pass every host gate.  Pinned from both sides by
+# test/test_hmx_manifest_minimum_rows.py.
+HMX_MINIMUM_ROWS = 4
+HMX_NON_HVX_PLANS = frozenset({"full-hmx", "hmx-tail"})
 HMX_PLAN_REASONS = {
     "full-hmx": frozenset({"selected-aligned"}),
     "hmx-tail": frozenset({"selected-tail"}),
@@ -665,6 +673,14 @@ def _validate_hmx_shape(entry, path, plan, logical_values):
         ):
             raise ValueError(f"{path}.padded.{axis} has inconsistent padding")
 
+    if plan in HMX_NON_HVX_PLANS and logical_values["m"] <= HMX_MINIMUM_ROWS:
+        # Mirrors kMinimumHmxRows on the producer side.  The host is the last
+        # gate before a manifest reaches the launcher, so a record the compiler
+        # could not have produced has to stop here rather than at a device.
+        raise ValueError(
+            f"{path} HMX plans require logical M > {HMX_MINIMUM_ROWS}, "
+            f"got {logical_values['m']}"
+        )
     if plan == "full-hmx":
         if any(tail.values()):
             raise ValueError(f"{path} full-hmx must have an all-zero tail")
