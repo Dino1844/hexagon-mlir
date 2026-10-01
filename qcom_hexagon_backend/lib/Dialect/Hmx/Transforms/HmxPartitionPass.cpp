@@ -155,16 +155,36 @@ constexpr int64_t kSerialPipelineDepth = 3;
 //     docs/hmx/gap-vs-llama-plain-2026-09-29.md:11. The lone outlier is
 //     exp/hmx/op_bench/bench_ops.py:291 (1024x64x256 = Kt=8), which by that
 //     count is mislabelled.
-//     **But no log records which shape the -10% was actually taken on.** A
-//     3-1 file vote is evidence, not proof, and it is deciding what a
-//     calibration point MEANS -- so it is recorded as a vote, and the earlier
-//     phrasing "RESOLVED" (and the "8x below the floor, not 4x" inference that
-//     came with it) is withdrawn. Settling it needs the original A/B log; until
-//     then the negative point below the floor is **unpinned**, and the gap
-//     between the floor and the measured loss is somewhere between 4x and 8x.
+//     **But no log recorded which shape the -10% was actually taken on.** A
+//     3-1 file vote is evidence, not proof, and it was deciding what a
+//     calibration point MEANS -- so the earlier phrasing "RESOLVED" (and the
+//     "8x below the floor, not 4x" inference that came with it) was withdrawn.
 //
-//     To settle: find the run that produced 60.5 -> 67 us and read the shape off
-//     it. Do not infer it from a probe script's label.
+//     SETTLED 2026-10-02, same-build on device, N=1000, 3 reps, fingerprints
+//     identical before and after (ce26015e8efb75cc047515000c8ad70f). Arm
+//     enableHmxPipelineDepth=3 is the plain tile loop, =2 is staged with
+//     overlap, config=base; log at
+//     logs/phase0-1-anchor-2026-10-02/depth_ab_N1000.log, writeup at
+//     docs/results/kstage-floor-pinned-2026-10-02.md:
+//
+//       shape              Kt   vs floor 32   depth3      depth2    depth2 vs depth3
+//       S1 1024x512x64      2      0.06x        55 us       64 us      +16.4%  (loses)
+//       S3 128^3            4      0.12x        10 us       16 us      +60.0%  (loses)
+//       S2 256x64x2048     64      2.00x        87 us       41 us      -52.9%  (wins)
+//
+//     So the negative point IS 8x below the floor -- the withdrawn inference
+//     was right -- and `auto` picks the faster arm on all three.
+//
+//     The old number was wrong because of the iteration count, not the noise.
+//     That run used N=30, where once_share is 79% for S3 (ROADMAP1001.md 5.1.2):
+//     it mostly measured the per-invocation bring-up, which staging does not
+//     touch, so it diluted the mechanism to +10.8% where the mechanism is
+//     +60.0%. Same dilution on the winning side: S2 read 1.94x then, 2.12x now.
+//     A verdict drawn at N=30 is a verdict about the wrong quantity.
+//
+//     Still unpinned: the band just above the floor. Nothing is measured
+//     between Kt 5 and 63, so 32 is a conservative pick inside (4, 64), not a
+//     searched optimum. depth=1 (staged serial) is also still unmeasured.
 // Flip point, re-derived and confirmed by host codegen: Kt is read off the
 // crouton array (actType.getDimSize(1)) and K == Kt * layout::kTileEdge is
 // required just above, so the floor of 32 flips at **K = 1024 exactly**.
