@@ -443,6 +443,29 @@ Triton → TTIR → Linalg
 - ⛔ 没重建 `libtriton.so`。设备锚点仍是
   `ce26015e8efb75cc047515000c8ad70f` / `97af133e81fbc361bca3be10164b7bc8`。
 
+### ✅ 2026-10-02 夜：f16 除法那条（项目已知最大单点）的两块基石都到位了
+
+**与本方案无关，但它是项目当前已知最大的单点，登记在此备查：**
+`fdiv <64 x half>` → **194 次 libcall**；`fdiv <64 x float>` → **2 次**。
+根因是 LLVM InstCombine 的 binop 收窄把 `<64 x float>` 变成 `<64 x half>`
+（HVX 没有向量 f16 除法 ⇒ 192 次 libcall）。
+
+**今天补上了它的一块基石**：上游 \`320a8a4db872\`（PR #202489，2026-07-03）已 backport
+（patch 落 \`tools/hexmlir/llvm-hexagon-fdiv-ninf-narrowing.patch\`，4/4 hunk @ offset −113，往返验证过）。
+它**保留收窄、只修 miscompile**：收窄后的 binop 在更小类型里重算，
+可能在宽运算有限处溢出成 inf，\`ninf\` 被原样拷过去就会产生 poison。
+实测行为：\`fdiv nnan ninf <4 x float>(fpext, fpext)\` → 收窄成 \`fdiv nnan <4 x half>\`（**\`ninf\` 被清**）；
+而 fptrunc 也带 \`ninf\` 时 → \`fdiv nnan ninf <4 x half>\`（**保留**）。
+**收窄没被取消，只丢了不安全的那个标志。** LLVM InstCombine 全套 1804 个测试 0 失败。
+
+⚠️ **这也是「不给 fdiv 加 \`nnan ninf\`」的独立理由**：在未打这个补丁的基线上，
+\`fdiv nnan ninf <64 x float>\` 会被收窄成 \`fdiv nnan ninf <64 x half>\`
+⇒ **正是那个 poison-on-overflow miscompile。**
+
+**⛔ 未做**：两个 patch 都**只对 \`build/bin/opt\` 生效**（各自重建过 opt）。
+**要让 hexagon-mlir 吃到，必须重建 \`build/install\` 树，那会改 \`libtriton.so\`、作废设备锚点**
+⇒ 归 S0b 那条，需用户批窗口。
+
 ---
 
 ## 5.1 ⛔ 验收判据：必须带 N，且判决分三类（2026-10-02 定）
