@@ -14,10 +14,12 @@
 > （把 0.58× 当成"我们慢 1.7 倍"，据此以为 S3 是主要战场；实际 S3 是我们**快** 1.7 倍）。
 > **任何按「ratio < 1 = 我们慢」来读的读者都会得出与 §1.2 相反的结论。**
 >
-> ⚠️ **0.92 与实测表的 0.89 并存且无人裁决**（`ROADMAP.md:50` = 1.13/0.92；
-> `hmx-next-round-plan.md:306` 实测表 = 1.14/0.89）。本文抄 `ROADMAP.md:50` 那一套。
+> ⚠️ **0.92 与实测表的 0.89 并存，无人裁决 —— 标「待权威源裁决」**。
+> 两套数：`ROADMAP.md:50` = 1.13/0.92；`docs/hmx/hmx-next-round-plan.md:306` 实测表 = 1.14/0.89。
+> **本文引用时抄 `ROADMAP.md:50` 那一套，但这是权宜之计，不是裁决。**
 > ⚠️ **`ROADMAP.md:50` 自称的权威源 `docs/state/STATE-OF-PLAY.md:559` 引用链已断**
 > —— 该行讲的是 `FastInversePass` 除法反号，与本比值无关。
+> ⇒ **待办：指定一个权威源，或重测一次同构建 S1/S2/S3，消灭这组分叉。**
 
 ---
 
@@ -27,7 +29,10 @@
 编译器把每个 kernel 切成 HMX-role 与 HVX-role 两类区域（判据=硬件能力，零成本模型），
 运行时只提供两个执行器——**一条进程级专属 HMX 线程（ensure 一次、锁跨算子持有、永不接触 HVX）**
 + **现有 HVX 线程池**——两线程间用 SPSC 环接成软件流水，
-让「第 i+1 块的 stage/pack（HVX 侧 DMA+向量）」与「第 i 块的 HMX mma」真正重叠。
+让 **HVX 侧 `pack_act(i+1)` / `unpack(i)`（+ `hmx.stage` DMA 提交）**
+与 **HMX 侧 `mma(i+1)` / `bias_load` / `acc_read`** 真正重叠。
+（**这是全文唯一权威的重叠表述**；§2 给出引擎归属边界的定义，§5 给出验收。
+原稿 §0/§2/§5 三处互相矛盾，已按 2026-10-02 决策统一为此式。）
 
 ---
 
@@ -38,7 +43,7 @@
 | 保留项 | 证据 | 为什么对 |
 |---|---|---|
 | 逐 op 归属的能力谓词（shape/dtype/对齐/VTCM 预算 + reason code + remark） | `MatmulToHmxPass.cpp`（ROADMAP §1.2） | 与 Triton `getMMAVersionSafe`（AccelerateMatmul.cpp:42-83）同型，是"能力驱动自动切分"的正确形态；M3.1 退役结论（不建成本模型）继续成立 |
-| `hmx.stage/await` 值边 + DMA staging tile 环 | ROADMAP §4.3、"机制就绪 stage/await 值边 ✅" | 跨线程流水的现成 IR 契约——stage/await 本来就是"提交 DMA/等待完成"的值边，今天在同一线程交错，明天天然跨线程 |
+| `hmx.stage/await` 值边 + DMA staging tile 环 | ROADMAP §4.3、"机制就绪 stage/await 值边 ✅" | 跨线程流水的现成 IR 契约——stage/await 本来就是"提交 DMA/等待完成"的值边，今天在同一线程交错，明天天然跨线程。⚠️ **但它不是 §3.1 的判据刀口**（那是 DMA 语义，serial 路径上不存在）——**刀口是引擎归属边界**，见 §2 |
 | `OpTrait::HmxDmaOnly` 结构性极性 | HmxToLLVMPass.cpp:101-110（"every *unmarked* dialect op counts as engine until proven otherwise…错并到 HVX 侧=挂死，错并到 HMX 侧=多付一对锁"） | 本方案把这个极性从"要不要锁"推广为"跑哪条线程"，继承同一 fail-safe 方向 |
 | 单 HMX 资源 + "引擎不让出线程"前提 | ROADMAP M3.3、§2.4 | 硬约束（qurt_hmx.h:184 [未验证：SDK 头，不在本仓]，实测 0.998），方案的出发点 |
 | 测量与门纪律 | 同构建双指纹、max(3×CV,15%)、owner+退出条件、证据指针 | 方案分阶段全按此执行 |
@@ -89,42 +94,61 @@ Triton → TTIR → Linalg
                             ▼
   T_HVX 池（现有 HexagonThreadPool）◄──SPSC环──► T_HMX（进程单例线程）
   · linalg/epilogue/softmax 链        (VTCM tile   · 只跑 hexagon_hmx 函数
-  · hmx.stage = DMA 提交（引擎无关）    描述符+事件字) · mma/bias/acc_read  ⚠️见下
-  · pack/unpack 归属未定 ⛔                        · ensure 一次，锁跨算子
+  · hmx.stage = DMA 提交（引擎无关）    描述符+事件字) · mma / bias_load / acc_read
+  · pack_act(i+1)  ‖  unpack(i)                    · ensure 一次，锁跨算子
+                                            · 永不 acquire HVX 上下文（编译期保证）
 ```
 
-> ## ⛔⛔ 本图有一处**未决硬矛盾**，S2 开工前必须先解决
+> ## ✅ 决策已定（2026-10-02）：**方案 A** —— `pack`/`unpack` 归 T_HVX
 >
-> **原稿在 T_HMX 侧同时列了 `pack`/`unpack`，又同时声明 T_HMX「永不 acquire HVX 上下文」。这两句不能同时成立。**
->
-> **证据**（已核）：`bin/runtime/hmx/src/HMXLayout.c` 里**引擎 intrinsic 零命中**
-> （`Q6_mx*`/`mxmem`/`mxclracc`/`Q6_bias*`/`Q6_activation*`/`Q6_weight*` 全部 0），
-> **31 处是 HVX intrinsic**（`Q6_vmem_QRIV`/`Q6_vscatter_RMVhV`/`Q6_W_vdeal_VVR` …）。
-> 引擎指令全在 `bin/runtime/hmx/src/HMXAPI.c:32,37,43,53-54`。
+> **原稿的矛盾已解除。** 原稿在 T_HMX 侧同时列了 `pack`/`unpack`、又声明 T_HMX
+> 「永不 acquire HVX 上下文」，两句不能同时成立。**证据（可复算）**：
+> `bin/runtime/hmx/src/HMXLayout.c` 里**引擎 intrinsic 零命中**
+> （`grep -cE 'Q6_mx|mxmem|mxclracc|Q6_bias|Q6_activation|Q6_weight' HMXLayout.c` = 0），
+> 而**含 `Q6_*` 的有 34 行 / 17 个唯一符号，全部是 HVX 向量 intrinsic**
+> （`Q6_vmem_QRIV` / `Q6_vscatter_RMVhV` / `Q6_W_vdeal_VVR` / `Q6_V_vror_VR` …）
 > ⇒ **`pack_act` 与 `unpack_acc` 是纯 HVX 代码。**
+> 对照：引擎侧 5 个唯一符号全在 `HMXAPI.c`
+> （`Q6_mxmem_AR_after_hf` / `Q6_mxclracc_hf` / `Q6_bias_mxmem2_A` /
+> `Q6_activation_hf_mxmem_RR_deep` / `Q6_weight_hf_mxmem_RR`）。
+> **现按方案 A 定稿。**
 >
-> **所以二选一，且两侧不可兼得**：
+> **三条理由（记录在案，供日后回溯）：**
 >
-> | | 主张 | 代价 |
-> |---|---|---|
-> | **方案 A** | `pack`/`unpack` 归 **T_HVX** ⇒ T_HMX 只做 `mma/bias/acc_read` | 与 §1.1 的 `OpTrait::HmxDmaOnly` 极性**方向相反**（今天未标记 = 算引擎 op）⇒ **必须新增 trait**，否则 T_HVX 上的 pack 去抢 HMX 锁 ⇒ **永久挂死**（`HmxToLLVMPass.cpp:96-99` 的失效模式）。见 §4.5 |
-> | **方案 B** | `pack`/`unpack` 留 **T_HMX** ⇒ T_HMX **需要** HVX 上下文 | ⚠️ **上游 `hexagon_hmx` 的语义失效**：其前提是函数内**没有** HVX 代码（`hmx-attr-no-autohvx.ll` 原文 "so no HVX unit is acquired on the HMX thread" [未验证：本仓不可见]）。且 T_HMX 线程的"纯度"保证被打破，`hexagon_hmx` 不再是它的静态契约 |
+> 1. **选 B 会让上游 `hexagon_hmx` 语义失效。** 该属性的前提是**函数内没有 HVX 代码**
+>    （`hmx-attr-no-autohvx.ll` 原文 "so no HVX unit is acquired on the HMX thread"
+>    [未验证：本仓不可见]）。选 B 等于放弃「**线程契约由编译器静态保证**」这个方案核心，
+>    退化成「把单线程的锁挪进一条线程」，**收益趋零**。
+> 2. **量化上天花板差 ~3.6×。** S1 的 LWP 口径（`docs/hmx/hmx-next-round-plan.md:61-70`，
+>    跨构建 `5cea8231`/125 µs，**仅方向参考**）：`engine` 35.2% · `pack_act` 9.8% ·
+>    `pack_weight` 4.7% · `unpack` 37.4% · `residual` 12.8%。
+>    **方案 A** ⇒ T_HMX 串行链只剩 **35.2%**，`pack_act` 9.8% + `unpack` 37.4% **全部**变成 HVX 侧可重叠对象。
+>    **方案 B** ⇒ T_HMX 链 ≈ **35.2 + 47.2 = 82%**，跨线程只剩 `residual` 可动。
+> 3. **A 顺带化解 §6.10 的「pack 还是 unpack」两难** —— 两个都归 HVX 侧，不必二选一。
 >
-> ⚠️ **原稿 §2.1 引用上游那句「这正是本方案线程契约的官方表达」，在方案 B 下是错的。**
-> **⇒ 这是本文档最硬的一处内部矛盾，且不在 §6 的风险表里。**
+> **代价与对冲见 §4.5**：必须新增 `HmxLayoutHvx` trait，
+> **否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ 永久挂死。**
 
 > ### 重叠哪一半 —— 唯一权威表述
 >
 > **§0 / §2 / §5 三处原稿互相矛盾**（`:15` 说 pack；`:70` 把 pack+unpack 同时列 T_HMX；
-> `:71-72` 又同时列 T_HVX；`:163` 说 pack）。**以本节为准。**
+> `:71-72` 又同时列 T_HVX；`:163` 说 pack）。**现按决策 3 统一为：**
 >
-> **可重叠的对象按引擎归属分两类**：
-> - **纯 HVX 代码**（`pack_act` / `unpack_acc` / `hmx.stage`）⇒ 只能在 T_HVX 侧
-> - **纯引擎代码**（`hmx.mma` / `acc_read` / `bias_load`）⇒ 只能在 T_HMX 侧
+> ```
+>   HVX 侧:   pack_act(i+1)  ‖  unpack(i)
+>   HMX 侧:                    mma(i+1) / bias_load / acc_read
+> ```
 >
-> **⇒ 跨线程 SPSC 环的天然刀口，就是这条引擎归属边界。**
-> **⇒ 而 `§3.1` 现在的刀口写的是 stage/await 值边** —— 那是 DMA 语义，不是引擎归属，
-> **两者不是同一条线**（serial 路径上没有 `hmx.stage`/`hmx.await` 可切，见 §3.1 补注）。
+> **重叠对象 = 引擎归属边界**（`pack_act`/`unpack_acc`/`hmx.stage` 纯 HVX
+> ⇔ `hmx.mma`/`acc_read`/`bias_load` 纯引擎）。**这条边界就是 SPSC 环的刀口。**
+>
+> ⚠️ **它与 §3.1 原先写的 stage/await 值边不是同一条线** —— 后者是 DMA 语义
+> （DDR→VTCM 传输），**serial 路径上没有 `hmx.stage`/`hmx.await` 可切**
+> （FA 的 QK 就在那条路上：`logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
+> Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样）。**判据已按此改写，见 §3.1。**
+>
+> **可藏量口径**：`enableWeightResident` 默认开 ⇒ `pack_weight` ≈ 0
+> ⇒ 可重叠对象 ≈ `pack_act` 9.8% + `unpack` 37.4% = **47.2%**（跨构建 LWP，**仅方向参考**）。
 
 四个关键选择：
 
@@ -191,7 +215,7 @@ Triton → TTIR → Linalg
 > **serial 路径上没有 `hmx.stage`/`hmx.await` 可切** ⇒ 原判据在 serial 形状上恒不成立。
 > 实证：FA 的 QK 落在这条 —— `logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
 > Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样。
-> ⇒ **判据需要第二种刀口，或显式承认 S4 在 QK 那一侧不成立**（见 §5 S4 备注）。
+> ⇒ **判据需要第二种刀口，或显式承认 S4a/S4b 在 QK 那一侧不成立**（见 §5 S4a/S4b 行）。
 
 与 M3.1 退役结论的关系：**判据里没有任何"哪个更快"**——MatmulToHmx 继续回答"能不能上 HMX"，
 本 pass 只回答"在哪个线程跑"，两者正交。
@@ -246,25 +270,58 @@ Triton → TTIR → Linalg
    「A NON_SHARED unlock clears the accumulators per qurt_hmx.h, so it must come after the last
    read, **which the compiler's position guarantees**」。锁跨算子持有 ⇒ 这个 unlock 清零不再发生
    ⇒ **注释里的保证失效，必须变成测试。**
+   **动作（已定，2026-10-02）**：把这条从注释升为 **FileCheck 测试** ——
+   ① 正向：任何 `hmx.mma` 支配链上必须可见 `hmx.acc_clear`；
+   ② **反向（今天的关键缺口）**：跨 kernel 场景下**不得**依赖 unlock 清零，
+   即 `enableThreadRolePartition=ON` 时 acc 的初值必须由显式 `acc_clear` 提供。
+   ⚠️ 这是 EdgeTPU「保证只存在于注释里」教训的**编译期版本**。
 
-5. ⛔⛔ **引擎归属的第三类标记**（**缺了会永久挂死**）
-   `issuesHmxEngineLeaves`（`HmxToLLVMPass.cpp:527-536`）把**任何**非 `HmxDmaOnly` 的 hmx op
-   当引擎 op。而 `pack_act`（`HmxOps.td:156-158`）、`pack_weight`（`:228-230`）、
+5. ✅ **引擎归属的第三类标记 `HmxLayoutHvx`**（**缺了会永久挂死；设计已定，2026-10-02**）
+   **问题**：`issuesHmxEngineLeaves`（`HmxToLLVMPass.cpp:527-536`）把**任何**非 `HmxDmaOnly`
+   的 hmx op 当引擎 op。而 `pack_act`（`HmxOps.td:156-158`）、`pack_weight`（`:228-230`）、
    `unpack_acc`（`:288-290`）**三者都没有 `HmxDmaOnly` trait，也都没有 `HmxEngineResource` effect**
    （全 `.td` 只有 2 个 `HmxDmaOnly` 载体：`stage:570` / `await:623`）
    ⇒ **今天 pack/unpack 被算成引擎 op。**
    **若 pack/unpack 移到 T_HVX 而不新增「要 HVX、不要引擎」的第三类标记，
    T_HVX 上的 pack 会去抢 HMX 锁 ⇒ 永久挂死**——正是 `HmxToLLVMPass.cpp:96-99` 警告的失效模式。
    ⚠️ **§1.1 说"继承同一 fail-safe 方向"，但这不是继承，是要新增一个 trait。**
-   ⇒ 归主笔待决（§2 的方案 A/B 取决于此）。
+
+   **设计（已定）：**
+   - **新增 `NativeOpTrait` `HmxLayoutHvx`**（语义："HMX 布局代码，由 HVX 实现"），
+     定义在 `HmxDialect.h`（与 `HmxDmaOnly:160` 并列）。
+   - **加在恰好三个 op 上**：`pack_act` · `pack_weight` · `unpack_acc`。
+   - **`issuesHmxEngineLeaves` 判据改为**：
+     `无 HmxDmaOnly 且 无 HmxLayoutHvx ⇒ 引擎`（即两个 trait 都是"排除引擎"的标记）。
+
+   **失效方向重审计（两个方向都不静默）：**
+
+   | 误标 | 后果 | 可诊断性 |
+   |---|---|---|
+   | 布局 op 误标为**引擎** | 多付一对 ensure/unlock，函数自己会还 | 与今日行为完全相同，**无害** |
+   | 引擎 op 误标为**布局** | 未持锁发引擎指令 ⇒ **设备 abort** | **响亮失败，好诊断** |
+
+   ⇒ **fail-safe 极性仍是「未证明即引擎」**（`HmxToLLVMPass.cpp:106-109` 的原意不变），
+   逐 op 显式授予豁免。**新的错误方向比旧的方向更容易发现，不是更难。**
+
+   **再加一道双向一致性 lit**：trait 分类 ↔ 叶子符号分类两张表互钉 ——
+   引擎叶取自 `HMXAPI.c:32,37,43,53-54`，布局叶取自 `HMXLayout.c`（31 处 HVX intrinsic），
+   **任一边漂移即变红**。
+   ⚠️ **配对决策仍由 trait 做，不违反「不许按 callee 前缀决定配对」的现行规则**
+   （`HmxToLLVMPass.cpp:113-115` 明确禁止按前缀判断）——**这张 lit 是审计表，不是配对表。**
+
+   **Legacy 路径零影响**：trait 只改「算不算引擎」；legacy 下 pack 照旧被锁，无害。
 
 6. ⛔ **host→device 的分流通道不存在**
    §4.2 说 legacy 路径「由 manifest 的 `topology` 字段区分」。但**设备 runtime 今天完全不读 manifest**：
    `bin/runtime/src/HexagonAPI.cpp` 与 `HexagonCAPI.cpp` 里 `grep manifest` 与
    `grep topology` **均 0 命中**。manifest 只到 host launcher
-   （`backend/triton_hexagon_launcher.py:557-568` → `utils.py:1658` `enforce_hmx_launch_contract`）。
+   （`backend/triton_hexagon_launcher.py:557-568` → `backend/utils.py:1658` `enforce_hmx_launch_contract`）。
    ⇒ 要按 `topology` 在设备侧分流，**需要一条新的 launch 通道**
    （launch 参数 / per-kernel 符号 / 环境变量）。**manifest 字段本身不够。**
+   **默认候选（已定方向，三选一留给 S2 设计）：per-kernel 符号方案** ——
+   HMX 段函数保留 `.hmx_section` 类稳定后缀，运行时 `dlsym` 探测分流。
+   **理由**：比 launch 参数**侵扰小**（不改现有 launch ABI）、比环境变量**可组合**
+   （可逐 kernel 判定，不受进程环境污染）。
 
 ---
 
@@ -276,13 +333,14 @@ Triton → TTIR → Linalg
 | **S1**（host 全验） | ThreadRolePartition pass + attr + verifier + manifest 字段；默认只 emit 单角色 | FileCheck 全套（成功/拒绝/mixed-irreducible/半HMX→PARTIAL+dual-role）；零行为变化 | 纯编译期 |
 | **S2**（运行时底座） | 角色执行器 + T_HMX + SPSC 环 + 锁迁移（legacy 共存）；4 个探针：环吞吐、锁长持、DMA 跨线程等待、VTCM 跨线程 alloc/free | host 单元测试 + 探针报告；不跑真 kernel | [未验证]×4 见 §6 |
 | **S2.5**（⛔ 新增前置） | **给 S1-class 引入 per-tile pack**：把整数组 prologue 的 pack（`MatmulToHmxPass.cpp:1139-1163`）折进 tile 循环，让 S1 形状**有可重叠对象** | 纯 host：manifest `pack_act_sites` 从 1 变 2（对齐 `s2_anchor`）；lit 全绿 | ⛔ **S3 的硬前置**。不做这步，S3 在 S1-class 上按 §3.1 自己的判据就是 no-op（`role-split-nopack`） |
-| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的形态**）：HVX pack 第 i+1 块 ‖ T_HMX mma 第 i 块 | 同构建双指纹 A/B ≥ max(3×CV,15%)；NOT-PROVEN 允许 | ⚠️ **不能是 S1-class**（见 S2.5）。⚠️ 且见 §6.10：重叠 pack 还是 unpack 未决，**天花板差 2.6 倍**，本阶段须先定 |
-| **S4**（FA 重叠 + 减税） | softmax 链（HVX）‖ QK·PV（HMX）；顺带量 M3.2（锁持有后 per-launch 固定税降幅） | ⛔ **原验收门「FA 稳态 17.4ms 上 A/B，max(3×CV,15%)」物理不可达** —— 引擎份额实测 0.6%（§6.8）⇒ **验收门或机制描述必须二选一改** | ⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ **重叠主体是 softmax 链，QK 走 serial 不影响**；但 §3.1 的 stage/await 刀口在 QK 上恒不成立 |
-| **S5**（收口） | S3/S4 过门 ⇒ 报用户批准翻默认；per-kernel 配对降级 legacy-only；经验推上游（hexagon 侧 RFC / async affinity） | 门数字 + 契约评审 | 翻默认须用户批准（你们规则） |
+| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B ≥ max(3×CV,15%)；NOT-PROVEN 允许<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」** | ⚠️ 不能是 S1-class（见 S2.5，S1 的 A/B 待 S2.5 后补）。⚠️ 可藏量 ≈ 47.2%（`pack_act` 9.8 + `unpack` 37.4，`pack_weight` 已被 weight-resident 消掉），**跨构建 LWP 仅方向参考**。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
+| **S4a**（⛔ 由 S4 拆出 · 观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
+| **S4b**（⛔ 由 S4 拆出 · 真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%) | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响；但 §3.1 的 stage/await 刀口在 QK 上恒不成立 |
+| **S5**（收口） | S3/S4b 过门 ⇒ 报用户批准翻默认；per-kernel 配对降级 legacy-only；经验推上游（hexagon 侧 RFC / async affinity） | 门数字 + 契约评审 | 翻默认须用户批准（你们规则） |
 
-**依赖：`S0 → S1 → S2 → S2.5 → S3 → S4 → S5`**
+**依赖：`S0 → S1 → S2 → S2.5 → S3 → S4a → S4b → S5`**
 
-⚠️ **原稿"S1 与 S2 文件面不重叠，可并行"不成立**，有两处真实的**写-读**依赖：
+⚠️ **原稿"S1 与 S2 文件面不重叠，可并行"已撤回**，有两处真实的**写-读**依赖：
 
 | 依赖 | 证据 |
 |---|---|
@@ -291,8 +349,9 @@ Triton → TTIR → Linalg
 
 ⇒ **S1 与 S2 只在「探针 / 单元测试」这部分文件面确实不重叠、可并行。**
 
-⚠️ **S1/S2 开工前必须先解决 §2 的引擎归属硬矛盾**（`pack`/`unpack` 归 T_HVX 还是留 T_HMX）——
-它决定 §4.5 要不要新增 trait，而**选错就是永久挂死**。
+✅ **§2 的引擎归属硬矛盾已解决**（2026-10-02 定为**方案 A**）。
+⇒ **`S2` 开工前的前置只剩一件：§4.5 的 `HmxLayoutHvx` trait 必须先落地**，
+否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ **永久挂死**（`HmxToLLVMPass.cpp:96-99` 的失效模式）。
 
 ---
 
@@ -300,45 +359,48 @@ Triton → TTIR → Linalg
 
 1. [未验证] pinned LLVM 是否已含 PR #222340（llvm_triton 子仓在 Linux 侧，本仓不可见）。
 2. [未验证] DMA 事件跨线程等待语义（UserDMA 描述符由谁 poll、能否在另一线程 await）。
-3. [未验证] VTCMPool 并发 alloc/free 真实覆盖（VTCMPool.h:15 有 `<mutex>`，但所有权交接语义需探针）。
+3. [未验证] VTCMPool 并发 alloc/free 真实覆盖（`bin/runtime/include/VTCMPool.h:15` 有 `#include <mutex>`，`:444` 有 `mutable std::mutex mutex_`，但所有权交接语义需探针）。
 4. [未验证] `HAP_compute_res_hmx_lock` 长期持有与其他进程/驱动的交互（探针：独占 N 分钟 + 释放重取）。
 5. [未验证] accumulator 跨 kernel 持久的正确性前提（acc_clear 显式化不变量是否处处成立）。
 6. [未验证] Hexagon 内存序下环索引的 fence 选型。
 7. 已知约束：单 HMX 线程使"多实例并发 HMX"更不可能——与既有 single-instance 立场一致（workspace-resident grid>1 硬拒同款契约）。
-8. ⛔⛔ **[未验证 · 门不可达] S4 的验收门与机制上限矛盾。**
-   S4 的机制是「softmax 链（HVX）‖ QK·PV（HMX）」⇒ **可隐藏量 = HMX 引擎在 FA 时间里的份额**，
-   而该份额 LWP **两轮实测为 0.6%**（`docs/history/hmx/fa-time-attribution-2026-09-21.md:97`
-   `hmx.acc_clear`/`mma`/`acc_read` 合计 0.6%；`:101`「引擎彻底无关（0.6%）——第二轮再次确认」；
-   `docs/state/STATE-OF-PLAY.md:600` 复述）。
-   项目门是 `max(3×CV,15%)`（`ROADMAP.md:48`）⇒ **0.6% ≪ 15%，纯拓扑收益路径在物理上不可达该门。**
-   而 §5 S4 同一格写「**不动融合白名单，纯拓扑收益**」——引擎只有 0.6%，纯拓扑收益上限就是 0.6%。
-   **这是方案内部的第二处硬矛盾。**
-   ⇒ 若 S4 要过门，必须**同时解决 softmax 链本身的串行化**
-   （`fa-time-attribution:222` 记 softmax 链 **43.7%**，`maxnumf` 归约的 running-max 依赖），
-   那是 **M4.1 / `docs/hmx/fa-softmax-serialization-plan.md` 的工作面**，
-   **与"不动融合白名单、纯拓扑收益"不是同一件事**。
-   ⇒ **S4 的验收门或机制描述必须二选一改。**
-9. ⛔ **[未验证] S3 的目标形状与机制不匹配。**
-   S3 原定打「S1-class matmul」，但 `HmxPartitionPass.cpp:679-706` 的 `emitSerialTileLoop`
-   **循环体内无 pack**（详见 §3.1 `role-split-nopack`）⇒ **「第 i+1 块 pack」在 S1-class 上没有对象**。
-   ⚠️ 另注：`HmxPartitionPass.cpp:1589` 的 `shallow-k` 判定**只管 `emitStageLoop` 的 DMA staging 环**
-   （DDR→VTCM 传输），**管不到 pack‖mma**；且 `ROADMAP.md:113` 记载 `pipeline-depth=1/2` 可绕过它
-   ⇒ **「K=1024 的门让 S1 摊不上跨线程环」这个推理不成立**（原 §3.1 讨论曾据此推论，已删）。
-   **真正的障碍是上面那条：S1 的 tile 循环里没有 pack。**
-10. ⛔ **[未验证] pack 还是 unpack —— 天花板差 2.6 倍。**
-    S1 的 LWP 分区（`hmx-next-round-plan.md:61-70`）：**`unpack` 37.4%** vs
+8. ✅ **[已决 2026-10-02] S4 门不可达 —— 接受物理，拆成 S4a / S4b。**
+   **原发现（保留在案）**：**原 S4** 的机制是「softmax 链（HVX）‖ QK·PV（HMX）」
+   ⇒ **可隐藏量 = HMX 引擎在 FA 时间里的份额**，而该份额 LWP **两轮实测为 0.6%**
+   （`docs/history/hmx/fa-time-attribution-2026-09-21.md:97` `hmx.acc_clear`/`mma`/`acc_read`
+   合计 0.6%；`:101`「引擎彻底无关（0.6%）——第二轮再次确认」；`docs/state/STATE-OF-PLAY.md:600` 复述）。
+   项目门是 `max(3×CV,15%)`（`ROADMAP.md:46`）⇒ **0.6% ≪ 15%，纯拓扑收益路径在物理上不可达该门。**
+   **决策（门和机制描述都改）**：
+   - **S4a（观测台架，无 FA 性能门）**：验收改为 **LWP 归因的重叠率报告**，
+     **只有 M3.2 减税那项**套 `max(3×CV,15%)`。
+   - **S4b（真收益）**：组合门 = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座**。
+     **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。**
+   ⇒ 43.7% 的来源：`fa-time-attribution:222`，`maxnumf` 归约的 running-max 依赖。
+9. ✅ **[已决 2026-10-02] S3 目标形状不匹配 —— 采信 S2.5 前置 + 首发改 S2-class。**
+   **原发现（保留在案）**：S3 原定打「S1-class matmul」，但 `HmxPartitionPass.cpp:679-706`
+   的 `emitSerialTileLoop` **循环体内无 pack**（详见 §3.1 `role-split-nopack`）
+   ⇒ **「第 i+1 块 pack」在 S1-class 上没有对象。**
+   ⚠️ 另注（一个曾被推翻的推论，保留以免重犯）：`HmxPartitionPass.cpp:1589` 的 `shallow-k` 判定
+   **只管 `emitStageLoop` 的 DMA staging 环**（DDR→VTCM 传输），**管不到 pack‖mma**；
+   且 `ROADMAP.md:113` 记载 `pipeline-depth=1/2` 可绕过它
+   ⇒ **「K=1024 的门让 S1 摊不上跨线程环」这个推理不成立。真正的障碍是 S1 的 tile 循环里没有 pack。**
+   **决策**：S2.5 升为**硬前置**；S3 首发形状 = **S2-class**（`pack_act_sites` 1→2 对齐 `s2_anchor`）；
+   **S1-class 的 A/B 待 S2.5 完成后再补。**
+10. ✅ **[已决 2026-10-02] 「pack 还是 unpack」两难已消解 —— 方案 A 下两者都归 HVX 侧。**
+    **原发现（保留在案）**：S1 的 LWP 分区（`hmx-next-round-plan.md:61-70`）：**`unpack` 37.4%** vs
     **`pack_act` 9.8% + `pack_weight` 4.7% = 14.5%**（`exp/hmx/leaf_bw_probe/RESULTS.md:89` 独立复核 14.5%）。
-    **§0/§2/§5 原稿三处互相矛盾**（`:15` pack · `:70` pack+unpack 列 T_HMX · `:163` pack），
-    而**唯一有数的那个（§5 S3）选了天花板低 2.6 倍的那一半**。
-    ⚠️ 另注：**`pack_weight` 那一档已被 `enableWeightResident`（默认开）消掉**
-    ⇒ 真正可重叠的只有 `pack_act` ≈ 9.8%，**比 7.25 µs 的差距还小** ⇒ **S3 的目标可能不可达**。
-    ⇒ **需同构建重测 A/B 才能定，跨构建数不可用于决策。**
-11. ⛔ **[未验证] 单线程内可能已经有可观重叠。**
-    `docs/hmx/hmx-hvx-co-scheduling.md:104-116` 实测：**真实核比它自己各部分的上界之和还低 37%**
-    ⇒ **单线程内已经在重叠**。这对本方案是双向的：
-    **支持** = 跨线程只是把已有重叠做得更彻底；
-    **反对** = **那 37% 已经被吃掉了，跨线程的增量空间要在这 37% 之外算。**
-    ⇒ **立项前必须先答：跨线程相对"单线程内已有重叠"的净增量是多少。**
+    原稿 §0/§2/§5 三处互相矛盾（`:15` pack · `:70` pack+unpack 列 T_HMX · `:163` pack），
+    而唯一有数的那个（§5 S3）选了天花板低 2.6 倍的那一半。
+    **决策（§2 方案 A）**：`pack_act` 与 `unpack_acc` **都归 T_HVX**
+    ⇒ **两难自动消失，不必二选一**；可重叠对象 ≈ `pack_act` 9.8% + `unpack` 37.4% = **47.2%**
+    （`pack_weight` 已被 `enableWeightResident` 默认开消掉）。
+    ⚠️ **仍是跨构建 LWP（`5cea8231`/125 µs），仅方向参考；S3 须同构建重测 A/B 才能定。**
+11. ✅ **[已决 2026-10-02] 净增量 —— 定为 S3 的第一等验收输出，不作为立项前置。**
+    **原发现（保留在案）**：`docs/hmx/hmx-hvx-co-scheduling.md:104-117` 实测
+    **真实核比它自己各部分的上界之和还低 37%** ⇒ **单线程内已经在重叠**。
+    **决策**：**开工前无法知道净增量，把它当前提等于自我否决；S3 的 A/B 两臂本身就是测量。**
+    ⇒ **S3 新增一条 LWP 归因探针臂**，显式输出「**跨线程相对单线程已有 37% 重叠的净增量**」。
+    ⇒ **若净增量 < 门 ⇒ 默认保持 OFF + 负结果收档**（正落在 NOT-PROVEN 框架内）。
 
 ---
 
