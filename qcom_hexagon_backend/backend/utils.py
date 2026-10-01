@@ -571,9 +571,15 @@ def _validate_logical(entry, path, reason, plan):
         raise ValueError(f"{path} is missing required field(s): ['logical']")
     logical = entry["logical"]
     if logical is None:
-        if reason not in ("library-call", "non-rank-2"):
+        # Must mirror HmxManifest.cpp:937-944 exactly. That check admits an
+        # unavailable logical shape for these three reasons; a fourth added on
+        # the C++ side without adding it here turns every such kernel into a
+        # launch-time rejection, and the cross-language gate compares reason
+        # vocabularies rather than conditional rules so it cannot catch it.
+        if reason not in ("library-call", "non-rank-2", "unsupported-layout"):
             raise ValueError(
-                f"{path}.logical may be null only for library-call or non-rank-2"
+                f"{path}.logical may be null only for library-call, non-rank-2 "
+                f"or unsupported-layout"
             )
         if shape_state != "unavailable":
             raise ValueError(

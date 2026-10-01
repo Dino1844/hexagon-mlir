@@ -342,6 +342,15 @@ class TranslationMetadataTest(unittest.TestCase):
             ("hvx", "min-rows", (4, 64, 64)),
             ("hvx", "tile-alignment", (65, 64, 64)),
             ("hvx", "unsupported-layout", (64, 64, 64)),
+            # The same reason with no logical shape. HmxManifest.cpp:937-944
+            # admits an unavailable shape for unsupported-layout as well as for
+            # library-call and non-rank-2, and _validate_logical has to agree --
+            # the case above alone cannot catch a mirror that drifts, because it
+            # only exercises the non-null path. Found 2026-10-02: the C++ side
+            # allowed it, backend/utils.py did not, so every contraction the
+            # interface generalization refuses (linalg.contract, transposed-B
+            # matmul, matvec, vecmat, mmt4d) was rejected at launch.
+            ("hvx", "unsupported-layout", None),
             ("hvx", "vtcm-budget", (64, 64, 64)),
         ]
         for index, (plan, reason, shape) in enumerate(cases):
