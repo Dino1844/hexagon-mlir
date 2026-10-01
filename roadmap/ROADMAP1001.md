@@ -578,6 +578,83 @@ S3 首发形状（S2-class matmul）在这一类里 ✅；
 
 ---
 
+## 5.4 ⛔ 独立审核推翻了我的 trait 设计（2026-10-02）——**动代码前先读这一节**
+
+派了独立 agent 攻「加 `HmxLayoutHvx` trait」这个判断，**它推翻了我三条**。我逐条复算，全部成立。
+
+### ① 「零行为变化」是错的：我只扫了 fixture，没扫 lit
+
+`test/Conversion/HmxToLLVM/` 下**有 32 个函数只含布局 op、不含引擎 op**
+（`hmx-tail-leaves.mlir` 6 个 · `hmx-to-llvm-diagnostic-ntile-reject.mlir` 6 个 ·
+`hmx-to-llvm.mlir` 5 个（`@bridge` / `@bridge_offset` / `@bridge_ranged` / `@bridge_f32_source`）·
+`pack-strided-src.mlir` 4 个 · `hmx-to-llvm-fused-tail.mlir` 3 个 · 其余 8 个）。
+**它们今天都拿到 `ensure_dsp`/`unlock_dsp`，且 CHECK 行钉住了。**
+⇒ 加 trait ⇒ 这些 CHECK 全红 ⇒ **S1 的「lit 全绿」门当场失败。**
+⚠️ 我第一次的扫描脚本 regex 写成 `func `（没匹配 `func.func`），得出「0 个」的假零结论。
+**假零比假正更危险——它会让人直接否掉正确的东西。**
+
+### ② 最深的一条：**一个 bit 不能同时对两个方向 fail-safe**
+
+| 判据 | 默认极性 | 忘标记的后果 |
+|---|---|---|
+| ensure/unlock（`issuesHmxEngineLeaves`） | **未标记 ⇒ 引擎** | 多付一次锁，函数自己会还 ⇒ 无害 |
+| 线程角色归属（本方案 §3） | **未标记 ⇒ HVX** | 布局 op 被切进 HMX-role、落到 T_HMX、**去抢 HVX context ⇒ 挂死且无诊断** |
+
+⇒ 这正是 `HexagonTargetTransformInfo.cpp:453-458` 描述的死锁，也正是 §2 方案 A 第 1 条理由要保住的东西。
+⇒ **一个 trait 不能同时承担这两个判据。** 需要**两个判据、两个相反的默认极性**：
+- `HmxLayoutHvx`（负向豁免，默认引擎）⇒ 解决 ensure/unlock
+- **新的正向 trait**（如 `HmxEngineIns`，默认 HVX）⇒ 解决线程角色
+  ⇒ 忘标记时退化成「HVX 线程偶尔抢 HMX 锁」= **有竞争、无死锁**
+
+### ③ `verifyHmxLeafCallers` 必然被触发，而 roadmap 全文没提它
+
+`HmxToLLVMPass.cpp:559` 会检查「调了 `hmx_` 前缀叶子的函数必须在 `engineKernels` 里」。
+pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExternalFnNames.cpp:24-36`）⇒ 带前缀。
+⇒ §2 的目标态**必然产生 pack-only 函数，必然编译失败**。
+
+### ④ 为什么不能复用已有的 `HmxEngineResource` effect
+
+它的极性是「**动了那块唯一的共享硬件状态**」——
+`HmxDialect.h:73-76`：「the engine's accumulator / bias-register state **and its staging pipeline**」。
+⇒ `stage`/`await` 带它**不是 bug**，它们驱动 staging pipeline。
+⇒ 想拿它当判据就必须手工剔掉这两个 = **engine 白名单**，
+而 `HmxToLLVMPass.cpp:113-115` **明令禁止**（「omission hangs the device」）。
+
+### ⑤ ⛔ 结构性发现：**有���个决策点，方案的切分点写空了**
+
+- `createHmxPartitionPass` 在 `LinalgToLLVMPass.cpp:536`
+- `createHmxToLLVMPass` 在 `LinalgToLLVMPass.cpp:640`（**在后**）
+- 而 `HmxToLLVMPass.cpp:1999` 有 `addIllegalDialect<HmxDialect>()`
+  ⇒ **在 HmxToLLVM 那个决策点上，hmx op 必须已经全没了**
+
+⇒ **`hmx.matmul` 与 `hmx.alloc_crouton` 在第一个决策点存在、在第二个不存在。**
+⇒ **两处的「引擎 op 集合」不同**，而 §2 的图把 ThreadRolePartition 画在 MatmulToHmxPass 之后、
+**没写它在 hmx-partition 之前还是之后**。§3.1 的判据表也没提这两个 op。
+⇒ **ThreadRolePartition 必须在 hmx-partition 之前切**，判据要覆盖
+`matmul` / `alloc_crouton` 这两个在第二点不存在的 op。
+
+### ⑥ 我说错的两处事实
+
+- **`hmx.matmul` 不是容器 op**，是**无 region 的叶子 op**
+  （`HmxOps.td:47-49` 只有 `[DestinationStyleOpInterface, MemoryEffects<...>]`，无 region）。
+- 「三个 op」确实漏了 **`unpack_acc_f32`（`HmxOps.td:349`）**，它与 `unpack_acc` 状态相同、
+  同样降到 `HMXLayout.c`。
+  ⚠️ 独立审核给的更硬的理由：`HmxToLLVMPass.cpp:2037-2039` 把 `LowerUnpackAcc` 与
+  `LowerUnpackAccF32` 注册成**两个独立 pattern**，漏标不会有任何编译期信号。
+
+### 建议的修法（**待用户签认，未动代码**）
+
+1. `HmxLayoutHvx` 打**四个** op：`pack_act` · `pack_weight` · `unpack_acc` · `unpack_acc_f32`。
+2. **另加一个正向 trait** 给线程角色判据用，默认极性相反。
+3. `verifyHmxLeafCallers`（`:559`）改成**只查 `HMXAPI.c` 的 5 个引擎符号**
+   （`HmxExternalFnNames.cpp:20-24`）⇒ 既解掉破面，又**把这个 check 变强**。
+   现有注释 `:554-558` 自己就写明该前缀「**for verification only, never for the decision**」，
+   所以**不违反** `:113-115`。
+4. 上述 1 与 3 落地时，那 32 个函数的 CHECK 行会变——**那是修一个今天就存在的多余锁，不是回归**，
+   必须逐个列出并在 commit message 里说明。
+
+---
+
 ## 6. 风险与未验证（预登记，S2 探针优先级从上到下）
 
 1. [未验证] pinned LLVM 是否已含 PR #222340（llvm_triton 子仓在 Linux 侧，本仓不可见）。
