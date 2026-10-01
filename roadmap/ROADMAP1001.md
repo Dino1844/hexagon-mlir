@@ -413,6 +413,27 @@ Triton → TTIR → Linalg
 3. 若确实需要 `alwaysinline` 也被拦，**要再 backport 一处 inliner 改动**——
    **超出 S0 范围，未做**，登记在此以免日后当成已覆盖。
 
+
+### ✅ 那个问号已查实（2026-10-02）：HMX 段**不带** `alwaysinline`
+
+对 `logs/fa_pure.ll`（212 个 `define`）逐个解析 attribute group：
+
+| | 数量 | 是谁 |
+|---|---|---|
+| 带 `alwaysinline` | **23** | **全部是 `_hexagon_runtime_*` 数学叶**（`acos/asin/atan/ceil/cos/exp/floor/pow/rsqrt/sin/sqrt/tan/tanh` 的 `__vf`/`__vhf`） |
+| 不带 | 189 | 含 `@attention_fwd_kernel`、6 个 `@async_execute_fn*`、2 个 `@hexagon_runtime_hmx_{ensure,unlock}_dsp` |
+| **HMX/matmul/pack/unpack 里带 `alwaysinline` 的** | **0** | — |
+
+⇒ **`alwaysinline` 那条缝对本方案不构成风险**：那些数学叶是 HVX 侧代码，
+而 HMX 段（`mma`/`acc_read`/`bias_load`）不需要超越函数 ⇒ 不会出现在 HMX 段的调用面上。
+⇒ **选项 1 成立**：承重的是 §3.3 第 2 条的 pass 级检查，TTI 钩子是普通内联路径的第二道防线。
+⚠️ 若将来 HMX 段需要超越函数（S1 那种带激活的形状**要重新查**），
+本条结论作废，须回头补 inliner 的 backport。
+
+本仓流水线自己就跑 AlwaysInliner（`lib/Target/HEX_LLVMIR/LLVMIRTranslation.cpp:51`
+`createAlwaysInlinerLegacyPass`），所以「有没有 `alwaysinline`」是每个形状都要重问的问题，
+不是一次性结论。
+
 ### 未做（明确登记）
 
 - ⛔ **没有重建 `install/` 树**（`build/install/lib/cmake/llvm`，hexagon-mlir 链的就是它）。
