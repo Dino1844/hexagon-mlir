@@ -334,9 +334,9 @@ Triton → TTIR → Linalg
 | **S1**（host 全验） | ThreadRolePartition pass + attr + verifier + manifest 字段；默认只 emit 单角色 | FileCheck 全套（成功/拒绝/mixed-irreducible/半HMX→PARTIAL+dual-role）；零行为变化 | 纯编译期 |
 | **S2**（运行时底座） | 角色执行器 + T_HMX + SPSC 环 + 锁迁移（legacy 共存）；4 个探针：环吞吐、锁长持、DMA 跨线程等待、VTCM 跨线程 alloc/free | host 单元测试 + 探针报告；不跑真 kernel | [未验证]×4 见 §6 |
 | **S2.5**（⛔ 新增前置） | **给 S1-class 引入 per-tile pack**：把整数组 prologue 的 pack（`MatmulToHmxPass.cpp:1139-1163`）折进 tile 循环，让 S1 形状**有可重叠对象** | 纯 host：manifest `pack_act_sites` 从 1 变 2（对齐 `s2_anchor`）；lit 全绿 | ⛔ **S3 的硬前置**。不做这步，S3 在 S1-class 上按 §3.1 自己的判据就是 no-op（`role-split-nopack`） |
-| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B ≥ max(3×CV,15%)；NOT-PROVEN 允许<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」** | ⚠️ 不能是 S1-class（见 S2.5，S1 的 A/B 待 S2.5 后补）。⚠️ 可藏量 ≈ 47.2%（`pack_act` 9.8 + `unpack` 37.4，`pack_weight` 已被 weight-resident 消掉），**跨构建 LWP 仅方向参考**。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
-| **S4a**（⛔ 由 S4 拆出 · 观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
-| **S4b**（⛔ 由 S4 拆出 · 真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%) | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响；但 §3.1 的 stage/await 刀口在 QK 上恒不成立 |
+| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B，**`N ≥ 1000`**（once_share 1.70%），≥ max(3×CV,15%)；判决**四选一**见 §5.1.3<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」**<br>③ ⛔ **先过 §5.1.7 的 reject 判据**（`budgetDepth` 下降 ⇒ 不进 A/B） | ⚠️ 不能是 S1-class（见 S2.5，S1 的 A/B 待 S2.5 后补）。⛔ **不得以 47.2% 为预期**——S2-class 已有一笔 **1.92× staging 重叠**入账（`hmx-perf-findings-2026-09-27.md:183`/`:293`），真实上限更低（§5.1.5②）。⛔ **47.2% 与 37% 不许相减**（§5.1.5①）。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
+| **S4a**（⛔ 由 S4 拆出 · 观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` + §5.1 的 N 规则 | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
+| **S4b**（⛔ 由 S4 拆出 · 真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%)<br>⛔ **必须单独列交互项** `A_both − max(A_topo, A_softmax)` | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⛔ **合并门在数学上不可证伪拓扑**（§5.1.6）。⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响；但 §3.1 的 stage/await 刀口在 QK 上恒不成立 |
 | **S5**（收口） | S3/S4b 过门 ⇒ 报用户批准翻默认；per-kernel 配对降级 legacy-only；经验推上游（hexagon 侧 RFC / async affinity） | 门数字 + 契约评审 | 翻默认须用户批准（你们规则） |
 
 **依赖：`S0 → S1 → S2 → S2.5 → S3 → S4a → S4b → S5`**
@@ -353,6 +353,139 @@ Triton → TTIR → Linalg
 ✅ **§2 的引擎归属硬矛盾已解决**（2026-10-02 定为**方案 A**）。
 ⇒ **`S2` 开工前的前置只剩一件：§4.5 的 `HmxLayoutHvx` trait 必须先落地**，
 否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ **永久挂死**（`HmxToLLVMPass.cpp:96-99` 的失效模式）。
+
+---
+
+## 5.1 ⛔ 验收判据：必须带 N，且判决分三类（2026-10-02 定）
+
+> **这一节是对 S3 / S4b 两行的前置修正。原表只写「≥ max(3×CV,15%)」，漏了量纲。**
+
+### 5.1.1 为什么：那条判据量的不是性能
+
+稳态口径下（`docs/hmx/hmx-next-round-plan.md:226`）：
+
+```
+Perf(N) = A + B/N          A = 真稳态边际 · B ≈ 1470 µs = 每调用一次性 bring-up
+```
+
+⇒ **对 `Perf(N)` 施加固定百分比，测的东西取决于 N**：
+N 小 ⇒ 百分比里 `B/N` 占比大，实际在测「一次性开销变小了」；N 大 ⇒ 在测「边际变小了」。
+**两个不同的物理量被同一个数字回答。**
+
+已实测的后果：RoPE trig 那次效应 **27.76%**（> 15% 地板，效应本身够大），
+但 sd 4.99 ⇒ **CV 17.96%** ⇒ 阈值 `max(53.9,15) = 53.9%` ⇒ 三趟全 NOT-PROVEN。
+`docs/hmx/rope-trig-share-device-result-2026-10-01.md:56`：**加样本救不回来**
+（CV 的分子 sd 估的是散布不是标准误）。
+
+### 5.1.2 ⛔ 硬规则：`once_share ≤ 2%` 才许下判决
+
+```
+once_share(N) = (B/N) / (A + B/N) ≤ 0.02   ⇔   N ≥ 50·B/A
+```
+
+按本方案三个形状的 `A`（`hmx-next-round-plan.md:268`，S1 69 / S2 85 / S3 13 µs）：
+
+| 形状 | A | N≥300 | **N≥1000** | N≥3000 |
+|---|---:|---:|---:|---:|
+| S1-class | 69 | 6.63% | **2.09%** | 0.71% |
+| **S2-class**（S3 首发形状） | 85 | 5.45% | **1.70%** ✅ | 0.57% |
+| S3-class | 13 | 27.37% | 10.16% | 3.63% |
+
+⇒ **S3 用 `N ≥ 1000`**（S2-class，once_share 1.70%）。
+⚠️ `hmx-next-round-plan.md:240` 建议的 `ITERS≥300` **不够**（5.45%）⇒ 此处上调。
+⚠️ **S3-class 要 2% 需 N ≥ 5654**——若将来在 S3-class 上做，门槛另算。
+
+**`once_share > 2%` 时唯一允许的判决是 `PROVEN (wrong quantity)`。**
+
+### 5.1.3 判决词表：**三类**，不是两类
+
+| 判决 | 含义 |
+|---|---|
+| `PROVEN` | 效应 ≥ 阈值，且 `once_share ≤ 2%` |
+| `NOT-PROVEN (effect below floor)` | 效应本身 < 15%（**机制没用**） |
+| `NOT-PROVEN (noise floor above effect)` | 效应 > 15% 但阈值被 3×CV 顶高（**尺子不够细**） |
+| `PROVEN (wrong quantity)` | 测出的差异落在 `B/N` 上，不是 `A` 上（**量纲错了**） |
+
+**第三类已经真实发生过**（`STATE-OF-PLAY.md §5.6` 撤回的两条结论就是这个）。
+
+⚠️ **前两类不是划分**——效应 27% > 15% 且阈值 54% 时，两条描述**同时成立**。
+
+### 5.1.4 ⚠️ 测量手段：先排斜坡，再谈样本量
+
+RoPE 那 9 个样本是**单调斜坡不是噪声**（`32.57 / 27.24 / 23.29`，`retries:0`）
+⇒ `3×CV` 惩罚的是斜坡，不是噪声。
+**先做这三件（零机制改动），再考虑多采 N**：
+1. **A/B 交错**（不是「跑完 A 再跑 B」）
+2. **丢 1 趟暖机**
+3. **取中位数**（不是取均值）
+
+### 5.1.5 ⛔ 两个不许做的算术
+
+**① 47.2% 与 37% 分母不同、构建不同，不许相减。**
+47.2% 来自 `5cea8231`/125 µs；37% 来自 `docs/hmx/hmx-hvx-co-scheduling.md:104-117`
+（真实核比各部分上界之和低 **≥**37%，下界，且混着 LWP 自身 1.80× 扰动）。
+⇒ **净增量必须是实测 treat/base 比值；37% 只进 interpretation，不进算术。**
+
+**② ⚠️ S2-class 已经有一笔 1.92× staging 重叠入账了。**
+`docs/hmx/hmx-perf-findings-2026-09-27.md:183`：**S2 256×64×2048（Kt=64）= 1.92×（重叠赢）**；
+`:293`「我们在 S2 上的 1.92× 来自 **staging 重叠（Kt≥32）**」。
+**这正是 S3 的首发形状。** 而 47.2% 来自 staging 之前的构建
+⇒ **真实可藏上限 < 47.2%，S3 不得以 47.2% 为预期。**
+
+### 5.1.6 ⛔ S4b 的组合门在数学上不可证伪拓扑
+
+拓扑单独贡献 `min(m, s) ≤ 0.6%` ⇒ **softmax 侧 + 拓扑侧的合并门恒等于 softmax 单独过门**，
+拓扑既白嫖又无法被证伪。
+⇒ **唯一信号是交互项** `A_both − max(A_topo, A_softmax)`，**它被合并门吃掉了**。
+⇒ S4b 报告时**必须单独列交互项**，不许只报合并值。
+
+### 5.1.7 ⛔ 环吃 VTCM 预算 ⇒ 这是 **reject 判据**，不是性能判据
+
+线程创建 / ensure 属一次性（`§4.2`，进程单例）⇒ 进 `B`，不是 `A`。
+**真正的边际风险不是环的建立成本，是环吃 VTCM 预算压低 `budgetDepth`**：
+`HmxPartitionPass.cpp:1626-1631` 的 `fits(d) = scratchBytes + d*ringBytes <= room`
+—— 加第二个环会让 `fits(2)` 可能变 `fits(1)`。
+⇒ **新增判据：若 role-split 使 `budgetDepth` 下降，本 kernel 直接 reject**
+（落 `role-split-nobudget`），**不进入 A/B**。**这是正确性/可行性判据，不是性能判据。**
+
+---
+
+## 5.2 ⛔ 设备窗口：S3 / S4a / S4b 的硬前置
+
+**原稿全文搜「run_tests.sh lock / 用户授权 / 设备窗口」= 0 命中。补上：**
+
+1. ⛔ **要用户签认**（设备窗口）。**S3 / S4a / S4b 三条都要。**
+2. ⛔ 必须走
+   `bash tools/run_tests.sh lock bash -c 'source tools/hexmlir/env.sh && exec <cmd>'`
+3. ⛔ **禁止重建**——会作废设备锚点。
+4. ⚠️ **每样本前后各盖一次指纹**（`libtriton.so` + `libhmxapi.a` 的 md5）。
+5. ⚠️ **`kernel.warmup(...)` = 只编译；`kernel[grid](...)` = 真启动。**
+   曾把编译写成启动，无意触碰设备（已披露两起，见 `docs/state/CURRENT.md`）。
+
+**锚点（2026-10-02 复核，未变）**：
+`libtriton.so ce26015e8efb75cc047515000c8ad70f`（2026-10-01 14:18）
+· `libhmxapi.a 97af133e81fbc361bca3be10164b7bc8`（2026-10-01 12:46）
+
+---
+
+## 5.3 ⚠️ 「`pack_weight ≈ 0`」的适用边界（此前未划界）
+
+**可藏量 47.2% 压在这个假设上**：`enableWeightResident` 默认开
+（`backend/hexagon_options.py:105` `enableWeightResident: bool = True`）⇒ `pack_weight ≈ 0`。
+
+⚠️ **但「默认开」不等于「对每个 kernel 都成立」**，本方案从未划界：
+
+| 情况 | `pack_weight` | 证据 |
+|---|---|---|
+| 权重是入口块参数 + host 预排 | **≈ 0** | `AGENTS.md:131` 第 ⑤ 条（matmul 生效：S1 −8.5% / S2 −19.8% / S3 −25.0%） |
+| **FA 的 K site** | **每趟 2 次** | 源是 `memref.alloc`（`tl.trans` 物化转置后的临时缓冲），两条源视图匹配器都返回空（`WeightResidentPass.cpp:1803-1834`） |
+| **FA 的 V site** | **每趟 2 次** | 源确是入口块参数的视图，但是 `[1024,64]` **行块（K-block）**，匹配器只认「更宽权重的 N 列块」（`:954` 的 `n<=bn`） |
+
+⇒ **本方案的 47.2% 只对「权重走 `argument-slot` + host 预排」的 kernel 成立。**
+S3 首发形状（S2-class matmul）在这一类里 ✅；
+**FA 不在这一类里**（每趟 4 次 `pack_weight`，见板上 `bf04bf2b`）。
+
+**⇒ S4a / S4b（FA）不得直接套用 47.2% 这个口径。**
 
 ---
 
