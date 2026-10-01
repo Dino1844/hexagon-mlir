@@ -78,7 +78,23 @@ void setLinalgToLLVMOptions(
   options.enableHexagonmemCopyToDMA =
       !arch_kwargs.at("enableHexagonmemCopyToDMA").compare(TRUE);
   options.enableHexKL = !arch_kwargs.at("enableHexKL").compare(TRUE);
-  options.hexKLMode = arch_kwargs.at("hexKLMode");
+  // hexKLMode: the Python field is GONE as of 2026-09-30, so there is nothing
+  // to read here any more. Left `std::string` unset so the declared default
+  // ("micro", Passes.td) applies -- deliberately NOT an `at()` read, because
+  // `at()` throws on a missing key and 16 tests build partial option maps.
+  //
+  // Why deleting the field is behaviour-preserving, verified rather than argued:
+  //  * every `hexKLMode == "macro"` branch sits behind `enableHexKL`, and
+  //    LinalgToLLVMPass rejects that combination outright --
+  //    "enableHexKL is incompatible with the HMX manifest contract" -- so those
+  //    branches were unreachable before this change and are still unreachable;
+  //  * the only caller that ever set the field is
+  //    test/python/torch-mlir/test_hexkl_macro_matmul.py, and it already fails
+  //    on exactly that error, and is not part of the host gate;
+  //  * the direct-drive lit path (test/Conversion/LinalgToLLVM/
+  //    matmul_to_hexkl.mlir) passes `(matmul-to-hexkl)` its own options and
+  //    never goes through this function, so the pass option stays in Passes.td.
+  // See docs/codegen/knob-fork-classification-2026-09-30.md §1.3.1-5.
   options.enableCollapseAddressSpace =
       !arch_kwargs.at("enableCollapseAddressSpace").compare(TRUE);
   options.tileSizes = arch_kwargs.at("tileSizes");
@@ -86,8 +102,18 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("lowerConstantsInSeparateSharedObjects").compare(TRUE);
   options.enableBufferization =
       !arch_kwargs.at("enableBufferization").compare(TRUE);
-  options.enableSeedLayoutConversions =
-      !arch_kwargs.at("enableSeedLayoutConversions").compare(TRUE);
+  // `enableSeedLayoutConversions` is no longer read from arch_kwargs (its
+  // Python field was removed 2026-09-30), so the pipeline now takes the pass
+  // default -- the same way the other pass options with no Python field do.
+  // The upstream pass option itself is untouched and still reachable directly
+  // via -linalg-to-llvm="enable-seed-layout-conversions=true".
+  //
+  // Note the coupling this line used to hide: `arch_kwargs.at(...)` THROWS on a
+  // missing key, and the option dict these keys come from is built from
+  // `HexagonOptions().__dict__` (see test/test_hmx_record_v3.py). So deleting a
+  // Python field without deleting its `at()` here is a hard failure, not a
+  // silent default. test/test_arch_kwargs_contract.py is what keeps the two
+  // sides in step.
   options.extendPackUpperFrontier =
       !arch_kwargs.at("extendPackUpperFrontier").compare(TRUE);
   options.extendPackLowerFrontier =
@@ -130,6 +156,15 @@ void setLinalgToLLVMOptions(
       hmxPipelineDepth != arch_kwargs.end()
           ? std::stoll(hmxPipelineDepth->second)
           : 0;
+  // K croutons per hmx.mma. Tolerant read for the same reason: absent = 0,
+  // which hmx-partition resolves to the hardware maximum, i.e. the behaviour
+  // that existed before the option was split out. The range is not checked
+  // here; hmx-partition owns the {0} u [1, 32] domain so that one place decides
+  // what an out-of-domain value means, whoever supplied it.
+  auto croutonsPerMma = arch_kwargs.find("hmxCroutonsPerMma");
+  options.hmxCroutonsPerMma = croutonsPerMma != arch_kwargs.end()
+                                 ? std::stoll(croutonsPerMma->second)
+                                 : 0;
   // Per-launch VTCM workspace residency. Tolerant read: absent = off, so a
   // partial options map never throws.
   auto workspaceResident = arch_kwargs.find("enableWorkspaceResident");
@@ -147,32 +182,15 @@ void setLinalgToLLVMOptions(
   auto maxnumLegalize = arch_kwargs.find("enableMaxnumLegalize");
   if (maxnumLegalize != arch_kwargs.end())
     options.enableMaxnumLegalize = !maxnumLegalize->second.compare(TRUE);
-  // Fixup bisection knob for the same pass; absent = fixup on (semantics
-  // preserved). false = bare maximumf (maxnum semantics dropped).
-  auto maxnumFixup = arch_kwargs.find("enableMaxnumLegalizeFixup");
-  if (maxnumFixup != arch_kwargs.end())
-    options.emitMaxnumFixup = !maxnumFixup->second.compare(TRUE);
-  // Site-selector bisection knobs, parsed tolerantly: plain atoi mapped
-  // garbage to 0, i.e. silently "rewrite/skip zero sites" for a typo'd knob.
-  // Non-integer now warns and keeps the default instead.
-  auto parseIntOr = [&](const char *key, int def) {
-    auto it = arch_kwargs.find(key);
-    if (it == arch_kwargs.end())
-      return def;
-    const std::string &s = it->second;
-    char *end = nullptr;
-    long v = std::strtol(s.c_str(), &end, 10);
-    if (end == s.c_str() || *end != '\0') {
-      llvm::errs() << "hexagon backend: non-integer option " << key << "=\""
-                   << s << "\" ignored (keeping " << def << ")\n";
-      return def;
-    }
-    return static_cast<int>(v);
-  };
-  options.maxnumSiteLimit =
-      parseIntOr("enableMaxnumLegalizeSel", options.maxnumSiteLimit);
-  options.maxnumSiteSkip =
-      parseIntOr("enableMaxnumLegalizeSkip", options.maxnumSiteSkip);
+  // Row reduction kept in the vector domain. Tolerant read for the same reason:
+  // absent = off.
+  auto rowReduceGroupStore = arch_kwargs.find("enableRowReduceGroupStore");
+  options.enableRowReduceGroupStore =
+      rowReduceGroupStore != arch_kwargs.end() &&
+      !rowReduceGroupStore->second.compare(TRUE);
+  // The pass's three bisection knobs are gone (2026-09-30) and are no longer
+  // read here, so a stale key in a saved arch_kwargs map is ignored rather than
+  // silently driving the pass.
 }
 
 namespace mlir {

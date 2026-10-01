@@ -57,7 +57,7 @@
 // DEPTH1: %[[T:.*]] = hmx.stage ins(%arg0, %[[ROW]] : memref<128x1024xf16>) outs(%[[SLOT]], %[[ST]] : memref<32x1024xf16, 1>, memref<1xi32>) -> i32
 // DEPTH1: %[[READY:.*]] = hmx.await ins(%[[T]] : i32) outs(%[[SLOT]] : memref<32x1024xf16, 1>) -> memref<32x1024xf16, 1>
 // DEPTH1: hmx.pack_act ins(%[[READY]], {{.*}}, {{.*}} : memref<32x1024xf16, 1>) outs(%[[SCRATCH]] : memref<1x32x16x32x2xf16, 1>) {count = 32 : i64, hmx.decision_id = 0 : i64}
-// DEPTH1: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 1 : i32}
+// DEPTH1: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 32 : i32}
 // DEPTH1-NOT: hmx.matmul
 
 // Forced depth 2 with the default budget: the double ring fits, so two slots
@@ -75,7 +75,7 @@
 // DEPTH2: scf.for {{.*}} iter_args(%[[T:.*]] = %[[T0]], %[[S:.*]] = %[[SSEL0]]) -> (i32, memref<32x1024xf16, 1>) {
 // DEPTH2: %[[READY:.*]] = hmx.await ins(%[[T]] : i32) outs(%[[S]] : memref<32x1024xf16, 1>) -> memref<32x1024xf16, 1>
 // DEPTH2: hmx.pack_act ins(%[[READY]], {{.*}}, {{.*}} : memref<32x1024xf16, 1>) outs(%[[SCRATCH]] : memref<1x32x16x32x2xf16, 1>) {count = 32 : i64, hmx.decision_id = 0 : i64}
-// DEPTH2: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 1 : i32}
+// DEPTH2: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 32 : i32}
 // DEPTH2-NOT: hmx.matmul
 
 // Forced serial (pipeline-depth=3): no staging rewrite at all. The activation
@@ -94,8 +94,9 @@
 // DEPTH3: scf.for %[[M:.*]] = {{.*}} to {{.*}} step
 // DEPTH3: scf.for %[[N:.*]] = {{.*}} to {{.*}} step
 // DEPTH3: hmx.acc_clear
-// DEPTH3: scf.for %[[K:.*]] = {{.*}} to {{.*}} step
-// DEPTH3: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 1 : i32}
+// DEPTH3-NOT: scf.for
+// DEPTH3: %[[K:.*]] = arith.constant 0 : index
+// DEPTH3-NEXT: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 32 : i32}
 // DEPTH3: hmx.acc_read %{{.*}}, %[[ACC]], %[[M]], %[[N]] {bias_set = 0 : i32}
 // DEPTH3-NOT: hmx.matmul
 

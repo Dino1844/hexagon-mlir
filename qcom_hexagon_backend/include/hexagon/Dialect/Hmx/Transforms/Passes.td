@@ -18,7 +18,7 @@
 include "mlir/Pass/PassBase.td"
 
 def MatmulToHmx : InterfacePass<"matmul-to-hmx", "mlir::FunctionOpInterface"> {
-  let summary = "Convert HMX-eligible linalg.matmul to hmx.matmul";
+  let summary = "Attribute and convert HMX-eligible linalg contractions to hmx.matmul";
 
   let description = [{
     Engine attribution for the HMX matrix engine, modelled on Triton's
@@ -117,6 +117,14 @@ def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
     `hmx.stage`/`hmx.await`, the activation bridge and its array are kept -- so
     it is the same clear -> K mmas -> read nest the pass emits when the pipeline
     does not apply, reached by construction rather than by declining.
+
+    `croutons-per-mma` sizes a batch instead of choosing one: it is how many K
+    croutons a single `hmx.mma` walks, and it is the same integer in the staged
+    arm, the unstaged arm and the peeled edge regions, so one value describes
+    the whole kernel. The default (0) is the hardware maximum, so the knob
+    cannot make the default path slower; its only purpose is to make "batch less
+    than the maximum" expressible, which is what turns the batching into a
+    measurable A/B rather than a rebuild.
   }];
 
   let options = [
@@ -129,7 +137,20 @@ def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
            "ask for the double ring (narrowed to the deepest ring that fits, "
            "with a remark, when the budget cannot pay for it), 3 = skip the "
            "staging rewrite and emit the unstaged serial tile loop (no "
-           "hmx.stage/hmx.await, the activation array is kept).">
+           "hmx.stage/hmx.await, the activation array is kept).">,
+    Option<"croutonsPerMma", "croutons-per-mma", "int64_t", /*default=*/"0",
+           "How many K croutons one hmx.mma walks, i.e. the engine's repeat "
+           "count. 0 = the hardware maximum (32), which is what 32 itself "
+           "means -- so 'not passed' and 'passed 32' are the same request, the "
+           "same way vtcm-budget's 0 means the device default. 1 reproduces the "
+           "one-mma-per-cronton form (a Kt-trip software loop of single-cronton "
+           "mmas) and is the A/B arm against the default; Kt smaller than the "
+           "value still collapses to one mma of n_croutons = Kt. The domain is "
+           "{0} u [1, 32] because 32 is a hardware bound (Rt[dC] is five bits, "
+           "HmxOps.cpp:410-411), and a value outside it is an error rather "
+           "than a clamp: silently narrowing '64' would make a request that "
+           "cannot be encoded look like it took effect. See "
+           "docs/hmx/ncroutons-k-fusion-2026-10-01.md.">
   ];
 
   let constructor = "mlir::hmx::createHmxPartitionPass()";

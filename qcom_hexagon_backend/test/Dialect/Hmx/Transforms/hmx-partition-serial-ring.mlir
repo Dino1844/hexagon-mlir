@@ -39,8 +39,8 @@
 // CHECK: %[[READY:.*]] = hmx.await ins(%[[T]] : i32) outs(%[[SLOT]] : memref<32x1024xf16, 1>) -> memref<32x1024xf16, 1>
 // CHECK: hmx.pack_act ins(%[[READY]], {{.*}}, {{.*}} : memref<32x1024xf16, 1>) outs(%[[SCRATCH]] :
 // CHECK: hmx.acc_clear
-// CHECK: scf.for %[[K:.*]] = {{.*}} step {{.*}} {
-// CHECK: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, %[[K]] {n_croutons = 1 : i32}
+// CHECK: %[[K:.*]] = arith.constant 0 : index
+// CHECK-NEXT: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, %[[K]] {n_croutons = 32 : i32}
 // CHECK: hmx.acc_read {{.*}} {bias_set = 0 : i32}
 // The ring and the scratch are released after the loop.
 // CHECK: memref.dealloc %[[SLOT]]

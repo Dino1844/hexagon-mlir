@@ -24,7 +24,7 @@
 // CHECK: %[[T:.*]] = hmx.stage ins(%arg0, %[[ROW:.*]] : memref<128x1024xf32>) outs(%[[SLOT]], %[[ST]] : memref<32x1024xf32, 1>, memref<1xi32>) -> i32
 // CHECK: %[[READY:.*]] = hmx.await ins(%[[T]] : i32) outs(%[[SLOT]] : memref<32x1024xf32, 1>) -> memref<32x1024xf32, 1>
 // CHECK: hmx.pack_act ins(%[[READY]], {{.*}}, {{.*}} : memref<32x1024xf32, 1>) outs(%[[SCRATCH]] :
-// CHECK: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 1 : i32}
+// CHECK: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 32 : i32}
 // CHECK-NOT: hmx.matmul
 func.func @depth_f32(%a: memref<128x1024xf32>, %w: memref<1024x64xf16>) {
   %c0 = arith.constant 0 : index

@@ -21,7 +21,6 @@ class HexagonOptions:
     arch_features: str = f'+hvxv{os.getenv("HEXAGON_ARCH_VERSION")},+hvx-length128b'
     device_type: str = "hexagon"
     vectorize: int = 1
-    vector_length: int = 32
     num_threads: int = 4
     data_layout: str = (
         "e-m:e-p:32:32:32-a:0-n16:32-i64:64:64-i32:32:32-i16:16:16-i1:8:8-f32:32:"
@@ -64,7 +63,15 @@ class HexagonOptions:
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
     enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
-    hexKLMode: str = "micro"  # possible options "macro", "micro"
+    # hexKLMode (str, "micro"/"macro") was REMOVED here on 2026-09-30. Every
+    # branch that tested it sat behind enableHexKL, which LinalgToLLVMPass
+    # rejects outright ("enableHexKL is incompatible with the HMX manifest
+    # contract"), so the field was unreachable; the declared pass default is
+    # "micro" (Passes.td), i.e. what this field always supplied. Verified in
+    # docs/codegen/knob-fork-classification-2026-09-30.md §1.3.1-5. Re-adding a
+    # Python field for a pass option that no reachable path reads is the
+    # "adding a knob that cannot change anything" pattern; register a real
+    # owner in ROADMAP §2.1 first if one is ever needed.
     enableMultiThreading: bool = (
         False  # linalg-generic based multi-threading (FormVirtualThreadsPass)
     )
@@ -118,14 +125,28 @@ class HexagonOptions:
     # (FA_MAXNUM in exp/hmx/op_bench/fa_ablate.py -- workspace scaffold, not
     # in this repo).
     enableMaxnumLegalize: bool = False
-    # Bisection knob for the pass above: false = bare maximumf (drops the NaN
-    # fixup and with it strict maxnum semantics). Only for device debugging.
-    enableMaxnumLegalizeFixup: bool = True
-    # Bisection knob: >=0 rewrites only the first N walk-ordered maxnumf
-    # sites (-1 = all). Device crash triage only.
-    enableMaxnumLegalizeSel: int = -1
-    # Bisection knob: skip the first N walk-ordered maxnumf sites.
-    enableMaxnumLegalizeSkip: int = 0
+    # A row reduction that lands its per-row result in a rank-0 slice of a
+    # tensor<rows x T> keeps that result in the vector domain instead
+    # (row-reduce-group-store pass): the row loop steps by a whole HVX vector of
+    # rows, the group's running values stay a vector<lanes x T> loop-carried
+    # value, the hvx.vror butterfly is not extracted, and an arith.cmpi +
+    # arith.select places it in the group's lane. Off by default: device A/B
+    # switch. Only the maxnumf fold is rewritten -- addf would reassociate the
+    # row sum, which is inside the pipeline's reassoc contract but is a numerical
+    # change nobody asked for.
+    enableRowReduceGroupStore: bool = False
+    # The pass's three bisection knobs (enableMaxnumLegalizeFixup / Sel / Skip)
+    # are deliberately NOT exposed here. All three were removed 2026-09-30:
+    #   - Fixup was a semantics switch, not a debug affordance. Turning it off
+    #     emits bare `maximumf`, which DROPS strict maxnum NaN semantics -- a
+    #     different, wrong answer. A correctness footgun does not belong on a
+    #     user-facing option surface.
+    #   - Sel/Skip bisected a device crash that has since been attributed to the
+    #     LLVM Hexagon AP under-alignment (see docs/hmx/fa-crash-resolved.md and
+    #     the cherry-picked tools/hexmlir/llvm-hexagon-ps-aligna.patch). The
+    #     question R1 still owes an answer is "does it pay?", which is a
+    #     whole-knob ON/OFF A/B, not a per-site bisection.
+    # No lit test ever passed any of the three, so nothing regressed here.
 
     # HMX tile-level software-pipeline depth (hmx-partition). 0 = auto (the
     # deepest activation-staging ring the VTCM budget and the tile count allow),
@@ -134,6 +155,20 @@ class HexagonOptions:
     # 3 = skip staging and emit the unstaged serial tile loop (the third A/B arm:
     # no hmx.stage/hmx.await, the activation bridge is kept).
     enableHmxPipelineDepth: int = 0
+
+    # K croutons walked by one `hmx.mma` (hmx-partition's croutons-per-mma).
+    # 0 = the hardware maximum, 32, which is also what 32 means -- so this field
+    # left at its default emits exactly the code it emitted before the option
+    # existed. 1 is the A/B arm: one mma per crouton, i.e. a Kt-trip software
+    # loop, which is what the compiler emitted before the batching. The domain
+    # is {0} u [1, 32]; anything else is an error from hmx-partition, not a
+    # clamp, because 32 is a hardware bound (the engine's K repeat field is
+    # five bits) and a clamped request would look honoured when it is not.
+    # Why it is on the Python surface rather than CLI-only: the batching's
+    # benefit is unmeasured, and the only way to measure it without rebuilding
+    # (which invalidates the device anchor) is two arms in one build. See
+    # docs/hmx/ncroutons-k-fusion-2026-10-01.md.
+    hmxCroutonsPerMma: int = 0
 
     # Per-launch VTCM workspace residency (hmx-workspace-resident). When on, the
     # crouton arrays, conversion state, staging ring/scratch and statuses of an
@@ -144,15 +179,16 @@ class HexagonOptions:
     # instances over the same buffers.
     enableWorkspaceResident: bool = False
 
-    # Unit-test-only: seeds layout conversion ops around conv2d ops, which
-    # introduces builtin.unrealized_conversion_cast ops. It is wired behind
-    # `enableMatmulToConv && enableSeedLayoutConversions` in
-    # LinalgToLLVMPass.cpp, and `enableMatmulToConv` has no field here, so from
-    # this backend the option alone is a no-op (it does not error). Nothing
-    # eliminates those casts either: the hmx dialect declares matmul-to-hmx /
-    # hmx-partition / weight-resident / hmx-workspace-resident only -- there is
-    # no conv -> hmx pass yet.
-    enableSeedLayoutConversions: bool = False
+    # `enableSeedLayoutConversions` was removed from this surface 2026-09-30.
+    # It is an UPSTREAM pass option and it still works when driven directly
+    # (`-linalg-to-llvm="enable-seed-layout-conversions=true"`, and
+    # test/Conversion/LinalgToLLVM/matmul_to_conv.mlir drives -matmul-to-conv
+    # directly) -- none of that was touched. What was removed is only the
+    # Python field, because from this backend the option alone was a no-op: it
+    # needs `enableMatmulToConv` too, and that has no field here. It therefore
+    # sat on the option surface as something a user could set that changed
+    # nothing. `enableConvTiling` is a separate S-class option and was NOT
+    # touched.
 
     # Upstream crouton/pack machinery. The pack frontier extension is on by
     # default upstream; the HVX croutonization pass is not, and it is what turns

@@ -37,10 +37,18 @@
 // CHECK: memref.alloc() : memref<2x32x16x32x2xf16, 1>
 // CHECK: hmx.pack_act ins(%{{.*}} : memref<64x1024xf16>
 // ... and the tile loop walks it serially: no staging ring at all.
+//
+// The whole K extent (32 croutons) is walked by ONE `hmx.mma` carrying
+// `n_croutons = 32` rather than by a software K loop: `hfm` packs the hardware
+// repeat-count field, so a K tile count of 32 is one instruction, not 32. This
+// is the shape Phase B of the n_croutons work changed, and it is why the two
+// `scf.for` nestings sit next to each other with the mma between them rather
+// than an mma per K tile.
+// CHECK: scf.for
 // CHECK: scf.for
 // CHECK: hmx.acc_clear
-// CHECK: scf.for
 // CHECK: hmx.mma
+// CHECK-SAME: n_croutons = 32 : i32
 // CHECK: hmx.acc_read
 // CHECK-NOT: hmx.stage
 // CHECK-NOT: hmx.await

@@ -171,6 +171,12 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "HMX tile-level staging ring depth (hmx-partition): 0 = auto, "
           "1 = force the serial ring, 2 = request double buffering, 3 = skip "
           "staging (emit the unstaged serial tile loop).">,
+    Option<"hmxCroutonsPerMma", "hmx-crontons-per-mma", "int64_t",
+          /*default=*/"0",
+          "K croutons walked by one hmx.mma (hmx-partition's croutons-per-mma): "
+          "0 = the hardware maximum (32), 1 = one mma per crouton, 32 = the "
+          "maximum. 0 and 32 are the same request. Anything outside {0} u "
+          "[1, 32] is rejected by hmx-partition rather than clamped.">,
     Option<"enableWorkspaceResident", "enable-workspace-resident", "bool",
           /*default=*/"false",
           "Make every per-launch VTCM workspace of an HMX kernel a "
@@ -197,18 +203,28 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "Hexagon backend RA bugs (docs/history/hmx/llvm-hexagon-ra-bugs.md; "
           "the PS_aligna one is cherry-picked under tools/hexmlir, the rest "
           "await upstream) -- keep OFF until then.">,
-    Option<"emitMaxnumFixup", "emit-maxnum-fixup", "bool",
-          /*default=*/"true",
-          "Emit the NaN fixup selects of the maxnum legalization (debug/"
-          "bisection knob; false changes maxnum semantics to maximum).">,
-    Option<"maxnumSiteLimit", "maxnum-site-limit", "int",
-          /*default=*/"-1",
-          "Bisection knob: >=0 rewrites only the first N walk-ordered "
-          "maxnumf sites instead of all (device crash triage).">,
-    Option<"maxnumSiteSkip", "maxnum-site-skip", "int",
-          /*default=*/"0",
-          "Bisection knob: skip the first N walk-ordered maxnumf sites.">
+    Option<"enableRowReduceGroupStore", "enable-row-reduce-group-store", "bool",
+           /*default=*/"false",
+           "Rewrite a vectorized row reduction that lands its per-row result in a "
+           "rank-0 tensor slice into a per-group form: the row loop steps by one "
+           "HVX vector instead of one row, a group's running values stay in a "
+           "vector<lanes x T> loop-carried value, each row's horizontal butterfly "
+           "stays in the vector domain (no vector.extract, no scalar store), and an "
+           "arith.cmpi + arith.select pair places it in the group's lane. The "
+           "Hexagon backend has no vector-lane-to-GPR instruction, so any reduction "
+           "result that becomes a scalar costs one 128-byte stack write plus a 4-byte "
+           "stack read back, per row per 128-byte chunk. Runs after "
+           "HexagonVectorLowering (which is what expands vector.multi_reduction into "
+           "the per-chunk vector.reduction this pass rewrites) and before bufferize. "
+           "Off by default: the knob is the device A/B switch, not a correctness "
+           "guard.">,
    ];
+  // The pass's `emitMaxnumFixup` / `maxnumSiteLimit` / `maxnumSiteSkip` options
+  // were removed 2026-09-30. Fixup was a semantics switch (false emits bare
+  // `maximumf`, dropping strict maxnum NaN handling), and Sel/Skip bisected a
+  // crash since attributed to the LLVM Hexagon AP under-alignment. No lit test
+  // ever passed any of them; leaving them would be a legacy surface with no
+  // user. See backend/hexagon_options.py for the same note.
 }
 
 // --- Supporting passes ---
@@ -232,6 +248,45 @@ def VectorRowReduce : Pass<"vector-row-reduce", "func::FuncOp"> {
   }];
 
   let constructor = "hexagon::createVectorRowReducePass()";
+}
+
+def RowReduceGroupStore : Pass<"row-reduce-group-store", "func::FuncOp"> {
+  let summary = "Keep a vectorized row reduction's per-row result in the vector domain";
+  let description = [{
+    Matches the shape `HexagonVectorLowering` leaves behind for a 2-D last-dim
+    row reduction of a static f16/f32 tensor: an `scf.for` over rows carrying a
+    `tensor<rows x T>`, whose body is a single `scf.for` over columns stepping by
+    one whole 128-byte HVX vector, whose body reads each chunk with a
+    `vector.transfer_read`, folds it with `vector.reduction <maxnumf>` against a
+    `tensor.extract` of the row's current value, and writes the scalar result
+    into a rank-0 slice of that same carrier.
+
+    Rewrites it so the per-row result never becomes a scalar. The row loop steps
+    by `lanes` instead of 1; the group's running values live in a
+    `vector<lanes x T>` loop-carried value (which one-shot bufferization leaves
+    alone, so it stays in registers); each row's horizontal butterfly
+    (`hvx.vror` + `maxnumf`, `log2(128/elemBytes)` steps, llama.cpp
+    hvx-reduce.h style) produces an all-lanes-equal vector that is *not*
+    extracted; an `arith.cmpi eq` against a constant lane-index vector plus
+    `arith.select` places it in the group's lane, folding the group's previous
+    value in on the way; and the group is written back with one
+    `vector.transfer_write` per `lanes` rows.
+
+    This is the only reason the scalar form is worth changing: the Hexagon HVX
+    backend has no "vector lane 0 to GPR" instruction, so one `vector.reduction`
+    result that becomes an `f32` costs a 128-byte vector stack write followed by
+    a 4-byte stack read back -- per row, per 128-byte chunk, in a loop-carried
+    dependency chain.
+
+    Everything else -- dynamic shapes, a column loop that does not step by a
+    whole vector, a reduction kind other than `maxnumf`, a result that does not
+    land in a rank-0 slice, a carrier with another reader, a row tile or tile
+    base that is not a multiple of the lane count -- is left untouched, and each
+    refusal says which gate stopped it. The gate is structural: no shape, kernel
+    name or operator name appears in it.
+  }];
+
+  let constructor = "hexagon::createRowReduceGroupStorePass()";
 }
 
 def FormAsyncThreads : Pass<"form-async-threads", "func::FuncOp"> {

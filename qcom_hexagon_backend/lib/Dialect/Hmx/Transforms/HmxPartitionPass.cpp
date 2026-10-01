@@ -119,23 +119,68 @@ namespace {
 /// rewrite, the activation bridge and its array kept as ordinary memory. It is
 /// the A/B arm that reproduces the pre-pipeline codegen; the staged emitter
 /// never sees this value.
+///
+// NOT-A-DECISION: an enum sentinel for the `pipeline-depth` knob, not a
+// decision constant. It carries no profitability meaning, so demanding a
+// traceability triple of it would be noise. It was previously listed as one;
+// see `docs/codegen/constants-traceability-2026-09-30.md` C8.
 constexpr int64_t kSerialPipelineDepth = 3;
 
-/// The K extent (in croutons) at or above which `auto` (`pipeline-depth=0`) is
-/// willing to stage. It is a profitability floor, not a footprint one: the
-/// staged path can pay for the ring at any K, but the overlap only wins when
-/// the transfer is large next to the DMA engine's fixed per-transfer cost
-/// (issue + wait + scratch addressing). One staged tile is `32 * K * 2` bytes
-/// with `K = 32 * Kt`, i.e. `2 KiB * Kt`: at the Kt=32 floor that is 64 KiB
-/// (2 KiB per source row) and it shrinks linearly with Kt. Measured on device
-/// in one build (warm A/B, `auto` staging vs the `pipeline-depth=3` serial arm,
-/// on the S1/S2/S3 anchor shapes; drivers under exp/hmx):
-///   * S2 (Kt=64): 297 us -> 153 us = 1.94x  (overlap wins)
-///   * S1 (Kt=2):  125.5 us -> 126.5 us      (flat, nothing to win)
-///   * S3 (Kt=4):  60.5 us -> 67 us = -10%   (overlap loses)
-/// so the cutoff sits at Kt=32. Only `auto` is gated: `pipeline-depth=1/2` are
-/// the A/B arms and stage whatever the shape is, and `3` never reaches the
-/// staged emitter.
+// TRACEABILITY: kStageMinKTiles
+//   mechanism: The staged path can pay for the ring at any K; the overlap only
+//     wins when the transfer is large next to the DMA engine's fixed
+//     per-transfer cost (issue + wait + scratch addressing). One staged tile is
+//     32 * K * 2 bytes with K = 32 * Kt, i.e. 2 KiB * Kt, so the transfer grows
+//     linearly in Kt while the fixed cost does not.
+//   measurement: warm A/B in ONE build, `auto` staging vs the
+//     `pipeline-depth=3` serial arm; drivers under exp/hmx. S2 (Kt=64):
+//     297 -> 153 us (1.94x). S1 (Kt=2): 125.5 -> 126.5 us (flat). S3: 60.5 ->
+//     67 us (-10%). Only `auto` is gated; 1/2 are the A/B arms, 3 never reaches
+//     the staged emitter.
+//   shape set: S1/S2/S3, defined in exp/hmx/op_bench/bench_ops.py. **These are
+//     the project's own anchor shapes, not a real workload set.** They are not
+//     traced to any llama.cpp per-op bench entry.
+//   workload representativeness: **NOT ESTABLISHED.** bench_ops.py calls S1
+//     "the S1 anchor shape", which is circular. Their weights are 0-3% of VTCM,
+//     so they do not exercise the residency pressure the gate is supposed to
+//     trade against.
+//   known-bad: the mechanism itself is refuted in-repo. exp/hmx/leaf_bw_probe/
+//     RESULTS.md says the right predicate is "is the source L2-cold" (activation
+//     bytes vs L2 capacity), not a Kt >= 32 approximation. **Re-tuning the
+//     number on the same mechanism would be wasted work**; the fix is to replace
+//     the scalar with that capability query.
+//   S3 identity: a 3-file vote, NOT resolved. Three files define S3 as
+//     128x128x128 (= Kt=4) -- exp/hmx/throughput_probe/host_residual_structure.py:42,
+//     exp/hmx/deep_k_shapes/probe_deep_k.py:38, and
+//     docs/hmx/gap-vs-llama-plain-2026-09-29.md:11. The lone outlier is
+//     exp/hmx/op_bench/bench_ops.py:291 (1024x64x256 = Kt=8), which by that
+//     count is mislabelled.
+//     **But no log records which shape the -10% was actually taken on.** A
+//     3-1 file vote is evidence, not proof, and it is deciding what a
+//     calibration point MEANS -- so it is recorded as a vote, and the earlier
+//     phrasing "RESOLVED" (and the "8x below the floor, not 4x" inference that
+//     came with it) is withdrawn. Settling it needs the original A/B log; until
+//     then the negative point below the floor is **unpinned**, and the gap
+//     between the floor and the measured loss is somewhere between 4x and 8x.
+//
+//     To settle: find the run that produced 60.5 -> 67 us and read the shape off
+//     it. Do not infer it from a probe script's label.
+// Flip point, re-derived and confirmed by host codegen: Kt is read off the
+// crouton array (actType.getDimSize(1)) and K == Kt * layout::kTileEdge is
+// required just above, so the floor of 32 flips at **K = 1024 exactly**.
+// Observed: 256x256x512 -> reason "shallow-k"; 256x256x1024 -> staged, depth 2.
+//
+// Real-workload proximity (2026-09-30 survey over logs/real-shapes-2026-09-29/;
+// the six non-synthetic manifests there are attn_pv_s1024, attn_pv_s4096,
+// attn_qk_d128, attn_qk_d256, s1_anchor, s2_anchor -- the other seven files in
+// that directory are a synthetic K-sweep ladder, not workloads):
+// 3 below / 3 at-or-above. The band is THIN:
+// one real shape sits exactly ON the boundary (FA PV, 1024x128x1024, Kt=32)
+// and one at the low edge (FA QK, 1024x1024x256, Kt=8). Nothing real lands
+// strictly inside Kt 9..31. The same attention op straddles the gate -- QK^T's
+// K is head_dim (small, refused) while PV's K is seq (large, allowed).
+// => Priority is moderate, not high. A better predicate would move the Kt=8
+// case at most. See docs/codegen/constants-traceability-2026-09-30.md.
 constexpr int64_t kStageMinKTiles = 32;
 
 struct PipelineDecision {
@@ -500,18 +545,124 @@ static Value emitAwait(IRRewriter &rewriter, Location loc, Value token,
       ->getResult(0);
 }
 
-/// Emit the K traversal of one tile as `hmx.mma`s: one mma per K crouton.
+// The engine's activation repeat count `Rt[dC]` is five bits, so ONE `hmx.mma`
+// covers at most 32 K croutons = 1024 input channels (V81 PRM 4.2.1: "up to 32
+// croutons (1024 input channels)", hmx_prm_v81.txt:1593-1594). That is the
+// verifier's `n_croutons <= 32` (HmxOps.cpp:410-411) -- a hardware bound, not a
+// tunable -- and it is the same bound llama.cpp asserts before its dot chunk
+// (`__builtin_assume(n_dot_tiles <= 32)`, hmx-mm-kernels-tiled.h:609).
+//
+// NOT-A-DECISION. This is the widest value the field can legally carry, read
+// off the hardware encoding rather than chosen: the runtime already computed it
+// (`HMXAPI.c:51 act_rt = 2047 | ((n_croutons-1) << 11)`, and `HMXAPI.c:53`
+// `wt_rt = ((kBlockPairs * n_croutons - 1) << 7) | 0x7f`), so a smaller value
+// here would leave the widest encoding unused, not encode a different choice.
+// The encoder has no mechanism for "batch less than the hardware maximum", so
+// there is nothing here to calibrate: lowering it cannot select a different
+// code path, only a slower one. See docs/hmx/ncroutons-k-fusion-2026-10-01.md.
+//
+// `croutons-per-mma` is an Option, and the reason above is why that does not
+// make 32 a decision: the option's DEFAULT is this same hardware maximum, so the
+// emitted code is unchanged. The option exists to make "batch less than the
+// maximum" *expressible*, which is what lets the batching be A/B'd inside one
+// build instead of by editing a constant and rebuilding. The domain is
+// {0} u [1, 32] (0 = this maximum), and out-of-domain values are an error, not
+// a clamp.
+static constexpr int64_t kMaxCroutonsPerMma = 32;
+
+/// Resolve the `croutons-per-mma` option to the batch size the emitter uses.
+/// 0 means the hardware maximum, exactly as `vtcm-budget`'s 0 means the device
+/// default -- so a caller that does not pass the option, one that passes 0, and
+/// one that passes 32 all ask for the same thing. The caller is responsible for
+/// having rejected the out-of-domain values (see `runOnOperation`); this only
+/// maps 0.
 ///
-/// `act`/`wt` are the whole crouton arrays and `m`/`n` the tile indices.
-/// `zero`/`step`/`cKt` are the loop bounds the caller already materialised.
+/// The parameter is named `requested` because the resolved value is not what was
+/// asked for whenever 0 is passed, and the distinction is the whole reason the
+/// two spellings are not merged.
+static int64_t resolveCroutonsPerMma(int64_t requested) {
+  return requested == 0 ? kMaxCroutonsPerMma : requested;
+}
+
+/// Emit the K traversal of one output tile as `hmx.mma`s, batching K croutons
+/// through the engine's repeat count instead of issuing one instruction per
+/// crouton.
+///
+/// `act`/`wt` are the whole crouton arrays and `m`/`n` the tile indices. `kt` is
+/// K in croutons -- the activation array's second grid dim -- and it is a
+/// compile-time constant (the last paragraph says why the integer may be
+/// passed). `batch` is the resolved `croutons-per-mma` value: K croutons per
+/// `hmx.mma`, in [1, 32]. The prose below is written for the default
+/// `batch = 32`; the same three cases hold for any `batch`, with 32 read as
+/// "the batch".
+///
+/// The batching is sound because the op's contract is "starting at position
+/// (m, k) ... and walking forward from there" (HmxOps.td:474-476) and the count
+/// travels ONLY in `n_croutons`: the address `croutonAddr` builds is a function
+/// of `k` alone, `base + (row*rowStride + col) * 2048`, and
+/// `test/Conversion/HmxToLLVM/mma-deep-croutons.mlir` pins that the whole
+/// address chain is identical for `n_croutons = 1` and `n_croutons = 32` at the
+/// same Kt, with the count reaching the leaf as the third argument and nothing
+/// else. So a run of `c` croutons is one mma at `k` with `n_croutons = c`, and K
+/// is walked as
+///
+///     floor(Kt / 32) batches of 32, then -- only when Kt % 32 != 0 -- one tail
+///     batch of Kt % 32 at k = floor(Kt / 32) * 32.
+///
+/// That is llama.cpp's shape (`n_loops = n_dot_tiles / 32`, then
+/// `rem = n_dot_tiles % 32` handled separately, hmx-mm-kernels-tiled.h:657-668)
+/// and the tail is NOT optional: at `Kt % 32 == 0` there is no tail at all, and
+/// emitting one anyway would be a zero-count mma the verifier rejects. The Kt
+/// values that separate those two cases -- 31, 32, 33, 64, 65 -- are exactly the
+/// ones `mma-deep-croutons.mlir` covers on the lowering side and
+/// `hmx-partition-deep-crontons.mlir` covers here.
+///
+/// Every caller's `kt` was already this value, materialised as an
+/// `arith.constant` for the loop bound: `shape.k = lhs.getDimSize(1)` for the
+/// serial arm, `grid.kTiles` for a peeled region (equal to the same dim, which
+/// `readTailGrid` rejects a disagreement with), and `Kt` for the staged scratch.
+/// Passing the integer instead of the `Value` therefore changes the loop, not
+/// its extent.
 static void emitMmaKLoop(IRRewriter &rewriter, Location loc, Value act,
-                         Value wt, Value m, Value n, Value zero, Value step,
-                         Value cKt) {
-  auto kLoop = scf::ForOp::create(rewriter, loc, zero, cKt, step, ValueRange{});
+                         Value wt, Value m, Value n, int64_t kt, int64_t batch) {
+  // K = 0 emitted nothing before this change (the loop was zero-trip), so keep
+  // that: emitting a zero-count mma instead would turn a degenerate shape into a
+  // verifier error, which is a new failure mode rather than a fix.
+  if (kt < 1)
+    return;
+  // The whole K in one instruction: no loop and no tail. This is the shallow-K
+  // case (the S1/S3 anchors have Kt = 2..8), where the one-per-cronton form
+  // spent a `Kt`-iteration software loop and `Kt` issue slots on a single
+  // engine packet's worth of work. A K no deeper than one batch needs no
+  // batching either, and there the count is the shape, not the batch.
+  if (kt <= batch) {
+    auto kOnly = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    MmaOp::create(rewriter, loc, act, wt, m, n, kOnly,
+                  rewriter.getI32IntegerAttr(kt));
+    return;
+  }
+
+  int64_t batches = kt / batch;
+  int64_t rem = kt % batch;
+  auto zero = arith::ConstantIndexOp::create(rewriter, loc, 0);
+  auto batchStep = arith::ConstantIndexOp::create(rewriter, loc, batch);
+  auto batchEnd =
+      arith::ConstantIndexOp::create(rewriter, loc, batches * batch);
+  // The induction variable IS the crouton index: stepping it by the batch size
+  // walks the batches without a multiply.
+  auto kLoop =
+      scf::ForOp::create(rewriter, loc, zero, batchEnd, batchStep, ValueRange{});
   rewriter.setInsertionPointToStart(kLoop.getBody());
   MmaOp::create(rewriter, loc, act, wt, m, n, kLoop.getInductionVar(),
-                rewriter.getI32IntegerAttr(1));
+                rewriter.getI32IntegerAttr(batch));
   rewriter.setInsertionPointAfter(kLoop);
+
+  if (rem == 0)
+    return;
+  auto kTail =
+      arith::ConstantIndexOp::create(rewriter, loc, batches * batch);
+  MmaOp::create(rewriter, loc, act, wt, m, n, kTail,
+                rewriter.getI32IntegerAttr(rem));
 }
 
 /// The serial tile loop: bias clear, the (m, n) tiles, one K loop of mmas and a
@@ -526,7 +677,7 @@ static void emitMmaKLoop(IRRewriter &rewriter, Location loc, Value act,
 /// staged. There is no structural assumption here beyond the tile shapes the
 /// caller already resolved.
 static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
-                               MatmulOp op, TileShape shape) {
+                               MatmulOp op, TileShape shape, int64_t batch) {
   Value act = op.getLhs();
   Value wt = op.getRhs();
   Value ar = op.getOuts();
@@ -537,7 +688,6 @@ static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
   auto step = arith::ConstantIndexOp::create(rewriter, opLoc, 1);
   auto mM = arith::ConstantIndexOp::create(rewriter, opLoc, shape.m);
   auto nN = arith::ConstantIndexOp::create(rewriter, opLoc, shape.n);
-  auto kK = arith::ConstantIndexOp::create(rewriter, opLoc, shape.k);
 
   auto mLoop =
       scf::ForOp::create(rewriter, opLoc, zero, mM, step, ValueRange{});
@@ -548,8 +698,8 @@ static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
       scf::ForOp::create(rewriter, opLoc, zero, nN, step, ValueRange{});
   rewriter.setInsertionPointToStart(nLoop.getBody());
   AccClearOp::create(rewriter, opLoc);
-  emitMmaKLoop(rewriter, opLoc, act, wt, m, nLoop.getInductionVar(), zero, step,
-               kK);
+  emitMmaKLoop(rewriter, opLoc, act, wt, m, nLoop.getInductionVar(), shape.k,
+               batch);
   AccReadOp::create(rewriter, opLoc, bias, ar, m, nLoop.getInductionVar(),
                     rewriter.getI32IntegerAttr(0));
 }
@@ -764,7 +914,7 @@ static std::optional<UnpackBridge> findUnpackBridge(MatmulOp matmul) {
 static void emitTileRegion(IRRewriter &rewriter, Location loc, Value bias,
                            Value act, Value wt, Value ar, int64_t mBegin,
                            int64_t mEnd, int64_t nBegin, int64_t nEnd,
-                           int64_t kEnd, Operation *&cursor) {
+                           int64_t kEnd, int64_t batch, Operation *&cursor) {
   if (mBegin >= mEnd || nBegin >= nEnd || kEnd <= 0)
     return;
 
@@ -779,7 +929,6 @@ static void emitTileRegion(IRRewriter &rewriter, Location loc, Value bias,
   auto mStop = arith::ConstantIndexOp::create(rewriter, loc, mEnd);
   auto nStart = arith::ConstantIndexOp::create(rewriter, loc, nBegin);
   auto nStop = arith::ConstantIndexOp::create(rewriter, loc, nEnd);
-  auto kStop = arith::ConstantIndexOp::create(rewriter, loc, kEnd);
 
   auto mLoop =
       scf::ForOp::create(rewriter, loc, mStart, mStop, step, ValueRange{});
@@ -789,7 +938,7 @@ static void emitTileRegion(IRRewriter &rewriter, Location loc, Value bias,
   rewriter.setInsertionPointToStart(nLoop.getBody());
   AccClearOp::create(rewriter, loc);
   emitMmaKLoop(rewriter, loc, act, wt, mLoop.getInductionVar(),
-               nLoop.getInductionVar(), zero, step, kStop);
+               nLoop.getInductionVar(), kEnd, batch);
   AccReadOp::create(rewriter, loc, bias, ar, mLoop.getInductionVar(),
                     nLoop.getInductionVar(), rewriter.getI32IntegerAttr(0));
   rewriter.setInsertionPointAfter(mLoop);
@@ -802,11 +951,11 @@ static void emitTileRegion(IRRewriter &rewriter, Location loc, Value bias,
 /// zero-filled by the pack contract and are not a separate M/N region.
 static Operation *emitPeeledEdgeTileLoop(IRRewriter &rewriter, Location loc,
                                          Value bias, MatmulOp op,
-                                         const TailGrid &grid) {
+                                         const TailGrid &grid, int64_t batch) {
   Operation *cursor = op.getOperation();
   auto emit = [&](int64_t mBegin, int64_t mEnd, int64_t nBegin, int64_t nEnd) {
     emitTileRegion(rewriter, loc, bias, op.getLhs(), op.getRhs(), op.getOuts(),
-                   mBegin, mEnd, nBegin, nEnd, grid.kTiles, cursor);
+                   mBegin, mEnd, nBegin, nEnd, grid.kTiles, batch, cursor);
   };
 
   // The full rectangle is the ordinary fast region. It is still serial in this
@@ -913,36 +1062,98 @@ static LogicalResult emitDiagnosticInputBridges(
     SmallVectorImpl<Operation *> &retired) {
   auto actBridge = findPackBridge(op.getLhs(), /*isWeight=*/false);
   auto weightBridge = findPackBridge(op.getRhs(), /*isWeight=*/true);
+
+  // A WEIGHT-RESIDENT operand arrives already in crouton form, so no
+  // `hmx.pack_weight` writes it and `findPackBridge` necessarily returns null.
+  // That null used to be indistinguishable from "the weight bridge is
+  // malformed", which made the whole diagnostic tail path unreachable for the
+  // default configuration -- `enableWeightResident` is True by default
+  // (hexagon_options.py), so this was not a corner case.
+  //
+  // The two are told apart by asking whether ANY pack writes the array at all:
+  //   * no PackWeightOp writes it  => the array's contents come from outside the
+  //     pack path, i.e. it is already resident => nothing to check about a
+  //     row-major SOURCE, because there is no source.
+  //   * a PackWeightOp writes it but findPackBridge said no => mixed
+  //     destinations / several loops / a non-arith loop body => refuse, exactly
+  //     as before. This is why the test is "any writer" and not "bridge null".
+  //
+  // ⚠️ THIS IS A PROXY INFERENCE, and it is only sound because of a pass-order
+  // invariant that used to be unwritten (2026-10-01, independent audit). Stating
+  // it here so the next reader does not have to rediscover it:
+  //
+  //   In the PRODUCTION pipeline, `MatmulToHmxPass` always emits the weight
+  //   packs (its :1436 / :1587 / :1631 construction sites), and
+  //   `WeightResidentPass` runs IMMEDIATELY before this pass
+  //   (LinalgToLLVMPass.cpp:509-512 then :527-530) -- so by the time we get
+  //   here, "no PackWeightOp" really does mean "WeightResidentPass replaced them
+  //   with a resident array", and the other meaning cannot occur.
+  //
+  //   That invariant is NOT available to a STANDALONE `hmx-partition`
+  //   invocation, which HmxPartitionPass.cpp:1751 explicitly supports and which
+  //   is how every lit test in this directory runs. There the audit MEASURED two
+  //   accepting counterexamples: an rhs that is an untouched `memref.alloc`
+  //   (engine reads uninitialised memory), and an rhs filled by a row-major
+  //   `hmx.unpack_acc` (a crouton-order mixup, the mirror image of the
+  //   HmxToLLVMPass `rowStride` hole -- and `rowStride` cannot see it, because it
+  //   only sees rank-2 leaf buffers). Both lowered to four real `hmx.mma`.
+  //
+  // ⇒ The standalone form is a "no pack means resident" CLAIM, not a proof. The
+  //   cheap strengthening (require the rhs to be a block argument, an alloc, or
+  //   a reinterpret_cast -- i.e. something WeightResidentPass could have
+  //   produced) is deliberately NOT done here: it would need its own
+  //   counterexample sweep, and a wrong tightening would re-break the default
+  //   configuration this change exists to unlock. If you tighten it, tighten it
+  //   with a lit case per shape you exclude.
+  auto anyWeightPackWrites = [&](Value array) {
+    for (OpOperand &use : array.getUses())
+      if (isa<PackWeightOp>(use.getOwner()))
+        return true;
+    return false;
+  };
+  const bool weightResident = !weightBridge && !anyWeightPackWrites(op.getRhs());
+  if (weightResident) {
+    PackBridge resident;
+    resident.buffer = op.getRhs();
+    weightBridge = resident;
+  }
   if (!actBridge || !weightBridge)
     return op.emitError("diagnostic tail partition requires direct activation "
                         "and weight pack bridges");
   DominanceInfo dominance(op.getOperation());
   if (!diagnosticValueDominates(dominance, actBridge->source,
                                 op.getOperation()) ||
-      !diagnosticValueDominates(dominance, weightBridge->source,
-                                op.getOperation()))
+      (!weightResident &&
+       !diagnosticValueDominates(dominance, weightBridge->source,
+                                 op.getOperation())))
     return op.emitError("diagnostic tail partition requires pack sources that "
                         "dominate the matmul");
+  // Coverage is counted over the packs a bridge owns. A resident weight owns
+  // none, and that is correct rather than a gap: there is nothing to cover,
+  // because the engine reads the crouton the caller already handed it.
   if ((!actBridge->loop &&
        failed(verifyPackCoverage(op.getOperation(), actBridge->ops,
                                  /*isWeight=*/false, grid.mTiles,
                                  grid.kTiles))) ||
-      (!weightBridge->loop &&
+      (!weightResident && !weightBridge->loop &&
        failed(verifyPackCoverage(op.getOperation(), weightBridge->ops,
                                  /*isWeight=*/true, grid.nTiles, grid.kTiles))))
     return failure();
+  // Likewise the two source checks are about a ROW-MAJOR source, which a
+  // resident weight by definition does not have.
   if (failed(verifyDiagnosticRowMajor(op.getOperation(), actBridge->source,
                                       "activation source")) ||
-      failed(verifyDiagnosticRowMajor(op.getOperation(), weightBridge->source,
-                                      "weight source")) ||
+      (!weightResident &&
+       (failed(verifyDiagnosticRowMajor(op.getOperation(), weightBridge->source,
+                                        "weight source")) ||
+        failed(verifyDiagnosticMatrixShape(
+            op.getOperation(), weightBridge->source, grid.kLogical,
+            grid.nLogical, grid.kTiles * layout::kTileEdge,
+            grid.nTiles * layout::kTileEdge, "weight source")))) ||
       failed(verifyDiagnosticMatrixShape(
           op.getOperation(), actBridge->source, grid.mLogical, grid.kLogical,
           grid.mTiles * layout::kTileEdge, grid.kTiles * layout::kTileEdge,
-          "activation source")) ||
-      failed(verifyDiagnosticMatrixShape(
-          op.getOperation(), weightBridge->source, grid.kLogical, grid.nLogical,
-          grid.kTiles * layout::kTileEdge, grid.nTiles * layout::kTileEdge,
-          "weight source")))
+          "activation source")))
     return failure();
 
   Value actValue = actBridge->buffer;
@@ -1054,14 +1265,21 @@ static LogicalResult emitDiagnosticInputBridges(
       emitAct(grid.mFullTiles, grid.mTiles, grid.kFullTiles, grid.kTiles,
               validM, validK);
   }
-  emitWeight(0, grid.nFullTiles, 0, grid.kFullTiles, noValid, noValid);
-  if (grid.nFullTiles < grid.nTiles)
-    emitWeight(grid.nFullTiles, grid.nTiles, 0, grid.kFullTiles, full, validN);
-  if (grid.kFullTiles < grid.kTiles) {
-    emitWeight(0, grid.nFullTiles, grid.kFullTiles, grid.kTiles, validK, full);
+  // A resident weight is already crouton: there is no row-major source to pack
+  // FROM, so emitting packs for it would need a source value that does not
+  // exist. Skipping is the whole point of the resident path.
+  if (!weightResident) {
+    emitWeight(0, grid.nFullTiles, 0, grid.kFullTiles, noValid, noValid);
     if (grid.nFullTiles < grid.nTiles)
-      emitWeight(grid.nFullTiles, grid.nTiles, grid.kFullTiles, grid.kTiles,
-                 validK, validN);
+      emitWeight(grid.nFullTiles, grid.nTiles, 0, grid.kFullTiles, full,
+                 validN);
+    if (grid.kFullTiles < grid.kTiles) {
+      emitWeight(0, grid.nFullTiles, grid.kFullTiles, grid.kTiles, validK,
+                 full);
+      if (grid.nFullTiles < grid.nTiles)
+        emitWeight(grid.nFullTiles, grid.nTiles, grid.kFullTiles, grid.kTiles,
+                   validK, validN);
+    }
   }
 
   auto retirePackBridge = [&](PackBridge &bridge) {
@@ -1262,14 +1480,14 @@ static LogicalResult emitDiagnosticOutputBridge(
 /// the activation.
 static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
                             Value scratch, Value wt, Value ar, Value m,
-                            Value stagedSlot, Value c0, Value c1, Value cKt,
-                            Value cNt, std::optional<int64_t> decisionId) {
+                            Value stagedSlot, Value c0, Value c1, int64_t Kt,
+                            int64_t batch, Value cNt,
+                            std::optional<int64_t> decisionId) {
   // The pack's destination is the scratch itself: its crouton grid is one row
   // tall, so the destination crouton is (0, k) while the source block is
   // (row 0, column k) of the staged slot. The scratch's contiguous axis is K,
   // so one ranged pack covers the whole K run -- the same shape the row-major
-  // bridge uses (`packCroutonsWithLeaves`); `cKt` is not needed as a loop
-  // bound.
+  // bridge uses (`packCroutonsWithLeaves`).
   auto scratchType = cast<MemRefType>(scratch.getType());
   emitPackAct(rewriter, loc, scratch, stagedSlot, c0, c0, decisionId,
               rewriter.getI64IntegerAttr(scratchType.getDimSize(1)));
@@ -1277,8 +1495,8 @@ static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
   auto nLoop = scf::ForOp::create(rewriter, loc, c0, cNt, c1, ValueRange{});
   rewriter.setInsertionPointToStart(nLoop.getBody());
   AccClearOp::create(rewriter, loc);
-  emitMmaKLoop(rewriter, loc, scratch, wt, c0, nLoop.getInductionVar(), c0, c1,
-               cKt);
+  emitMmaKLoop(rewriter, loc, scratch, wt, c0, nLoop.getInductionVar(), Kt,
+               batch);
   AccReadOp::create(rewriter, loc, bias, ar, m, nLoop.getInductionVar(),
                     rewriter.getI32IntegerAttr(0));
   rewriter.setInsertionPointAfter(nLoop);
@@ -1316,7 +1534,7 @@ static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
 static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
                                    Value bias, MatmulOp op, func::FuncOp func,
                                    int64_t vtcmBudget, int64_t requestedDepth,
-                                   bool &staged) {
+                                   int64_t batch, bool &staged) {
   staged = false;
   std::optional<int64_t> decisionId;
   if (failed(readDecisionId(op.getOperation(), decisionId)))
@@ -1381,6 +1599,26 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   int64_t scratchBytes = Kt * layout::kCroutonBytes;
   int64_t srcElemBytes = srcType.getElementTypeBitWidth() / 8;
   int64_t slotBytes = layout::kTileEdge * K * srcElemBytes;
+  // TRACEABILITY: statusBytes
+  //   ⚠️ NOT GATE-VISIBLE, deliberately. `statusBytes` is a non-constexpr local
+  //   and the depth cap is a bare `2` at three sites, so
+  //   test_hmx_constant_traceability.py cannot see either. This block is
+  //   documentation only. That is stated here so no reader assumes a machine
+  //   check is standing behind it -- promoting these to named constants purely
+  //   to satisfy the gate would be churn, not rigour.
+  //   mechanism: one i32 completion token per ring slot, so the size is the
+  //     token size and not a tunable. The depth cap of 2 is structural, not
+  //     measured: the pipeliner issues one tile per stage, so a third slot
+  //     would be a buffer nothing writes. `fits()` then derives the affordable
+  //     depth from the remaining VTCM rather than from a constant.
+  //   measurement: none required -- the size is the token size and the cap of 2
+  //     is structural (the pipeliner issues one tile per stage, so a third slot
+  //     is a buffer nothing writes). `fits()` derives the affordable depth from
+  //     remaining VTCM rather than from a constant.
+  //   shape set: n/a (not shape dependent).
+  //   workload representativeness: n/a.
+  //   The value that *is* measured, the K floor above, is a separate constant
+  //     with its own traceability block.
   int64_t statusBytes = 4;
   int64_t ringBytes = slotBytes + statusBytes;
   int64_t room = vtcmBudget - vtcmBytesCommitted(func) + actBytes;
@@ -1469,7 +1707,6 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   auto c1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
   auto cTileEdge =
       arith::ConstantIndexOp::create(rewriter, loc, layout::kTileEdge);
-  auto cKt = arith::ConstantIndexOp::create(rewriter, loc, Kt);
   auto cNt = arith::ConstantIndexOp::create(rewriter, loc, Nt);
   auto cMt = arith::ConstantIndexOp::create(rewriter, loc, Mt);
 
@@ -1514,8 +1751,8 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   Value row = arith::MulIOp::create(rewriter, loc, m, cTileEdge);
   Value token = emitStage(rewriter, loc, bridge->src, row, slotSel, statusSel);
   Value ready = emitAwait(rewriter, loc, token, slotSel);
-  emitTileCompute(rewriter, loc, bias, scratch, wt, ar, m, ready, c0, c1, cKt,
-                  cNt, decisionId);
+  emitTileCompute(rewriter, loc, bias, scratch, wt, ar, m, ready, c0, c1, Kt,
+                  batch, cNt, decisionId);
 
   // The pipeliner owns the schedule from here: everything through the
   // `hmx.stage` is stage 0, the await and the compute are stage 1. With the
@@ -1663,6 +1900,34 @@ struct HmxPartitionPass
                                    ? this->vtcmBudgetBytes
                                    : HmxTarget::defaultVtcmBudget;
 
+    // The K batch per `hmx.mma`, resolved the same way: 0 is the hardware
+    // maximum, so "not passed", "passed 0" and "passed 32" are one request.
+    //
+    // Rejected rather than clamped, and this is the only knob here that is.
+    // `pipeline-depth` clamps because anything past its widest ring means "as
+    // deep as you can", so the clamp agrees with the request. Here 32 is a
+    // hardware bound (`Rt[dC]` is five bits) and a value above it is not a
+    // deeper request but an unencodable one: clamping 64 to 32 would report
+    // success for a batch the caller never asked for, which is the failure mode
+    // `AGENTS.md` rule 8 exists to prevent -- a knob that looks effective and is
+    // not. A negative value has no meaning either, so it is in the same class.
+    //
+    // Checked here, after the empty-matmul return above, because this is an
+    // interface pass: a function the pass does not touch must not fail a build
+    // over a configuration mistake that cannot affect its output.
+    if (this->croutonsPerMma < 0 ||
+        this->croutonsPerMma > kMaxCroutonsPerMma) {
+      // `.getValue()` not the implicit conversion: streaming `Pass::Option`
+      // directly prints nothing, which would ship a diagnostic that names the
+      // domain but not the offending value.
+      func.emitError(
+          "hmx-partition croutons-per-mma must be 0 (the hardware maximum, "
+          "32) or in [1, 32], but got ")
+          << this->croutonsPerMma.getValue();
+      return signalPassFailure();
+    }
+    const int64_t batch = resolveCroutonsPerMma(this->croutonsPerMma);
+
     Location loc = func.getLoc();
     IRRewriter rewriter(func.getContext());
     rewriter.setInsertionPointToStart(&func.getBody().front());
@@ -1712,7 +1977,8 @@ struct HmxPartitionPass
         if (failed(emitDiagnosticInputBridges(rewriter, op.getLoc(), op, grid,
                                               decisionId, cursor, retired)))
           return signalPassFailure();
-        cursor = emitPeeledEdgeTileLoop(rewriter, op.getLoc(), bias, op, grid);
+        cursor = emitPeeledEdgeTileLoop(rewriter, op.getLoc(), bias, op, grid,
+                                       batch);
         if (failed(emitDiagnosticOutputBridge(rewriter, op.getLoc(), op, grid,
                                               *unpackBridge, decisionId, cursor,
                                               retired)))
@@ -1793,12 +2059,12 @@ struct HmxPartitionPass
       } else {
         bool staged = false;
         if (failed(emitStageLoop(rewriter, opLoc, bias, op, func, vtcmBudget,
-                                 this->pipelineDepth, staged)))
+                                 this->pipelineDepth, batch, staged)))
           return signalPassFailure();
         if (staged)
           continue;
       }
-      emitSerialTileLoop(rewriter, opLoc, bias, op, *shape);
+      emitSerialTileLoop(rewriter, opLoc, bias, op, *shape, batch);
       rewriter.eraseOp(op);
     }
 

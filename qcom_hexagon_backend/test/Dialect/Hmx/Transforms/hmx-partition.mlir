@@ -23,8 +23,11 @@
 // CHECK: scf.for %[[M:.*]] = {{.*}} to
 // CHECK: scf.for %[[N:.*]] = {{.*}} to
 // CHECK: hmx.acc_clear
-// CHECK: scf.for %[[K:.*]] = {{.*}} to
-// CHECK: hmx.mma %{{.*}}, %{{.*}}, %[[M]], %[[N]], %[[K]] {n_croutons = 1 : i32}
+// Kt = 4 is one engine batch, so there is no K loop at all: one mma at k = 0
+// with the whole K as its repeat count.
+// CHECK-NOT: scf.for
+// CHECK: %[[K:.*]] = arith.constant 0 : index
+// CHECK-NEXT: hmx.mma %{{.*}}, %{{.*}}, %[[M]], %[[N]], %[[K]] {n_croutons = 4 : i32}
 // CHECK: hmx.acc_read %{{.*}}, %{{.*}}, %[[M]], %[[N]] {bias_set = 0 : i32}
 // The conversion state has its paired release at the single exit: it is kernel
 // setup, not a per-launch leak.
@@ -46,10 +49,11 @@ func.func @partition() {
 // Only one conversion-state block per kernel.
 // CHECK: hmx.bias_init
 // CHECK-NOT: hmx.bias_init
-// The first dot's grid (Mt=2, Kt=4) ...
-// CHECK: arith.constant 4 : index
+// The first dot's grid (Mt=2, Kt=4): Kt is now visible as the mma's repeat
+// count, since there is no K loop left to carry it as a bound.
 // CHECK: scf.for
-// CHECK: hmx.mma
+// CHECK: hmx.acc_clear
+// CHECK: hmx.mma {{.*}} {n_croutons = 4 : i32}
 // CHECK: hmx.acc_read
 // ... and the second dot's grid (Mt=8) lowers to its own loop nest.
 // CHECK: arith.constant 8 : index
@@ -107,11 +111,12 @@ func.func @two_dots_keep_grids() {
 // CHECK: %[[ST0:.*]] = memref.alloc() {alignment = 4 : i64} : memref<1xi32>
 // CHECK: %[[SLOT1:.*]] = memref.alloc() {alignment = 128 : i64} : memref<32x1024xf16, 1>
 // CHECK: %[[ST1:.*]] = memref.alloc() {alignment = 4 : i64} : memref<1xi32>
-// Ring/grid constants: depth = 2, tile edge = 32, Kt = 32, Nt = 2, Mt = 4.
+// Ring/grid constants: depth = 2, tile edge = 32, Nt = 2, Mt = 4. Kt has no
+// constant of its own any more: it is the mma's repeat count, and 32 % 32 == 0
+// so it is never a tail either.
 // CHECK: %[[C0:.*]] = arith.constant 0 : index
 // CHECK: %[[C1:.*]] = arith.constant 1 : index
 // CHECK: %[[TILE_EDGE:.*]] = arith.constant 32 : index
-// CHECK: %[[KTILE:.*]] = arith.constant 32 : index
 // CHECK: %[[NTILE:.*]] = arith.constant 2 : index
 // CHECK: %[[MT:.*]] = arith.constant 4 : index
 // Prologue (the pipeliner's): the issue part of tile 0 -- parity select of the
@@ -140,8 +145,8 @@ func.func @two_dots_keep_grids() {
 // CHECK: hmx.pack_act ins(%[[ROW]], %[[C0]], %[[C0]] : memref<32x1024xf16, 1>) outs(%[[SCRATCH]] : memref<1x32x16x32x2xf16, 1>) {count = 32 : i64}
 // CHECK: scf.for %[[N:.*]] = %[[C0]] to %[[NTILE]] step %[[C1]] {
 // CHECK: hmx.acc_clear
-// CHECK: scf.for %[[K2:.*]] = %[[C0]] to %[[KTILE]] step %[[C1]] {
-// CHECK: hmx.mma %[[SCRATCH]], %[[WCRING]], %[[C0]], %[[N]], %[[K2]] {n_croutons = 1 : i32}
+// CHECK: %[[KZ:.*]] = arith.constant 0 : index
+// CHECK-NEXT: hmx.mma %[[SCRATCH]], %[[WCRING]], %[[C0]], %[[N]], %[[KZ]] {n_croutons = 32 : i32}
 // The compute part runs at the unshifted induction variable (the pipeliner
 // re-derives it per use, so the m operand is `iv + 0`): output tile m.
 // CHECK: hmx.acc_read %[[STATE]], %[[ACC]], {{.*}}, %[[N]] {bias_set = 0 : i32}
@@ -215,7 +220,7 @@ func.func @pipeline(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>) {
 // CHECK: %[[ROW:.*]] = hmx.await ins(%[[T]] : i32) outs(%[[S]] : memref<32x1024xf16, 1>) -> memref<32x1024xf16, 1>
 // CHECK: hmx.pack_act ins(%[[ROW]], %[[ZERO:.*]], %[[ZERO]] : memref<32x1024xf16, 1>) outs(%[[SCRATCH]] : memref<1x32x16x32x2xf16, 1>) {count = 32 : i64}
 // CHECK: hmx.acc_clear
-// CHECK: hmx.mma %[[SCRATCH]], %[[WCRING]], %[[ZERO]], {{.*}}, {{.*}} {n_croutons = 1 : i32}
+// CHECK: hmx.mma %[[SCRATCH]], %[[WCRING]], %[[ZERO]], {{.*}}, {{.*}} {n_croutons = 32 : i32}
 // CHECK: hmx.acc_read %[[STATE]], %[[ACC]], {{.*}}, {{.*}} {bias_set = 0 : i32}
 // CHECK: scf.yield %[[TNK]], %[[SSELK]] : i32, memref<32x1024xf16, 1>
 // Peeled epilogue: one await and compute, no stage.
@@ -269,8 +274,9 @@ func.func @pipeline_carried(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>) {
 // CHECK: scf.for %[[M:.*]] = {{.*}} to
 // CHECK: scf.for %[[N:.*]] = {{.*}} to
 // CHECK: hmx.acc_clear
-// CHECK: scf.for %[[K:.*]] = {{.*}} to
-// CHECK: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 1 : i32}
+// CHECK-NOT: scf.for
+// CHECK: %[[K:.*]] = arith.constant 0 : index
+// CHECK-NEXT: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 4 : i32}
 // CHECK: hmx.acc_read {{.*}}, %[[ACC]], %[[M]], %[[N]] {bias_set = 0 : i32}
 // CHECK-NOT: hmx.stage
 // CHECK-NOT: hmx.await

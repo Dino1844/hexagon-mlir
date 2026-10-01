@@ -425,6 +425,22 @@ public:
     }
     pm.addPass(createRewriteUBPoisonToZeroPass());
     pm.addPass(createHexagonVectorLoweringPass());
+    // A row reduction whose per-row result is stored into a rank-0 slice of a
+    // tensor<rows x T> is rewritten to keep that result in the vector domain:
+    // the row loop steps by a whole HVX vector of rows, the group's running
+    // values stay a vector<lanes x T> loop-carried value (which one-shot
+    // bufferization leaves alone), the hvx.vror butterfly is not extracted, and
+    // an arith.cmpi + arith.select places it in the group's lane. Hexagon HVX has
+    // no vector-lane-to-GPR instruction, so a reduction result that becomes a
+    // scalar costs one 128 B stack write plus a 4 B stack read back, per row per
+    // 128 B chunk. Runs here because createHexagonVectorLoweringPass is what
+    // expands vector.multi_reduction into the per-chunk vector.reduction this
+    // pass rewrites -- before it, the reduction is still one op per row. Stays
+    // before HexagonAddFastMath so the butterfly's own folds carry the nnan it
+    // needs rather than depending on that pass to stamp them. Off by default;
+    // the knob is the device A/B switch.
+    if (enableRowReduceGroupStore)
+      pm.addNestedPass<func::FuncOp>(createRowReduceGroupStorePass());
     pm.addPass(createCanonicalizerPass());
 
     if (addFastMath) {
@@ -508,8 +524,14 @@ public:
       // threading special case.
       // The HMX tile loop's activation-staging ring depth: 0 = auto, 1 = force
       // the serial ring, 2 = request the double ring (see hmx-partition).
+      // The K batch per mma travels next to it: 0 = the hardware maximum (32),
+      // so the default is the same code it was before the option existed, and
+      // the knob exists to make "batch fewer croutons per instruction"
+      // measurable inside one build instead of by editing a constant and
+      // rebuilding (docs/hmx/ncroutons-k-fusion-2026-10-01.md §3.5.3).
       mlir::hmx::HmxPartitionOptions hmxPartitionOpts;
       hmxPartitionOpts.pipelineDepth = enableHmxPipelineDepth;
+      hmxPartitionOpts.croutonsPerMma = hmxCroutonsPerMma;
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createHmxPartitionPass(hmxPartitionOpts));
 
@@ -580,8 +602,7 @@ public:
     // row-reduce butterfly's fold steps. Runs after AddFastMath, so the
     // fixup ops it emits are never stamped with the nnan assertion.
     if (enableMaxnumLegalize)
-      pm.addNestedPass<func::FuncOp>(createHvxMaxnumLegalizePass(
-          emitMaxnumFixup, maxnumSiteLimit, maxnumSiteSkip));
+      pm.addNestedPass<func::FuncOp>(createHvxMaxnumLegalizePass());
     pm.addPass(createConvertLinalgToLoopsPass());
 
     pm.addNestedPass<func::FuncOp>(createFormAsyncThreadsPass());
