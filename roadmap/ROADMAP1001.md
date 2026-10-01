@@ -55,7 +55,10 @@
 - 三个问题：
   1. **失效模式零容忍**：你们自己的注释（HmxToLLVMPass.cpp:96）——漏一次 unlock，下一个线程在 `HAP_compute_res_hmx_lock` 上**永久挂死**。持锁人是"任意执行该 kernel 的线程"。
   2. **税**：每 kernel 一次锁往返；NON_SHARED unlock 还清 accumulator（HexagonCAPI.cpp:212-213）。属 M3.2 要削的 per-launch 固定税。
-  3. **拓扑病根**：async 池里任何线程都可能既跑 linalg fallback（HVX）又跑 HMX 段——正是 LLVM PR #222340 TTI 注释（HexagonTargetTransformInfo.cpp:460-470 [未验证：本仓不可见]（本地该文件仅 449 行，全文 grep 无此内容））描述的上下文饥饿拓扑：*"The hardware provides a fixed number of HVX contexts. Software that mixes the two engines dedicates some threads to HVX, and those threads hold the contexts for as long as they run. A thread dedicated to HMX needs no context at all, until HVX code reaches it."*
+   3. **拓扑病根**：async 池里任何线程都可能既跑 linalg fallback（HVX）又跑 HMX 段——正是 LLVM PR #222340 TTI 注释描述的上下文饥饿拓扑
+      （**2026-10-02 已 backport 进本仓**，见 §5.0）：`llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:453-462`
+      （`areInlineCompatible` 定义起于 `llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:451`）原文：
+      *"The hardware provides a fixed number of HVX contexts. Software that mixes the two engines dedicates some threads to HVX, and those threads hold the contexts for as long as they run. A thread dedicated to HMX needs no context at all, until HVX code reaches it."*
 - **修正**：锁的所有权 = 一条专属 HMX 线程 × 整个会话。T_HMX 在首次 HMX launch 时 ensure 一次、持有；其余线程永不触碰 HMX 锁。竞态为零，"挂死"失效类整体消失，锁往返每会话 2 次。per-kernel 配对降级为 legacy 路径（A/B 与回滚需要它）。
 
 **推翻二："线程路径已四次证伪"不应遮蔽 M3.3——四次证伪的是工作切分，不是角色切分。**
@@ -116,8 +119,9 @@ Triton → TTIR → Linalg
 > **三条理由（记录在案，供日后回溯）：**
 >
 > 1. **选 B 会让上游 `hexagon_hmx` 语义失效。** 该属性的前提是**函数内没有 HVX 代码**
->    （`hmx-attr-no-autohvx.ll` 原文 "so no HVX unit is acquired on the HMX thread"
->    [未验证：本仓不可见]）。选 B 等于放弃「**线程契约由编译器静态保证**」这个方案核心，
+>    （`llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:2` 原文
+>    "so no HVX unit is acquired on the HMX thread"——**2026-10-02 已随 backport 进本仓，
+>    逐字核对通过**）。选 B 等于放弃「**线程契约由编译器静态保证**」这个方案核心，
 >    退化成「把单线程的锁挪进一条线程」，**收益趋零**。
 > 2. **量化上天花板差 ~3.6×。** S1 的 LWP 口径（`docs/hmx/hmx-next-round-plan.md:61-70`，
 >    跨构建 `5cea8231`/125 µs，**仅方向参考**）：`engine` 35.2% · `pack_act` 9.8% ·
@@ -155,7 +159,7 @@ Triton → TTIR → Linalg
 1. **T_HMX 的"纯度"由编译器保证，不靠纪律**：所有 T_HMX 上跑的函数带 LLVM fn 属性
    `"hexagon_hmx"`（上游 PR #222340，2026-09-17 合并，commit `2e055b8de1a1`，Qualcomm 参与）。
    上游 TTI 保证：`useHVX() = … && !IsHMX`（该函数永不auto-HVX）+ `areInlineCompatible()`
-   双向拒绝跨角色内联。语义与测试见 llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:1-2 [未验证：本仓不可见]
+   双向拒绝跨角色内联。语义与测试见 llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:1-2 与 hmx-attr-inline-compat.ll:1-41（**2026-10-02 已随 backport 进本仓**）
    （"so no HVX unit is acquired on the HMX thread"）——**这正是本方案线程契约的官方表达**。
 2. **HVX 侧复用现有 async 底座**：`FormAsyncThreadsPass.cpp:10` "lowering virtual-threads to
    async.execute"（现限 rank-1 forall）→ `bin/runtime/multithreading/HexagonThreadPool`。
@@ -353,6 +357,70 @@ Triton → TTIR → Linalg
 ✅ **§2 的引擎归属硬矛盾已解决**（2026-10-02 定为**方案 A**）。
 ⇒ **`S2` 开工前的前置只剩一件：§4.5 的 `HmxLayoutHvx` trait 必须先落地**，
 否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ **永久挂死**（`HmxToLLVMPass.cpp:96-99` 的失效模式）。
+
+---
+
+## 5.0 ✅ S0 已完成：LLVM `hexagon_hmx` 已 backport（2026-10-02），附一处**机制限制**
+
+**做了什么**：把上游 PR #222340（`2e055b8de1a1`，2026-09-17，Qualcomm）逐字 apply 进
+`llvm_triton/llvm-project`。**用的就是上游 diff 本身**（`curl .../pull/222340.diff`），
+不是凭记忆重写。`patch -p1` **5 个 hunk 全部命中**，只偏 `-8`（.cpp）与 `-1`（.h）行。
+
+| 文件 | 改动 |
+|---|---|
+| `.../HexagonTargetTransformInfo.cpp:55` | `useHVX()` 加 `&& !IsHMX` |
+| `.../HexagonTargetTransformInfo.cpp:451-468` | 新增 `areInlineCompatible`（含那段上下文饥饿注释） |
+| `.../HexagonTargetTransformInfo.h:44` | 新增成员 `const bool IsHMX;` |
+| `.../HexagonTargetTransformInfo.h:60` | 构造里初始化 `IsHMX(F.hasFnAttribute("hexagon_hmx"))` |
+| `.../HexagonTargetTransformInfo.h:194` | 声明 `areInlineCompatible` |
+| `llvm/test/CodeGen/Hexagon/hmx-attr-inline-compat.ll` | 新增（上游） |
+| `llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll` | 新增（上游） |
+
+**patch 已落盘**：`tools/hexmlir/llvm-hexagon-hmx-attr.patch`（181 行，头部写明出处与应用方式）。
+⚠️ **`llvm_triton/llvm-project` 是 tarball 不是 git 仓 ⇒ 这个 patch 是唯一的持久化凭据，
+丢了就只剩重下一次上游 diff。** 已做 **revert → 逐字节回 baseline → reapply** 往返验证。
+
+### 零行为变化：已证
+
+本仓源码里 `hexagon_hmx` **零命中** ⇒ 没有任何函数带该属性 ⇒ `IsHMX` 恒 `false`
+⇒ `useHVX()` 与 `areInlineCompatible` 都退化成原行为。**今天不重建就完全不生效。**
+
+### ⛔ 一处机制限制（本节最重要的产出）
+
+上游两个测试在我们树上**一个过一个挂**，查清了原因，**不是 patch 的错**：
+
+| 测试 | 结果 | 原因 |
+|---|---|---|
+| `hmx-attr-no-autohvx.ll` | ✅ **过** | `!IsHMX` 生效，有属性的函数不再被 loop-vectorize 变成 `<32 x i32>` |
+| `hmx-attr-inline-compat.ll` | ❌ **挂** | 它的两个 helper 都是 **`alwaysinline`**，而**我们 pinned LLVM 的 `AlwaysInliner` 绕过兼容性检查** |
+
+**根因（本仓可查）**：`llvm/lib/Analysis/InlineCost.cpp:3224` 的注释写明
+「Never inline functions with conflicting attributes (**unless callee has always-inline attribute**)」，
+其上 `:3215-3222` 的早返回块在 `isInlineViable` 成功时直接 `return`，
+**跳过了 `:3227` 的 `functionsHaveCompatibleAttributes`**（该函数在 `:3088-3089` 才问
+`TTI.areInlineCompatible`，默认 `IgnoreTTIInlineCompatible=false`，即检查是开的）。
+
+**实测确认不是「钩子没接」**：把两个 helper 的 `alwaysinline` 去掉、走普通 `-passes=inline`
+（高阈值）后，**两个跨角色 call 都被拦住了**（各留 1 个 `call void`）。
+⇒ **`areInlineCompatible` 对普通内联有效，只对 `alwaysinline` 无效。**
+
+**对本方案的三条影响：**
+
+1. **§2 的「双向拒绝跨角色内联」今天只对普通内联成立。** 上游那句「这正是本方案线程契约的
+   官方表达」要打折读。
+2. **承重的是 §3.3 第 2 条那个 pass 级检查**（自家 clone/桥消除 pass 加同极性检查），
+   TTI 钩子是普通内联路径上的第二道防线。**不要把安全性押在 TTI 钩子 alone。**
+3. 若确实需要 `alwaysinline` 也被拦，**要再 backport 一处 inliner 改动**——
+   **超出 S0 范围，未做**，登记在此以免日后当成已覆盖。
+
+### 未做（明确登记）
+
+- ⛔ **没有重建 `install/` 树**（`build/install/lib/cmake/llvm`，hexagon-mlir 链的就是它）。
+  ⇒ **patch 目前只对 `build/bin/opt` 生效**（已重建，4 步，1 分钟）。
+  ⇒ **要让 hexagon-mlir 真正用上，必须重建 install 树，那会改 `libtriton.so`、作废设备锚点。**
+  **这一步须用户批窗口。**
+- ⛔ 没重建 `libtriton.so`。设备锚点仍是
+  `ce26015e8efb75cc047515000c8ad70f` / `97af133e81fbc361bca3be10164b7bc8`。
 
 ---
 
