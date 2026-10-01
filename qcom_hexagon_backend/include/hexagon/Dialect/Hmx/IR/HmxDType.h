@@ -45,10 +45,10 @@ namespace mlir {
 namespace hmx {
 namespace dtype {
 
-/// The engine's fp16 element. Every crouton array holds it, and it is also the
-/// element a prepack/resident weight *source* must carry; a wider source is
-/// quantised to it by the pack, so "what may a source be" is an
-/// `isAdmittedFloat` question, not this one.
+/// The engine's fp16 element. Every crouton array holds it -- including the
+/// image a prepack/resident weight materialises -- whatever the source's
+/// element type is: a wider source is quantised to it by the pack, so "what
+/// may a source be" is an `isAdmittedFloat` question, not this one.
 ///
 /// A quantized crouton (int8) would change this predicate. Sites that mean "an
 /// f16 payload the layout whitelist can re-host" rather than "the engine's

@@ -61,7 +61,7 @@ func.func @dead_first_dot(%a: tensor<64x64xf16>, %b: tensor<64x64xf16>,
 // engine would have explained, but its operation is gone, so it is neither
 // remarked nor counted. The one live refusal is reported exactly as if the
 // dead dot were not in the function, and its record is the only one published.
-// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=min-rows]; matmul M=2, N=64, K=64}}
+// expected-warning @+1 {{HMX: 1 matmul(s) skipped; first refusal: HMX not applied: needs 2D static shapes, M/N/K multiples of 32, M > 4 [reason=min-rows]; matmul M=2, N=64, K=64}}
 module {
 func.func @dead_refusal(%a: tensor<16x16xf16>, %b: tensor<16x16xf16>,
                         %c: tensor<2x64xf16>,
@@ -70,7 +70,7 @@ func.func @dead_refusal(%a: tensor<16x16xf16>, %b: tensor<16x16xf16>,
   %0 = linalg.matmul ins(%a, %b : tensor<16x16xf16>, tensor<16x16xf16>)
                      outs(%e0 : tensor<16x16xf16>) -> tensor<16x16xf16>
   %e1 = tensor.empty() : tensor<2x64xf16>
-  // expected-remark @+1 {{HMX not applied: needs f16/f32 inputs and an f16/f32 result, 2D static shapes, M/N/K multiples of 32, M > 4 [reason=min-rows]}}
+  // expected-remark @+1 {{HMX not applied: needs 2D static shapes, M/N/K multiples of 32, M > 4 [reason=min-rows]}}
   %1 = linalg.matmul ins(%c, %d : tensor<2x64xf16>, tensor<64x64xf16>)
                      outs(%e1 : tensor<2x64xf16>) -> tensor<2x64xf16>
   return %1 : tensor<2x64xf16>

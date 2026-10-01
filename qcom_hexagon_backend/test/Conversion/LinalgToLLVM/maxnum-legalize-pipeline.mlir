@@ -20,12 +20,16 @@
 // OFF (default): the pass must not run at all.
 // OFF-NOT: hvx-maxnum-legalize
 //
-// With the option on, exactly one vector maxnumf candidate is seen, at the
-// default bisection settings (rewrite all: limit=-1, skip=0). NB: FileCheck
-// treats every occurrence of the ON prefix followed by a colon as a directive
-// (that is how the remark line below is checked), so no prose line may spell
-// that sequence out.
-// ON: remark: hvx-maxnum-legalize: candidates=1 skip=0 limit=-1
+// With the option on, exactly one vector maxnumf candidate is seen. NB:
+// FileCheck treats every occurrence of the ON prefix followed by a colon as a
+// directive (that is how the remark line below is checked), so no prose line may
+// spell that sequence out.
+//
+// EXPECTED-CHANGE (2026-09-30): this line used to end `skip=0 limit=-1`. The
+// pass's three bisection knobs were removed, so the remark no longer reports
+// them. The assertion's actual job -- "the pass ran and saw N sites" -- is
+// unchanged, and `candidates=1` is what carries it.
+// ON: remark: hvx-maxnum-legalize: candidates=1
 func.func @wiring(%a: vector<32xf32>, %b: vector<32xf32>) -> vector<32xf32> {
   %r = arith.maxnumf %a, %b : vector<32xf32>
   return %r : vector<32xf32>

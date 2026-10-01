@@ -755,25 +755,127 @@ Value croutonAddr(ConversionPatternRewriter &rewriter, Location loc,
 /// layout, so the dense path emits exactly the IR it did before. A dynamic
 /// stride cannot be read here, so it falls back to `width` (the dense contract)
 /// rather than mis-addressing.
-Value rowStride(ConversionPatternRewriter &rewriter, Location loc,
-                MemRefType type, Value width) {
+///
+/// A STATIC non-inner-contiguous layout is the case that used to be silent, and
+/// it is not a stride question at all. The leaf walks ROWS, so no `row_stride`
+/// value makes a column-major buffer come out right: the address arithmetic is
+/// transposed relative to the writer. `strided<[1, N]>` puts element (i,j) at
+/// `i + N*j`, so handing the leaf the declared stride(rank-2)=1 makes it store
+/// at `i + j` -- element `(i+j, 0)` where it meant `(i, j)`. That is a silent
+/// wrong-value store, not a crash, and nothing downstream can notice it.
+///
+/// So this fails closed, which is what `verifyDiagnosticRowMajor` already does
+/// on the diagnostic tail path (`HmxPartitionPass.cpp:1175`, requires
+/// `strides[1] == 1`) and what the pack-source tail leaf already does
+/// (`test/Conversion/HmxToLLVM/hmx-tail-layout-reject.mlir`). The ordinary
+/// full-tile path had no such gate: the destination went straight from the op
+/// into `rowStride` with nothing in between.
+///
+/// A DYNAMIC outer stride is NOT a guess and must not be gated. 2026-10-01: a
+/// first attempt here rejected `ShapedType::isDynamic(stride)` as "an unreadable
+/// stride cannot be guessed", and the gate immediately failed **12** lit tests
+/// -- which is how the mistake became visible. The memrefs that broke are
+/// `memref<64x64xf16, strided<[?, ?], offset: ?>>` weight-RESIDENT source views
+/// (`hmx-weight-resident-pipeline.mlir` and siblings): a resident weight is a
+/// view into a packed buffer whose stride only resolves at run time, and that
+/// `rowStride` returns a `Value` rather than a constant is the mechanism, not
+/// an oversight. Gating it would have broken the feature on the strength of a
+/// guess.
+///
+/// The genuinely unknown case is narrower and is still open, NOT fixed here: a
+/// dynamic INNER stride means the leaf's contiguous inner run is not
+/// contiguous, which the leaf cannot express at all. No such memref was found
+/// reachable (every dynamic-stride memref in the suite has an identity or
+/// unit-inner layout), so there is no evidence to gate on and nothing was
+/// changed. Recorded rather than guessed at -- see
+/// docs/hmx/rowstride-inner-contiguity-2026-10-01.md.
+// TRACEABILITY: rowStride inner-contiguity gate
+//   mechanism: the leaf addresses row-by-row, so a transposed layout cannot be
+//     expressed by any row_stride value; only the inner stride can rule it out,
+//     and only when it is statically known.
+//   measurement: found by lowering a probe and reading the emitted leaf call --
+//     test/Conversion/HmxToLLVM/unpack-dst-non-contiguous-reject.mlir.
+//     `strided<[1, 32]>` before the gate: rc=0, no diagnostic,
+//     row_stride=1, i.e. a silent store to element (i+j, 0) where (i, j) was
+//     meant. After the gate: an error.
+//   shape set: n/a (layout, not shape).
+//   workload representativeness: n/a.
+//   failure mode: reported as an error before lowering, never silently
+//     mis-addressed. Same "degrade to unknown, not to wrong" shape as
+//     kMaxDiagnosticNTile and kMaxProvenanceRounds.
+//
+// WHY THIS BUG SURVIVED SO LONG, and the generalisable lesson (2026-10-01).
+// `verifyStaticTailLayout(..., rowMajor = true)` in this same file ALREADY
+// refuses a non-unit inner stride: `if (strides.back() != 1) return
+// emitError() << ... << " tail leaf requires unit inner stride"`. So on the TAIL
+// path this gate is redundant -- and reading that function gives the false
+// impression that the invariant is covered. It is covered on the tail path and
+// nowhere else. The ordinary full-tile path had no inner-stride check at all,
+// which is exactly where the silent store lived.
+//
+// The lesson worth keeping: "there is a check for this somewhere in the file" is
+// not the same claim as "this call site is checked", and the two diverge
+// silently whenever coverage is per-path rather than per-function. When adding a
+// guard, enumerate the PATHS that reach it, not the functions that contain
+// similar-looking code.
+//
+// SCOPE, measured 2026-10-01 by an independent audit -- three surfaces reach
+// this function, and only ONE of them can actually be a non-contiguous buffer:
+//   * unpack destination  -- REACHABLE, and the case that was silent. Pinned by
+//     test/Conversion/HmxToLLVM/unpack-dst-non-contiguous-reject.mlir.
+//   * unpack f32 residual -- REACHABLE (the f32 tail lowering). Pinned by
+//     test/Conversion/HmxToLLVM/rowstride-gate-coverage.mlir.
+//   * hmx.stage source    -- REACHABLE. Pinned there too, in both directions.
+//   * pack source (act and weight, four call sites) -- NOT REACHABLE. The
+//     hmx.pack_act / hmx.pack_weight op verifier rejects an overlapping-row
+//     source first ("src row stride 1 is smaller than its N columns"), so
+//     conversion never starts. The checks at those call sites are defence in
+//     depth. Do not write a test for them expecting the gate to fire -- the
+//     audit measured that it cannot; a test would have to assert the op
+//     verifier's message instead.
+LogicalResult rowStride(ConversionPatternRewriter &rewriter, Location loc,
+                        MemRefType type, Value width, Operation *anchor,
+                        Value &out) {
   SmallVector<int64_t, 2> strides;
   int64_t offset;
   int64_t widthC = type.getDimSize(type.getRank() - 1);
   if (succeeded(type.getStridesAndOffset(strides, offset)) &&
       strides.size() >= 2) {
+    int64_t inner = strides[strides.size() - 1];
     int64_t stride = strides[strides.size() - 2];
-    if (!ShapedType::isDynamic(stride) && stride != widthC)
-      return LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
-                                      rewriter.getI32IntegerAttr(stride));
+    if (!ShapedType::isDynamic(inner) && inner != 1)
+      return anchor->emitError()
+             << "HMX leaf requires an inner-contiguous buffer; got inner "
+                "stride "
+             << inner << " on a rank-" << type.getRank()
+             << " memref. The leaf walks rows, so a transposed layout cannot be "
+                "addressed by any row stride -- passing one would store to the "
+                "wrong elements silently.";
+    if (!ShapedType::isDynamic(stride) && stride != widthC) {
+      out = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                     rewriter.getI32IntegerAttr(stride));
+      return success();
+    }
   }
-  return width;
+  out = width;
+  return success();
 }
 
 /// The runtime reads buffer addresses as i32. Reserve the widest supported
 /// unpack element (f32) when bounding a diagnostic N-tile coordinate, so both
 /// its logical-column and byte-offset products remain representable by the
 /// signed i32 ABI before lowering starts.
+// TRACEABILITY: kMaxDiagnosticNTile
+//   mechanism: the runtime reads buffer addresses as i32, so a diagnostic
+//     N-tile coordinate must keep both its logical-column and byte-offset
+//     products representable in signed i32. The bound is therefore derived
+//     from that ABI and the widest supported unpack element (f32), not chosen.
+//   measurement: none needed -- it is arithmetic on the ABI.
+//   shape set: n/a.
+//   workload representativeness: n/a.
+//   failure mode: exceeding it is reported as an error before lowering, never
+//     silently truncated. Same "degrade to unknown, not to wrong" shape as
+//     kMaxProvenanceRounds.
 static constexpr int64_t kMaxDiagnosticNTile =
     std::numeric_limits<int32_t>::max() /
     (layout::kTileEdge * /*max element bytes=*/4);
@@ -1167,7 +1269,10 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
       };
       Value rows = dimCst(srcType.getDimSize(0));
       Value cols = dimCst(srcType.getDimSize(1));
-      Value srcStride = rowStride(rewriter, loc, srcType, cols);
+      Value srcStride;
+      if (failed(rowStride(rewriter, loc, srcType, cols, op,
+                                    srcStride)))
+        return failure();
       SmallVector<Value> args{dst,
                               src,
                               rows,
@@ -1208,7 +1313,9 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
     };
     Value rows = dimCst(srcType.getDimSize(0));
     Value cols = dimCst(srcType.getDimSize(1));
-    Value srcStride = rowStride(rewriter, loc, srcType, cols);
+    Value srcStride;
+    if (failed(rowStride(rewriter, loc, srcType, cols, op, srcStride)))
+      return failure();
 
     SmallVector<Value> args{dst,
                             src,
@@ -1279,7 +1386,9 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
       };
       Value k = dimCst(srcType.getDimSize(0));
       Value n = dimCst(srcType.getDimSize(1));
-      Value srcStride = rowStride(rewriter, loc, srcType, n);
+      Value srcStride;
+      if (failed(rowStride(rewriter, loc, srcType, n, op, srcStride)))
+        return failure();
       SmallVector<Value> args{dst,
                               src,
                               k,
@@ -1320,7 +1429,9 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     };
     Value k = dimCst(srcType.getDimSize(0));
     Value n = dimCst(srcType.getDimSize(1));
-    Value srcStride = rowStride(rewriter, loc, srcType, n);
+    Value srcStride;
+    if (failed(rowStride(rewriter, loc, srcType, n, op, srcStride)))
+      return failure();
 
     SmallVector<Value> args{dst,
                             src,
@@ -1415,9 +1526,11 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                               srcType.getElementTypeBitWidth() / 8);
       Value rows = dimCst(dstType.getDimSize(0));
       Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
-      Value dstStride = nTile ? rowStride(rewriter, loc, dstType,
-                                          dimCst(dstType.getDimSize(1)))
-                              : rowStride(rewriter, loc, dstType, cols);
+      Value dstStride;
+      if (failed(rowStride(rewriter, loc, dstType,
+                           nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                           dstStride)))
+        return failure();
       SmallVector<Value> args{dst,
                               src,
                               rows,
@@ -1476,9 +1589,11 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                     sourceCol, srcType.getElementTypeBitWidth() / 8);
     Value rows = dimCst(dstType.getDimSize(0));
     Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
-    Value dstStride =
-        nTile ? rowStride(rewriter, loc, dstType, dimCst(dstType.getDimSize(1)))
-              : rowStride(rewriter, loc, dstType, cols);
+    Value dstStride;
+    if (failed(rowStride(rewriter, loc, dstType,
+                         nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                         dstStride)))
+      return failure();
 
     SmallVector<Value> args{dst,       src,
                             rows,      cols,
@@ -1597,7 +1712,9 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
           return failure();
         hasRes = dimCst(1);
         Value resWidth = dimCst(resType.getDimSize(1));
-        resStride = rowStride(rewriter, loc, resType, resWidth);
+        if (failed(rowStride(rewriter, loc, resType, resWidth, op,
+                              resStride)))
+          return failure();
       } else {
         res = dimCst(0);
         hasRes = dimCst(0);
@@ -1609,9 +1726,11 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                               srcType.getElementTypeBitWidth() / 8);
       Value rows = dimCst(dstType.getDimSize(0));
       Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
-      Value dstStride = nTile ? rowStride(rewriter, loc, dstType,
-                                          dimCst(dstType.getDimSize(1)))
-                              : rowStride(rewriter, loc, dstType, cols);
+      Value dstStride;
+      if (failed(rowStride(rewriter, loc, dstType,
+                           nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                           dstStride)))
+        return failure();
       SmallVector<Value> args{dst,
                               res,
                               hasRes,
@@ -1685,7 +1804,8 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
       // `src_stride` / unpack `dst_stride` cases. Dense falls back to the
       // width.
       Value resWidth = dimCst(resType.getDimSize(1));
-      resStride = rowStride(rewriter, loc, resType, resWidth);
+      if (failed(rowStride(rewriter, loc, resType, resWidth, op, resStride)))
+        return failure();
     } else {
       res = dimCst(0);
       hasRes = dimCst(0);
@@ -1699,9 +1819,11 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                     sourceCol, srcType.getElementTypeBitWidth() / 8);
     Value rows = dimCst(dstType.getDimSize(0));
     Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
-    Value dstStride =
-        nTile ? rowStride(rewriter, loc, dstType, dimCst(dstType.getDimSize(1)))
-              : rowStride(rewriter, loc, dstType, cols);
+    Value dstStride;
+    if (failed(rowStride(rewriter, loc, dstType,
+                         nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                         dstStride)))
+      return failure();
 
     SmallVector<Value> args{
         dst,       res,       hasRes,
@@ -1763,7 +1885,9 @@ struct LowerStage : public ConvertOpToLLVMPattern<StageOp> {
     // constant and the dense `memref<MxK>` emits stride(0) == K == width.
     Value row = toI32(rewriter, loc, adaptor.getRow());
     Value srcCols = cst(srcType.getDimSize(1));
-    Value srcStride = rowStride(rewriter, loc, srcType, srcCols);
+    Value srcStride;
+    if (failed(rowStride(rewriter, loc, srcType, srcCols, op, srcStride)))
+      return failure();
     Value rowBytes = LLVM::MulOp::create(
         rewriter, loc, i32Ty,
         LLVM::MulOp::create(rewriter, loc, i32Ty, row, srcStride),

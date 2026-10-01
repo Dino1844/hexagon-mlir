@@ -191,8 +191,95 @@ StringRef reasonCode(MatmulReason reason) {
   llvm_unreachable("unknown HMX manifest reason");
 }
 
+/// A contraction this pass can reason about.
+///
+/// The pass matches `linalg::ContractionOpInterface`, not `linalg::MatmulOp`,
+/// so that the set of shapes HMX accepts grows by *implementing an interface*
+/// rather than by adding a pass per op. The Triton frontend is the reason this
+/// matters today: `MatmulConverter` picks the linalg op by result rank
+/// (`triton-shared/Conversion/TritonArithToLinalg/ConversionPatterns.hpp`),
+/// rank 2 becoming `linalg.matmul` and rank 3 becoming `linalg.batch_matmul`.
+/// A matmul-only walk therefore ignored every batched dot -- silently, with no
+/// manifest record and no diagnostic, because the op was never even offered to
+/// the pass.
+///
+/// The DPS check is belt-and-braces rather than a narrowing: every op declaring
+/// `LinalgContractionOpInterface` inherits `DestinationStyleOpInterface` through
+/// `LinalgStructuredBase_Op`, so requiring it cannot exclude a contraction. It
+/// stays because operand roles (which operand is the accumulator) are read
+/// through the DPS model, and that model is the thing that has to be right.
+using HmxContraction = linalg::ContractionOpInterface;
+
+/// The destination-style view used to read operand roles, or null when `op` is
+/// not an HMX contraction at all.
+static DestinationStyleOpInterface
+contractionDps(Operation *op) {
+  return dyn_cast<DestinationStyleOpInterface>(op);
+}
+
+static HmxContraction asHmxContraction(Operation *op) {
+  if (!isa<HmxContraction>(op) || !contractionDps(op))
+    return {};
+  return cast<HmxContraction>(op);
+}
+
+/// Whether the crouton bridge can express this contraction's *form*.
+///
+/// The interface says "this is a contraction". It does not say the bridge can
+/// consume it, and widening the match widened the input set to ops whose shape
+/// of computation the bridge does not model. The bridge lowers exactly one
+/// row-major `M x K * K x N -> M x N` triple -- that is the engine's contract,
+/// not a shape preference. Two interface-legal cases fall outside it:
+///
+///  * **Indexing maps.** `linalg.contract` carries arbitrary maps, so a
+///    transposed or broadcast operand is a *legal* op that this bridge would
+///    pack as if it were row-major -- and then fail deep inside the verifier
+///    ("inner tile counts must agree") instead of at the decision.
+///    CORRECTION (2026-10-01, appendix A5 of
+///    docs/hmx/fa-transpose-copy-design-2026-09-30.md): the original text here
+///    said "`linalg.matmul` cannot reach that state: its ODS only permits
+///    broadcast maps". That is true only of `MatmulOp`'s DEFAULT map.
+///    `MatmulTransposeBOp` is a separate class that subclasses `MatmulOp`,
+///    shares its name, and `resolveTypeID()` returns the PARENT's -- with the
+///    transposed B map as its default (LinalgOps.cpp:4088-4097). So a transposed
+///    access map does reach here, and this refusal is load-bearing for it.
+///    Do not "fix" this by widening the predicate: the existing leaf's
+///    expressible family is `(row_step, col_step) = (S, 1)` (HMXLayout.c:91
+///    `row_bytes = src_stride * 2`), a transposed source needs `(1, N)`, and a
+///    host sweep of `src_stride` over [1,256] finds no value that works
+///    (exp/hmx/oracle/leaf_transposed_source_oracle.c). Worse, widening it makes
+///    the SQUARE case (N == K, which is flash attention's 64x64) compile with
+///    zero diagnostics while computing the transpose -- see A5.3 and
+///    exp/hmx/transpose/03b-square-packs.mlir. Widening trades "does not apply"
+///    for "silently wrong", which is the one direction this codebase must never
+///    move in.
+///    Also worth knowing before looking for a workaround: real flash attention
+///    does NOT reach this refusal. Its transpose is a separate, already
+///    materialised `linalg.transpose`, so the maps reaching here are row-major
+///    and both matmuls are already `full-hmx` / `selected-aligned`
+///    (exp/hmx/transpose/04-real-fa-slice.mlir). The transpose tax in FA is
+///    paid at that materialisation and the pack after it, not at admission.
+///  * **`linalg::ContractOp` itself.** Its body is `u5(u1(c) + u2(u3(a) * u4(b)))`
+///    with arbitrary unary ops, and its `cast` attribute may re-interpret the
+///    accumulator type. The bridge has only ever computed `C = A*B (+ C)`.
+///    Rather than grow a body/cast validator for one op, contract is refused by
+///    name with a published reason; making HMX honour it is separate work.
+///
+/// `isRowMajorBatchMatmul` is accepted here and still refused later as
+/// `non-rank-2`: the batch dimension is a parallel dim over independent
+/// rank-2 contractions, so it is a *lowering* gap, not a form gap.
+static bool bridgeCanExpress(Operation *op) {
+  HmxContraction contraction = cast<HmxContraction>(op);
+  if (!(contraction.isRowMajorMatmul() || contraction.isRowMajorBatchMatmul()))
+    return false;
+  return !isa<linalg::ContractOp>(op);
+}
+
 struct MatmulDecision {
-  linalg::MatmulOp op;
+  /// Kept as a plain `Operation *` on purpose: the decision outlives the
+  /// rewrite (the greedy driver can drop an op before any pattern sees it),
+  /// and the concrete op class is exactly the thing this pass must not name.
+  Operation *op = nullptr;
   std::string functionName;
   int64_t id = 0;
   std::optional<MatmulContract> contract;
@@ -227,14 +314,16 @@ void setDecisionId(Operation *op, int64_t id) {
               IntegerAttr::get(IntegerType::get(op->getContext(), 64), id));
 }
 
-static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
+static std::shared_ptr<ManifestFacts>
+makeManifestFacts(Operation *op, bool expressible) {
   auto facts = std::make_shared<ManifestFacts>();
+  DestinationStyleOpInterface dps = contractionDps(op);
   auto shaped = [](Value value) -> ShapedType {
     return dyn_cast<ShapedType>(value.getType());
   };
-  ShapedType lhs = shaped(op.getDpsInputOperand(0)->get());
-  ShapedType rhs = shaped(op.getDpsInputOperand(1)->get());
-  ShapedType out = shaped(op.getDpsInitOperand(0)->get());
+  ShapedType lhs = shaped(dps.getDpsInputOperand(0)->get());
+  ShapedType rhs = shaped(dps.getDpsInputOperand(1)->get());
+  ShapedType out = shaped(dps.getDpsInitOperand(0)->get());
   auto recordType = [&](ShapedType type, std::string &destination) {
     if (type)
       destination = typeName(type.getElementType());
@@ -245,8 +334,14 @@ static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
   recordType(rhs, facts->rhsElem);
   recordType(out, facts->outElem);
 
-  if (lhs && rhs && out && lhs.getRank() == 2 && rhs.getRank() == 2 &&
-      out.getRank() == 2) {
+  // `expressible` gates the logical shape, not just the rewrite. The M/N/K
+  // reading below is "the row-major triple HMX would tile", so for a form the
+  // bridge cannot express it is not merely unused -- it is *wrong* (a
+  // transposed operand would be read as if it were row-major). Publishing it
+  // would put a false shape in the manifest, so an inexpressible form reports
+  // no logical shape at all and says why.
+  if (expressible && lhs && rhs && out && lhs.getRank() == 2 &&
+      rhs.getRank() == 2 && out.getRank() == 2) {
     auto dim = [](ShapedType type, int64_t index) {
       return type.isDynamicDim(index) ? int64_t(-1) : type.getDimSize(index);
     };
@@ -261,7 +356,7 @@ static std::shared_ptr<ManifestFacts> makeManifestFacts(linalg::MatmulOp op) {
                                        : ManifestShapeState::PartiallyDynamic;
   }
 
-  Value source = op.getDpsInputOperand(1)->get();
+  Value source = dps.getDpsInputOperand(1)->get();
   if (auto argument = dyn_cast<BlockArgument>(source)) {
     if (auto function = op->getParentOfType<func::FuncOp>()) {
       int64_t slot = 0;
@@ -293,7 +388,15 @@ public:
   AttributionTally(func::FuncOp func, const HmxTarget &target, bool recordOnly)
       : recordOnly(recordOnly) {
     int64_t nextId = 0;
-    func.walk([&](linalg::MatmulOp op) {
+    func.walk([&](Operation *anyOp) {
+      // Interface-driven: every structured contraction with a destination-style
+      // accumulator gets a record, whatever its concrete class. Ops that are
+      // not contractions are simply not offered to this pass.
+      HmxContraction contraction = asHmxContraction(anyOp);
+      if (!contraction)
+        return;
+      Operation *op = contraction.getOperation();
+      DestinationStyleOpInterface dps = contractionDps(op);
       auto shapedType = [&](Value value) -> ShapedType {
         if (auto tensor = dyn_cast<RankedTensorType>(value.getType()))
           return tensor;
@@ -304,9 +407,12 @@ public:
           return dyn_cast<ShapedType>(value.getType());
         return {};
       };
-      ShapedType lhsType = shapedType(op.getDpsInputOperand(0)->get());
-      ShapedType rhsType = shapedType(op.getDpsInputOperand(1)->get());
-      ShapedType outType = shapedType(op.getDpsInitOperand(0)->get());
+      ShapedType lhsType = shapedType(dps.getDpsInputOperand(0)->get());
+      ShapedType rhsType = shapedType(dps.getDpsInputOperand(1)->get());
+      ShapedType outType = shapedType(dps.getDpsInitOperand(0)->get());
+      // Decide expressibility before anything reads a shape: it decides both
+      // whether a logical shape may be published and which reason is reported.
+      bool expressible = bridgeCanExpress(op);
       bool ranked = lhsType && rhsType && outType;
       bool rank2 = ranked && lhsType.getRank() == 2 && rhsType.getRank() == 2 &&
                    outType.getRank() == 2;
@@ -315,8 +421,8 @@ public:
                     !outType.hasStaticShape());
 
       MatmulDecision decision{op, func.getName().str(), nextId++};
-      decision.facts = makeManifestFacts(op);
-      if (rank2 && !dynamic) {
+      decision.facts = makeManifestFacts(op, expressible);
+      if (rank2 && !dynamic && expressible) {
         decision.contract =
             MatmulContract{lhsType.getDimSize(0),    rhsType.getDimSize(1),
                            lhsType.getDimSize(1),    lhsType.getElementType(),
@@ -325,6 +431,10 @@ public:
 
       if (op->hasAttr("library_call")) {
         decision.reason = MatmulReason::LibraryCall;
+      } else if (!expressible) {
+        // Refused before any shape is read: this is about the *form* of the
+        // contraction, so it must not be reported as a rank or shape problem.
+        decision.reason = MatmulReason::UnsupportedLayout;
       } else if (!rank2) {
         decision.reason = MatmulReason::NonRank2;
       } else if (dynamic) {
@@ -339,7 +449,7 @@ public:
         decision.contractionPlan = capability.plan;
         if (!capability.supported()) {
           bool diagnosticTail =
-              isHmxDiagnosticTailMarker(op.getOperation()) &&
+              isHmxDiagnosticTailMarker(op) &&
               capability.refusal ==
                   HmxTarget::ContractionRefusal::TileAlignment &&
               capability.tailCandidate();
@@ -372,14 +482,14 @@ public:
           decision.reason = MatmulReason::SelectedAligned;
         }
       }
-      byOp[op.getOperation()] = decisions.size();
+      byOp[op] = decisions.size();
       decisions.push_back(std::move(decision));
     });
   }
 
-  MatmulDecision &operator[](linalg::MatmulOp op) {
-    auto it = byOp.find(op.getOperation());
-    assert(it != byOp.end() && "matmul has no attribution record");
+  MatmulDecision &operator[](Operation *op) {
+    auto it = byOp.find(op);
+    assert(it != byOp.end() && "contraction has no attribution record");
     return decisions[it->second];
   }
 
@@ -407,12 +517,40 @@ private:
 /// rather than a second set of predicates. The few cases that were silent
 /// before attribution (library dispatch, missing rank/static shape and an
 /// unsupported element type) stay silent; their reason is still published.
+///
+/// The rule, settled 2026-09-30 after finding that three refusals were silent:
+///
+///   **A refusal is loud unless the party that made the decision is the party
+///   that already knows.**
+///
+/// The silence had been justified as "these were silent before attribution;
+/// their reason is still published". That justification does not hold: the
+/// manifest is a *machine-facing* record, so publishing there is not publishing
+/// to the person who has to decide whether the limitation matters. Measured on
+/// this pass: a `bf16` and a dynamic-shape `linalg.matmul` each compiled clean,
+/// produced a perfectly good manifest record, and printed nothing at all. A
+/// user who wrote `bf16` had no way to learn that the engine admits f16/f32
+/// only.
+///
+/// What stayed silent is `LibraryCall`, and it stays silent *because* of the
+/// rule rather than in spite of it: that attribute is set by our own
+/// `ReplaceWithLibraryCallsPass`, so this backend chose the library call and the
+/// chooser already knows. That is the whole distinction -- the silence tracks
+/// who decided, not how old the case is.
+///
+/// Loudness is not free, which is the argument against it: scoping a rank-3
+/// contraction had to be done by reading `renderRefusal`'s `llvm_unreachable`
+/// arm rather than by running the compiler and reading a diagnostic. Silence is
+/// never cheaper, only quieter.
 bool reportsRefusal(MatmulReason reason) {
   return reason == MatmulReason::VtcmAllocatorDisabled ||
          reason == MatmulReason::MinRows ||
          reason == MatmulReason::TileAlignment ||
          reason == MatmulReason::UnsupportedLayout ||
-         reason == MatmulReason::VtcmBudget;
+         reason == MatmulReason::VtcmBudget ||
+         reason == MatmulReason::NonRank2 ||
+         reason == MatmulReason::UnsupportedDType ||
+         reason == MatmulReason::DynamicShape;
 }
 
 InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
@@ -424,13 +562,32 @@ InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
     diag << "the crouton arrays live in VTCM and this pipeline has no VTCM "
             "allocator (the hexagonmem path)";
     break;
-  case MatmulReason::UnsupportedDType:
   case MatmulReason::MinRows:
   case MatmulReason::TileAlignment:
-  case MatmulReason::UnsupportedLayout:
-    diag << "needs f16/f32 inputs and an f16/f32 result, 2D static shapes, "
-            "M/N/K multiples of "
+    // Shape-only, so it no longer also lists the dtype condition. A bf16
+    // matmul with a perfect 64x64x64 shape used to be told it needed "2D static
+    // shapes, M/N/K multiples of 32, M > 4" -- three conditions it already
+    // satisfied. UnsupportedDType below now carries the dtype message alone.
+    diag << "needs 2D static shapes, M/N/K multiples of "
          << HmxTarget::tileEdge << ", M > " << HmxTarget::minRows;
+    break;
+  case MatmulReason::UnsupportedLayout:
+    // Distinct from the shape/dtype refusals above: the bridge consumes one
+    // row-major M x K * K x N -> M x N triple, and this op is not that form.
+    // The "no transposed operand maps" half of that message is ALSO a statement
+    // about the runtime, not only about this predicate (2026-10-01, appendix A5
+    // of docs/hmx/fa-transpose-copy-design-2026-09-30.md): no transposed-source
+    // leaf exists. The pack leaf's expressible family is
+    // (row_step, col_step) = (S, 1), and a transposed source needs (1, N) --
+    // measured, not argued, in
+    // exp/hmx/oracle/leaf_transposed_source_oracle.c. So this refusal is NOT
+    // "the predicate is too strict"; widening the predicate is what turns a
+    // refusal into a silent wrong answer on the square shapes.
+    diag << "the crouton bridge consumes a row-major M x K * K x N -> M x N "
+            "contraction only (no transposed or broadcast operand maps, and no "
+            "linalg.contract cast/unary body); a transposed source is refused "
+            "because no transposed-source pack leaf exists, not merely because "
+            "this predicate rejects it";
     break;
   case MatmulReason::VtcmBudget:
     diag << "matmul (M=" << decision.contract->m
@@ -442,9 +599,40 @@ InFlightDiagnostic &renderRefusal(InFlightDiagnostic &diag,
          << ") bridge footprint does not fit remaining VTCM (vtcmBudget="
          << target.vtcmBudget << " bytes)";
     break;
-  case MatmulReason::LibraryCall:
-  case MatmulReason::NonRank2:
+  case MatmulReason::UnsupportedDType: {
+    // The admission set is narrow and the *user* chose the dtype, so name what
+    // is admitted rather than only what was not. The check is exact-kind on
+    // purpose: `isFloat(16)` would also match bf16.
+    diag << "needs f16/f32 inputs and an f16/f32 result; the engine's mma has "
+            "no bf16 or f64 form";
+    if (decision.contract)
+      diag << "; got lhs=" << decision.contract->lhsElem
+           << ", rhs=" << decision.contract->rhsElem
+           << ", out=" << decision.contract->outElem;
+    break;
+  }
   case MatmulReason::DynamicShape:
+    // Also the user's shape, not ours.
+    diag << "the shape is not static, so the bridge cannot pick a tile grid; "
+            "specialise the extents (or pad to a multiple of 32) to reach HMX";
+    break;
+  case MatmulReason::NonRank2:
+    // The engine's mma is rank-2 and the bridge has no batch concept, so a
+    // rank-3 contraction is refused rather than approximated. No shape is
+    // printed here because MatmulContract is only populated once the operands
+    // are known to be rank-2, so on this path it is null.
+    diag << "not a rank-2 contraction. The HMX mma is rank-2, and a batch "
+            "dimension is a scheduling fact of the host loop rather than of the "
+            "mma. Collapsing the batch into M is only correct when the weight is "
+            "shared across the batch; linalg.batch_matmul carries a per-batch "
+            "weight, so that needs a batch loop instead, which in turn drops "
+            "weight residency because a resident weight must be rank-2";
+    break;
+  case MatmulReason::LibraryCall:
+    // Silent on purpose: `library_call` is set by ReplaceWithLibraryCallsPass,
+    // so this backend chose the library call and the chooser already knows.
+    // See the rule on reportsRefusal.
+    llvm_unreachable("silent or successful decision rendered as refusal");
   case MatmulReason::SelectedAligned:
   case MatmulReason::SelectedTail:
     llvm_unreachable("silent or successful decision rendered as refusal");
@@ -999,7 +1187,7 @@ bool fusedTailLegal(RankedTensorType outType) {
 /// row-sum lowering flips 128-wide to 32-wide and quadruples its static
 /// reduces), so firing there trades a removed widen loop for unpredictable
 /// downstream motion. Narrow by construction; widen with measurements.
-bool resultEscapesUnconsumed(linalg::MatmulOp op) {
+bool resultEscapesUnconsumed(Operation *op) {
   return llvm::all_of(op->getUsers(), [](Operation *user) {
     return isa<func::ReturnOp>(user);
   });
@@ -1202,7 +1390,7 @@ static bool isLoopInvariant(Value v, Operation *op) {
   return inLoop;
 }
 
-static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
+static LogicalResult emitDiagnosticTailMatmul(Operation *op,
                                               MatmulDecision &decision,
                                               const HmxTarget &target,
                                               PatternRewriter &rewriter) {
@@ -1215,10 +1403,11 @@ static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
   assert(capability.plan == HmxTarget::ContractionPlan::HMXTail &&
          "diagnostic tail decision lost its shape plan");
   const HmxTarget::ContractionShape &shape = capability.shape;
-  Location loc = op.getLoc();
-  Value lhs = op.getDpsInputOperand(0)->get();
-  Value rhs = op.getDpsInputOperand(1)->get();
-  Value init = op.getDpsInitOperand(0)->get();
+  DestinationStyleOpInterface dps = contractionDps(op);
+  Location loc = op->getLoc();
+  Value lhs = dps.getDpsInputOperand(0)->get();
+  Value rhs = dps.getDpsInputOperand(1)->get();
+  Value init = dps.getDpsInitOperand(0)->get();
   auto outType = cast<RankedTensorType>(init.getType());
   auto lhsType = cast<RankedTensorType>(lhs.getType());
   auto rhsType = cast<RankedTensorType>(rhs.getType());
@@ -1232,7 +1421,7 @@ static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
   auto paddedLhsType = hmx::croutonLayoutType(
       RankedTensorType::get({shape.mp, shape.kp}, lhsType.getElementType()));
   auto paddedRhsType = hmx::weightCroutonType(
-      RankedTensorType::get({shape.np, shape.kp}, rhsType.getElementType()));
+      RankedTensorType::get({shape.kp, shape.np}, rhsType.getElementType()));
   auto paddedF16Out =
       RankedTensorType::get({shape.mp, shape.np}, rewriter.getF16Type());
   auto tailPlan = TailPlanAttr::get(
@@ -1270,15 +1459,23 @@ static LogicalResult emitDiagnosticTailMatmul(linalg::MatmulOp op,
 
 /// `linalg.matmul` -> `hmx.matmul` on croutons, bridged in and out of
 /// row-major.
-struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
+struct MatmulToHmx : public RewritePattern {
   MatmulToHmx(MLIRContext *ctx, HmxTarget target, AttributionTally *tally)
-      : OpRewritePattern<linalg::MatmulOp>(ctx), target(target), tally(tally) {}
+      : RewritePattern(RewritePattern::MatchAnyOpTypeTag(), /*benefit=*/1, ctx),
+        target(target), tally(tally) {}
 
-  LogicalResult matchAndRewrite(linalg::MatmulOp op,
+  LogicalResult matchAndRewrite(Operation *anyOp,
                                 PatternRewriter &rewriter) const override {
+    // Rooted at `Operation` so the match is the interface, not an op class: a
+    // new contraction that implements `linalg::ContractionOpInterface` is
+    // picked up here for free, with no pattern to add.
+    if (!asHmxContraction(anyOp))
+      return failure();
+    Operation *op = anyOp;
+    DestinationStyleOpInterface dps = contractionDps(op);
     if (op->hasAttr(kHmxDiagnosticTailAttr) &&
-        !isHmxDiagnosticTailMarker(op.getOperation())) {
-      op.emitError("hmx.diagnostic_tail_partition must be a unit attribute");
+        !isHmxDiagnosticTailMarker(op)) {
+      op->emitError("hmx.diagnostic_tail_partition must be a unit attribute");
       return failure();
     }
     MatmulDecision &decision = (*tally)[op];
@@ -1290,7 +1487,7 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // A marked tail candidate that does not fit the padded bridge budget is a
     // diagnostic refusal, never permission to retry the logical shape through
     // the full-HMX path.
-    if (isHmxDiagnosticTailMarker(op.getOperation()) &&
+    if (isHmxDiagnosticTailMarker(op) &&
         decision.contractionPlan == HmxTarget::ContractionPlan::HMXTail &&
         decision.reason != MatmulReason::SelectedTail)
       return rewriter.notifyMatchFailure(
@@ -1299,13 +1496,13 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
         decision.reason != MatmulReason::SelectedTail &&
         decision.reason != MatmulReason::VtcmBudget)
       return rewriter.notifyMatchFailure(op, reasonCode(decision.reason));
-    assert(decision.contract && "attributable matmul has no contract");
+    assert(decision.contract && "attributable contraction has no contract");
     const MatmulContract &contract = *decision.contract;
 
-    Location loc = op.getLoc();
-    Value lhs = op.getDpsInputOperand(0)->get();
-    Value rhs = op.getDpsInputOperand(1)->get();
-    Value init = op.getDpsInitOperand(0)->get();
+    Location loc = op->getLoc();
+    Value lhs = dps.getDpsInputOperand(0)->get();
+    Value rhs = dps.getDpsInputOperand(1)->get();
+    Value init = dps.getDpsInitOperand(0)->get();
     auto outType = cast<RankedTensorType>(init.getType());
     auto lhsType = cast<RankedTensorType>(lhs.getType());
     auto rhsType = cast<RankedTensorType>(rhs.getType());
@@ -1356,6 +1553,8 @@ struct MatmulToHmx : public OpRewritePattern<linalg::MatmulOp> {
     // The bridge stages crouton arrays, which are the engine's fp16 whatever
     // the sources' element type is, so every byte figure here is a crouton
     // byte.
+    // NOT-A-DECISION: a local alias of HmxTarget::croutonElemBytes, named for
+    // the unit it expresses. It decides nothing on its own.
     constexpr int64_t inBytes = HmxTarget::croutonElemBytes;
     int64_t room = target.vtcmBudget - vtcmUsed;
     int64_t rhsBytes = contract.k * contract.n * inBytes;
@@ -1806,12 +2005,25 @@ static Value rehostAsCrouton(RewriterBase &b, Value v, RankedTensorType target,
   SmallVector<Node> nodes;
   SmallVector<Value> operands;
   SmallVector<AffineMap> maps;
-  constexpr unsigned kNodeBudget = 128;
-
   std::function<std::optional<unsigned>(Value, AffineMap, int)> build =
       [&](Value value, AffineMap mapToValue, int d) -> std::optional<unsigned> {
-    if (d > 16 || nodes.size() > kNodeBudget)
-      return std::nullopt;
+      // TRACEABILITY: kNodeBudget
+      //   mechanism: a recursion/size guard on the producer-tree walk, not a
+      //     profitability threshold. Its only effect is to decline an elision, so
+      //     a wrong value costs fusion, never correctness.
+      //   measurement: none, and none owed -- there is no claim that a larger
+      //     budget would be faster. The guard exists so a diamond-shaped chain
+      //     cannot duplicate without bound.
+      //   shape set: n/a (not shape dependent).
+      //   workload representativeness: n/a.
+      //   failure mode: silent loss of fusion -- a missed optimisation, not a
+      //     wrong answer. That direction is deliberate. The sibling `d > 16`
+      //     guard is the same kind and shares this rationale.
+      //   If this ever needs tuning the question is "how deep can a producer
+      //     tree get before the fold stops paying", which is a measurement.
+      constexpr unsigned kNodeBudget = 128;
+      if (d > 16 || nodes.size() > kNodeBudget)
+        return std::nullopt;
 
     Node node;
     auto addLeaf = [&](Value leaf, bool crouton,
@@ -2120,11 +2332,13 @@ struct MatmulToHmxPass
     }
 
     bool invalidDiagnosticMarker = false;
-    func.walk([&](linalg::MatmulOp matmul) {
-      if (matmul->hasAttr(kHmxDiagnosticTailAttr) &&
-          !isHmxDiagnosticTailMarker(matmul.getOperation())) {
-        matmul.emitError(
-            "hmx.diagnostic_tail_partition must be a unit attribute");
+    func.walk([&](Operation *anyOp) {
+      if (!asHmxContraction(anyOp))
+        return;
+      Operation *op = anyOp;
+      if (op->hasAttr(kHmxDiagnosticTailAttr) &&
+          !isHmxDiagnosticTailMarker(op)) {
+        op->emitError("hmx.diagnostic_tail_partition must be a unit attribute");
         invalidDiagnosticMarker = true;
       }
     });

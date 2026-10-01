@@ -30,8 +30,18 @@ def test_vec_add():
     y = torch.rand(BLOCK_SIZE)
     output = torch.empty_like(x)
 
-    # best performance currently is with just MT on.
-    # Rest are enabled for correctness checks.
+    # "best performance is with just MT on" is no longer something we can claim (or
+    # need): for this shape the three staging flags below are currently no-ops.
+    # Default vs staging-off: ttsharedir byte-identical (md5 865d25d1...) and the
+    # kernel @async_execute_fn.resume is 34 lines with the same external symbols on
+    # both -- the direct consequence of VTCMTiling's "skip pure-streaming" fix.
+    # They stay ON to keep exercising the staging path, NOT for speed.
+    # Re-check (host only, no device):
+    #   bash tools/run_tests.sh codegen vec_add
+    #   bash tools/run_tests.sh codegen vec_add enableVTCMTiling=False \
+    #       enableConvertToHexagonmem=False enableHexagonmemCopyToDMA=False
+    # Instrument matters: whole-llir/whole-.o md5 is NOT valid for "no artifact"
+    # (AGENTS.md 7.9); use ttsharedir bytes + per-kernel disassembly.
     add_kernel[(1,)](
         x,
         y,

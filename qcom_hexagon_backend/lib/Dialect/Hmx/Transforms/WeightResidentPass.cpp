@@ -776,7 +776,7 @@ makeRuntimeSourceView(MLIRContext *context, Value source,
                       BlockArgument argument, const WeightSlice *slice) {
   auto type = dyn_cast<MemRefType>(source.getType());
   if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
-      !dtype::isCroutonElement(type.getElementType()))
+      !dtype::isAdmittedFloat(type.getElementType()))
     return std::nullopt;
 
   SmallVector<int64_t> shape(type.getShape().begin(), type.getShape().end());
@@ -880,12 +880,12 @@ static LogicalResult validateRuntimeSourceView(DictionaryAttr sourceView,
     return reject();
   if (auto ranked = dyn_cast<MemRefType>(argument.getType())) {
     if (!ranked.hasStaticShape() || ranked.getRank() != 2 ||
-        !dtype::isCroutonElement(ranked.getElementType()) ||
+        !dtype::isAdmittedFloat(ranked.getElementType()) ||
         !ranked.getLayout().isIdentity() ||
         ranked.getShape() != ArrayRef<int64_t>{k, wholeN})
       return reject();
   } else if (auto unranked = dyn_cast<UnrankedMemRefType>(argument.getType())) {
-    if (!dtype::isCroutonElement(unranked.getElementType()))
+    if (!dtype::isAdmittedFloat(unranked.getElementType()))
       return reject();
   } else {
     return reject();
@@ -994,17 +994,19 @@ static bool looksLikeEntryWeightSource(Value value) {
 
 /// The strict runtime-source proof is intentionally narrower than the existing
 /// matcher. A host prepack contract may describe a ranked or unranked entry
-/// memref, but it must be f16, have an exact static view, and use either a
-/// zero/dense view or a statically fixed N slice.  A dynamic offset is not a
-/// content identity: it can select a different object on each invocation.
+/// memref, but it must be an admitted float (f16, or f32 which the host packs
+/// to the same fp16 crouton the device pack would build), have an exact static
+/// view, and use either a zero/dense view or a statically fixed N slice.  A
+/// dynamic offset is not a content identity: it can select a different object
+/// on each invocation.
 static LogicalResult
 validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
                             Operation *anchor, int64_t *slotOut,
                             DictionaryAttr *sourceViewOut = nullptr) {
   auto srcMemref = dyn_cast<MemRefType>(src.getType());
-  if (!srcMemref || !dtype::isCroutonElement(srcMemref.getElementType()))
+  if (!srcMemref || !dtype::isAdmittedFloat(srcMemref.getElementType()))
     return anchor->emitError(
-        "strict resident runtime weight source must be an f16 memref view");
+        "strict resident runtime weight source must be an f16/f32 memref view");
 
   BlockArgument arg;
   std::optional<WeightSlice> slice = underlyingSliceArgument(src, crouton);
@@ -1042,7 +1044,7 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
   auto unrankedArgument = dyn_cast<UnrankedMemRefType>(arg.getType());
   if (argumentType) {
     if (!argumentType.hasStaticShape() || argumentType.getRank() != 2 ||
-        !dtype::isCroutonElement(argumentType.getElementType()) ||
+        !dtype::isAdmittedFloat(argumentType.getElementType()) ||
         !argumentType.getLayout().isIdentity())
       return anchor->emitError(
           "strict resident runtime weight argument has no exact ranked "
@@ -1061,7 +1063,7 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
           "argument shape");
     }
   } else if (!unrankedArgument || slice || !srcMemref ||
-             !dtype::isCroutonElement(srcMemref.getElementType()) ||
+             !dtype::isAdmittedFloat(srcMemref.getElementType()) ||
              srcMemref.getRank() != 2) {
     return anchor->emitError(
         "strict resident runtime weight argument has no exact ranked "
@@ -1097,7 +1099,24 @@ validateStrictWeightPack(WeightPack &pack, MemRefType crouton,
                          func::FuncOp func, Operation *anchor, int64_t *slotOut,
                          DictionaryAttr *sourceViewOut) {
   if (pack.packs.empty())
-    return anchor->emitError("strict resident weight bridge has no pack");
+    // Wording matters here (2026-10-01). "has no pack" reads like a claim that
+    // the IR is malformed, and the reader then goes looking for a producer bug.
+    // Under `hasStrictResidentContract` the truth is narrower: strict mode is
+    // documented as "the explicit request to fail closed on identity/descriptor
+    // evidence" (HmxResidentContract.h:102-104), so a missing pack is the
+    // pass refusing to proceed without that evidence. A legitimately
+    // weight-RESIDENT operand also has no pack -- that is what residency means
+    // -- and conflating the two is the same mistake
+    // HmxPartitionPass.cpp:emitDiagnosticInputBridges made until 2026-10-01
+    // (see ROADMAP.md §2.1, the tail-weight-resident row). Say which one this
+    // is. Unreachable today: the only caller passes a `pack` that came from
+    // `findWeightPack`, so it is non-empty by construction; kept as a defensive
+    // assertion, not as a live gate.
+    return anchor->emitError(
+        "strict resident contract: the weight bridge carries no pack, so this "
+        "pass cannot establish that the weight is resident; refusing to "
+        "proceed. NOTE a genuinely weight-resident operand also has no pack, so "
+        "this is not by itself evidence of a malformed producer");
   Value source = pack.packs.front().getSrc();
   for (PackWeightOp writer : pack.packs)
     if (writer.getSrc() != source)
@@ -1227,7 +1246,7 @@ validateExistingWeightResident(Operation *operation,
     }
     if (!argument)
       return anchor->emitError(
-          "strict runtime resident weight is not an entry f16 argument");
+          "strict runtime resident weight is not an entry f16/f32 argument");
     auto argumentType = dyn_cast<MemRefType>(argument.getType());
     bool unrankedArgument = isa<UnrankedMemRefType>(argument.getType());
     if (type.getRank() != 5 || type.getDimSize(2) != 16 ||
@@ -1236,13 +1255,13 @@ validateExistingWeightResident(Operation *operation,
           "strict runtime resident weight has an invalid crouton type");
     const int64_t logicalK = hmx::weightKTiles(type) * hmx::layout::kTileEdge;
     const int64_t logicalN = hmx::weightNTiles(type) * hmx::layout::kTileEdge;
-    if (!sourceType || !dtype::isCroutonElement(sourceType.getElementType()) ||
+    if (!sourceType || !dtype::isAdmittedFloat(sourceType.getElementType()) ||
         argument.getOwner() != &parentFunction.getBody().front())
       return anchor->emitError(
-          "strict runtime resident weight is not an entry f16 argument");
+          "strict runtime resident weight is not an entry f16/f32 argument");
     if (argumentType) {
       if (!argumentType.hasStaticShape() || argumentType.getRank() != 2 ||
-          !dtype::isCroutonElement(argumentType.getElementType()) ||
+          !dtype::isAdmittedFloat(argumentType.getElementType()) ||
           !argumentType.getLayout().isIdentity() ||
           argumentType.getDimSize(0) != logicalK ||
           argumentType.getDimSize(1) != logicalN)
@@ -1486,8 +1505,27 @@ static LogicalResult strictWeightPreflight(ModuleOp module,
         std::optional<WeightPack> pack = findWeightPack(operand.get());
         if (!pack) {
           if (looksLikeEntryWeightSource(operand.get())) {
+            // Same wording correction as validateStrictWeightPack above
+            // (2026-10-01). `findWeightPack` returning null has several causes
+            // and "no pack bridge" names only one of them. The common cause in
+            // production shapes is the mundane one: the source is not a view
+            // this pass knows how to make resident. Flash attention's V is
+            // exactly that -- a row block (K-block) of a wider matrix, which
+            // `looksLikeEntryWeightSource` cannot tell apart from an entry
+            // weight, and which the N-slice matcher rejects by design
+            // (WeightResidentPass.cpp:954, and the comment at :959-964). So this
+            // error, if strict mode were ever enabled in production, would fire
+            // on a kernel that is merely NOT-RESIDENT rather than malformed.
+            // Say so, or the reader will go hunting for a producer bug that
+            // does not exist -- the same dead end HmxPartitionPass.cpp led
+            // someone down today (ROADMAP.md §2.1, tail-weight-resident row).
             op.emitError(
-                "strict resident runtime weight source has no pack bridge");
+                "strict resident contract: this runtime weight source has no "
+                "pack bridge this pass can use, so residency cannot be "
+                "established; refusing to proceed. That is the expected "
+                "outcome for any weight whose source view this pass does not "
+                "model (e.g. a K-block row slice), NOT evidence that the "
+                "producer is malformed");
             result = failure();
           }
           continue;
@@ -1786,12 +1824,16 @@ struct WeightResidentPass
           }
           continue;
         }
-        // The pre-pack contract is defined on an fp16 weight: the host permutes
-        // the weight's own bytes, so the resident holds exactly what this
-        // device-side pack would have written. A wider weight would need the
-        // host to quantise it to the same fp16 the crouton holds, which is a
-        // different contract -- leave such a weight on the per-launch bridge,
-        // whose pack does quantise (see hmx.pack_weight).
+        // The pre-pack contract is defined on the crouton image: the host
+        // produces the bytes this device-side pack would have written. For an
+        // fp16 source that is a permutation of its own bytes. For an fp32
+        // source the host quantises to the crouton's fp16 with the same
+        // round-to-nearest conversion and the same permutation as the f32 pack
+        // leaf, so the resident holds the device pack's image for every
+        // non-NaN weight (NaN payloads are the engine's own and are documented
+        // in backend/hmx_weight_prepack.py). The contract's `dtype` names the
+        // source so the host validates the argument it was handed. Any other
+        // element type keeps its per-launch bridge (see hmx.pack_weight).
         auto srcMemref = dyn_cast<MemRefType>(src.getType());
 
         BlockArgument arg;
@@ -1847,13 +1889,13 @@ struct WeightResidentPass
                   module, func.getSymName(), decisionId.getInt(), slot)))
             return signalPassFailure();
         }
-        // The manifest records the argument binding even when the source is f32
-        // or otherwise not eligible for resident prepack; the policy pass then
-        // gives that slot the canonical device-pack reason.
-        if (!srcMemref ||
-            !dtype::isCroutonElement(srcMemref.getElementType())) {
+        // The manifest records the argument binding even when the source is
+        // not an admitted float; the policy pass then gives that slot the
+        // canonical device-pack reason.
+        if (!srcMemref || !dtype::isAdmittedFloat(srcMemref.getElementType())) {
           if (strictResidentContract) {
-            op.emitError("strict resident runtime weight source must be f16");
+            op.emitError(
+                "strict resident runtime weight source must be f16/f32");
             return signalPassFailure();
           }
           continue;
@@ -2008,11 +2050,17 @@ struct WeightResidentPass
           SmallVector<int64_t> logical{
               hmx::weightKTiles(residentType) * hmx::layout::kTileEdge,
               logicalN};
+          // `dtype` names the *source* argument's element type, which is what
+          // the host validates the runtime tensor against; the packed image is
+          // always the fp16 crouton (`crouton`). The two coincide for an f16
+          // weight and differ for an f32 one, where the host quantises.
+          std::string sourceDtype =
+              dtype::isF32(srcMemref.getElementType()) ? "f32" : "f16";
           std::string entry =
               "{\"func\":\"" + func.getSymName().str() + "\",\"slot\":" +
               std::to_string(slot) + ",\"shape\":" + jsonArray(logical) +
               ",\"crouton\":" + jsonArray(residentType.getShape()) +
-              ",\"dtype\":\"f16\"}";
+              ",\"dtype\":\"" + sourceDtype + "\"}";
           appendPrepackEntry(module, entry);
           if (!module->getAttrOfType<StringAttr>(kPrepackLayoutAttr))
             module->setAttr(kPrepackLayoutAttr,

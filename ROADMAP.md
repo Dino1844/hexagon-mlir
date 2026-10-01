@@ -47,7 +47,7 @@ Triton → TTIR → triton-shared / Linalg
 
 | 项 | 数字 |
 |---|---|
-| 稳态 vs llama.cpp 手写（WR 默认开） | **S1 1.13× / S2 0.92× / S3 0.58×**（S2/S3 已快过手写） |
+| 稳态 vs llama.cpp 手写（WR 默认开） | **S1 1.13× / S2 0.92× / S3 0.58×**（S2/S3 已快过手写）。⚠️ **本行数字与 `docs/README.md` 原本不一致**（那边写 1.14×/0.89×）——**2026-10-01 已按权威源 `docs/state/STATE-OF-PLAY.md:559` 判定本行为准、README 为错并更正**。⚠️ **但本行同样已跨构建**：最后实测 2026-09-21，当前 `libtriton.so` 是 `e63e35c5`（2026-09-30 23:09:02）⇒ 按 `AGENTS.md §4` **今天只能当历史引用**；要拿它做决策须先重测一个同构建锚点 |
 | FlashAttention | 稳态 **32.4 → 17.4 ms（1.86×，f32 激活 ABI）**；仓库 FA 测试 **18312 → 8184 µs**（NUM_THREADS 4→1）；评审引述 39.4 → 18.1 ms 未复测 |
 | 常用算子 | `vec_add` 快手写 4.8×、`matmul` 1.15×、softmax/rms_norm 见 `docs/results/op-steady-state-2026-09-21.md` |
 | host 门 | **本页不复述数字**——lit / host / probe / 边界矩阵的实测值与其复算命令只在 `docs/state/STATE-OF-PLAY.md §4.1` 写一次，本页只引用 |
@@ -64,21 +64,115 @@ Triton → TTIR → triton-shared / Linalg
 5. **成熟度**：R1（maxnum legalize）等上游 LLVM Hexagon 后端 RA bug 待修 ⇒ 默认 OFF；临时门/红测的完整清单见 **§2.1**；
    full manual lit 当前 **0 红 / 1 个 skip**（活的数字与复算命令见 `docs/state/STATE-OF-PLAY.md §4.1`）；`docs/`、`tools/`、`AGENTS.md` 在工作区侧无版本控制。
 
+> **本节是 owner + 退出条件的唯一登记处**（项目规则，`AGENTS.md §7.8`：
+> 「加常量 / 加门 / 加特判是最后手段，且必须在这里登记 owner + 退出条件」；
+> 总判据是「加一个新能力的改动文件数应是 O(1)」，成本口径见
+> `docs/codegen/capability-file-tax-2026-09-30.md`——**真正的成本是与后续集中化提交的重叠**，
+> 行为修复才是 O(1）。⚠️ 同条规则的告警：**删闸门不是清理，是翻默认**）。
+
 ### 2.1 红测与临时门的 inventory（M1.4 的交付物，只登记一次）
 
 > **规则**：任何红测或临时门必须在此有 **owner + 退出条件**；没有就不许加。红/绿复算：`docs/state/STATE-OF-PLAY.md §4.1`。
 
+#### 2.1a 证据指针纪律（2026-09-30 起，与 §2.1 的 inventory 同等级）
+
+> ⚠️ 本节自己的 owner / 退出条件登记在 §2.1 表格**末尾** —— §2.1 开头那条规则要求
+> 「任何红测或临时门必须在此有 owner + 退出条件」，本节不例外。
+
+> **规则**：**能影响决策的陈述**（数字、倍数、"更快"、"已证否"、"严格更优"）必须带
+> **可复算的证据指针** = 一个日志文件/目录 **或** `file:line` **或** 一条能跑出该数字的命令。
+> 给不出指针的，**显式标 `[假设]`**。
+>
+> **"文档里写过"不算指针**，"另一份文档说"也不算 —— 必须能落到 `logs/` / `exp/` / 源码行 / 命令。
+>
+> **已证否的陈述不许删，只加勘误块**（保留原文 + 说明哪里错 + 正确值 + 出处），
+> 写法照 `docs/hmx/dma-overlap-reconsideration-2026-09-29.md §3`。
+>
+> **复算命令本身也会过期** —— 给了命令不等于命令还成立。
+> 已知踩坑：`docs/codegen/switch-census.md §0` 的"63 个字段"与它自带的复算命令
+> 在 `LWPloopDepth` 被删后就对不上了（命令现在打印 62）。
+>
+> **一个能解析、但指错地方的指针，比没有指针更阴** —— 读的人会以为核对过了。
+> 实例：审计文档曾把"7000×"的出处指成给出 18× 的那一行。
+>
+> 扫描器 `tools/hexmlir/scan_claims.py`（**刻意不以非零退出**：有无指针是待分诊的债，
+> 不是构建失败；挂成硬门只会在它变吵的那一刻变得不可行动）。
+> 审计记录与欠账清单：`docs/codegen/claim-audit-2026-09-29.md`。
+
 | 项 | 现状 | owner | 退出条件 |
 |---|---|---|---|
+| ⚠️ **`test_flash_attention.py` 里那行 `tl.trans` 是承重的**（2026-10-01 实测） | 旧的 TODO 说它是绕开 "block ptr transpose creation failure"——**该说法已过期**：pinned Triton 3.7.0 @ `a9ced83` 下**转置的 K block pointer 完全能降**（无 `tt.trans`、无 `linalg.transpose`，只是一个 `strides: [1, 64]` 的列主序视图）。真正的阻塞在**本仓**：`hmx.pack_weight` 的源契约只收行主序，列主序 K 视图被 `HmxOps.cpp` 的 `verifyPackSource` 拒。🚨 **静默错值陷阱**：**只删 `tl.trans` 这一行、不动 block pointer，会零诊断通过并安静地算成 `qkᵀ`**——它的 ttsharedir 与正确的转置写法**只差两个步长值**（该为 `[1,64]` 却是 `[64,1]`），其余完全相同；**只因为 `BLOCK_N == BLOCK_DMODEL == 64` 才通过类型检查**。⇒ 已在该文件就地写下警告（**纯注释改动、零代码改动**）。**任何「顺手清理这行」的动作前必须先读那段注释** | 本仓（已完成） | **不用做**：这是**记录一条已知的承重项 + 堵一个坑**，不是待办。真正的修法（让 pack 叶子能读 K 连续源）见 `docs/hmx/fa-transpose-copy-design-2026-09-30.md` 附录 A2 记录的**三条已被推翻的主张**——尤其「上游免费折叠调早 24 行即可」是假的，而且强行调早更糟（门不认转置访问 ⇒ 拒收 ⇒ 整个矩阵乘掉回 HVX，参照 M<32 测量里 HVX 慢 **4.35×**） |
+| `test/Dialect/Hmx/Transforms/tail-weight-resident.mlir` — **M<32 尾路径接受 weight-resident 权重**（2026-09-30 加红测钉「拒绝」；**2026-10-01 已翻转并实现**，文件从 `-reject` 改名为无后缀） | ✅ **已实现，待设备 A/B。** 根因：`findPackBridge(rhs, isWeight=true)` 找不到 `hmx.pack_weight` 就返回 null，而**权重常驻时按定义就没有 pack_weight** ⇒ `emitDiagnosticInputBridges` 把两者混为一谈。`enableWeightResident` 默认 True（`hexagon_options.py`）⇒ **默认配置下整条尾路径不可达**。**修法（与本行原预测不同，如实记录）**：新增 `anyWeightPackWrites(rhs)` 探针区分两种 null —— **没有任何 PackWeightOp 写它 ⇒ 已常驻 ⇒ 接受**，并跳过权重侧的 4 项「行主序源」检查（dominance / `verifyPackCoverage` / `verifyDiagnosticRowMajor` / `verifyDiagnosticMatrixShape`）**且不发 `emitWeight`**；**有 PackWeightOp 但 bridge 不合规 ⇒ 仍拒绝，行为不变**。⚠️ **原预测的第 ② 处（「把 `verifyPackCoverage` 从 op 条数改成 tile 覆盖集合」）**不必要且已不做**：常驻权重一个 pack 都没有，coverage 在那里是空集而非缺口。测试用 `CHECK-DAG`×4 钉 4 个 `hmx.mma` + `acc_clear`/`acc_read`，`CHECK-NOT: hmx.pack_weight`，并用单条正则钉角块的 `n_tile=1, valid_cols=1, valid_rows=1`（整块 tile 的 unpack **合法地没有** bounds，先踩了这个坑） | 本仓 | **退出条件剩一半**：同构建双指纹设备 A/B ≥ `max(3×CV,15%)`（**需用户批窗口**）。已达成部分：lit **310/0/1**（与基线同数：删 1 加 1）、host **26/26 文件 213 tests / 228 passed + 107 subtests**、**6 个 tail 拒绝测试逐条复跑全过**（`tail-bridge-loop-reject` / `tail-external-writer-reject` / `tail-source-dominance-reject` / `tail-marker-invalid{,-partition}` / `tail-plan-{invalid-,}partition-reject`）⇒ 拒绝路径未被削弱。⚠️ 上机前须确认既有正确性证据未损：`logs/hmx/promotion-tail-final.json`（direct 95/95 + resident 1/1）。⚠️ 原行提醒的 `rowStride` 静默错值（`HmxToLLVMPass.cpp:757-771` 对 `strided<[1,64]>` 返回常量 1）**本次未碰** |
+| `test/Conversion/HmxToLLVM/unpack-dst-non-contiguous-reject.mlir` — **非内连续的解包目的地响亮失败**（2026-10-01 新增） | 钉住**新增的闸**：`rowStride`（`HmxToLLVMPass.cpp`）在**静态内 stride ≠ 1** 时报 `HMX leaf requires an inner-contiguous buffer` 而不是照着声明的 stride 算。**为什么加**：改之前它把 `strided<[1,32]>`（列主序）的声明 stride(rank-2)=1 直接当 `row_stride` 传给叶子，而叶子是**行主序写** ⇒ 写到 `i+j`（即元素 `(i+j,0)`）而不是 `(i,j)`。**已实测**：改前 `rc=0`、stderr 零行、`llvm.call @hmx_unpack_acc_f16(..., %28, ...)` 而 `%28 = constant(1 : i32)`；改后同输入报错。**这比性能问题严重——它是静默错值。** **范围（为什么不夸大）**：只拦**静态**非内连续。**动态 stride 保持原样**（读不出来，仍退回 `width`），那是既有行为，改它是另一个决定。pack **源**本来就有闸（`bridgeCanExpress` `MatmulToHmxPass.cpp:251` + `verifyDiagnosticRowMajor` `HmxPartitionPass.cpp:1012/1015`），本条补的是**普通整块路径上没闸**的目的地（诊断尾路径 `:1175` 已有） | 本仓 | **退出条件：跑满一次设备窗口的 FA/矩阵乘后确认没有新的拒绝**。在此之前 ⚠️ **它可能把某个今天能编译（但算错）的东西变成编译不过**——那正是目的，但要有人知道。⚠️ 反向守卫同文件第二个函数：行主序 `strided<[64,1]>`（stride(0)>width，N-split 存储）**必须继续通过**，否则就把 N-split 存储一起杀了 |
+
 | `qcom_hexagon_backend/test/Conversion/LinalgToLLVM/vector_size.mlir` — **唯一的 lit skip** | `// REQUIRES: do-not-run-because-flaky-test-that-needs-being-investigated`。**上游自带**：`git diff main -- <file>` 为空，`git log main -- <file>` 只有上游的初始 commit，本地从未改过 ⇒ **本 fork 无 owner**。manual runner 不解析 `REQUIRES`，按**文件**记为 skip | **无（上游）** | 接受现状。触发条件：上游把它恢复为可跑且通过 ⇒ 删掉 `REQUIRES` 行并把本行移出 inventory；本 fork 若要在该文件上做工作 ⇒ **先给上游开 issue 并在此登记 owner**，不得单方面删 `REQUIRES` |
-| `enableMaxnumLegalize`（R1）+ 3 个子旋钮 | 默认 **OFF**，等上游 LLVM Hexagon RA bug 修好；真机在 hexmem 路径 + ≥[512,128] maxnum tile 上 5/5 崩（本仓侧根因与已 cherry-pick 的上游 PR #204660 见 `docs/hmx/fa-crash-resolved.md`） | 本仓（等上游） | 上游 RA 修复后上机 A/B ⇒ 改默认 |
-| `enableVectorRowReduce`（R2，vror butterfly） | 默认 OFF；host 查证其 pattern 在 FA/softmax 生产管线里**零命中**（+7% 属噪声，已 revert） | 本仓 | 若将来 FA/softmax 管线出现独立行归约再评估，否则按"不达标即关闭"保持关闭 |
+| `isCheapF16Elementwise` / `chainIsCheapF16Only`（`MatmulToHmxPass.cpp:1782` / `:1913`）— **epilogue/链式融合白名单**（**2026-10-01 补登记**） | 它**不是 epilogue 融合机制**，尽管 §3 闸 4 这么读。`FoldElementwiseIntoLayout` 是 `OpRewritePattern<hmx::PackActOp>`（`:2206`）⇒ 它实现的是 **matmul→elementwise→matmul 的桥消除**；**`→ store` 的 epilogue 根本没有 `pack_act` 可锚 ⇒ `+bias` 不融合是设计，不是缺陷**。⚠️ **2026-10-01 实测：它从未产出过一个能编译的 kernel。** 仓库 lit 正例 `@cheap_scale_chain` 在**单 pass** 下确实折叠（2 `hmx.matmul` + **1** `pack_act` + **1** `unpack_acc`），但同一 IR 过 `linalg-to-llvm` 立刻 `error: 'hmx.mma' op act must be in VTCM (memory space 1)`（机制：`findActivationBridge` 返回 null → `NoRowMajorBridge` → 无 staging 环 → verifier 拒绝）。**该 lit 的 RUN 行只跑单 pass，所以这条断裂整个测试套件看不见** ⇒ 已新增 `cheap-scale-chain-folded-e2e-reject.mlir` 把它钉成红断言。⚠️ 另两条窄门：`:1939` 要求每节点 `hasOneUse`，而 **Triton 的 `linalg.generic` 恒为 in-place DPS** ⇒ **凡 ≥2 个 map 的廉价链一律被否决**（手写 MLIR 用 fresh `tensor.empty` outs 才能折）；`:1922-1945` 要求叶子是 read-out / splat 常量 / crouton 值，rank-1 bias 广播是**硬否决** | 本仓 | **退出条件 = 要么让它产出可编译的 e2e，要么删掉它。** **在它产出可编译的 e2e 之前，「白名单折叠成功」不构成 epilogue 融合可用的证据。** ⚠️ `:2159-2160` 的 "Verified on device ... folded vs unfolded" **属于 `FoldChainedPack`（`:2164`）**，**不是**这个白名单 ⇒ **它没有任何真机验证记录** |
+| `enableHexKL`（`hexagon_options.py:65`）— **一个「设了就必失败」的公开选项**（**2026-10-01 补登记**） | `LinalgToLLVMPass.cpp:107-113` 的守卫**无条件**：`if (enableHexKL) { emitError(...); signalPassFailure(); }` ⇒ **`enableHexKL=True` 今天在任何输入上都不可能编译成功**。而选项面仍挂着它，注释还承诺 `use HexKL to lower matmul and convolutions` ⇒ **用户写进 `triton.Config` 就会拿到硬编译错误**。⚠️ 它的两个 lit 用例（`test_hexkl_macro_matmul.py:42,62` 显式设 `True`）**今天必失败且不在任何门里** | 本仓 | **退出条件 = 用户决定三选一**：① 从选项面删掉它（连带删两个用例）· ② 把守卫收窄到「契约确实激活时」（⚠️ 生产里契约是激活的 ⇒ **对生产用户无变化**，只影响测试与手写 memref IR）· ③ 标 `xfail` 并**加进门**。**我的推荐是 ①**：③ 单独用会把一个真缺陷固化成「预期失败」。⚠️ 无论选哪个，「两个用例今天必失败」这件事应该进门——现在没人知道 |
+| `enableDoubleBuffering`（`hexagon_options.py:61`）— **默认 OFF，但代码已写好并接线**（**2026-10-01 补登记**） | 消费点 `LinalgToLLVMPass.cpp:476,491`；运行时是真描述符链并返回 token（`bin/runtime/UserDMA/UserDMA.cc:49`）。⚠️ **它不是「已证否」**：`docs/analysis/gap-casual-op-…md` §6 曾把它写成「被测量关闭」，**那是错的**——`dma-overlap-reconsideration-2026-09-29.md §1` 明写「**没有一条覆盖『DMA 引擎做搬运、与之重叠』这个命题**」，§4.2 明写「**要实现的东西已经写好并接了线，门一直关着**」。⇒ **它是「从未测量」。** 标量线程那个问题**已答**（`logs/hmx/async_probe_batch3_20260919-125656_verdict.txt` 最后一行 `verdict (pcycles N=32 (B-A)/H median=0.998): SYNCHRONOUS`，读法契约见 `§3`：`B−A == H` ⇒ 同步） | 本仓 | **退出条件 = 一次设备 A/B，不是代码改动。** **前置**：① 先修引用它的那行（`gap-casual-op` 勘误 **E1** 已修）· ② 同构建双指纹（⚠️ 今晚后端重建过多次，现无可比锚点）。**在它测过之前，任何人不得引用「DMA 重叠已证否」** |
+| `enableBufferization`（`hexagon_options.py:58`）— **注释只写「Used to disable for some dma testing」，文档对 HMX 一字未提**（**2026-10-01 补登记**） | ⚠️ **2026-10-01 实测更正**：它**不是静默开关**。`LinalgToLLVMPass.cpp:122-124` 在 module 仍含张量 linalg op 时 **emitError** ⇒ **Triton 的张量路径上它是编译错误**（实测 `RuntimeError`，文案 `the no-bufferization path accepts manually managed memrefs only`）。它另有 `:300` `recordOnly = !enableBufferization`，**那一条只对手写 memref IR 静默**。⇒ **它不是一个可观测性问题** ⚠️ **同时更正一处流传的说法**：「`scratch>0` 与它都静默、只修一个等于没修」**前提有误**——两者在 `LinalgToLLVMPass.cpp:302` 上确实是同一个合取，**但只有一个是静默的**（`scratch>0`；而那个覆盖是 `compiler.py:285-299` **有意为之且带理由**的，缺的只是一句 `warnings.warn`，同后端 `triton_hexagon_launcher.py:685-689` 已有完全同型先例） | 本仓 | **退出条件 = 那句 `warnings.warn` 落地**（4 行，形状见 `triton_hexagon_launcher.py:685-689`）**或**用户决定不做。⚠️ **在此之前不要把这两条当成必须捆绑处理** |
+| `kStageMinKTiles = 32`（`HmxPartitionPass.cpp:184`）— **决定是否走 staged 路径的默认值** （**2026-10-01 补登记**：此前未登记，**违反本节规则**） | 它是 §8 排序里 D6 的对象，也是**一道可绕过的默认值**：`:1411-1416` 里显式 `pipeline-depth=1/2` 会**跳过它** ⇒ **它不是一道闸，是一个缺省值**。⚠️ 它自己的 traceability block（`:129-167`）已经把结论写死了：**机制本身在仓内已被证否**（`exp/hmx/leaf_bw_probe/RESULTS.md`：正确的谓词是「源是否 L2-cold」，即 activation 字节 vs L2 容量，而不是 `Kt >= 32` 这个近似）；同 block 的 `measurement` 记了 S2 1.94× / S1 flat / S3 −10%，而 `workload representativeness` **明写 NOT ESTABLISHED**（`bench_ops.py` 把 S1 称作「S1 anchor shape」是循环论证，且三者的权重只占 VTCM 的 0–3%，**没有施加这道门本来要权衡的驻留压力**）。⚠️ 今晚实测补一条**当前读数**：43 臂里**只有 2 个 arm 真的上了 staged**（K 循环 bk=1024 与整块 k=4096），其余 K 循环臂（bk=128 / bk=256 / FFN bk128）全部 `serial:shallow-k` ⇒ **在真实 FFN 形状上这道门基本总是关着的** | 本仓 | **退出条件 = 删掉它，或把机制换成 L2-cold 谓词**——**不是再调一次数字**。同 block 的原话：「在同一个机制上重调数值是白费功夫」。⚠️ 在那之前**不要**把「调 Kt 阈值」当成提速手段；⚠️ 也不要把它当闸门引用（它可被显式 `pipeline-depth` 绕过，且 43 臂实测里 41 个 arm 压根碰不到它） |
+| ⚠️ **测试面缺陷**：`hmx-layout-propagation.mlir` 的 `@cheap_scale_chain` 是**绿的，但它钉住的 IR 在 e2e 编译不过** （2026-10-01 实测） | `:24` 的 RUN 行是 `-pass-pipeline='builtin.module(func.func(matmul-to-hmx))'`——**只跑那一个 pass，从不做 e2e**。单 pass 下折叠确实发生（2 `hmx.matmul` + **1** `pack_act` + **1** `unpack_acc`，桥被消掉）；换成 `linalg-to-llvm` 立刻 `error: 'hmx.mma' op act must be in VTCM (memory space 1)`。**⇒ `FoldElementwiseIntoLayout`（`MatmulToHmxPass.cpp:2206`）至今从未产出过一个能编译的 kernel。** ⚠️ 另：`:2159-2160` 那句 "Verified on device ... folded vs unfolded" **属于它上面的 `FoldChainedPack`（`:2164`）**，**不是**元素 wise 折叠 ⇒ **元素 wise 折叠没有任何真机验证记录**。详见 `docs/hmx/epilogue-fusion-what-actually-exists-2026-10-01.md` | 本仓 | **✅ 2026-10-01 已达成一半**：新增 `test/Dialect/Hmx/Transforms/cheap-scale-chain-folded-e2e-reject.mlir`，**把折叠后的 IR 原样签入并用 `not ... linalg-to-llvm` 钉住那条 VTCM 错误** ⇒ 断裂现在是**测试套件里的一条红断言**，不再靠后人偶然发现。**为什么签入而不加 RUN 行**：① 本项目的门是 `run_lit_manual.sh`，它**跳过需要 `%t` 的文件** ⇒ 现场算中间产物的测试会被 SKIP，**而 SKIP 的测试作为证据等于零**；② 整文件跑 e2e 会先因 `resident-prepack is limited to one function` 失败（多函数），在原测试上加 `not` 会**因错误的原因变绿，比没有更糟**。**剩下的退出条件**：有人修好 e2e 断裂时，**连同删掉这个文件**，并在提交信息里说明。 ⚠️ 在那之前「白名单折叠成功」**不构成** epilogue 融合可用的证据。**在它变红之前，不要把「白名单折叠成功」当成 epilogue 融合可用的证据。** ⚠️ 顺带记两条窄门（不是 bug，是设计/取舍）：① 锚点是 `hmx.pack_act` ⇒ **`→ store` 的 epilogue 设计上就不在射程**，`+bias` 不融合是**设计**不是缺陷；② `:1939` 要求每节点 `hasOneUse`，而 **Triton 的 `linalg.generic` 恒为 in-place DPS** ⇒ **凡 ≥2 个 map 的廉价链一律被否决**，手写 MLIR 用 fresh `tensor.empty` outs 才能折 |
+| `enableMaxnumLegalize`（R1）+ 3 个子旋钮 | 默认 **OFF**。⚠️ **本行原文的等上游理由是错的，2026-09-30 更正**（见下方「R1/R2 前提复核」）。原写「等上游 LLVM Hexagon RA bug 修好」并把它算作已由 `tools/hexmlir/llvm-hexagon-ps-aligna.patch` 解决——**但那个 patch 只碰栈/帧对齐**：`HexagonFrameLowering`、`HexagonISelDAGToDAG`、`HexagonRegisterInfo`、`HexagonVExtract` + 3 个测试，**RA / scheduler / callingconv / prologepilog 一个都没有**。真机在 hexmem 路径 + ≥[512,128] maxnum tile 上曾 5/5 崩（`docs/hmx/fa-crash-resolved.md`）。**✅ 2026-09-30 晚：两个前置条件都已查清并通过** —— ①「等上游」是假的（见下方复核节）；② **pattern 在线**：四份真机 FA dump 都有 **33/33/17/33 处** `<32 x float>` 上的 `llvm.maxnum.v32f32`，恰好满足 `isHvxVectorMaxnum`（要 VectorType + f32/f16）。⚠️ 本行此前一度写成「pattern 可能不在线」，那是**在一份 LLIR 上 grep `maxnumf` 打错了 token**（那是 MLIR 的写法；LLIR 里是 `llvm.maxnum`），错了一整天没被发现 （`docs/codegen/r1r2-pattern-presence-2026-09-30.md §2.1`）。⚠️ **同文 §7.1 又更正了那个「在线」的口径**：`33/33/17/33` 是 **LLIR**（R1 之后才展开的形态）的静态处数；**R1 在自己流水线位置上直接看到的是 4 处**向量 `arith.maxnumf`（`tools/hexmlir/dump_ir_stage.sh` 单节观测），而 §2.1 写的「60 处」是**对 `-mlir-print-ir-after-all` 全日志 `grep -c`** 的计数伪影（同一处 op × 含它的 dump 节数）。**✅ 2026-09-30 晚：上机 A/B 已跑完（`docs/codegen/r1-ab-2026-09-30.md`）** —— 当年 5/5 崩的形状**不再复现**（9 次 R1-ON 全部 PASS，`rel` 7e-5~9e-5）；性能 −4.9%（BN=128/grid=1，3/3 轮同号、差值 CV 1.5%）、≈0（grid=2）、反慢 1.1%（BN=64），**三个配置都低于 `max(3×CV,15%)`** ⇒ **保持 OFF，记负结果**。机制：R1 只改逐元素 maxnum，**够不着行归约**（那条链末端是 `vector.reduce.fmax`），所以量级本来就小。⚠️ 「R1-ON 会破坏行归约蝶形」**已查清为探针伪影**：那是**漏了 `fast` 旗标**的 `.ll` 探针得出的；真机 LLIR 里是 `call fast <32 x float> @llvm.maxnum.v32f32`，带 `fast` 时两个 intrinsic 都落成 `vmax`（真机对象码 R1-OFF 36 条 `vmax`、0 条 `sfmax`）⇒ **该说法不成立**（`docs/hmx/maxnum-maximum-selectability-recheck-2026-09-30.md`，含两轮假结论的复算）⇒ **R1 保持 OFF 的理由只剩"收益不达标"**（本行 −4.9% < 15% 判据）。另：⚠️ 本行原写「崩不再复现」时把 6 次失败说成"都与被测旋钮无关"，**过强**——R1-ON 在 BN=64 档 2/5 失败、同配置 OFF 0/5，不显著 ⇒ 只能写「**未复现**」（分档见 `docs/codegen/r1-ab-2026-09-30.md §4`）| 本仓 | **退出条件已满足**（A/B 完成，结论=保持 OFF）。**不删旋钮**：它是设备 A/B 开关（消费者 `exp/hmx/op_bench/fa_ablate.py` 的 `FA_MAXNUM`），且删闸门会**翻默认**（`isHvxVectorMaxnum` 匹配任何 `vector<*>` 的 `arith.maxnumf`，无形状前提 ⇒ 去掉闸门 = 全量改写）。**三个子旋钮已于 2026-09-30 删除，不要重建**。下次触发：随「FA 行归约向量化」落地后重测一次，届时若仍无效则连 pass 一起删 |
+| `enableVectorRowReduce`（R2，vror butterfly） | 默认 OFF。⚠️ **「生产管线零命中」已被证伪（2026-09-30）**：谓词 `matchVectorRowReduce`（`lib/Conversion/LinalgToLLVM/Common.cpp:78-129`）接受**带 reduction iterator 的 `linalg.generic`**，而 generic 路径比那次测量**新**（`Common.cpp`/`VectorRowReducePass.cpp` 是 09-24，测量是 09-22）。现测生产 FA：`vector.reduce.fmax` 调用点 **4 → 0**、`vror` **0 → 20**（`docs/hmx/row-reduce-vector-domain-plan-2026-09-29.md:52`）⇒ **它今天就命中**。**✅ 2026-09-30 晚：上机 A/B 已跑完**（`docs/codegen/r1-ab-2026-09-30.md §3.2`，BN=128/grid=1、固定 R1=OFF、3 个健康轮）：R2=OFF 均值 9769 µs、R2=ON 均值 9631 µs，**配对差 +1.4% 而差值 CV 8.2%**（只有 1/3 轮同号）⇒ **纯噪声，保持 OFF，记负结果** | 本仓 | **退出条件已满足**（A/B 完成，结论=保持 OFF）。**不删旋钮**，理由同 R1 行（它是 A/B 开关，且删闸门会**同时**翻两个默认：去掉闸门还会把 `vectorizeOpts.skipVectorRowReduce` 置 false（`LinalgToLLVMPass.cpp:423`），把那 4 个归约从 vectorizer 手里带走 ⇒ **R1/R2 是一对，不能各自单独删**）。下次触发：同 R1 行（行归约向量化落地后重测） |
 | `HEXAGON_EPI_LOG` | env 门，默认关（`python/triton_qcom_hexagon_backend_api.cc`） | 本仓 | FA/rowmax 调查收口后删除 |
 | `HEXAGON_PTR_LOG` | env 门，默认关；**在 LLIR 里插 `hexagon_runtime_dbg_log_ptr` 调用**，用来命名 FA 崩溃背后那个坏指针 | 本仓 | 同上。⚠️ 配对的 runtime 导出 `hexagon_runtime_dbg_log_ptr`（`bin/runtime/src/HexagonCAPI.cpp`）**自身无 env 门**（直接写 `rt_trc.txt`），但只有本门打开、LLIR 里插了调用才会被调到 |
 | `HEXAGON_ASM_DUMP` / `HEXAGON_ASM_TO_OBJ` / `HEXAGON_ASM_DUMP_FILE` | env 门，默认关，**dump 汇编**（纯诊断件，与 HMX workarounds 无关） | 本仓（长期） | 无退出计划：只观测、默认关 |
 | `HEXMLIR_RUNTIME_TRACE` | **编译期宏，不是 env 门**（`bin/runtime/{src/HexagonCAPI.cpp,multithreading/AsyncRuntime.cpp}` 的 `#ifdef`），默认不定义 | 本仓 | 同上 |
 | `HEXMLIR_RUNTIME_DEBUG` | **CMake 选项**（`bin/runtime/CMakeLists.txt`，默认 OFF），恢复 `VTCMPool` 的 per-alloc/free 不变量扫描与日志 | 本仓（长期） | 无退出计划：默认关、行为不变，是诊断件不是 workaround |
 | 已删除、不要重建的插桩 | `FA_O_OVERRIDE`（把编译出的 kernel `.o` 换成任意文件——**它在 launch 契约已强制之后替换 kernel 对象，是交付物里的活洞，已删**）、`FA_PIN_VREG`/`FA_GUARD`/`FA_PTR_LOG` env 门、barrier 插桩（emitter 与 runtime stub 均无） | — | 复活任一项都要先在本表登记 owner 与理由 |
+| **§2.1a 证据指针纪律本身** | 已生效。扫描器 `tools/hexmlir/scan_claims.py` 已入库，刻意非零退出。分诊欠账见 `docs/codegen/claim-audit-2026-09-29.md §7.3` 排序短名单 | 本仓 | 无退出计划（永久规则）。触发条件：全库无指针 claim 分诊完 ⇒ 把该文档 §7 收缩为一句归档说明 |
+| `HmxWorkspaceResidentPass.cpp:15` 的过期数字 | 注释写 `~6.3 us per alloc/free pair`，真值 **1.12 / 1.51 / 1.69 µs**（`docs/hmx/m3.2-device-result-2026-09-29.md §4`）。A2 护栏限定只改 `docs/`，故未动源码 | 本仓 | 随下一次 `hexagon-mlir/` 代码改动一并修正，**必须同批重生成 `split_patch.py`**。**这是全树唯一一处已知带错数字的源码注释** |
+| `enableRowReduceGroupStore`（RGS，行归约留在向量域） | **默认 OFF**（2026-09-30 落地 Step 1，**真机一步没走**）。pass 挂在 `LinalgToLLVMPass.cpp:442`，即 `:427` 向量化之后、`:444` canonicalize 之前、**`:431` AddFastMath 之前**——最后这条顺序是承重的：蝶形的 5 个折叠只有在带 `fastmath<nnan>` 时才落成 5 条 `vmax`（无旗标实测 `vmax=0` / `valign=31`）。只改写 `maxnumf`；`addf` **显式拒绝**（会把 `max(max(c0,m),c1)` 重结合成 `max(m,max(c0,c1))`，数值有变、无人要求）。host 证据：lit **309/0/1**（新文件含 f32 5 步 + f16 6 步 + 4 类拒绝路径，每条带 `expected-remark`；`arith.select` 两臂按**形态**钉住，变异测试证明对调会被抓）。独立复核提出的 5 个「合法 IR 被静默改错」反例（非单位 stride / chunk offset 被忽略 / acc 来自别的张量 / 行循环 yield 别的值 / 归约结果无人消费）**现已全部改为拒绝 + remark** | 本仓 | **Step 2/3 未做**：① 机器码判据（归约区 `memw`=0、`vmax`/`vror` 计数、每 32 行一次 128 B 分组 store；`allocframe` 增量**不预注册**）② 设备 A/B：**先过 F1 门**（`nomax` 天花板若已 <15% 就不开工），生产 FA 形状、同构建交错、双指纹、`rel` 对拍。设计/施工单：`docs/hmx/row-reduce-vector-domain-design-2026-09-30.md` + `docs/hmx/row-reduce-group-store-spec-2026-09-30.md`（后者记了施工单里 3 处被代码否掉的假设） |
+| **`HmxCroutonLayout.h:46` 的裸字面量 `2`** | `kCroutonBytes = kCroutonElements * 2;` —— 那个 `2` 是**元素字节数**，但**没有名字**，所以任何绑定都锚不到它。同一事实另有两个**具名**副本：`HmxTarget::croutonElemBytes`（`HmxTarget.h:248`）与 Python 的 `hmx_weight_prepack._CROUTON_ELEM_BYTES`，而 `test_crouton_size_agreement.py`（2026-09-30 加）**只能绑后面两个**。⚠️ **不要绑 `kCroutonHalf`**：它也是 2，但那是「一个 pair 的两半」，**是不同的 fact**，绑它等于断言巧合 | 本仓 | 命名它（`kCroutonElemBytes`）并让 `kCroutonBytes` 引用之，再把该测试的元素大小锚点从 `HmxTarget::croutonElemBytes` 移到布局头 ⇒ 头与 host 才真正绑上。**需要一次 C++ 改动 ⇒ 必须增量编译验证，且同批重生成 `split_patch.py`** |
+| `enableWorkspaceResident`（per-launch VTCM 工作区常驻） | 默认 **OFF**（`qcom_hexagon_backend/backend/hexagon_options.py:148`）。⚠️ **本行推翻了一条已被引用的结论**：`docs/codegen/knob-fork-classification-2026-09-30.md` §1.3 写「实测 `=true` 在 256×1024×256 上**产物完全相同** ⇒ 该形状上门是**惰性的**」——**那是错的**。2026-09-30 晚复算（已构建的 `linalg-hexagon-opt`，**未重建、未上机**）：OFF = 17646 B / md5 `2c6b794e4cd29e877408e88d423e89cb` / `hexagon_runtime_{alloc,free}_1d_dsp` 出现 **8** 次；ON = 17241 B / md5 `5b201c81d094def6facf416dca2f71af` / 出现 **0** 次 / `workspace_resident` **4** 处 ⇒ **产物完全不同**。真机 A/B 早已测过：**S1 +5.71% / S2 +15.07% / S3 +16.38%**（`PerfPcycles`，5 组交错，`retries=0`，`docs/hmx/m3.2-device-result-2026-09-29.md:43-48`，原始日志 `logs/m3_2_2026-09-29/ab_steady.log`）。⇒ **它不惰性：它有效。** 但**默认必须保持 OFF**，理由是下一列 | 本仓 | **无退出计划：默认 OFF 是终态，不是待办。** 用户 2026-09-29 已拍板保持 opt-in（`docs/hmx/m3.2-device-result-2026-09-29.md:150`），理由：「grid>1 硬拒属破坏性契约变更，当前收益不构成现在翻默认的理由；若将来要翻，先按契约发布流程单独评审」。⛔ **翻默认需要用户单独批准，不在 agent 工作面内。** ⛔ **不许删闸门**：`HmxWorkspaceResidentPass.cpp:254-261` 的匹配条件是「函数里有**任一** Hmx 方言 op」（`func.walk` 找 `HmxDialect` 命名空间），**无形状前提、无预算前提** ⇒ 去掉闸门 = 全量改写，且 `backend/triton_hexagon_launcher.py:664-671` 对 `prod(grid)>1` **硬 `ValueError`** ⇒ **每一个 grid>1 的 HMX launch 都会在设备访问前失败**。下次触发：只有用户主动要求按契约发布流程评审时才动 |
+| `addFastMath` | **C++ 侧默认 `true`，无 Python 字段** ⇒ 不属于 A1 step 4 的代码工作面。位置 `LinalgToLLVMPass.cpp:430`；`.td` 默认在 `include/hexagon/Conversion/LinalgToLLVM/Passes.td:54-56`；`backend/hexagon_options.py` 里 `grep -c "^    addFastMath"` = **0**，`lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp` 也不读它。**是真决策点、不是死代码**：实测 `add-fastmath=false` → 17607 B vs 默认 17646 B，`fast` 旗标 1 处 → 0 处。已由 `qcom_hexagon_backend/test/test_option_surface_agreement.py:123-126` 的 `PINNED_DEFAULTS` 钉住默认值与理由 | 本仓（长期） | 无退出计划：它是 §2 那 13 个「够不到的决策点」之一（值被 `.td` 钉死、用户够不到），钉在 `PINNED_DEFAULTS` 里就是它的登记。**触发条件**：若将来给它加 Python 字段（= 把它暴露成可调项），必须先回答「fast-math 旗标是对输入域的断言、不是提示」，并同步更新 `PINNED_DEFAULTS`（那个测试会因 `.td` 默认变化而失败） |
+| `enableConvTiling` | 默认 OFF（`backend/hexagon_options.py:60`），消费点 `LinalgToLLVMPass.cpp:317`。分类表标 **UNSURED**，2026-09-30 晚把**理由从猜变成查实**（结论不变）：pass 只匹配 `linalg::Conv2DNhwcFhwcOp`（`lib/Transforms/ConvTilingPass.cpp:204`），而全仓唯一的**生产者**是 `lib/Transforms/MatmulToConvPass.cpp:79`（其余 4 处命中全是消费者），那个 pass 只在 `LinalgToLLVMPass.cpp:310` 发、被 `:309` 的 `if (enableMatmulToConv && enableSeedLayoutConversions)` 包着，**`enableMatmulToConv` 没有 Python 字段**（`Passes.td:29-31` 默认 `false`）⇒ **从本后端到不了**。实测 `enable-conv-tiling=true` 在 matmul 上产物与默认**逐字节相同** | 本仓 | **无退出计划，直到 conv 路径拿到真实流量。** 退出条件：**给 conv 路径开工时**（那时 `enableMatmulToConv` 可能变成可达，`enableConvTiling` 的 UNSURED 才需要重评）。在那之前**不许**以「产物相同」为理由删它——那只能证明这条路径不命中，不能证明收益为零。`[未验证]`：「`triton_shared` 的 TableGen 有无间接路径」只做到 grep 级（`grep -rln "conv" triton_shared/` 的命中全是 `convertLhsToF32` 之类无关词），未逐条追完 `TritonArithToLinalg` 的全部 pattern |
+| `enableHVXInlining`（A/B 前不许碰） | 默认 OFF（`backend/hexagon_options.py:86`），消费点**在 `api.cc` 的 LLVM 链接期**：`python/triton_qcom_hexagon_backend_api.cc:968-969` 与 `:1064-1065`，都调 `cond_run_inliner`（`lib/Target/HEX_LLVMIR/LLVMIRTranslation.cpp:44-54`，跑 `createAlwaysInlinerLegacyPass`）。**是活的**（现行审计 §6 第 1 条已把「死字段」翻掉）。⚠️ **本组最大的「测试配置伪影」风险：15+ 处测试/脚手架显式打开它** —— `hexagon-mlir/test/python/triton/test_flash_attention.py:209`、`test_softmax.py:88`、`tools/hexmlir/dump_codegen.py:132,173`、`exp/hmx/op_bench/fa_ablate.py:368,477`、`exp/hmx/tiny_matmul/*` ⇒ **改默认会同时改掉所有基线数字** | 本仓 | **退出条件 = 跑完那一次上机 A/B，不是代码改动。** 该 A/B 已在 `docs/codegen/measurement-config-audit-2026-09-29.md` 登记、board 上标着「至今未跑」。⛔ **A/B 之前不许碰这个默认值**（理由：它同时是 15+ 处基线的输入，改它 = 同时改掉对照组）。A/B 出来之前，任何「它大概是死代码/大概是严格更优」的推断都按 `knob-audit-2026-09-29-revised.md §6` 的方法规则处理：**先 grep 全仓**（含 `python/`、`bin/`、`test/`）并打 `git show main:` 基线 |
+| `enableSplitReduceGeneric`（A/B 前不许碰） | 默认 OFF（`backend/hexagon_options.py:75`），消费点 `LinalgToLLVMPass.cpp:377`。**谓词在 pass 内、不在旋钮里**（`lib/Conversion/LinalgToLLVM/SplitReduceGenericPass.cpp:79-93`）：generic 体里 yield 了 `MaxNumF/MaximumF/MinNumF/MinimumF/MaxSI/MaxUI/MinSI/MinUI` 就 `notifyMatchFailure("max/min combining reductions do not vectorise after the split")`。⇒ **删闸门本身安全**（pass 自带拒绝路径），**但删闸门 = 默认 OFF→ON = 一次行为变更**。⚠️ 那个常被引用的 **8.5×**（softmax 1089 → 128 µs，`AGENTS.md:117`、`docs/state/STATE-OF-PLAY.md:363-364`）是**「pass 拒绝拆分」换来的，不是「拆分」的收益**；不拒绝的后果记在同文件 `:69-72`（128 element f16 max：78 → 941 条指令） | 本仓 | **退出条件 = 一次覆盖 add 型与非归约 kernel 的上机 A/B，不是代码改动。** 建议臂：`rms_norm`（add 型，正收益）+ `vec_add` / `silu`（无归约，验证无害）+ `softmax`（max 型，验证 pass 的拒绝路径仍生效）。⛔ **不许先删闸门再测**——删了就再也拿不到 OFF 对照臂。⚠️ add 型的正收益目前只有**指令数**（1239 → 686，`AGENTS.md:117`），**缺上机 A/B** ⇒ 引用它时必须说清这一点 |
+| `enableVectorization`（A/B 前不许碰，且**不能与 R2 分开动**） | 默认 **ON**（`backend/hexagon_options.py:76`），**两个**消费点：`LinalgToLLVMPass.cpp:388`（`HexagonTilingPass`）与 `:421`（`HexagonVectorizationPass`）。实测 `=false` 仍合法（rc=0，17013 B vs 17646 B）。⚠️ **`:421` 的 `if (enableVectorization)` 块里有 `vectorizeOpts.skipVectorRowReduce = enableVectorRowReduce;`（`:423`）** ⇒ **它与 `enableVectorRowReduce` 共用一个 option struct，删 `:421` 的闸门会同时删掉这行** ⇒ R2 的 skip 语义被静默清掉。⚠️ 顺带勘误一条被引用的数字：分类表写「实测 `=false` 仍合法、`mma`=3」——「仍合法」成立，但本形状上 `mma` **恒为 2 不变**（K=256 只切 2 个 K-tile，`mma` 数与向量化无关） | 本仓 | **退出条件 = 与 `enableVectorRowReduce` 一起做一个联合决定，不是代码改动。** 两条必须同进同退（理由见上列 `:423`）。⛔ **不许单独动 `:421`。** 由于 R2 已在上一两行结案（A/B 完成、结论=保持 OFF），本行的实际处置是：**先只做登记**（把「`:421`+`:423` 是一个不可分割单元」写进本表），联合决定等 R2 的下次触发条件（随 FA 行归约向量化落地后重测）一起做 |
+| **R1/R2 两行已结案 —— step 4 不得重开** | 上两行（`enableMaxnumLegalize` / `enableVectorRowReduce`）的退出条件**已满足**：上机 A/B 跑完，结论=**保持 OFF**（`docs/codegen/r1-ab-2026-09-30.md:145-149`；R1 −4.9% / ≈0 / 反慢 1.1%，R2 +1.4% 而差值 CV 6.4%，三个配置全部低于 `max(3×CV, 15%)`） | 本仓 | **无退出计划：已结案。** ⛔ **A1 step 4（S 组）不得重开这两条。** 它们已经是「默认 OFF 的已测项」，不是「待处理项」；S 组的 27 个数字里含它们只是因为本表按**决策点**计数，不按**待办**计数。下次触发：随「FA 行归约向量化」落地后**重测一次**，届时若仍无效则连 pass 一起删 |
+| **`backend/compiler.py` 的 `scratch>0` 静默改写（独立缺陷，需用户）** | `backend/compiler.py:292-299`：`scratch > 0` 时用 `dataclasses.replace` **静默改写 4 个 flag** —— `enableMultiThreading=False`、`enableConvertToHexagonmem=False`、`enableVTCMTiling=True`、`enableThreadedDispatch=True`，**用户完全不被告知**。⚠️ 其中 `enableConvertToHexagonmem=False` **正是那个会干净拒绝全部 HMX 的开关**（`reason=vtcm-allocator-disabled`，见 §1.2 / `docs/codegen/knob-fork-classification-2026-09-30.md §1.2`）。它确实进了编译 key（`backend/hexagon_options.py:187`）⇒ A/B 本身可靠，但「**用户设的值 ≠ 被编译的值**」，违反项目硬规则「不许静默回退」 | **用户**（不是本仓 agent） | **无 agent 退出计划：这是需要用户决定的契约变更，不在 A1 的工作面内。** 三个选项：(a) 改成 loud 拒绝（`scratch>0` 与用户显式设的 flag 冲突时报错）；(b) 保留静默但**在编译日志里逐条打印**改写了什么；(c) 删掉这个隐式耦合、让 `scratch>0` 不再改写任何 flag。⚠️ **本行只是登记，不代表已批准任何一项**（`AGENTS.md`：未经用户批准不得自动变更契约）。**分类表 §3 已定性它是「独立缺陷，不是冗余旋钮」** ⇒ **不许把它当成 S 组旋钮顺手改掉** |
+
+#### R1/R2 前提复核（2026-09-30）——为什么上面两行被改
+
+原两行的问题不是措辞，是**它们被当成依据引用，而内容已经不成立**：
+
+1. **R1 的「等上游 RA 修复」是假的。** 已 cherry-pick 的
+   `tools/hexmlir/llvm-hexagon-ps-aligna.patch` 逐文件核对只含
+   `HexagonFrameLowering` / `HexagonISelDAGToDAG` / `HexagonRegisterInfo` /
+   `HexagonVExtract` + 3 个测试——**没有 RA、scheduler、callingconv、prologepilog**。
+   它修的是**栈/帧对齐**（AP 欠对齐），不是寄存器分配。
+   ⚠️ 仓内还有一处**未解决的自相矛盾**：`fa-crash-resolved.md:53` 认为
+   那三个"bug"很可能只是同一个 AP 欠对齐的下游症状——**若如此，这个 patch 确实修好了它**，
+   只不过机制不是 RA。**没有修好之后 R1-ON 的上机 A/B 记录**，
+   所以退出条件（"上游 RA 修复后上机 A/B ⇒ 改默认"）**未满足**。
+   ⇒ 待办：跑那一次 A/B。它是**唯一**能同时决定 R1 和 R2 的测量。
+
+2. **R2 的「生产管线零命中」已过期 —— 而且不只是"过期"，是设计如此。**
+   谓词 `matchVectorRowReduce`（`lib/Conversion/LinalgToLLVM/Common.cpp:78`）
+   的注释原文写着：
+   *"The op reaches us either still as a `linalg.reduce` or, since
+   LinalgGeneralize rewrites every reduce to a generic earlier in the pipeline,
+   as a `linalg.generic` carrying a reduction iterator. Both are accepted."*
+   ⇒ **generic 形式就是当前流水线实际喂进来的形式**，谓词就是为它写的。
+   现测生产 FA：`vector.reduce.fmax` 调用点 **4 → 0**、`vror` **0 → 20**
+   （`docs/hmx/row-reduce-vector-domain-plan-2026-09-29.md:52`）。
+   旧测量（09-22）早于 generic 路径（09-24）。
+
+3. **两个旋钮都不冗余 —— 删掉它们是行为变更，不是清理。**
+   - R1 的 `isHvxVectorMaxnum` 匹配任何 `vector<*>` 的 `arith.maxnumf`，无形状前提；
+   - R2 除匹配外还牵动 `skipVectorRowReduce`（`LinalgToLLVMPass.cpp:423`），
+     而 **R1 消费 R2 的产物**（`:579-581`）⇒ 两者是一对。
+   ⇒ **不许把它们当"旋钮冗余"顺手删掉。**
+
+4. **三个子旋钮**（`Fixup` / `Sel` / `Skip`）**已在 pass 侧**（不是 Python-only），
+   且自述为 bisection 调试件。其中 `emitMaxnumFixup=false` 会把 `maxnum` 降成
+   `maximum`、**丢掉 maxnum 的 NaN 语义** ⇒ 那不是调试旋钮，是语义开关。
+   但它们的活消费者是 `exp/hmx/op_bench/fa_ablate.py:50,54,56`（`FA_MAXNUM*`），
+   **要删必须连那个脚手架一起删**，不能只删旋钮留一个失效的 env 门。
+   按「无 legacy」，等 R1 定案后一并处理。
+
+复算命令见 `docs/codegen/knob-audit-2026-09-29-revised.md`。
 
 ---
 
@@ -89,6 +183,43 @@ Triton → TTIR → triton-shared / Linalg
 | # | 工作项 | 内容 | 验收 |
 |---|---|---|---|
 | M1.1 | **决策系统 / kernel manifest**（评审差距①） | 每个 matmul 报告：是否走 HMX、为何没走、VTCM 用量、是否 blocking、pack/unpack 次数。现有 remark/warning 收敛为**结构化 manifest + 诊断接口**；先保留现有 remark/warning 作为兼容输出 | 标准批可一键打印 manifest；字段与 pass 内判定一一对应；manifest 缺失或字段不一致使测试失败 |
+> **⚠️ M1.1 的实测状态（2026-10-01）——「manifest 已经有了，缺的是有人读它」**
+>
+> **manifest 侧已经完成**：`execution.plan` / `reason` / `pipeline.*` / `bridge_counts.*` 齐全，
+> host 侧有读取器。**但 Triton 路径上没有任何东西会把它印出来。**
+> 实测 43 臂（host-only，单构建逐臂盖指纹）：41 个含 `tl.dot` 的算子里
+> **31 到 HMX / 8 静默掉回 HVX（19.5%）/ 2 响亮硬错误**；
+> **8 个静默里 6 个在 manifest 里有精确 reason code——数据是对的，只是没人看到。**
+>
+> **机制（三步，均本机复核）**：`mlir/lib/IR/Diagnostics.cpp:258-262` 先遍历 handler、都没接住才走
+> 「只打印 `Error`」的默认路径 ⇒ **阈值只在没有 handler 时才生效**；
+> Triton 确实装了 handler（`triton/python/src/ir.cc:107`），但它是**按值返回的局部对象**、
+> 基类 `ScopedDiagnosticHandler` **析构即注销**（`Diagnostics.cpp:432`），
+> 只活 `:168`/`:594`/`:1976` 三处；
+> 而 HMX 归属跑在 `backend/compiler.py:199` 的 `translate_linalg_to_obj` 里 —— **不在那三处**。
+>
+> **⛔ `MLIR_ENABLE_DIAGNOSTICS` 是诱饵，不要去调它。** 它真实存在（`ir.cc:108-131`）且看起来正是
+> 那个旋钮，但它抬高的是**一个当时并未装在编译 context 上的** handler 的阈值：
+> 本机四组设置（不设 / `warnings` / `remarks` / `warnings,remarks`）实测 **MLIR 诊断行数全为 0**。
+> 复现：`PROBE_M=16 .venv/bin/python exp/hmx/diag_visibility/probe.py`
+> （**两行输出就是全部证据**：`manifest: hvx / tile-alignment` + `MLIR diagnostic lines: 0`）。
+>
+> **⚠️ 本条自己的勘误 E2 已被 E12 推翻**（`docs/analysis/gap-casual-op-hmx-hvx-fusion-2026-10-01.md`）：
+> E2 写「没有阈值 setter ⇒ handler 办法是死路」，**三句全错**。
+> **教训**：「我们没有某个 setter」这类**否定判断必须去读被依赖那个库的源码**，
+> 不能靠本仓调用点推断——MLIR 源码就在 `llvm_triton/llvm-project/` 里。
+>
+> **已落地的部分**：`tools/hexmlir/manifest_verdict.py`（每 matmul 一行 + 模块级
+> `ALL n / ⚠️ PARTIAL only k of n / NO site on HMX`），`codegen.sh` 在 JSON 之前先打它。
+> **⚠️ 它顺手暴露了一个新问题**：`vtcm-budget` 会产出**「半 HMX」kernel**
+> （3 个链式 matmul，1 个被拒 2 个收下，**报告成功、三分之一在 HVX、原本无任何标记**）——
+> 「我拿到 HMX 了吗」这个问题对这种 kernel 的答案是**错的**。
+>
+> **剩下的（需用户决定）**：把 handler 装到 `translate_linalg_to_obj` 那层（**噪声是真的**：
+> 所有 Triton 编译都会开始出 warning，含与 HMX 无关的 kernel），还是只做 manifest 汇总
+> （信息更少，但 `triton_hexagon_launcher.py:571` 已有先例）。详见
+> `docs/codegen/why-hmx-refusals-are-invisible-2026-10-01.md`。
+
 | M1.2 | **Triton 支持矩阵**（差距②） | 明确四档：可编译 / 可 HMX / 仅 HVX / 拒绝；落成文档 + 测试矩阵，替代"散落在 pass 条件里" | 矩阵每格有对应测试；新 kernel 能 5 分钟查到归宿 |
 | M1.3 | **记档项按触发执行** | 先建立缺失状态文档，记录布局生命周期、BufferManager 五入口、预算归属、resident 内容校验的现状和触发条件；再按文档中的触发条件实施，不把未存在的 `STATE §7.8/§7.9` 当作已批准设计 | 每个记档项都有源码证据、设计决议、lit 锁和设备验证记录 |
 | M1.4 | **清理与退役** | 先复现并分类 `return_alloc_from_loop`；只有确认是既存且与本线无关时才 XFAIL。对 `HEXAGON_EPI_LOG`、`HEXAGON_PTR_LOG`、`HEXAGON_ASM_DUMP` 等环境门逐项标明用途、默认值、移除条件 | `run_lit_all` 的结果可复现；**每个红测/临时门都在 §2.1 的 inventory 里有 owner 和退出条件** |

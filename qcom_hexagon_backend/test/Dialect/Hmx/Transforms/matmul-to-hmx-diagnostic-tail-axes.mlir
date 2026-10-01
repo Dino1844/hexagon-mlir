@@ -46,3 +46,24 @@ func.func @tail_k_only(%a: tensor<64x33xf16>, %b: tensor<33x64xf16>) -> tensor<6
       -> tensor<64x64xf16>
   return %0 : tensor<64x64xf16>
 }
+
+// A rectangular contraction is the case that exposes a swapped weight-crouton
+// argument: `weightCroutonType` takes the row-major [K, N], so feeding it the
+// padded [N, K] silently transposed the grid and the matmul verifier refused
+// ("inner tile counts must agree"). Every square-shape case above is blind to
+// it. M=16 with N=512 is also the decode shape this M-tail path exists for,
+// and it is the full-M=0 edge (full M is empty; the M edge is the whole work).
+// CHECK-LABEL: func.func @tail_m16_rect
+// CHECK: hmx.matmul
+// CHECK-SAME: tail_plan = #hmx.tail_plan<logical = [16, 512, 64], padded = [32, 512, 64], full = [0, 512, 64], tail = [16, 0, 0]
+// E2E-LABEL: func.func @tail_m16_rect
+// E2E-DAG: llvm.call @hmx_pack_act_tail_f16
+// E2E-DAG: llvm.call @hmx_pack_weight_f16
+// E2E-DAG: llvm.call @hmx_unpack_acc_tail_f16
+func.func @tail_m16_rect(%a: tensor<16x64xf16>, %b: tensor<64x512xf16>) -> tensor<16x512xf16> {
+  %c = tensor.empty() : tensor<16x512xf16>
+  %0 = linalg.matmul ins(%a, %b : tensor<16x64xf16>, tensor<64x512xf16>)
+      outs(%c : tensor<16x512xf16>) {hmx.diagnostic_tail_partition}
+      -> tensor<16x512xf16>
+  return %0 : tensor<16x512xf16>
+}

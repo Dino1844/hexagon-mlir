@@ -53,16 +53,12 @@ struct HvxMaxnumLegalizePass
 public:
   explicit HvxMaxnumLegalizePass() = default;
 
-  // Bisection knob (set by the factory, not a pass option): false = bare
-  // maximumf without the NaN fixup. NOT semantically safe in general (drops
-  // strict maxnum semantics); only for isolating device-side failures.
-  bool emitFixup = true;
-  // Site selector for bisection: <0 = rewrite all candidates (normal);
-  // >=0 = rewrite only the first N walk-ordered sites (device crash triage,
-  // rowmax plan §10).
-  int rewriteLimit = -1;
-  // Additionally skip this many walk-ordered sites from the start.
-  int skipFirst = 0;
+  // The pass used to carry three bisection knobs here (`emitFixup`,
+  // `rewriteLimit`, `skipFirst`), settable only through the factory. They were
+  // removed 2026-09-30: the NaN fixup is not optional (dropping it emits bare
+  // `maximumf` and loses strict maxnum semantics), and the two site selectors
+  // bisected a device crash since attributed to the LLVM Hexagon AP
+  // under-alignment. What the pass does is now one behaviour, not a family.
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<arith::ArithDialect>();
@@ -77,21 +73,13 @@ public:
         candidates.push_back(op);
     });
     // Always-on observability for the success path (this pass used to dump to
-    // raw stderr): a remark both reports the bisection state and doubles as
-    // the wiring assertion of
-    // test/Conversion/LinalgToLLVM/maxnum-legalize-pipeline.mlir.
-    fn->emitRemark() << "hvx-maxnum-legalize: candidates=" << candidates.size()
-                     << " skip=" << skipFirst << " limit=" << rewriteLimit;
-    size_t idx = 0;
-    for (arith::MaxNumFOp op : candidates) {
-      if (idx++ < static_cast<size_t>(skipFirst > 0 ? skipFirst : 0))
-        continue;
-      if (rewriteLimit >= 0 &&
-          static_cast<int>(idx - (skipFirst > 0 ? skipFirst : 0)) >
-              rewriteLimit)
-        break;
+    // raw stderr). The remark is also the wiring assertion of
+    // test/Conversion/LinalgToLLVM/maxnum-legalize-pipeline.mlir, so it must
+    // stay: it is the only place that says how many sites were found.
+    // (It used to also report the bisection state; those knobs are gone.)
+    fn->emitRemark() << "hvx-maxnum-legalize: candidates=" << candidates.size();
+    for (arith::MaxNumFOp op : candidates)
       rewrite(op);
-    }
   }
 
 private:
@@ -105,11 +93,6 @@ private:
     // ISel selects into V6_vmax. The original op's fastmath flags carry
     // over: they are assertions about the inputs, not a semantic change.
     Value vmax = arith::MaximumFOp::create(b, loc, a, c, op.getFastmath());
-    if (!emitFixup) {
-      op.replaceAllUsesWith(vmax);
-      op.erase();
-      return;
-    }
 
     // Strict maxnum NaN semantics (a NaN operand yields the other operand):
     // oeq(x, x) is false exactly when x is NaN, so each select substitutes
@@ -132,11 +115,6 @@ private:
 } // namespace
 
 std::unique_ptr<OperationPass<func::FuncOp>>
-mlir::hexagon::createHvxMaxnumLegalizePass(bool emitFixup, int rewriteLimit,
-                                            int skipFirst) {
-  auto pass = std::make_unique<HvxMaxnumLegalizePass>();
-  pass->emitFixup = emitFixup;
-  pass->rewriteLimit = rewriteLimit;
-  pass->skipFirst = skipFirst;
-  return pass;
+mlir::hexagon::createHvxMaxnumLegalizePass() {
+  return std::make_unique<HvxMaxnumLegalizePass>();
 }

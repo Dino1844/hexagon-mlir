@@ -182,3 +182,42 @@ module {
     return
   }
 }
+
+// -----
+
+// An f32 source is admitted too: the host quantises it to the crouton's fp16
+// with the same round-to-nearest conversion the device f32 pack leaf runs, so
+// the contract names the *source* dtype (`"f32"`) and the image stays an fp16
+// crouton. The resident byte count is therefore the crouton's 8192, not the
+// argument's 16384, and the bridge is still erased.
+// CHECK: hmx.weight_prepack = "[{\22func\22:\22runtime_weight_f32\22,\22slot\22:1,\22shape\22:[64,64],\22crouton\22:[2,2,16,32,2],\22dtype\22:\22f32\22}]"
+// CHECK: hmx.weight_prepack_layout = "{{[{]\\22ndims\\22:5,\\22results\\22:\[\[\[1,32\],\[2,2\],\[4,1\]\],\[\[0,32\],\[3,1\]\]\][}]}}"
+// CHECK: hmx.weight_resident_bytes = 8192 : i64
+module {
+  // CHECK-LABEL: func.func @runtime_weight_f32
+  func.func @runtime_weight_f32(%a: memref<64x64xf16>, %w: memref<64x64xf32>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c4 = arith.constant 4 : index
+    // CHECK-NOT: hmx.pack_weight
+    // CHECK: %[[ADDR:.*]] = memref.extract_aligned_pointer_as_index
+    // CHECK: %[[W:.*]] = hexagonmem.alloc(%[[ADDR]]) {hmx.weight_resident = {address, bytes = 8192 : i64}} : memref<2x2x16x32x2xf16, 1>
+    %wa = memref.alloc() : memref<2x2x16x32x2xf16, 1>
+    scf.for %i = %c0 to %c4 step %c1 {
+      %r = arith.divui %i, %c2 : index
+      %c = arith.remui %i, %c2 : index
+      hmx.pack_weight ins(%w, %r, %c : memref<64x64xf32>) outs(%wa : memref<2x2x16x32x2xf16, 1>)
+    }
+    %aa = memref.alloc() : memref<2x2x16x32x2xf16, 1>
+    %ar = memref.alloc() : memref<2x2x16x32x2xf16, 1>
+    // CHECK: hmx.matmul ins({{.*}}, %[[W]] : memref<2x2x16x32x2xf16, 1>
+    // CHECK-NOT: memref.dealloc %[[W]]
+    // CHECK: return
+    hmx.matmul ins(%aa, %wa : memref<2x2x16x32x2xf16, 1>, memref<2x2x16x32x2xf16, 1>) outs(%ar : memref<2x2x16x32x2xf16, 1>)
+    memref.dealloc %wa : memref<2x2x16x32x2xf16, 1>
+    memref.dealloc %aa : memref<2x2x16x32x2xf16, 1>
+    memref.dealloc %ar : memref<2x2x16x32x2xf16, 1>
+    return
+  }
+}

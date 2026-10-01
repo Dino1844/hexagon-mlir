@@ -10,6 +10,7 @@ add_mlir_conversion_library(LinalgToLLVM
   FusionPass.cpp
   SplitReduceGenericPass.cpp
   VectorRowReducePass.cpp
+  RowReduceGroupStorePass.cpp
   EraseVectorToTensorWritebackPass.cpp
   SlicingPass.cpp
   TilingPass.cpp

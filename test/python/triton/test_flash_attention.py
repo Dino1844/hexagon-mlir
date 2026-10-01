@@ -61,9 +61,35 @@ def _attn_fwd_inner(
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
         k = tl.load(K_block_ptr)
+        # DO NOT "FIX" THIS BY DELETING `tl.trans` AND NOTHING ELSE.
+        #
+        # The old comment here said the explicit transpose was a workaround for
+        # "block ptr transpose creation failure". That is obsolete: with the
+        # pinned Triton (3.7.0 @ a9ced83) a transposed K block pointer
+        # (shape=(BLOCK_DMODEL, N_CTX), strides=(stride_3, stride_2),
+        # block_shape=(BLOCK_DMODEL, BLOCK_N), order=(0,1)) lowers cleanly --
+        # no `tt.trans`, no `linalg.transpose`, just a column-major
+        # `memref.reinterpret_cast` with `strides: [1, 64]`. Measured, see
+        # docs/hmx/fa-transpose-copy-design-2026-09-30.md.
+        #
+        # The blocker is ours, not Triton's: `hmx.pack_weight`'s source contract
+        # is row-major only, and the column-major K view is rejected by
+        # `HmxOps.cpp` verifyPackSource ("src row stride 1 is smaller than its
+        # 64 columns"). Worse, a column-major RHS currently sails through
+        # `MatmulToHmxPass` admission (`isRowMajorMatmul` compares indexing
+        # maps, not strides) and only dies in that leaf verifier.
+        #
+        # ⚠️ THE TRAP, measured 2026-10-01: deleting ONLY the `tl.trans` line,
+        # leaving the block pointer alone, compiles with ZERO diagnostics and
+        # silently computes qkᵀ instead of qk. Its ttsharedir differs from the
+        # correct transposed-block-pointer form in exactly two stride values
+        # (`strides: [64, 1]` where it must be `[1, 64]`) and nothing else. It
+        # type-checks only because BLOCK_N == BLOCK_DMODEL == 64.
+        # The explicit transpose below is therefore load-bearing until the
+        # pack leaf can read a K-contiguous source; see the same doc.
         qk = tl.dot(
             q, tl.trans(k)
-        )  # TODO: Explicit transpose to override block ptr tranpose creation failure
+        )
         m_ij = tl.maximum(m_i, tl.max(qk, 1) * qk_scale)
         qk = qk * qk_scale - m_ij[:, None]
         p = tl.math.exp2(qk)

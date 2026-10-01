@@ -22,6 +22,18 @@ and it verifies its vectorised fast path against that map on a small canary, so
 a future change to the compiler layout fails loudly instead of silently
 corrupting the weight.
 
+The image is always the engine's fp16 crouton. An f16 source is permuted; an
+f32 source is first quantised to fp16 with the same conversion the device-side
+f32 pack leaf runs (``hmx__f32_pair_to_block``: an exact ``+0.0`` in f32, then
+round-to-nearest-even to fp16). For every non-NaN input the resident bytes are
+therefore exactly what that pack would have written, including the ``-0.0``
+canonicalisation the leaf's ``+0.0`` performs. NaN payloads are the one
+exception: the leaf canonicalises a NaN to its sign with an all-ones payload
+(observed on hexagon-sim, all four of qNaN/sNaN x +/-), while this packer keeps
+numpy's (quiet bit alone). A NaN weight is a NaN either way, so the images are
+numerically equivalent, not bit-equal. The contract's ``dtype`` names the
+source, and ``pack`` refuses a tensor whose dtype does not match it.
+
 Identity/caching: packing is keyed by ``(slot, shape, dtype, content hash)`` --
 a content-addressed cache, never a tensor `data_ptr` cache -- so repeated
 launches of the same weight reuse one packed image. The host contract accepts
@@ -40,6 +52,9 @@ import numpy as np
 from triton.backends.qcom_hexagon_backend.utils import validate_weight_prepack
 
 _TILE = 32
+#: The crouton image's element is the engine's fp16, whatever the source dtype
+#: is (a wider source is quantised by the pack).
+_CROUTON_ELEM_BYTES = 2
 
 
 class WeightPrepack:
@@ -92,13 +107,29 @@ class WeightPrepack:
     def unconsumed_slots(self, consumed: set[int]) -> set[int]:
         return set(self._by_slot) - set(consumed)
 
+    def image_bytes(self, slot: int) -> Optional[int]:
+        """The crouton image's byte count for a contract slot.
+
+        ``None`` means that the contract has no such slot. The image is the
+        engine's fp16 crouton, so this is exact and independent of the source
+        dtype: an f16 source packs to the argument's own byte count, an f32
+        source to half of it. The launcher asserts ``pack`` against this
+        instead of padding whatever it is handed.
+        """
+        desc = self._by_slot.get(slot)
+        if desc is None:
+            return None
+        return int(np.prod(desc["crouton"], dtype=np.int64)) * _CROUTON_ELEM_BYTES
+
     def pack(self, tensor, slot: int) -> Optional[bytes]:
-        """Return crouton-ordered bytes for a contract slot.
+        """Return the fp16 crouton image for a contract slot.
 
         ``None`` means that the contract has no such slot.  Once a slot is
         present, a runtime shape or dtype mismatch is an error: the generated
         kernel consumes the resident image directly and has no safe raw-byte
-        fallback.
+        fallback.  An f32 source packs to an image half its byte size; the
+        launcher writes it as the argument image (zero-padded to the
+        argument's own byte count).
         """
         desc = self._by_slot.get(slot)
         if desc is None:
@@ -114,9 +145,12 @@ class WeightPrepack:
             raise ValueError(
                 f"weight slot {slot} has shape {tuple(arr.shape)}, expected {shape}"
             )
-        if arr.dtype != np.dtype(np.float16):
+        # The contract spells dtypes in the compiler's vocabulary ("f16"/"f32").
+        expected = {"f16": np.float16, "f32": np.float32}[desc["dtype"]]
+        if arr.dtype != np.dtype(expected):
             raise ValueError(
-                f"weight slot {slot} has dtype {arr.dtype}, expected float16"
+                f"weight slot {slot} has dtype {arr.dtype}, "
+                f"expected {np.dtype(expected).name}"
             )
         raw = arr.tobytes()
         key = (
@@ -160,6 +194,19 @@ class WeightPrepack:
         if not self._layout_verified:
             self._verify_layout(t0, t1, j, c, h)
             self._layout_verified = True
+        # An f32 source is quantised to the crouton's fp16 first, with the
+        # device leaf's own sequence (`hmx__f32_pair_to_block`: qf32 convert +
+        # Q6_Vhf_equals_Wqf32). `astype` is IEEE round-to-nearest-even and the
+        # leaf's conversion agrees with it on every *non-NaN* value, with one
+        # deliberate addition: the leaf's `Q6_Vqf32_vadd_VsfVsf(v, zero)`
+        # canonicalises -0.0 to +0.0 (IEEE: (-0) + (+0) = +0), which this add
+        # reproduces. NaN payloads differ (the leaf writes sign + all-ones;
+        # numpy keeps its payload) and are not reproduced -- see the module
+        # docstring. Verified on hexagon-sim:
+        # logs/f32-prepack-2026-09-29/sim_rounding_check.py.
+        if arr.dtype == np.dtype(np.float32):
+            arr = arr + np.float32(0.0)
+            arr = arr.astype(np.float16)
         # f16 bits are preserved through the permutation.
         bits = arr.view(np.uint16)
         return self._permute(bits, t0, t1, j, c, h).tobytes()

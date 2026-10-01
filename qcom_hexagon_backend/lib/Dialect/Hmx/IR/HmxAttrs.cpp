@@ -71,6 +71,9 @@ ParseResult parseTailPlanString(AsmParser &parser, StringRef name,
 }
 
 bool alignUpTile(int64_t value, int64_t &result) {
+  // NOT-A-DECISION: a local alias of layout::kTileEdge so the arithmetic below
+  // reads in one unit. It carries no value of its own -- changing it changes
+  // nothing, which is exactly why it is not a decision.
   constexpr int64_t kTile = layout::kTileEdge;
   if (value <= 0 || value > std::numeric_limits<int64_t>::max() - (kTile - 1))
     return false;

@@ -53,6 +53,14 @@ std::unique_ptr<OperationPass<func::FuncOp>> createSplitReduceGenericPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createVectorRowReducePass();
 
+// Row reduction whose horizontal fold stays in the vector domain: the butterfly
+// result is placed into lane j of a group register and written once per group.
+// Declared here (like createVectorRowReducePass) because the generated
+// Passes.h.inc calls it too; without the declaration both call sites see an
+// implicit `void` and fail to compile.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createRowReduceGroupStorePass();
+
 std::unique_ptr<OperationPass<func::FuncOp>>
 createEraseVectorToTensorWritebackPass();
 

@@ -185,7 +185,20 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
         # required translation envelope. Resident weights are safe here only
         # because the wrapper consumes the same contract before writing inputs.
         obj_modules, translation_metadata = self.mlir_to_obj(mlir_mod, options)
-        weight_metadata, _ = parse_translation_metadata(translation_metadata)
+        # parse_translation_metadata returns (weight_prepack, hmx_manifest,
+        # hmx_record) -- utils.py:1686 and the backend's own tests all unpack
+        # three. This call site was left at two when the v3 `hmx_record` child
+        # was added, so it raised `ValueError: too many values to unpack` for
+        # EVERY kernel on the torch-mlir path -- found 2026-10-01 by noticing
+        # that hexagon-mlir/test/python/torch-mlir/ is 8-for-8 red and lives
+        # outside every gate (run_host_tests.py globs only
+        # qcom_hexagon_backend/test and qcom_hexagon_backend/bin/runtime/test).
+        #
+        # Only the weight contract is consumed here; the manifest and the record
+        # are host-side children this launcher has never read. So they are
+        # discarded by name, not by counting -- that way the next arity change
+        # is a loud error here rather than a silent mis-index.
+        weight_metadata, _, _ = parse_translation_metadata(translation_metadata)
         from triton.backends.qcom_hexagon_backend.hmx_weight_prepack import WeightPrepack
 
         weight_prepack = WeightPrepack.from_metadata(weight_metadata)

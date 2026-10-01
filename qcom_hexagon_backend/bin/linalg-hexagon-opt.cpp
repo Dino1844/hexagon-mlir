@@ -85,6 +85,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerHexagonTilingPass();
   mlir::hexagon::registerLinalgToLLVMPass();
   mlir::hexagon::registerVectorRowReducePass();
+  mlir::hexagon::registerRowReduceGroupStorePass();
   mlir::hvx::registerHvxToLLVMPass();
   mlir::hexagon::registerHexagonVectorLoweringPass();
   mlir::hexagon::registerHexagonVectorizationPass();

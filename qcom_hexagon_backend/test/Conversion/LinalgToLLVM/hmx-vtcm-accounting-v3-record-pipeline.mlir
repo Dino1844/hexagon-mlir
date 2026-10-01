@@ -15,7 +15,7 @@
 // the record carries are the ones the analysis derived from this IR: a fixture
 // that typed the sidecars in could not tell a real join from a copy.
 //
-// Three modules, three properties:
+// Four modules, four properties:
 //
 //  1. One attributed matmul with both census markers.  The census finds the four
 //     VTCM allocation sites the tile level emits (the bias state, the
@@ -37,6 +37,14 @@
 //     and the record must publish no requested byte at all -- the three names
 //     are present but empty next to `not-proven`.  A record that derived a
 //     number from the manifest alone would look like case 1 from outside.
+//
+//  4. Case 1 with an f32 weight: the resident contract admits it (the host
+//     quantises the crouton image), so the accounting pass's own copy of that
+//     admission must admit it too.  Before that copy was widened, this module
+//     failed with "HMX VTCM accounting is incomplete ..." even though the IR
+//     came out of this very pipeline.  The f16 byte figures are unchanged --
+//     the crouton is fp16 either way -- so only the policy reason and the
+//     source dtype differ.
 //
 // Nothing here changes the execution contract: the v2 manifest is still the
 // authority and the v3 document is still `admission = "not-authorized"`.
@@ -219,3 +227,51 @@ module attributes {hmx.diagnostic_v3_record} {
 // CHECK-DAG: proofs = {allocator = {basis, status = "not-proven"}, grid = {basis, status = "not-proven"}, liveness = {basis, status = "not-proven"}, resident = {basis, status = "not-proven"}}
 // CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes, resident_requested_bytes, status = "not-proven", transient_requested_peak_bytes, unit = "bytes"}
 // CHECK-DAG: schema = "hex.hmx.kernel_manifest/v3"
+
+// -----
+
+// Case 1 with an f32 weight.  The manifest names the quantising policy, the
+// weight pack site is still gone, and the census/liveness/record figures are
+// the f16 ones: the resident crouton is fp16 whatever the source dtype is.
+module attributes {hmx.diagnostic_vtcm_accounting,
+                    hmx.diagnostic_vtcm_liveness,
+                    hmx.diagnostic_v3_record} {
+  func.func @one_matmul_f32(%a: tensor<64x64xf32>, %b: tensor<64x64xf32>) -> tensor<64x64xf32> {
+    %empty = tensor.empty() : tensor<64x64xf32>
+    %zero = arith.constant 0.000000e+00 : f32
+    %c = linalg.fill ins(%zero : f32) outs(%empty : tensor<64x64xf32>) -> tensor<64x64xf32>
+    %m = linalg.matmul ins(%a, %b : tensor<64x64xf32>, tensor<64x64xf32>)
+                      outs(%c : tensor<64x64xf32>) -> tensor<64x64xf32>
+    return %m : tensor<64x64xf32>
+  }
+}
+
+// Attributes print alphabetically, so the checks follow the output order:
+// manifest, record, census, liveness.
+// CHECK: hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{dtypes = {crouton = "f16", lhs = "f32", out = "f32", rhs = "f32"}
+// CHECK-DAG: pack_weight_sites = 0 : i64
+// CHECK-DAG: plan = "full-hmx"
+// CHECK-DAG: weight_policies = [{consumers = [0], function = "one_matmul_f32", policy = "resident-prepack", reason = "eligible-quantized-f32", slot = 1 : i64}]
+// CHECK-DAG: schema = "hex.hmx.kernel_manifest/v2"
+
+// The record takes the sidecar's numbers, exactly as the f16 case does.
+// CHECK: "hmx.kernel_record/v3" = {admission = "not-authorized", record_mode = "record-only", records = [{fallback = {on_malformed_record = "reject-v3-record"}, function = "one_matmul_f32", id = 0 : i64, plan = "full-hmx"
+// CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes = 24832 : i64, resident_requested_bytes = 8192 : i64, status = "complete", transient_requested_peak_bytes = 16640 : i64, unit = "bytes"}
+
+// The census admits the f32 resident source and closes every transient site.
+// CHECK: hmx.kernel_vtcm_accounting = {
+// CHECK-DAG: allocation_sites = 4 : i64
+// CHECK-DAG: raw_site_sum_bytes = 24832 : i64
+// CHECK-DAG: resident_site_sum_bytes = 8192 : i64
+// CHECK-DAG: status = "complete"
+// CHECK-DAG: transient_bytes = 16640 : i64
+// CHECK-DAG: unknown_allocations = 0 : i64
+// CHECK-DAG: weight_resident_bytes = 8192 : i64
+
+// And so does the liveness sidecar.
+// CHECK: hmx.kernel_vtcm_live_range = {
+// CHECK-DAG: allocation_site_coverage = "complete"
+// CHECK-DAG: modeled_requested_peak_bytes = 24832 : i64
+// CHECK-DAG: status = "complete", symbol = "one_matmul_f32"
+// CHECK-DAG: transient_requested_peak_bytes = 16640 : i64
+// CHECK-DAG: weight_resident_requested_bytes = 8192 : i64

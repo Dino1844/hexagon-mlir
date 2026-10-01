@@ -9,6 +9,7 @@
 
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 
 #include "mlir/IR/Builders.h"
@@ -116,11 +117,18 @@ constexpr StringLiteral kRowMajorInnerContiguous =
     kHmxLayoutRowMajorInnerContiguous;
 constexpr StringLiteral kTailKPolicy = kHmxTailKPolicy;
 constexpr StringLiteral kTailMNPolicy = kHmxTailMNPolicy;
-constexpr int64_t kMinimumHmxRows = 4;
+// The minimum-rows threshold is NOT repeated here. It used to be, as a private
+// `kMinimumHmxRows = 4`. That was one more copy of a number whose other homes
+// are HmxTarget::minRows and the hand-referenced llama.cpp spelling -- copies
+// with no comment saying which was authoritative, which is how a value drifts
+// without anyone noticing. The manifest validates the same
+// predicate the attribution applies, so it reads the same constant.
 
 constexpr StringLiteral kWeightResidentPrepack = kHmxWeightResidentPrepack;
 constexpr StringLiteral kWeightDevicePack = kHmxWeightDevicePack;
 constexpr StringLiteral kWeightEligibleAlignedF16 = kHmxWeightEligibleAlignedF16;
+constexpr StringLiteral kWeightEligibleQuantizedF32 =
+    kHmxWeightEligibleQuantizedF32;
 constexpr StringLiteral kWeightEligibleB2NSlice = kHmxWeightEligibleB2NSlice;
 constexpr StringLiteral kWeightTailConsumer = kHmxWeightTailConsumer;
 constexpr StringLiteral kWeightF32Source = kHmxWeightF32Source;
@@ -156,6 +164,7 @@ bool isCanonicalGridPolicy(StringRef value) {
 bool isCanonicalWeightReason(StringRef policy, StringRef reason) {
   if (policy == kWeightResidentPrepack)
     return reason == kWeightEligibleAlignedF16 ||
+           reason == kWeightEligibleQuantizedF32 ||
            reason == kWeightEligibleB2NSlice;
   if (policy == kWeightDevicePack)
     return reason == kWeightTailConsumer || reason == kWeightF32Source ||
@@ -927,10 +936,12 @@ LogicalResult validateRecord(ModuleOp module, DictionaryAttr record,
         module, report, "HMX manifest plan requires a tagged logical shape");
   if (logical.present && logical.state == ShapeState::Unavailable &&
       reason.getValue() != kHmxReasonLibraryCall &&
-      reason.getValue() != kHmxReasonNonRank2)
+      reason.getValue() != kHmxReasonNonRank2 &&
+      reason.getValue() != kHmxReasonUnsupportedLayout)
     return emitManifestError(
         module, report,
-        "only library-call and non-rank-2 may have unavailable logical shape");
+        "only library-call, non-rank-2 and unsupported-layout may have "
+        "unavailable logical shape");
   if (logical.present && reason.getValue() == kHmxReasonDynamicShape &&
       logical.state == ShapeState::Static)
     return emitManifestError(
@@ -943,9 +954,11 @@ LogicalResult validateRecord(ModuleOp module, DictionaryAttr record,
         logical.state != ShapeState::Static)
       return emitManifestError(
           module, report, "HMX plans require all-static logical dimensions");
-    if (logical.staticShape && (*logical.staticShape)[0] <= kMinimumHmxRows)
+    if (logical.staticShape &&
+        (*logical.staticShape)[0] <= HmxTarget::minRows)
       return emitManifestError(module, report,
-                               "HMX plans require logical M > 4");
+                               "HMX plans require logical M > " +
+                                   llvm::Twine(HmxTarget::minRows));
     if (failed(validatePhysicalShape(module, record, *plan, logical, report,
                                      requireFinal)) ||
         failed(
@@ -1460,11 +1473,27 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
                 aligned = false;
             }
           }
+          // A resident-prepack consumer's weight is either exactly fp16 (the
+          // host permutes its bytes) or fp32 (the host quantises with the same
+          // conversion the device pack would run). The reason has to name the
+          // same dtype the record declares: `eligible-quantized-f32` exists so
+          // a manifest cannot claim an exact fp16 image for an fp32 weight.
+          bool admittedF16 =
+              dtypesValue && dtypesValue.getValue() == kHmxDTypeF16;
+          bool admittedF32 =
+              dtypesValue && dtypesValue.getValue() == kHmxDTypeF32;
+          StringAttr reasonAttr = stringField(summary.value, kKeyReason);
+          StringRef reason =
+              reasonAttr ? reasonAttr.getValue() : StringRef();
+          bool dtypeMatchesReason =
+              (reason != kWeightEligibleAlignedF16 || admittedF16) &&
+              (reason != kWeightEligibleQuantizedF32 || admittedF32);
           if (summaries[index].plan != PlanKind::FullHMX || !aligned ||
-              !dtypesValue || dtypesValue.getValue() != kHmxDTypeF16)
-            return emitManifestError(module, reportErrors,
-                                     "resident-prepack is only valid for "
-                                     "aligned exact-f16 HMX consumers");
+              (!admittedF16 && !admittedF32) || !dtypeMatchesReason)
+            return emitManifestError(
+                module, reportErrors,
+                "resident-prepack is only valid for aligned f16/f32 HMX "
+                "consumers whose policy reason matches the weight dtype");
         }
       }
     }
@@ -1798,6 +1827,9 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
 
   struct PrepackInfo {
     std::optional<int64_t> logicalN;
+    // The source dtype of the contract's crouton image: an f32 source is
+    // quantised by the host, which the policy reason distinguishes.
+    bool quantizedF32 = false;
   };
   std::map<std::string, PrepackInfo> prepackedSlots;
   if (auto prepack =
@@ -1831,6 +1863,8 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
               module, true, "hmx.weight_prepack entry has an invalid shape");
         info.logicalN = *n;
       }
+      if (auto sourceDtype = object->getString("dtype"))
+        info.quantizedF32 = *sourceDtype == kHmxDTypeF32;
       std::string key = (*function).str() + "\x1f" + std::to_string(*slot);
       if (!prepackedSlots.emplace(std::move(key), info).second)
         return emitManifestError(
@@ -1911,7 +1945,10 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
       policy = kWeightResidentPrepack;
       bool b2 = prepacked->second.logicalN && info.logical &&
                 *prepacked->second.logicalN != (*info.logical)[1];
-      reason = b2 ? kWeightEligibleB2NSlice : kWeightEligibleAlignedF16;
+      reason = b2 ? kWeightEligibleB2NSlice
+                  : (prepacked->second.quantizedF32
+                         ? kWeightEligibleQuantizedF32
+                         : kWeightEligibleAlignedF16);
     } else if (prepackRuntimeWeights) {
       if (info.hasShapeConflict)
         reason = kWeightIncompatibleConsumers;

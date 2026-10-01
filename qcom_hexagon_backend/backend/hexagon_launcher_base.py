@@ -520,6 +520,23 @@ class HexagonLauncherBase:
                         raise RuntimeError(
                             f"weight slot {i} has a prepack contract but no packed image"
                         )
+                    # The image is the crouton (fp16), so its length is exact:
+                    # an f16 source packs to the argument's own byte count, an
+                    # f32 source to half of it. Anything else is a packer or
+                    # contract defect, not something to pad over.
+                    expected = prepack.image_bytes(i)
+                    if len(payload) != expected or expected > data.nbytes:
+                        raise RuntimeError(
+                            f"weight slot {i} packed {len(payload)} bytes, "
+                            f"expected the {expected}-byte crouton image "
+                            f"(argument is {data.nbytes} bytes)"
+                        )
+                    if expected < data.nbytes:
+                        # The wrapper loads the argument's own byte image
+                        # (`elems * sizeof(T)`); the resident copy reads only
+                        # the image's prefix, so zero-pad the tail it never
+                        # reads.
+                        payload = payload.ljust(data.nbytes, b"\0")
                 if payload is None:
                     payload = data.numpy().tobytes()
                 with open(input_path, "wb") as file:

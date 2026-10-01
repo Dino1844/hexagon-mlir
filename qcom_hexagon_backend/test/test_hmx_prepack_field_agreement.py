@@ -60,15 +60,18 @@ TOP_LEVEL_FIELDS = ("layout", "weights")
 #: Rank of `shape` (logical [N, K]) and of `crouton` ([Nt, Kt, 16, 32, 2]).
 LOGICAL_RANK = 2
 CROUTON_RANK = 5
-#: The only dtype the producer emits and the only one the consumer accepts.
-DTYPE = "f16"
+#: The source dtypes the producer may emit and the consumer accepts. `dtype`
+#: names the source argument's element type; the packed image is always the
+#: fp16 crouton, and an f32 source is quantised by the host.
+DTYPES = ("f16", "f32")
+DTYPE = DTYPES[0]
 
 # A layout the consumer accepts, mirroring the producer's `prepackLayoutJson`
 # coefficient map: physical (d0=n_tile, d1=k_tile, d2=j, d3=c, d4=h) maps to
 # logical (tile*d1 + half*d2 + d4, tile*d0 + d3).
 _LAYOUT = {
     "ndims": 5,
-    "results": [[[1, 32], [2, 16], [4, 1]], [[0, 32], [3, 1]]],
+    "results": [[[1, 32], [2, 2], [4, 1]], [[0, 32], [3, 1]]],
 }
 
 
@@ -207,8 +210,15 @@ class PrepackBehaviourTest(unittest.TestCase):
         prepack["surprise"] = True
         self._rejects(prepack, "unknown field")
 
+    def test_both_admitted_source_dtypes_are_accepted(self):
+        for dtype in DTYPES:
+            with self.subTest(dtype=dtype):
+                self._accepts(_conforming_entry(dtype=dtype))
+
     def test_a_wrong_dtype_is_refused(self):
-        self._rejects(_prepack(_conforming_entry(dtype="f32")), "must be 'f16'")
+        self._rejects(
+            _prepack(_conforming_entry(dtype="bf16")), "must be 'f16' or 'f32'"
+        )
 
     def test_the_two_ranks_are_refused_when_wrong(self):
         # Rank is the load-bearing part of the crouton contract, not its values:
@@ -241,7 +251,7 @@ class PrepackBehaviourTest(unittest.TestCase):
         reached = 0
         for entry, pattern in (
             (_conforming_entry(extra=1), "unknown field"),
-            (_conforming_entry(dtype="f32"), "must be 'f16'"),
+            (_conforming_entry(dtype="bf16"), "must be 'f16' or 'f32'"),
             (_conforming_entry(crouton=[1]), "crouton"),
         ):
             with self.assertRaisesRegex(ValueError, pattern):

@@ -65,6 +65,7 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Debug.h"
 
+#include <cstdlib>
 #include <regex>
 
 #include "LinkRuntimeModules.h"
@@ -76,6 +77,19 @@
 
 // Wrapper over std::runtime_error to signal LLVM IR parsing errors
 void fail(const std::string &message) { throw std::runtime_error(message); }
+
+// A pass census ("candidates=N, rewritten=M") is reported with `emitRemark`.
+// A Triton compile does not show it, and the reason is NOT a missing handler:
+// this MLIR's DiagnosticEngine drops a diagnostic whose severity is below its
+// print threshold *before* consulting handlers, the threshold defaults to Error,
+// and DiagnosticEngine here exposes no setter to lower it. Verified: with a
+// handler registered, an unconditional emitRemark() from LinalgToLLVMPass still
+// printed nothing.
+//
+// The working mechanism is hexagon::printCensusRemarkToStderr in
+// hexagon/Conversion/LinalgToLLVM/Common.h, which the passes call alongside
+// their emitRemark. Kept here as a signpost so the next person who tries the
+// handler route finds the answer instead of repeating the experiment.
 
 std::unique_ptr<llvm::Module>
 fixAlignedAllocTypes(llvm::LLVMContext &context, llvm::Module *originalModule,

@@ -133,6 +133,19 @@ constexpr StringLiteral kRuntimeJoinNotIntegrated = "not-integrated";
 // `test_vtcm_layer_b_contract.py` pins them against `VTCMPool.cpp` so the two
 // copies cannot drift apart unnoticed. Changing a number here is a change to the
 // runtime's charge, not just to a bound.
+//
+// TRACEABILITY: kRuntimeSizeQuantumSmall kRuntimeSizeQuantumLarge kRuntimeSizeQuantumLargeThreshold
+//   mechanism: the runtime rounds every allocation up to 128 B and switches to
+//     2048 B granularity above that threshold, so a compiler-side bound has to
+//     charge the same quantum or it under-publishes. `HexagonBuffer.cpp` calls
+//     these "the historical 128/2048 size-rounding and placement rules".
+//   measurement: **none on record.** The origin of 128/2048 is unwritten; the
+//     only thing pinning them is the mirror test, which checks the two copies
+//     agree, not that either is right. That is the important half (drift cannot
+//     happen silently); the other half is still open.
+//   shape set: n/a -- a size quantum, not a tuned threshold.
+//   workload representativeness: n/a.
+//   drift protection: bin/runtime/test/test_vtcm_layer_b_contract.py.
 constexpr int64_t kRuntimeSizeQuantumSmall = 128;
 constexpr int64_t kRuntimeSizeQuantumLarge = 2048;
 constexpr int64_t kRuntimeSizeQuantumLargeThreshold = 2048;
@@ -805,8 +818,13 @@ static bool validAddressSource(Operation *operation,
   if (!function || argument.getOwner() != &function.getBody().front() ||
       extract->getParentOfType<func::FuncOp>() != function)
     return false;
+  // The source argument's element type follows the resident contract: f16
+  // directly, or f32 which the host quantises into the same fp16 crouton image
+  // (the resident type itself stays a crouton -- see exactResidentType). This
+  // is the accounting pass's copy of the same admission, so it must widen with
+  // WeightResidentPass instead of rejecting what that pass just produced.
   auto sourceType = dyn_cast<BaseMemRefType>(source.getType());
-  return sourceType && dtype::isCroutonElement(sourceType.getElementType());
+  return sourceType && dtype::isAdmittedFloat(sourceType.getElementType());
 }
 
 static bool validResidentTag(Operation *operation, StringRef attrName,
@@ -982,13 +1000,14 @@ static bool validRuntimeWeightSourceView(Operation *operation,
     return reject("runtime weight source_view argument kind disagrees");
   if (auto ranked = dyn_cast<MemRefType>(argument.getType())) {
     if (!ranked.hasStaticShape() || ranked.getRank() != 2 ||
-        !dtype::isCroutonElement(ranked.getElementType()) ||
+        !dtype::isAdmittedFloat(ranked.getElementType()) ||
         !ranked.getLayout().isIdentity() ||
         ranked.getShape() != ArrayRef<int64_t>{k, wholeN})
       return reject("ranked runtime weight argument shape/layout is not exact");
   } else if (auto unranked = dyn_cast<UnrankedMemRefType>(argument.getType())) {
-    if (!dtype::isCroutonElement(unranked.getElementType()))
-      return reject("unranked runtime weight argument element type is not f16");
+    if (!dtype::isAdmittedFloat(unranked.getElementType()))
+      return reject(
+          "unranked runtime weight argument element type is not admitted");
   } else {
     return reject("runtime weight argument is not a memref");
   }
@@ -1437,9 +1456,15 @@ static bool isReviewedStructuredOperation(Operation *operation) {
   return !regions.empty();
 }
 
-/// Proof budget for both fixpoints.  This is a termination guarantee, not a
-/// tuned threshold: a function needing more rounds than this is reported as not
-/// proven rather than allowed to keep refining.
+// TRACEABILITY: kMaxProvenanceRounds
+//   mechanism: a proof budget for both fixpoints. It bounds the refinement
+//     loop, so it is a termination guarantee and nothing else.
+//   measurement: none needed -- the failure mode is what makes it safe.
+//   shape set: n/a (not shape dependent).
+//   workload representativeness: n/a.
+//   failure mode: a function needing more rounds is reported as NOT PROVEN,
+//     never as a wrong number. This is the model the other constants should
+//     follow: a budget whose overflow degrades to "unknown", not to "wrong".
 static constexpr unsigned kMaxProvenanceRounds = 64;
 
 /// Computes, for every value in one function, which tracked allocation site

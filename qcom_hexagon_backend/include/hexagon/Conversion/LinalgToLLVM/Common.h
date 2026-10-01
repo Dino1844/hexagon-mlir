@@ -13,6 +13,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Operation.h"
 #include <optional>
+#include <string>
 
 namespace mlir {
 class TensorType;
@@ -22,6 +23,37 @@ class LinalgOp;
 } // namespace linalg
 
 namespace hexagon {
+
+/// Mirror a census remark to stderr when HEXMLIR_DIAG_REMARKS is set.
+///
+/// WHY THIS IS A PRINT AND NOT A DIAGNOSTIC HANDLER. Passes in this backend
+/// report "how many candidates did I see, how many did I rewrite" with
+/// `emitRemark`, because a census is what makes "the gate was too narrow" and
+/// "the kernel got faster" distinguishable. That works under
+/// `linalg-hexagon-opt`. It does NOT work in a Triton compile: this MLIR's
+/// `DiagnosticEngine` drops a diagnostic whose severity is below its print
+/// threshold *before* consulting any handler, and the threshold defaults to
+/// Error -- so a remark never reaches a registered handler, and the pinned
+/// `DiagnosticEngine` exposes no setter to lower it. A Triton compile therefore
+/// produced no remark at all, and "my pass never fired" was indistinguishable
+/// from "my pass fired and the rewrite was erased" (see
+/// docs/hmx/rgs-step2-machine-code-2026-09-30.md).
+///
+/// So the text is printed directly. The message is passed in already formatted,
+/// which keeps it byte-identical to the remark the same pass emits -- two docs
+/// quote that text, and re-wording it silently would invalidate both.
+///
+/// GATED because this is diagnostic visibility, not semantics: unconditional
+/// printing would make every Triton compile in CI unusable. Off unless
+/// HEXMLIR_DIAG_REMARKS is set to something other than "" / "0".
+inline void printCensusRemarkToStderr(const std::string &message) {
+  static const bool enabled = [] {
+    const char *flag = std::getenv("HEXMLIR_DIAG_REMARKS");
+    return flag && flag[0] != '\0' && std::string(flag) != "0";
+  }();
+  if (enabled)
+    llvm::errs() << "[census] " << message << "\n";
+}
 
 inline constexpr unsigned nativeVectorWidthInBytes = 128;
 inline constexpr unsigned maxElemSizeInByte = 8;

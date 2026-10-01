@@ -478,6 +478,46 @@ class TranslationMetadataTest(unittest.TestCase):
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
         self.assertIsNone(record_json)
 
+    def test_the_weight_policy_reason_must_match_the_entry_dtype(self):
+        # The Python mirror of the C++ pairing: the two dtype-specific reasons
+        # bind to the contract's source dtype, while the B2 N-slice reason
+        # names the view and is admitted for either.
+        def fixture(reason, dtype):
+            policy = copy.deepcopy(_POLICY)
+            policy["policy"] = "resident-prepack"
+            policy["reason"] = reason
+            record = _hmx_record(weight_kind="argument-slot", policy=policy)
+            record["dtypes"]["rhs"] = dtype
+            record["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(
+                record, policy
+            )
+            entry = copy.deepcopy(_VALID_WEIGHT)
+            entry["weights"][0]["dtype"] = dtype
+            return entry, _manifest([record], [policy])
+
+        for reason, dtype in (
+            ("eligible-aligned-f16", "f16"),
+            ("eligible-quantized-f32", "f32"),
+            ("eligible-b2-n-slice", "f16"),
+            ("eligible-b2-n-slice", "f32"),
+        ):
+            with self.subTest(reason=reason, dtype=dtype):
+                entry, manifest = fixture(reason, dtype)
+                _UTILS.parse_translation_metadata(
+                    _envelope(manifest=manifest, weight=entry)
+                )
+
+        for reason, dtype in (
+            ("eligible-aligned-f16", "f32"),
+            ("eligible-quantized-f32", "f16"),
+        ):
+            with self.subTest(reason=reason, dtype=dtype):
+                entry, manifest = fixture(reason, dtype)
+                with self.assertRaisesRegex(ValueError, "disagrees"):
+                    _UTILS.parse_translation_metadata(
+                        _envelope(manifest=manifest, weight=entry)
+                    )
+
     def test_strict_weight_contract_rejects_malformed_entries(self):
         def contract_with(**changes):
             value = copy.deepcopy(_VALID_WEIGHT)
@@ -504,7 +544,7 @@ class TranslationMetadataTest(unittest.TestCase):
             (entry_with(shape=[64, 0]), r"shape\[1\] must be >= 1"),
             (entry_with(crouton=[2, 2, 16, 32]), "crouton must have 5 entries"),
             (entry_with(crouton=[2, 2, 16, 32, 0]), r"crouton\[4\] must be >= 1"),
-            (entry_with(dtype="f32"), "dtype must be 'f16'"),
+            (entry_with(dtype="bf16"), "dtype must be 'f16' or 'f32'"),
         ]
         for value, message in cases:
             with self.subTest(message=message):
@@ -572,28 +612,64 @@ class TranslationMetadataTest(unittest.TestCase):
         fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"
         options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
         options["enableWeightResident"] = "True"
+        # The host packer's coefficient-map literal, loaded from the test that
+        # actually packs with it, so the compiler's own emitted map is bound to
+        # a Python literal instead of only to another copy of itself.
+        spec = importlib.util.spec_from_file_location(
+            "hexagon_backend_prepack_f32_tests",
+            _HERE.parent / "test_hmx_weight_prepack_f32.py",
+        )
+        assert spec is not None and spec.loader is not None
+        prepack_tests = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(prepack_tests)
 
-        context = ir.context()
-        qcom_hexagon_backend.load_dialects(context)
-        module = qcom_hexagon_backend.parse_mlir_module_from_str(
-            (fixture_root / "hmx-weight-resident-runtime-pipeline.mlir").read_text(),
-            context,
-        )
-        _, metadata_json = qcom_hexagon_backend.translate_linalg_to_obj(
-            module, options, True
-        )
-        envelope = json.loads(metadata_json)
-        manifest = envelope["hmx_manifest"]
-        self.assertIs(_UTILS.validate_hmx_manifest(manifest), manifest)
-        self.assertEqual(
-            manifest["matmuls"][0]["plan_fingerprint"],
-            _UTILS.compute_hmx_plan_fingerprint(
-                manifest["matmuls"][0], manifest["weight_policies"][0]
+        for fixture, reason, dtype in (
+            (
+                "hmx-weight-resident-runtime-pipeline.mlir",
+                "eligible-aligned-f16",
+                "f16",
             ),
-        )
-        self.assertEqual(
-            manifest["weight_policies"][0]["policy"], "resident-prepack"
-        )
+            (
+                "hmx-weight-resident-f32-pipeline.mlir",
+                "eligible-quantized-f32",
+                "f32",
+            ),
+        ):
+            with self.subTest(fixture=fixture):
+                context = ir.context()
+                qcom_hexagon_backend.load_dialects(context)
+                module = qcom_hexagon_backend.parse_mlir_module_from_str(
+                    (fixture_root / fixture).read_text(), context
+                )
+                _, metadata_json = qcom_hexagon_backend.translate_linalg_to_obj(
+                    module, options, True
+                )
+                envelope = json.loads(metadata_json)
+                manifest = envelope["hmx_manifest"]
+                weight = envelope["weight_prepack"]
+                self.assertIs(_UTILS.validate_hmx_manifest(manifest), manifest)
+                # The producer's own prepack contract joined to its policy by
+                # the consumer. The f32 fixture is what puts the new reason and
+                # the source dtype through the real C++ -> Python boundary.
+                _UTILS._validate_manifest_weight_prepack(manifest, weight)
+                self.assertEqual(
+                    manifest["matmuls"][0]["plan_fingerprint"],
+                    _UTILS.compute_hmx_plan_fingerprint(
+                        manifest["matmuls"][0], manifest["weight_policies"][0]
+                    ),
+                )
+                self.assertEqual(
+                    manifest["weight_policies"][0]["policy"], "resident-prepack"
+                )
+                self.assertEqual(manifest["weight_policies"][0]["reason"], reason)
+                self.assertEqual(weight["weights"][0]["dtype"], dtype)
+                # The producer's layout map is the host packer's map; a change
+                # to `prepackLayoutJson` must fail here, not in a launch.
+                self.assertEqual(
+                    weight["layout"]["results"],
+                    prepack_tests.LAYOUT["results"],
+                    "the compiler layout map drifted from the host literal",
+                )
 
     def test_cpp_serialized_manifest_publishes_workspace_facts(self):
         fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"

@@ -47,15 +47,74 @@ namespace hmx {
 struct HmxTarget {
   /// One crouton is a 32x32 fp16 block; every extent the engine touches is a
   /// multiple of it.
+  // NOT-A-DECISION: one crouton edge, 32. This is the HMX hardware tile
+  // geometry, not a tuning knob: the engine's crouton is 16x32x2 whatever we
+  // would prefer. Aliased from layout::kTileEdge so the one spelling lives in
+  // the layout contract (HmxCroutonLayout.h), cross-checked against
+  // bin/runtime/hmx/include/HMXAPI.h.
   static constexpr int64_t tileEdge = layout::kTileEdge;
 
-  /// The engine needs a few rows before a tile can even be formed. llama.cpp
-  /// draws the same line at HTP_MM_HMX_MIN_NROWS = 4.
+  /// The smallest logical M an HMX contraction may have.
+  ///
+  /// Sourced from the handwritten reference: llama.cpp draws the same line at
+  /// `HTP_MM_HMX_MIN_NROWS = 4`
+  /// (`llama.cpp/ggml/src/ggml-hexagon/htp/matmul-ops.h:20`, used at
+  /// `ggml-hexagon.cpp:3871`).
+  ///
+  /// ⚠️ **The two sides state different mechanisms, and that is unresolved.**
+  /// llama.cpp's own comment calls theirs "M alignment"; the comment here used
+  /// to claim "the engine needs a few rows before a tile can be formed", which
+  /// does not follow obviously — a crouton row is 32 elements, so needing only
+  /// 4 rows is not self-evident. Treat the *value* as sourced from the
+  /// reference (it is), and the *mechanism* as `[假设]`.
+  ///
+  /// ⚠️ **Reachable, but only for M in 1..4** — and that is a real gate, not a
+  /// dead one. `queryContraction` checks `minRows` *before* it splits extents
+  /// for alignment, so a contraction with `m = 1..4` is refused here as
+  /// `MinRows` even though it would also fail alignment. (An earlier note in
+  /// this file claimed it might be unreachable, on the reasoning that a
+  /// tile-aligned M is a multiple of 32 and so never <= 4. That reasoning is
+  /// wrong: alignment is checked *after* this gate, not before.)
+  ///
+  /// The open question is therefore not reachability but **whether M <= 4
+  /// occurs in a real workload at all** — plausible for a skinny GEMV/outer
+  /// product, unlikely for the attention/FFN matmuls this backend targets. That
+  /// is a workload question, not a code question; see
+  /// `docs/codegen/constants-traceability-2026-09-30.md` C4.
+  //
+  // TRACEABILITY: minRows
+  //   mechanism: a capability floor. `queryContraction` refuses M <= minRows
+  //     before it splits extents for alignment, so the M range 1..4 can never
+  //     reach HMX no matter how the other extents look.
+  //   measurement: **none of our own.** The value is sourced from the
+  //     handwritten reference (see above), and the two sides state DIFFERENT
+  //     mechanisms for it -- llama.cpp says "M alignment", this file previously
+  //     said "rows needed to form a tile", and a 32-row crouton needing only 4
+  //     rows does not follow obviously. **Mechanism: [假设].**
+  //   shape set: n/a -- the constant is a threshold, not a tuned parameter, and
+  //     no calibration set applies to it.
+  //   workload representativeness: **NOT ESTABLISHED.** Open question is whether
+  //     M <= 4 occurs in a real workload at all (plausible for a skinny
+  //     GEMV/outer product, unlikely for attention/FFN matmuls). Nobody has
+  //     looked, so the gate's real-world hit rate is unknown.
   static constexpr int64_t minRows = 4;
 
-  /// The device VTCM, in bytes (measured: docs/analysis/hmx-device-prerequisites.md
-  /// -- 8 MiB). The crouton arrays the bridge stages, the resident weights and
-  /// everything else the kernel puts in VTCM all come out of this one pool.
+  // TRACEABILITY: defaultVtcmBudget
+  //   mechanism: one shared on-chip VTCM pool. Every admission, block plan and
+  //     ring decision in the bridge is weighed against this number, so it is a
+  //     capacity, not a preference.
+  //   measurement: a DEVICE QUERY, not a measurement of ours --
+  //     `HAP_compute_res_query_VTCM` reports 8 MB total
+  //     (docs/analysis/hmx-device-prerequisites.md:222). The same document's
+  //     section 12 also records VTCM being unavailable or shared with system
+  //     processes, so the *usable fraction* is unverified.
+  //   shape set: n/a (a capacity, not a tuned threshold).
+  //   workload representativeness: n/a, but see the caveat above: this is the
+  //     TOTAL pool, and treating total as usable is the open question.
+  //   failure mode: if the usable pool is smaller, the pass admits work the
+  //     runtime cannot place. That is loud (allocation failure / DSP abort),
+  //     not a silent slowdown, which is why it is ranked below the staging
+  //     floor. Settling it needs no timing: print the queried usable bytes.
   static constexpr int64_t defaultVtcmBudget = 8 * 1024 * 1024;
 
   /// The budget every query is weighed against; defaults to the device's.
@@ -184,6 +243,8 @@ struct HmxTarget {
   /// The crouton's element size in bytes: the engine's fp16, whatever the
   /// source's element type is (a wider source is quantised by the pack, its
   /// crouton array is still fp16).
+  // NOT-A-DECISION: the crouton element is fp16, hence 2 bytes. A property of
+  // the format, not a choice.
   static constexpr int64_t croutonElemBytes = 2;
 
   /// The crouton footprint of a contraction operated on `rows` rows: both

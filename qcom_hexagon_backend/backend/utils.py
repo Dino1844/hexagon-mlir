@@ -393,7 +393,9 @@ HMX_WEIGHT_BINDING_KINDS = frozenset(
 )
 HMX_WEIGHT_POLICIES = frozenset({"resident-prepack", "device-pack"})
 HMX_WEIGHT_POLICY_REASONS = {
-    "resident-prepack": frozenset({"eligible-aligned-f16", "eligible-b2-n-slice"}),
+    "resident-prepack": frozenset(
+        {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
+    ),
     "device-pack": frozenset(
         {
             "tail-consumer",
@@ -1142,6 +1144,185 @@ def validate_hmx_manifest_json(manifest_json, field_name="hmx_manifest"):
 
 
 # ---------------------------------------------------------------------------
+# v2 manifest reporter (human-facing, opt-in)
+# ---------------------------------------------------------------------------
+# A pure reader, on the same terms as hmx_manifest_contract() in driver.py: it
+# turns an already-decided manifest into text and changes nothing.  Nothing in
+# the compile or launch path calls it, so this section is additive by
+# construction -- adding a line here cannot move a default code path.
+#
+# Every reason spelling it prints comes from HMX_PLAN_REASONS /
+# HMX_PIPELINE_REASONS above, never from a literal written here.  The C++
+# producer and this file are separate boundaries (HmxManifest.h:79-81), so a
+# hand-typed reason would print as a plausible-looking line that no validator
+# has ever heard of; asking the vocabulary instead turns that into an explicit
+# "unrecognized" marker.
+#
+# The one thing a `plan`-only report cannot express is that "on HMX" and
+# "using the HMX engine" are different questions.  A site can clear every
+# admission gate, take an HMX plan, and still run an unpipelined serial tile
+# loop (HmxManifest.h:112-113, HmxManifest.h:240-246); a report that prints
+# only the plan calls that a success.  So each site is labelled with which of
+# the two it is.
+
+
+def _hmx_summary_axis(logical, axis):
+    """One `logical` axis as text, tolerating the unavailable form.
+
+    `logical` is null for a site the compiler never had a shape for
+    (`library-call`, `non-rank-2` -- _validate_logical above), so a reporter
+    that assumed a dict would fail on exactly the sites whose reason matters
+    most.
+    """
+    if not isinstance(logical, dict):
+        return "?"
+    entry = logical.get(axis)
+    if not isinstance(entry, dict):
+        return "?"
+    value = entry.get("value")
+    if value is None:
+        return f"{axis}={entry.get('kind', '?')}"
+    return str(value)
+
+
+def _hmx_summary_shape(record):
+    logical = record.get("logical")
+    if not isinstance(logical, dict):
+        return "?"
+    return "x".join(_hmx_summary_axis(logical, axis) for axis in ("m", "n", "k"))
+
+
+def _hmx_summary_known(code, allowed):
+    """Render a reason code, marking one this boundary does not recognise.
+
+    An unknown code is reported as unknown rather than passed through.  The
+    failure it stands for is silent by nature: a manifest carrying a code no
+    validator accepts would otherwise be quoted back to the user as if it were
+    the compiler's own explanation.
+    """
+    if code in allowed:
+        return str(code)
+    return f"unrecognized reason {code!r}"
+
+
+def _hmx_summary_site(record):
+    """One line per contraction site: did it reach HMX, and what stopped it."""
+    if not isinstance(record, dict):
+        return f"  [?] unreadable manifest record: {record!r}"
+    plan = record.get("plan")
+    label = f"  [{record.get('id', '?')}] {record.get('function', '?')} " \
+            f"{_hmx_summary_shape(record)} {plan}: "
+
+    if plan in HMX_NON_HVX_PLANS:
+        allowed_plan_reasons = HMX_PLAN_REASONS[plan]
+        execution = record.get("execution")
+        pipeline = execution.get("pipeline") if isinstance(execution, dict) else None
+        pipeline = pipeline if isinstance(pipeline, dict) else {}
+        selected = pipeline.get("selected")
+        reason = record.get("reason")
+        admitted = _hmx_summary_known(reason, allowed_plan_reasons)
+        if selected == "staged":
+            return (
+                f"{label}ON HMX, staged pipeline depth="
+                f"{pipeline.get('depth', '?')} (admitted: {admitted})"
+            )
+        if selected == "serial":
+            # On the engine, running one tile at a time.  Not a refusal, and
+            # deliberately not worded like one.
+            pipeline_reason = pipeline.get("reason")
+            if pipeline_reason is None:
+                detail = "no pipeline reason published"
+            else:
+                detail = _hmx_summary_known(
+                    pipeline_reason, HMX_PIPELINE_REASONS
+                )
+            return (
+                f"{label}ON HMX but SERIAL tile loop, not pipelined "
+                f"(admitted: {admitted}; staging declined: {detail})"
+            )
+        return (
+            f"{label}ON HMX, pipeline selection unreadable "
+            f"(selected={selected!r}; admitted: {admitted})"
+        )
+
+    if plan in HMX_PLANS - HMX_NON_HVX_PLANS:
+        # Refused.  The reason is the compiler's own, and it is the whole
+        # answer to "why did this not get HMX".
+        return (
+            f"{label}DROPPED to {plan} (reason: "
+            f"{_hmx_summary_known(record.get('reason'), HMX_PLAN_REASONS[plan])})"
+        )
+
+    return f"{label}plan {plan!r} is not an HMX plan this boundary knows"
+
+
+def summarize_hmx_manifest(manifest):
+    """Return a human-readable verdict for one parsed v2 HMX manifest.
+
+    The question this answers is the one a `plan`-only answer gets wrong: of
+    the contraction sites in this kernel, how many reached the HMX engine, how
+    many were refused, and which sites reached it but run serially.
+
+    Properties this function is required to keep, and why:
+
+    * **Pure.**  It reads the manifest and builds a string.  No printing, no
+      warnings, no logging, no attribute writes, and no validation that could
+      raise -- a reporter that refuses to report a malformed manifest is
+      useless exactly when it is needed, so an unreadable value is labelled
+      instead of raised on.
+    * **No invented vocabulary.**  Plan and reason spellings are taken from
+      HMX_PLAN_REASONS / HMX_PIPELINE_REASONS, and "reached HMX" is decided by
+      HMX_NON_HVX_PLANS, the same set `enforce_hmx_launch_contract` uses.
+    * **Opt-in.**  Nothing in the compile or launch path calls it.  The one
+      caller is `hmx_manifest_verdict()` in driver.py, which is a read-only
+      sibling of `hmx_manifest_contract()` and is likewise only reached when a
+      caller asks for it.
+
+    Accepts `None`, which is what `hmx_manifest_contract()` returns before the
+    kernel's first launch.
+    """
+    if not isinstance(manifest, dict):
+        return "no HMX manifest on this kernel: nothing to summarize"
+    records = manifest.get("matmuls")
+    if not isinstance(records, list) or not records:
+        return "HMX manifest: no contraction site recorded in this kernel"
+
+    on_hmx = sum(
+        1
+        for record in records
+        if isinstance(record, dict) and record.get("plan") in HMX_NON_HVX_PLANS
+    )
+    refused = sum(
+        1
+        for record in records
+        if isinstance(record, dict)
+        and record.get("plan") in HMX_PLANS - HMX_NON_HVX_PLANS
+    )
+    total = len(records)
+
+    if on_hmx == total:
+        headline = f"HMX manifest: ALL {on_hmx} of {total} on HMX"
+    elif on_hmx == 0:
+        headline = (
+            f"HMX manifest: NO site on HMX -- 0 of {total} on HMX; "
+            f"all {refused} refused"
+        )
+    else:
+        headline = (
+            f"HMX manifest: PARTIAL -- {on_hmx} of {total} on HMX; "
+            f"{refused} refused"
+        )
+    unreadable = total - on_hmx - refused
+    if unreadable:
+        # Never claim a plan for a record this boundary could not classify.
+        headline += f"; {unreadable} record(s) carry an unrecognized plan"
+
+    lines = [headline]
+    lines.extend(_hmx_summary_site(record) for record in records)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Record-only v3 consumer
 # ---------------------------------------------------------------------------
 # Every check below is exact-field and closed-enum.  There is no "fill in a
@@ -1548,8 +1729,13 @@ def validate_weight_prepack(weight_prepack, field_name="weight_prepack"):
 
         _require_positive_int_list(entry["shape"], f"{path}.shape", 2)
         _require_positive_int_list(entry["crouton"], f"{path}.crouton", 5)
-        if entry["dtype"] != "f16":
-            raise ValueError(f"{path}.dtype must be 'f16', got {entry['dtype']!r}")
+        # The source argument's element type; the packed image is always the
+        # fp16 crouton. An f32 source is quantised by the host with the same
+        # conversion the device pack runs.
+        if entry["dtype"] not in ("f16", "f32"):
+            raise ValueError(
+                f"{path}.dtype must be 'f16' or 'f32', got {entry['dtype']!r}"
+            )
     if len(functions) > 1:
         raise ValueError(
             f"{field_name}.weights spans multiple functions {sorted(functions)}; "
@@ -1578,6 +1764,23 @@ def _validate_manifest_weight_prepack(manifest, weight_prepack):
             if entry is None:
                 raise ValueError(
                     "resident-prepack policy has no matching weight_prepack entry"
+                )
+            # Mirror the C++ pairing (`HmxManifest.cpp`, `isCanonicalWeightReason`
+            # + the finalize check): a dtype-specific reason must agree with the
+            # entry's source dtype. `eligible-b2-n-slice` names the view, not the
+            # dtype, so it is admitted for either -- exactly as in C++.
+            if policy["reason"] == "eligible-aligned-f16" and entry["dtype"] != "f16":
+                raise ValueError(
+                    "resident-prepack reason 'eligible-aligned-f16' disagrees "
+                    f"with weight_prepack dtype {entry['dtype']!r}"
+                )
+            if (
+                policy["reason"] == "eligible-quantized-f32"
+                and entry["dtype"] != "f32"
+            ):
+                raise ValueError(
+                    "resident-prepack reason 'eligible-quantized-f32' disagrees "
+                    f"with weight_prepack dtype {entry['dtype']!r}"
                 )
         elif entry is not None:
             raise ValueError(

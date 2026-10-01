@@ -163,6 +163,8 @@ inline constexpr StringLiteral kHmxWeightResidentPrepack = "resident-prepack";
 inline constexpr StringLiteral kHmxWeightDevicePack = "device-pack";
 inline constexpr StringLiteral kHmxWeightEligibleAlignedF16 =
     "eligible-aligned-f16";
+inline constexpr StringLiteral kHmxWeightEligibleQuantizedF32 =
+    "eligible-quantized-f32";
 inline constexpr StringLiteral kHmxWeightEligibleB2NSlice = "eligible-b2-n-slice";
 inline constexpr StringLiteral kHmxWeightTailConsumer = "tail-consumer";
 inline constexpr StringLiteral kHmxWeightF32Source = "f32-source";

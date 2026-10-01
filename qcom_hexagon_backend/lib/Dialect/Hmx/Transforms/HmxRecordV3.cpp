@@ -150,6 +150,9 @@ constexpr StringLiteral kSidecarPeakStatusStructuredUpperBound =
 /// is what distinguishes "this sidecar says complete" from "nobody said".
 constexpr StringLiteral kSidecarLivenessSchema = "structured-allocator-events-v1";
 
+// NOT-A-DECISION: the int64 saturation bound used by addBytes' overflow
+// check. It is a property of the type, not a tunable: any other value
+// would be a bug rather than a policy.
 constexpr int64_t kMaxI64 = std::numeric_limits<int64_t>::max();
 
 bool isCanonicalPlan(StringRef value) {

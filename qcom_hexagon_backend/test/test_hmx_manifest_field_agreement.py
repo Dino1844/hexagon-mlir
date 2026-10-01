@@ -39,6 +39,10 @@ _BACKEND = _TEST_DIR.parent
 _MANIFEST = (
     _BACKEND / "lib" / "Dialect" / "Hmx" / "Transforms" / "HmxManifest.cpp"
 )
+_MANIFEST_H = (
+    _BACKEND / "include" / "hexagon" / "Dialect" / "Hmx" / "Transforms"
+    / "HmxManifest.h"
+)
 _UTILS = _BACKEND / "backend" / "utils.py"
 
 MANIFEST_SCHEMA = "hex.hmx.kernel_manifest/v2"
@@ -84,6 +88,25 @@ EXPECTED = {
 # field the two validators do not agree about, because neither has a branch for
 # it.
 PLANS = frozenset({"full-hmx", "hmx-tail", "hvx"})
+
+# The weight-policy vocabulary is part of the same boundary: the policy names and,
+# per policy, its canonical reasons. A value only one side knows is a manifest
+# the producer emits and the consumer refuses (or a legal state the compiler
+# never publishes), and it stays silent until the other side runs.
+WEIGHT_POLICY_REASONS = {
+    "resident-prepack": frozenset(
+        {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
+    ),
+    "device-pack": frozenset(
+        {
+            "tail-consumer",
+            "f32-source",
+            "unproven-offset",
+            "incompatible-consumers",
+            "prepack-disabled",
+        }
+    ),
+}
 
 
 def _cpp_key_constants() -> dict[str, str]:
@@ -217,6 +240,62 @@ def _python_allowed_fields() -> dict[str, frozenset[str]]:
     return allowed
 
 
+def _cpp_weight_policy_reasons() -> dict[str, frozenset[str]]:
+    """Read the producer's vocabulary out of the header and the predicate.
+
+    The values live as `kHmxWeight*` constants in `HmxManifest.h`; the predicate
+    in `HmxManifest.cpp` names them through `kWeight*` aliases, so both hops are
+    resolved rather than matched as bare strings. A rename follows; changing a
+    value or the policy/reason partition does not.
+    """
+    header = _MANIFEST_H.read_text(encoding="utf-8")
+    cpp = _MANIFEST.read_text(encoding="utf-8")
+    values = dict(
+        re.findall(
+            r'inline constexpr StringLiteral (kHmxWeight\w+) =\s*"([^"]+)";',
+            header,
+        )
+    )
+    if not values:
+        raise AssertionError("no kHmxWeight constants found; the header moved")
+    aliases = dict(
+        re.findall(
+            r"constexpr StringLiteral (kWeight\w+) =\s*(kHmxWeight\w+);", cpp
+        )
+    )
+
+    def resolve(name: str) -> str:
+        return values[aliases.get(name, name)]
+
+    arms = re.findall(r"if \(policy == (kWeight\w+)\)\s*return (.*?);", cpp, re.S)
+    if len(arms) != 2:
+        raise AssertionError(
+            f"expected two policy arms in isCanonicalWeightReason, found {len(arms)}"
+        )
+    return {
+        resolve(policy): frozenset(
+            resolve(name) for name in re.findall(r"reason == (kWeight\w+)", body)
+        )
+        for policy, body in arms
+    }
+
+
+def _python_weight_policy_reasons() -> dict[str, frozenset[str]]:
+    """The consumer's own vocabulary constant, read rather than re-derived."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "hexagon_backend_utils_weight_policy", _UTILS
+    )
+    assert spec is not None and spec.loader is not None
+    utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(utils)
+    return {
+        policy: frozenset(reasons)
+        for policy, reasons in utils.HMX_WEIGHT_POLICY_REASONS.items()
+    }
+
+
 class ManifestFieldAgreement(unittest.TestCase):
     def test_producer_and_consumer_agree_with_the_frozen_literal(self) -> None:
         cpp = _cpp_allowed_fields()
@@ -240,6 +319,13 @@ class ManifestFieldAgreement(unittest.TestCase):
         self.assertEqual(
             cpp["base"] | cpp["non_hvx"] | cpp["tail_only"], py["hmx-tail"]
         )
+
+    def test_the_weight_policy_vocabulary_agrees_on_both_sides(self) -> None:
+        cpp = _cpp_weight_policy_reasons()
+        py = _python_weight_policy_reasons()
+        self.assertEqual(cpp, WEIGHT_POLICY_REASONS, "producer vocabulary drifted")
+        self.assertEqual(py, WEIGHT_POLICY_REASONS, "consumer vocabulary drifted")
+        self.assertEqual(cpp, py, "producer and consumer vocabularies differ")
 
     def test_the_three_plans_partition_the_vocabulary(self) -> None:
         self.assertEqual(set(EXPECTED), set(PLANS))

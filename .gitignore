@@ -43,6 +43,9 @@ __pycache__/
 .vscode
 .vs
 
+# Codemap
+.ua
+
 # triton-install dir
 triton-install
 
@@ -58,3 +61,12 @@ triton-install
 
 # Local agent/editor state: neither build output nor ours to track
 /.serena/
+
+# Written by test/python/torch-mlir/utils.py:write_bytecode_to_file on every run.
+# They are inputs to the launcher, not sources; without this, every torch-mlir
+# pytest run leaves untracked files and tools/hexmlir/split_patch.py refuses to
+# write a patch (2026-10-01, hit four times in one session).
+*.mlirbc
+
+# Editor/agent tool caches (not ours to track)
+.qoder/

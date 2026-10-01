@@ -36,9 +36,29 @@ _MANIFEST_SRC = _BACKEND / "lib" / "Dialect" / "Hmx" / "Transforms" / "HmxManife
 # module docstring.
 MINIMUM_ROWS = 4
 
-_CPP_CONSTANT = re.compile(
-    r"constexpr\s+int64_t\s+kMinimumHmxRows\s*=\s*(\d+)\s*;", re.MULTILINE
+# The boundary used to have a second, private home in the manifest
+# (`kMinimumHmxRows = 4`), which made it the fourth copy of one number. It now
+# reads `HmxTarget::minRows`, so the checks below point there instead. Same
+# guarantee, one fewer copy: the value is still pinned, and the manifest is now
+# additionally required to *use* the shared constant rather than restate it.
+_TARGET_SRC = (
+    _BACKEND / "include" / "hexagon" / "Dialect" / "Hmx" / "Transforms" / "HmxTarget.h"
 )
+
+_TARGET_CONSTANT = re.compile(
+    r"static\s+constexpr\s+int64_t\s+minRows\s*=\s*(\d+)\s*;", re.MULTILINE
+)
+
+# Any *other* spelling of the boundary inside the manifest is a reintroduced
+# duplicate, which is the thing this change set out to remove. Comments are
+# stripped first: the file documents this constant's history in prose, and
+# naming the old spelling there is correct, not a duplicate.
+_STRAY_BOUNDARY = re.compile(r"(?<!HmxTarget::)\b(?:kMinimumHmxRows|minRows)\b")
+_LINE_COMMENT = re.compile(r"//[^\n]*")
+
+
+def _code_only(source):
+    return _LINE_COMMENT.sub("", source)
 
 
 def _utils():
@@ -68,11 +88,11 @@ def _tail(m: int):
 
 class MinimumRowsAgreementTest(unittest.TestCase):
     def test_the_cpp_constant_is_the_frozen_value(self):
-        source = _MANIFEST_SRC.read_text(encoding="utf-8")
-        found = _CPP_CONSTANT.search(source)
+        source = _TARGET_SRC.read_text(encoding="utf-8")
+        found = _TARGET_CONSTANT.search(source)
         self.assertIsNotNone(
             found,
-            f"kMinimumHmxRows not found in {_MANIFEST_SRC}. If it was renamed, "
+            f"HmxTarget::minRows not found in {_TARGET_SRC}. If it was renamed, "
             "decide here whether the boundary moved or this regex went stale.",
         )
         self.assertEqual(
@@ -81,6 +101,25 @@ class MinimumRowsAgreementTest(unittest.TestCase):
             "the producer's minimum-rows boundary changed. That is a compiler "
             "contract change, not a test update: move MINIMUM_ROWS here "
             "deliberately, or revert the producer change.",
+        )
+
+    def test_the_manifest_uses_the_shared_constant(self):
+        """The manifest must read the one home, not restate the number.
+
+        This is the check that replaced "the private copy equals 4": a
+        duplicate is worse than a stale value, because it can drift silently
+        while both copies still look correct.
+        """
+        source = _MANIFEST_SRC.read_text(encoding="utf-8")
+        self.assertRegex(
+            source,
+            r"HmxTarget::minRows",
+            "the manifest no longer references HmxTarget::minRows; it must not "
+            "carry its own minimum-rows threshold",
+        )
+        strays = [m.group(0) for m in _STRAY_BOUNDARY.finditer(_code_only(source))]
+        self.assertEqual(
+            strays, [], f"reintroduced a private minimum-rows name in {_MANIFEST_SRC}"
         )
 
     def test_the_python_constant_is_the_frozen_value(self):
