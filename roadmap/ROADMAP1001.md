@@ -1,25 +1,23 @@
 # 方案：线程角色编译期定死 —— T_HMX 专属线程 + HVX 池双执行器架构
 
-> 基于 hexagon-mlir@`hmx` 分支 HEAD `a5761822`（2026-10-01）+ d9 调研（LLVM/IREE/Triton/Glow/ORT 先例；d9 调研报告未入库，关键先例与 file:line 已内联本文）。
-> 按本仓 §6.2 模板组织：契约 → 决策点 → 代码 → FileCheck → host → 设备 A/B → 记录。
+> 基于 hexagon-mlir@`hmx` 分支 + d9 调研（LLVM/IREE/Triton/Glow/ORT 先例；d9 调研报告未入库，关键先例与 file:line 已内联本文）。
 > 本文所有本仓引用带 file:line；未读/未测处显式标 [未验证]。
+> **被推翻过的判断不在这里** —— 它们在 `ERRATA.md`，那份文档独立成立，本文不依赖它即可读完。
 
-> ## ⚠️ 全文约定：S1/S2/S3 比值一律是「**我们 ÷ llama.cpp**」
->
-> **>1 = 我们慢，<1 = 我们快。** 依据 `hexagon-mlir/ROADMAP.md:50`（「S2/S3 已快过手写」）
-> 与 `docs/hmx/hmx-next-round-plan.md:304-307`（表头「vs llama」列的 52.25/56.71/15.41 是
-> **llama 的时间**；验算 59.5/52.25=1.139、50.5/56.71=0.890、9/15.41=0.584）。
->
-> **本约定是 2026-10-01 晚补加的** —— 原稿未写约定，而主笔在审阅时正是在这里读反了方向
-> （把 0.58× 当成"我们慢 1.7 倍"，据此以为 S3 是主要战场；实际 S3 是我们**快** 1.7 倍）。
-> **任何按「ratio < 1 = 我们慢」来读的读者都会得出与 §1.2 相反的结论。**
->
-> ⚠️ **0.92 与实测表的 0.89 并存，无人裁决 —— 标「待权威源裁决」**。
-> 两套数：`ROADMAP.md:50` = 1.13/0.92；`docs/hmx/hmx-next-round-plan.md:306` 实测表 = 1.14/0.89。
-> **本文引用时抄 `ROADMAP.md:50` 那一套，但这是权宜之计，不是裁决。**
-> ⚠️ **`ROADMAP.md:50` 自称的权威源 `docs/state/STATE-OF-PLAY.md:559` 引用链已断**
-> —— 该行讲的是 `FastInversePass` 除法反号，与本比值无关。
-> ⇒ **待办：指定一个权威源，或重测一次同构建 S1/S2/S3，消灭这组分叉。**
+## ⚠️ 全文约定：S1/S2/S3 比值一律是「**我们 ÷ llama.cpp**」
+
+**>1 = 我们慢，<1 = 我们快。** 依据 `hexagon-mlir/ROADMAP.md:50`（「S2/S3 已快过手写」）
+与 `docs/hmx/hmx-next-round-plan.md:304-307`（表头「vs llama」列的 52.25/56.71/15.41 是
+**llama 的时间**；验算 59.5/52.25=1.139、50.5/56.71=0.890、9/15.41=0.584）。
+
+**任何按「ratio < 1 = 我们慢」来读的读者都会得出与 §1.2 相反的结论。**
+
+⚠️ **0.92 与实测表的 0.89 并存，无人裁决 —— 标「待权威源裁决」**。
+两套数：`ROADMAP.md:50` = 1.13/0.92；`docs/hmx/hmx-next-round-plan.md:306` 实测表 = 1.14/0.89。
+**本文引用时抄 `ROADMAP.md:50` 那一套，但这是权宜之计，不是裁决。**
+⚠️ **`ROADMAP.md:50` 自称的权威源 `docs/state/STATE-OF-PLAY.md:559` 引用链已断**
+—— 该行讲的是 `FastInversePass` 除法反号，与本比值无关。
+⇒ **待办：指定一个权威源，或重测一次同构建 S1/S2/S3，消灭这组分叉。**
 
 ---
 
@@ -31,8 +29,7 @@
 + **现有 HVX 线程池**——两线程间用 SPSC 环接成软件流水，
 让 **HVX 侧 `pack_act(i+1)` / `unpack(i)`（+ `hmx.stage` DMA 提交）**
 与 **HMX 侧 `mma(i+1)` / `bias_load` / `acc_read`** 真正重叠。
-（**这是全文唯一权威的重叠表述**；§2 给出引擎归属边界的定义，§5 给出验收。
-原稿 §0/§2/§5 三处互相矛盾，已按 2026-10-02 决策统一为此式。）
+（**这是全文唯一权威的重叠表述**；§2 给出引擎归属边界的定义，§5 给出验收。）
 
 ---
 
@@ -55,10 +52,10 @@
 - 三个问题：
   1. **失效模式零容忍**：你们自己的注释（HmxToLLVMPass.cpp:96）——漏一次 unlock，下一个线程在 `HAP_compute_res_hmx_lock` 上**永久挂死**。持锁人是"任意执行该 kernel 的线程"。
   2. **税**：每 kernel 一次锁往返；NON_SHARED unlock 还清 accumulator（HexagonCAPI.cpp:212-213）。属 M3.2 要削的 per-launch 固定税。
-   3. **拓扑病根**：async 池里任何线程都可能既跑 linalg fallback（HVX）又跑 HMX 段——正是 LLVM PR #222340 TTI 注释描述的上下文饥饿拓扑
-      （**2026-10-02 已 backport 进本仓**，见 §5.0）：`llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:453-462`
-      （`areInlineCompatible` 定义起于 `llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:451`）原文：
-      *"The hardware provides a fixed number of HVX contexts. Software that mixes the two engines dedicates some threads to HVX, and those threads hold the contexts for as long as they run. A thread dedicated to HMX needs no context at all, until HVX code reaches it."*
+  3. **拓扑病根**：async 池里任何线程都可能既跑 linalg fallback（HVX）又跑 HMX 段——正是 LLVM PR #222340 TTI 注释描述的上下文饥饿拓扑
+     （**2026-10-02 已 backport 进本仓**，见 §5.0）：`llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:453-462`
+     （`areInlineCompatible` 定义起于 `llvm_triton/llvm-project/llvm/lib/Target/Hexagon/HexagonTargetTransformInfo.cpp:451`）原文：
+     *"The hardware provides a fixed number of HVX contexts. Software that mixes the two engines dedicates some threads to HVX, and those threads hold the contexts for as long as they run. A thread dedicated to HMX needs no context at all, until HVX code reaches it."*
 - **修正**：锁的所有权 = 一条专属 HMX 线程 × 整个会话。T_HMX 在首次 HMX launch 时 ensure 一次、持有；其余线程永不触碰 HMX 锁。竞态为零，"挂死"失效类整体消失，锁往返每会话 2 次。per-kernel 配对降级为 legacy 路径（A/B 与回滚需要它）。
 
 **推翻二："线程路径已四次证伪"不应遮蔽 M3.3——四次证伪的是工作切分，不是角色切分。**
@@ -102,64 +99,56 @@ Triton → TTIR → Linalg
                                             · 永不 acquire HVX 上下文（编译期保证）
 ```
 
-> ## ✅ 决策已定（2026-10-02）：**方案 A** —— `pack`/`unpack` 归 T_HVX
->
-> **原稿的矛盾已解除。** 原稿在 T_HMX 侧同时列了 `pack`/`unpack`、又声明 T_HMX
-> 「永不 acquire HVX 上下文」，两句不能同时成立。**证据（可复算）**：
-> `bin/runtime/hmx/src/HMXLayout.c` 里**引擎 intrinsic 零命中**
-> （`grep -cE 'Q6_mx|mxmem|mxclracc|Q6_bias|Q6_activation|Q6_weight' HMXLayout.c` = 0），
-> 而**含 `Q6_*` 的有 34 行 / 17 个唯一符号，全部是 HVX 向量 intrinsic**
-> （`Q6_vmem_QRIV` / `Q6_vscatter_RMVhV` / `Q6_W_vdeal_VVR` / `Q6_V_vror_VR` …）
-> ⇒ **`pack_act` 与 `unpack_acc` 是纯 HVX 代码。**
-> 对照：引擎侧 5 个唯一符号全在 `HMXAPI.c`
-> （`Q6_mxmem_AR_after_hf` / `Q6_mxclracc_hf` / `Q6_bias_mxmem2_A` /
-> `Q6_activation_hf_mxmem_RR_deep` / `Q6_weight_hf_mxmem_RR`）。
-> **现按方案 A 定稿。**
->
-> **三条理由（记录在案，供日后回溯）：**
->
-> 1. **选 B 会让上游 `hexagon_hmx` 语义失效。** 该属性的前提是**函数内没有 HVX 代码**
->    （`llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:2` 原文
->    "so no HVX unit is acquired on the HMX thread"——**2026-10-02 已随 backport 进本仓，
->    逐字核对通过**）。选 B 等于放弃「**线程契约由编译器静态保证**」这个方案核心，
->    退化成「把单线程的锁挪进一条线程」，**收益趋零**。
-> 2. **量化上天花板差 ~3.6×。** S1 的 LWP 口径（`docs/hmx/hmx-next-round-plan.md:61-70`，
->    跨构建 `5cea8231`/125 µs，**仅方向参考**）：`engine` 35.2% · `pack_act` 9.8% ·
->    `pack_weight` 4.7% · `unpack` 37.4% · `residual` 12.8%。
->    **方案 A** ⇒ T_HMX 串行链只剩 **35.2%**，`pack_act` 9.8% + `unpack` 37.4% **全部**变成 HVX 侧可重叠对象。
->    **方案 B** ⇒ T_HMX 链 ≈ **35.2 + 47.2 = 82%**，跨线程只剩 `residual` 可动。
-> 3. **A 顺带化解 §6.10 的「pack 还是 unpack」两难** —— 两个都归 HVX 侧，不必二选一。
->
-> **代价与对冲见 §4.5**：必须新增 `HmxLayoutHvx` trait，
-> **否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ 永久挂死。**
+### ✅ 已定（2026-10-02）：**方案 A** —— `pack`/`unpack` 归 T_HVX
 
-> ### 重叠哪一半 —— 唯一权威表述
->
-> **§0 / §2 / §5 三处原稿互相矛盾**（`:15` 说 pack；`:70` 把 pack+unpack 同时列 T_HMX；
-> `:71-72` 又同时列 T_HVX；`:163` 说 pack）。**现按决策 3 统一为：**
->
-> ```
->   HVX 侧:   pack_act(i+1)  ‖  unpack(i)
->   HMX 侧:                    mma(i+1) / bias_load / acc_read
-> ```
->
-> **重叠对象 = 引擎归属边界**（`pack_act`/`unpack_acc`/`hmx.stage` 纯 HVX
-> ⇔ `hmx.mma`/`acc_read`/`bias_load` 纯引擎）。**这条边界就是 SPSC 环的刀口。**
->
-> ⚠️ **它与 §3.1 原先写的 stage/await 值边不是同一条线** —— 后者是 DMA 语义
-> （DDR→VTCM 传输），**serial 路径上没有 `hmx.stage`/`hmx.await` 可切**
-> （FA 的 QK 就在那条路上：`logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
-> Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样）。**判据已按此改写，见 §3.1。**
->
-> **可藏量口径**：`enableWeightResident` 默认开 ⇒ `pack_weight` ≈ 0
-> ⇒ 可重叠对象 ≈ `pack_act` 9.8% + `unpack` 37.4% = **47.2%**（跨构建 LWP，**仅方向参考**）。
+**证据（可复算）**：`bin/runtime/hmx/src/HMXLayout.c` 里**引擎 intrinsic 零命中**
+（`grep -cE 'Q6_mx|mxmem|mxclracc|Q6_bias|Q6_activation|Q6_weight' HMXLayout.c` = 0），
+而**含 `Q6_*` 的有 34 行 / 17 个唯一符号，全部是 HVX 向量 intrinsic**
+（`Q6_vmem_QRIV` / `Q6_vscatter_RMVhV` / `Q6_W_vdeal_VVR` / `Q6_V_vror_VR` …）
+⇒ **`pack_act` 与 `unpack_acc` 是纯 HVX 代码。**
+对照：引擎侧 5 个唯一符号全在 `HMXAPI.c`
+（`Q6_mxmem_AR_after_hf` / `Q6_mxclracc_hf` / `Q6_bias_mxmem2_A` /
+`Q6_activation_hf_mxmem_RR_deep` / `Q6_weight_hf_mxmem_RR`）。
 
-四个关键选择：
+**三条理由：**
+
+1. **选 B 会让上游 `hexagon_hmx` 语义失效。** 该属性的前提是**函数内没有 HVX 代码**
+   （`llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:2` 原文
+   "so no HVX unit is acquired on the HMX thread"——**2026-10-02 已随 backport 进本仓，逐字核对通过**）。
+   选 B 等于放弃「**线程契约由编译器静态保证**」这个方案核心，退化成「把单线程的锁挪进一条线程」，**收益趋零**。
+2. **量化上天花板差 ~3.6×。** S1 的 LWP 口径（`docs/hmx/hmx-next-round-plan.md:61-70`，
+   跨构建 `5cea8231`/125 µs，**仅方向参考**）：`engine` 35.2% · `pack_act` 9.8% ·
+   `pack_weight` 4.7% · `unpack` 37.4% · `residual` 12.8%。
+   **方案 A** ⇒ T_HMX 串行链只剩 **35.2%**，`pack_act` 9.8% + `unpack` 37.4% **全部**变成 HVX 侧可重叠对象。
+   **方案 B** ⇒ T_HMX 链 ≈ **35.2 + 47.2 = 82%**，跨线程只剩 `residual` 可动。
+3. **A 顺带化解「pack 还是 unpack」两难** —— 两个都归 HVX 侧，不必二选一。
+
+**代价与对冲见 §4.5**：必须新增 `HmxLayoutHvx` trait，**否则 T_HVX 上的 pack 会去抢 HMX 锁 ⇒ 永久挂死。**
+
+### 重叠哪一半 —— 唯一权威表述
+
+```
+  HVX 侧:   pack_act(i+1)  ‖  unpack(i)
+  HMX 侧:                    mma(i+1) / bias_load / acc_read
+```
+
+**重叠对象 = 引擎归属边界**（`pack_act`/`unpack_acc`/`hmx.stage` 纯 HVX
+⇔ `hmx.mma`/`acc_read`/`bias_load` 纯引擎）。**这条边界就是 SPSC 环的刀口。**
+
+⚠️ **它不是 stage/await 值边** —— 后者是 DMA 语义（DDR→VTCM 传输），
+**serial 路径上没有 `hmx.stage`/`hmx.await` 可切**
+（FA 的 QK 就在那条路上：`logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
+Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样）。**判据见 §3.1。**
+
+⚠️ **可藏量口径**：`enableWeightResident` 默认开 ⇒ `pack_weight` ≈ 0
+⇒ 可重叠对象 ≈ `pack_act` 9.8% + `unpack` 37.4% = **47.2%**（跨构建 LWP，**仅方向参考**）。
+
+### 四个关键选择
 
 1. **T_HMX 的"纯度"由编译器保证，不靠纪律**：所有 T_HMX 上跑的函数带 LLVM fn 属性
    `"hexagon_hmx"`（上游 PR #222340，2026-09-17 合并，commit `2e055b8de1a1`，Qualcomm 参与）。
    上游 TTI 保证：`useHVX() = … && !IsHMX`（该函数永不auto-HVX）+ `areInlineCompatible()`
-   双向拒绝跨角色内联。语义与测试见 llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:1-2 与 hmx-attr-inline-compat.ll:1-41（**2026-10-02 已随 backport 进本仓**）
+   双向拒绝跨角色内联。语义与测试见 `llvm_triton/llvm-project/llvm/test/CodeGen/Hexagon/hmx-attr-no-autohvx.ll:1-2` 与 hmx-attr-inline-compat.ll:1-41（**2026-10-02 已随 backport 进本仓**）
    （"so no HVX unit is acquired on the HMX thread"）——**这正是本方案线程契约的官方表达**。
 2. **HVX 侧复用现有 async 底座**：`FormAsyncThreadsPass.cpp:10` "lowering virtual-threads to
    async.execute"（现限 rank-1 forall）→ `bin/runtime/multithreading/HexagonThreadPool`。
@@ -176,10 +165,6 @@ Triton → TTIR → Linalg
 
 ### 3.1 判据（两级，**正交，不是互斥枚举**）
 
-> ⚠️ **原稿把两级字段写进了一张表，表头却说"每个一个 canonical reason code"（暗示互斥）。
-> 一个 dual-role kernel 会同时持有区域级 `role-hmx` 与 kernel 级 `role-split-ok` ⇒ 原表不自洽。**
-> 现拆为两级。
-
 **① 区域级（每个 region 一条）**
 
 | 判定 | 规则（纯能力，零成本模型） | reason code |
@@ -193,12 +178,15 @@ Triton → TTIR → Linalg
 |---|---|---|
 | 混合可切 | 引擎段与向量段之间有**引擎归属边界**可下刀 | `role-split-ok` |
 | 混合不可切（依赖交织） | 引擎 op 与向量 op 依赖交织、无刀口 | `role-mixed-irreducible` → 单线程语义（=今日行为） |
-| 混合不可切（**无刀口**） | **tile 循环体内根本没有 pack** ⇒ 无可重叠对象 | **`role-split-nopack`** ⛔ 新增 |
-| 混合但环放不下 | 切得开，但 SPSC 环的内存预算不够 | **`role-split-nobudget`** ⛔ 新增 ⇒ 退回单线程。现成形态见下 |
+| 混合不可切（**无刀口**） | **tile 循环体内根本没有 pack** ⇒ 无可重叠对象 | **`role-split-nopack`** |
+| 混合但环放不下 | 切得开，但 SPSC 环的内存预算不够 | **`role-split-nobudget`** ⇒ 退回单线程 |
 | 全 kernel 单角色·引擎 | — | `topology-single-role-hmx`（要 T_HMX 线程） |
 | 全 kernel 单角色·向量 | — | `topology-single-role-hvx`（**不建线程**） |
 
-**⚠️ 三个新增/修订分支的证据：**
+⚠️ **两级必须分开写**：一个 dual-role kernel 会同时持有区域级 `role-hmx` 与 kernel 级 `role-split-ok`，
+把它们塞进一张表并声称"每个一个 canonical reason code"是不自洽的。
+
+**三个分支的证据：**
 
 - **`role-split-nopack`**：`HmxPartitionPass.cpp:679-706` 的 `emitSerialTileLoop` 函数体只有
   `AccClearOp` → `emitMmaKLoop` → `AccReadOp`，**循环体内无 pack、无 stage**。
@@ -210,16 +198,16 @@ Triton → TTIR → Linalg
 - **`role-split-nobudget`**：现成形态在 `HmxPartitionPass.cpp:1626-1631`
   （`fits(2)/fits(1)/fits(0)` → `budgetDepth==0` 时 decline）。
   ⚠️ **§4.3 要造的是第二个环（SPSC），它的内存预算目前无任何判据。**
+  ⚠️ **实测补充（2026-10-02）**：现有 staging 环在门槛正上方只占 VTCM 预算 **2.34%**，
+  `vtcm-budget` 在 103 份 manifest 里出现 **0 次** ⇒ **这条 reject 判据在实践中几乎不会触发**（见 §5.1.7）。
 - **单角色要拆两个值**：单角色且全 HVX **不建线程**；单角色且是引擎 **要 T_HMX 线程**。
-  运行时后果完全不同，原稿一个 `topology-single-role` 表达不了。
+  运行时后果完全不同，一个 `topology-single-role` 表达不了。
 
-> ⚠️ **刀口不止一种，原稿只写了一种**：§3.1 原来的刀口是 **stage/await 值边**，
-> 而那是 **DMA 语义**（`hmx.stage`/`hmx.await` = DDR→VTCM 传输）。
-> **但跨线程重叠需要的是引擎归属边界**（`pack`/`unpack` vs `mma`/`acc_read`），两者不是同一条线。
-> **serial 路径上没有 `hmx.stage`/`hmx.await` 可切** ⇒ 原判据在 serial 形状上恒不成立。
-> 实证：FA 的 QK 落在这条 —— `logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
-> Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样。
-> ⇒ **判据需要第二种刀口，或显式承认 S4a/S4b 在 QK 那一侧不成立**（见 §5 S4a/S4b 行）。
+⚠️ **刀口不止一种**：stage/await 值边是 **DMA 语义**（`hmx.stage`/`hmx.await` = DDR→VTCM 传输），
+而跨线程重叠需要的是**引擎归属边界**（`pack`/`unpack` vs `mma`/`acc_read`），两者不是同一条线。
+**serial 路径上没有 `hmx.stage`/`hmx.await` 可切** ⇒ stage/await 判据在 serial 形状上恒不成立。
+实证：FA 的 QK 落在这条 —— `logs/real-shapes-2026-09-29/attn_qk_d128.manifest.json`
+Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样。
 
 与 M3.1 退役结论的关系：**判据里没有任何"哪个更快"**——MatmulToHmx 继续回答"能不能上 HMX"，
 本 pass 只回答"在哪个线程跑"，两者正交。
@@ -239,6 +227,7 @@ Triton → TTIR → Linalg
 2. 跨角色禁止 inline/clone 合并：LLVM 层由上游 TTI 管（双向）；自家 clone/桥消除 pass
    （`preferCloneToConsumers` 等）加同极性检查——沿用 HmxToLLVMPass.cpp:101-110 的失效方向：
    错并到 HVX 侧=挂死，错并到 HMX 侧=多付一对锁，所以 fail-safe 方向是"未证明即 HMX"。
+   ⚠️ **§5.4 ② 指出这条需要两个相反极性的判据，不能靠同一个 bit。**
 3. 分区聚合收敛：一个 async.execute 单角色（IREE `Partition::verify` 形态；其 joinAND/joinOR
    "divergent affinities not yet implemented" assert 正是缺这个检查的教训）。
 4. VTCM 所有权跨线程交接必须显式：tile 所有权随事件字移交，禁止两线程同时写同一 tile
@@ -288,12 +277,11 @@ Triton → TTIR → Linalg
    ⇒ **今天 pack/unpack 被算成引擎 op。**
    **若 pack/unpack 移到 T_HVX 而不新增「要 HVX、不要引擎」的第三类标记，
    T_HVX 上的 pack 会去抢 HMX 锁 ⇒ 永久挂死**——正是 `HmxToLLVMPass.cpp:96-99` 警告的失效模式。
-   ⚠️ **§1.1 说"继承同一 fail-safe 方向"，但这不是继承，是要新增一个 trait。**
 
    **设计（已定）：**
    - **新增 `NativeOpTrait` `HmxLayoutHvx`**（语义："HMX 布局代码，由 HVX 实现"），
      定义在 `HmxDialect.h`（与 `HmxDmaOnly:160` 并列）。
-   - **加在恰好三个 op 上**：`pack_act` · `pack_weight` · `unpack_acc`。
+   - **加在四个 op 上**：`pack_act` · `pack_weight` · `unpack_acc` · **`unpack_acc_f32`**（§5.4 ⑥）。
    - **`issuesHmxEngineLeaves` 判据改为**：
      `无 HmxDmaOnly 且 无 HmxLayoutHvx ⇒ 引擎`（即两个 trait 都是"排除引擎"的标记）。
 
@@ -316,6 +304,8 @@ Triton → TTIR → Linalg
 
    **Legacy 路径零影响**：trait 只改「算不算引擎」；legacy 下 pack 照旧被锁，无害。
 
+   ⛔ **但这一项被独立审核推翻过三条，动代码前先读 §5.4。**
+
 6. ⛔ **host→device 的分流通道不存在**
    §4.2 说 legacy 路径「由 manifest 的 `topology` 字段区分」。但**设备 runtime 今天完全不读 manifest**：
    `bin/runtime/src/HexagonAPI.cpp` 与 `HexagonCAPI.cpp` 里 `grep manifest` 与
@@ -334,25 +324,25 @@ Triton → TTIR → Linalg
 
 | 阶段 | 内容 | 验收 | 备注 |
 |---|---|---|---|
-| **S0**（~半天） | 查 pinned llvm_triton/llvm-project 是否含 `2e055b8de1a1`；无则 backport TTI 两个 hunk（~30 行）。HMX leaf 函数带 `hexagon_hmx` 编译通过 | lit 全绿 | 零行为变化 |
-| **S1**（host 全验） | ThreadRolePartition pass + attr + verifier + manifest 字段；默认只 emit 单角色 | FileCheck 全套（成功/拒绝/mixed-irreducible/半HMX→PARTIAL+dual-role）；零行为变化 | 纯编译期 |
+| **S0**（~半天） | 查 pinned llvm_triton/llvm-project 是否含 `2e055b8de1a1`；无则 backport TTI 两个 hunk（~30 行）。HMX leaf 函数带 `hexagon_hmx` 编译通过 | lit 全绿 | ✅ **已完成**，见 §5.0 |
+| **S1**（host 全验） | ThreadRolePartition pass + attr + verifier + manifest 字段；默认只 emit 单角色 | FileCheck 全套（成功/拒绝/mixed-irreducible/半HMX→PARTIAL+dual-role）；零行为变化 | 纯编译期。⚠️ 开工前须先落 §5.4 的四条修法 |
 | **S2**（运行时底座） | 角色执行器 + T_HMX + SPSC 环 + 锁迁移（legacy 共存）；4 个探针：环吞吐、锁长持、DMA 跨线程等待、VTCM 跨线程 alloc/free | host 单元测试 + 探针报告；不跑真 kernel | [未验证]×4 见 §6 |
-| **S2.5**（⛔ 新增前置） | **给 S1-class 引入 per-tile pack**：把整数组 prologue 的 pack（`MatmulToHmxPass.cpp:1139-1163`）折进 tile 循环，让 S1 形状**有可重叠对象** | 纯 host：manifest `pack_act_sites` 从 1 变 2（对齐 `s2_anchor`）；lit 全绿 | ⛔ **S3 的硬前置**。不做这步，S3 在 S1-class 上按 §3.1 自己的判据就是 no-op（`role-split-nopack`） |
-| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B，**`N ≥ 1000`**（once_share 1.70%），≥ max(3×CV,15%)；判决**四选一**见 §5.1.3<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」**<br>③ ⛔ **先过 §5.1.7 的 reject 判据**（`budgetDepth` 下降 ⇒ 不进 A/B） | ⚠️ 不能是 S1-class（见 S2.5，S1 的 A/B 待 S2.5 后补）。⛔ **不得以 47.2% 为预期**——S2-class 已有一笔 **1.92× staging 重叠**入账（`hmx-perf-findings-2026-09-27.md:183`/`:293`），真实上限更低（§5.1.5②）。⛔ **47.2% 与 37% 不许相减**（§5.1.5①）。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
-| **S4a**（⛔ 由 S4 拆出 · 观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` + §5.1 的 N 规则 | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
-| **S4b**（⛔ 由 S4 拆出 · 真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%)<br>⛔ **必须单独列交互项** `A_both − max(A_topo, A_softmax)` | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⛔ **合并门在数学上不可证伪拓扑**（§5.1.6）。⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响；但 §3.1 的 stage/await 刀口在 QK 上恒不成立 |
+| **S2.5**（⛔ 硬前置） | **给 S1-class 引入 per-tile pack**：把整数组 prologue 的 pack（`MatmulToHmxPass.cpp:1139-1163`）折进 tile 循环，让 S1 形状**有可重叠对象** | 纯 host：manifest `pack_act_sites` 从 1 变 2（对齐 `s2_anchor`）；lit 全绿 | ⛔ **S3 的硬前置**。不做这步，S3 在 S1-class 上按 §3.1 自己的判据就是 no-op（`role-split-nopack`） |
+| **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B，**判决四选一**见 §5.1.3<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」**<br>③ ⛔ **先过 §5.1.7 的 reject 判据** | ⚠️ 不能是 S1-class（见 S2.5）。⛔ **不得以 47.2% 为预期**——S2-class 已有一笔 **1.92× staging 重叠**入账（`hmx-perf-findings-2026-09-27.md:183`/`:293`），真实上限更低（§5.1.5②）。⛔ **47.2% 与 37% 不许相减**（§5.1.5①）。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
+| **S4a**（观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` + §5.1 的 N 规则 | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
+| **S4b**（真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%)<br>⛔ **必须单独列交互项** `A_both − max(A_topo, A_softmax)` | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⛔ **合并门在数学上不可证伪拓扑**（§5.1.6）。⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响 |
 | **S5**（收口） | S3/S4b 过门 ⇒ 报用户批准翻默认；per-kernel 配对降级 legacy-only；经验推上游（hexagon 侧 RFC / async affinity） | 门数字 + 契约评审 | 翻默认须用户批准（你们规则） |
 
 **依赖：`S0 → S1 → S2 → S2.5 → S3 → S4a → S4b → S5`**
 
-⚠️ **原稿"S1 与 S2 文件面不重叠，可并行"已撤回**，有两处真实的**写-读**依赖：
+⚠️ **S1 与 S2 不能并行**，有两处真实的**写-读**依赖：
 
 | 依赖 | 证据 |
 |---|---|
 | 门 `enableThreadRolePartition` 需照 `enableHmxPipelineDepth` 的现成**三处**接线 | `include/hexagon/Dialect/Hmx/Transforms/Passes.td:134`（`Option<"pipelineDepth", "pipeline-depth", "int64_t", /*default=*/"0">`）· `lib/Target/Linalg_MLLVMIR/MLLVMIRTranslation.cpp:154-155` · `backend/hexagon_options.py:157`（`enableHmxPipelineDepth: int = 0`）。**S1 与 S2 都碰这三处** |
 | manifest `topology` 字段：**S1 写**（§3.4）、**S2 的 legacy 分支读**（§4.2） | ⇒ **S2 的第 2 项不可能在 S1 之前完成** |
 
-⇒ **S1 与 S2 只在「探针 / 单元测试」这部分文件面确实不重叠、可并行。**
+⇒ **只有「探针 / 单元测试」这部分文件面确实不重叠、可并行。**
 
 ✅ **§2 的引擎归属硬矛盾已解决**（2026-10-02 定为**方案 A**）。
 ⇒ **`S2` 开工前的前置只剩一件：§4.5 的 `HmxLayoutHvx` trait 必须先落地**，
@@ -360,7 +350,7 @@ Triton → TTIR → Linalg
 
 ---
 
-## 5.0 ✅ S0 已完成：LLVM `hexagon_hmx` 已 backport（2026-10-02），附一处**机制限制**
+## 5.0 ✅ S0 已完成：LLVM `hexagon_hmx` 已 backport（2026-10-02）
 
 **做了什么**：把上游 PR #222340（`2e055b8de1a1`，2026-09-17，Qualcomm）逐字 apply 进
 `llvm_triton/llvm-project`。**用的就是上游 diff 本身**（`curl .../pull/222340.diff`），
@@ -380,14 +370,13 @@ Triton → TTIR → Linalg
 ⚠️ **`llvm_triton/llvm-project` 是 tarball 不是 git 仓 ⇒ 这个 patch 是唯一的持久化凭据，
 丢了就只剩重下一次上游 diff。** 已做 **revert → 逐字节回 baseline → reapply** 往返验证。
 
-### 零行为变化：已证
+**零行为变化：已证。** 本仓源码里 `hexagon_hmx` **零命中** ⇒ 没有任何函数带该属性 ⇒ `IsHMX` 恒 `false`
+⇒ `useHVX()` 与 `areInlineCompatible` 都退化成原行为。
+（这一条本仓早有记录 —— `hexagon-mlir-local.patch:64792`。）
 
-本仓源码里 `hexagon_hmx` **零命中** ⇒ 没有任何函数带该属性 ⇒ `IsHMX` 恒 `false`
-⇒ `useHVX()` 与 `areInlineCompatible` 都退化成原行为。**今天不重建就完全不生效。**
+### ⛔ 一处机制限制
 
-### ⛔ 一处机制限制（本节最重要的产出）
-
-上游两个测试在我们树上**一个过一个挂**，查清了原因，**不是 patch 的错**：
+上游两个测试在我们树上**一个过一个挂**，原因**不是 patch 的错**：
 
 | 测试 | 结果 | 原因 |
 |---|---|---|
@@ -401,7 +390,7 @@ Triton → TTIR → Linalg
 `TTI.areInlineCompatible`，默认 `IgnoreTTIInlineCompatible=false`，即检查是开的）。
 
 **实测确认不是「钩子没接」**：把两个 helper 的 `alwaysinline` 去掉、走普通 `-passes=inline`
-（高阈值）后，**两个跨角色 call 都被拦住了**（各留 1 个 `call void`）。
+（高阈值）后，**两个跨角色 call 都被拦住了**（各留 1 个 `call void`）
 ⇒ **`areInlineCompatible` 对普通内联有效，只对 `alwaysinline` 无效。**
 
 **对本方案的三条影响：**
@@ -413,8 +402,7 @@ Triton → TTIR → Linalg
 3. 若确实需要 `alwaysinline` 也被拦，**要再 backport 一处 inliner 改动**——
    **超出 S0 范围，未做**，登记在此以免日后当成已覆盖。
 
-
-### ✅ 那个问号已查实（2026-10-02）：HMX 段**不带** `alwaysinline`
+### ✅ HMX 段不带 `alwaysinline`（2026-10-02 查实）
 
 对 `logs/fa_pure.ll`（212 个 `define`）逐个解析 attribute group：
 
@@ -424,117 +412,87 @@ Triton → TTIR → Linalg
 | 不带 | 189 | 含 `@attention_fwd_kernel`、6 个 `@async_execute_fn*`、2 个 `@hexagon_runtime_hmx_{ensure,unlock}_dsp` |
 | **HMX/matmul/pack/unpack 里带 `alwaysinline` 的** | **0** | — |
 
-⇒ **`alwaysinline` 那条缝对本方案不构成风险**：那些数学叶是 HVX 侧代码，
+⇒ **那条缝对本方案不构成风险**：那些数学叶是 HVX 侧代码，
 而 HMX 段（`mma`/`acc_read`/`bias_load`）不需要超越函数 ⇒ 不会出现在 HMX 段的调用面上。
-⇒ **选项 1 成立**：承重的是 §3.3 第 2 条的 pass 级检查，TTI 钩子是普通内联路径的第二道防线。
-⚠️ 若将来 HMX 段需要超越函数（S1 那种带激活的形状**要重新查**），
-本条结论作废，须回头补 inliner 的 backport。
+⚠️ 若将来 HMX 段需要超越函数（S1 那种带激活的形状**要重新查**）。
+⚠️ 本仓流水线自己就跑 AlwaysInliner（`lib/Target/HEX_LLVMIR/LLVMIRTranslation.cpp:51`
+`createAlwaysInlinerLegacyPass`）⇒ **「有没有 `alwaysinline`」是每个形状都要重问的问题。**
 
-本仓流水线自己就跑 AlwaysInliner（`lib/Target/HEX_LLVMIR/LLVMIRTranslation.cpp:51`
-`createAlwaysInlinerLegacyPass`），所以「有没有 `alwaysinline`」是每个形状都要重问的问题，
-不是一次性结论。
+### ✅ S0b 已完成：重建能力已解锁（2026-10-02）
 
-### 未做（明确登记）
+**卡点不是重建，是 `clang++` 缺 `libtinfo.so.5`。** 解法一行：
+`LD_LIBRARY_PATH=<workspace>/HOST_TOOLCHAIN/libtinfo5/lib/x86_64-linux-gnu`
+⇒ **本机第一次能重编 `libtriton.so`，全程 2 分钟。**
 
-- ⛔ **没有重建 `install/` 树**（`build/install/lib/cmake/llvm`，hexagon-mlir 链的就是它）。
-  ⇒ **patch 目前只对 `build/bin/opt` 生效**（已重建，4 步，1 分钟）。
-  ⇒ **要让 hexagon-mlir 真正用上，必须重建 install 树，那会改 `libtriton.so`、作废设备锚点。**
-  **这一步须用户批窗口。**
-- ⛔ 没重建 `libtriton.so`。设备锚点仍是
-  `ce26015e8efb75cc047515000c8ad70f` / `97af133e81fbc361bca3be10164b7bc8`。
+**⇒ 2026-10-02 已重建 install 树，`libtriton.so` 重链，经 9/9 形状验证可用。**
+⇒ `libhmxapi.a` 全天未变，仍 `97af133e81fbc361bca3be10164b7bc8`。
 
-### ✅ 2026-10-02 夜：f16 除法那条（项目已知最大单点）的两块基石都到位了
+**两个 LLVM 补丁的落地状态（已实测确认）：**
 
-**与本方案无关，但它是项目当前已知最大的单点，登记在此备查：**
-`fdiv <64 x half>` → **194 次 libcall**；`fdiv <64 x float>` → **2 次**。
+| 补丁 | 状态 |
+|---|---|
+| `hmx-attr` | 在 `.so` 里，但**可证 no-op**（后端 `hexagon_hmx` 零命中）；产物影响仅 `areInlineCompatible` 的 inline 决策 |
+| **`fdiv-ninf`** | **在 `.so` 里，且两条语义分支实测正确**：`narrowed`（BO 带 `ninf`、`FPT` 不带）→ `ninf` 被清；`control`（都带）→ `ninf` 保留。触发条件是 `fptrunc` 喂 binop，**不是 `fdiv`** |
+| `a576182`（K-fusion） | 落地但**选项默认关** ⇒ 产物逐字节不变 |
+| `ps-aligna` / `fmaxnum-nnan` | 早已含在工作 `.so` 里，不在 delta 内 |
 
-> **⚠️ 勘误八（2026-10-02 17:30）：上面这个数字在当前构建上复现不出来，且其机制在本流水线上没有入口。**
->
-> 全仓搜「194」：**本仓没有更早的出处、没有量它的脚本、没有它对应的那份 IR**
-> （`docs/` 里其余 5 处命中全部是 2026-10-02 我自己写的）。
->
-> **用当前构建（含 patch 的 `20342db0`）扫遍 `dump_codegen.py` 支持的全部 7 个算子**：
-> `matmul` / `silu` / `softmax` / `rms_norm` / `vec_add` 的 **`x half` 均为 0、数学 libcall 均为 0**；
-> `flash_attention` 有 8 处 `x half`，**逐处看全是 `load <64 x half>` + `fpext` 到 f32**
-> （输入布局转换，不是算术）；全篇**没有一个数学函数被 call**。
->
-> **机制上它也走不通**：`narrowBinOp` 的入口守卫是
-> `match(Trunc.getOperand(0), m_OneUse(m_BinOp(BinOp)))` ⇒ **必须有 `fptrunc`**，
-> 而 HVX→HMX 这条流水线上 `f16` 只出现在**输入侧**、算术全在 f32 ⇒ **永不收窄**。
-> 且 opcode 列表里**没有 `Fdiv`**（只有 `and/or/xor/add/sub/mul` 与 `FAdd/FSub/FMul`）。
->
-> ⇒ **⇒ 这一项应当记作「出处不明」，不是「已证存在、只等重测」。**
-> ⇒ ⇒ **「方案 A 改 LLVM」vs「方案 B 插 pass 扩回 f32」这个分野目前无法用证据裁决**，
-> 因为**被比较的现象本身没能在任何可达 kernel 上复现**。
-> ⇒ ⇒ **下一步不是选 A 或 B，而是先找到「194 次」的那个 kernel**
-> ——候选是 `exp` / `log` / `rsqrt` / `gelu`，**它们不在 `dump_codegen.py` 的支持列表里，从没被扫过**。
-> ⇒ ⚠️ 反向证据：今晚 `hexmlir-all` **7/7**（含 `test_gelu` / `test_silu` / `test_softmax`）
-> ⇒ **⇒ 它在真机上没有造成正确性问题，只可能造成性能问题；而含除法算子的 Perf 从未有过对照。**
->
-> 📄 `docs/results/f16-division-194-unreproducible-2026-10-02.md`（含逐算子数据与复现命令）
+⚠️ **一次「不可复现的失败」曾导致错误回滚**：13:14 那次 S1 启动 rc=1、零输出。
+最终查明**不是任何构建的性质** —— 两个构建生成的**设备指令流逐字节相同**
+（S1/S2/S3 归一化后 md5 全同）⇒ 没有任何 codegen 变化能解释它。
+**⇒ 方法论：功能测试与产物对拍回答的是两个不同问题，「9/9 通过」说明不了「代码有没有变」。**
 
-根因是 LLVM InstCombine 的 binop 收窄把 `<64 x float>` 变成 `<64 x half>`
-（HVX 没有向量 f16 除法 ⇒ 192 次 libcall）。
+### ⛔「f16 除法 194 次 libcall」：出处不明，且机制在本流水线无入口
 
-**今天补上了它的一块基石**：上游 \`320a8a4db872\`（PR #202489，2026-07-03）已 backport
-（patch 落 \`tools/hexmlir/llvm-hexagon-fdiv-ninf-narrowing.patch\`，4/4 hunk @ offset −113，往返验证过）。
-它**保留收窄、只修 miscompile**：收窄后的 binop 在更小类型里重算，
-可能在宽运算有限处溢出成 inf，\`ninf\` 被原样拷过去就会产生 poison。
-实测行为：\`fdiv nnan ninf <4 x float>(fpext, fpext)\` → 收窄成 \`fdiv nnan <4 x half>\`（**\`ninf\` 被清**）；
-而 fptrunc 也带 \`ninf\` 时 → \`fdiv nnan ninf <4 x half>\`（**保留**）。
-**收窄没被取消，只丢了不安全的那个标志。** LLVM InstCombine 全套 1804 个测试 0 失败。
+`fdiv <64 x half>` → 194 次 libcall 这个数字，**在本仓查不到出处**：没有更早的记录、没有量它的脚本、没有它对应的那份 IR。
 
-⚠️ **这也是「不给 fdiv 加 \`nnan ninf\`」的独立理由**：在未打这个补丁的基线上，
-\`fdiv nnan ninf <64 x float>\` 会被收窄成 \`fdiv nnan ninf <64 x half>\`
-⇒ **正是那个 poison-on-overflow miscompile。**
+**两个独立测量都指向「它不在 matmul 上」：**
 
-**⛔ 未做**：两个 patch 都**只对 \`build/bin/opt\` 生效**（各自重建过 opt）。
-**要让 hexagon-mlir 吃到，必须重建 \`build/install\` 树，那会改 \`libtriton.so\`、作废设备锚点**
-⇒ 归 S0b 那条，需用户批窗口。
+1. **全算子扫描**（含 fdiv patch 的构建）：`matmul` / `silu` / `softmax` / `rms_norm` / `vec_add`
+   的 `x half` 均为 0、数学 libcall 均为 0；`flash_attention` 有 8 处 `x half`，
+   **逐处看全是 `load <64 x half>` + `fpext` 到 f32**（输入布局转换，不是算术）；
+   全篇**没有一个数学函数被 call**。
+2. **两个 `.so` 各编一次 `matmul` 的 `llir`，逐行对比**：函数体都是 160 行、
+   **逐字节完全相同**；`llvm.fdiv` 0 次；数学 libcall 的 `declare` 0 个。
 
-### ⛔⛔ 2026-10-02 夜：同构建锚点重测完成，**本方案的立项理由被削弱**
+**机制上也走不通**：`narrowBinOp` 的入口守卫
+`match(Trunc.getOperand(0), m_OneUse(m_BinOp(BinOp)))` 要求路径上存在 `fptrunc`，
+而 HVX→HMX 这条流水线上 `f16` 只出现在**输入侧**、算术全在 f32 ⇒ **永不收窄**。
+且 opcode 列表里**没有 `Fdiv`**（只有 `and/or/xor/add/sub/mul` 与 `FAdd/FSub/FMul`）。
+
+⇒ **⇒ 这一项记作「出处不明」，不是「已证存在、只等重测」。**
+⇒ ⇒ **「方案 A 改 LLVM」vs「方案 B 插 pass 扩回 f32」这个分野目前无法用证据裁决**，
+因为**被比较的现象本身没能在任何可达 kernel 上复现**。
+⇒ ⇒ **下一步不是选 A 或 B，而是先找到「194 次」的那个 kernel** ——
+候选是 `exp` / `log` / `rsqrt` / `gelu` / `silu` / `softmax`（`hexmlir-all` 里就有）。
+⇒ ⚠️ **反向证据**：`hexmlir-all` **7/7**（含 `test_gelu` / `test_silu` / `test_softmax`）
+⇒ **它在真机上没有造成正确性问题，只可能造成性能问题；而含除法算子的 Perf 从未有过对照。**
+
+📄 `docs/results/f16-division-194-unreproducible-2026-10-02.md`
+📄 `docs/results/s0b-rebuild-2026-10-02.md` · `docs/results/s1-regression-not-reproducible-2026-10-02.md`
+
+### ✅ 2026-10-02 夜：同构建锚点重测，**本方案的立项理由被削弱**
 
 真机、`ITERS=1000`、`REPS=3`、指纹 `ce26015e` 前后一致、null 臂三个形状全 0.0%。
 报告：`docs/results/phase0-1-same-build-anchor-2026-10-02.md`。
 
+⚠️ **这张表是 `N=1000` 口径，而预热修复后这个口径已作废**（见 §5.1）：
+
 | shape | 旧锚点（`388b6a2e`, 09-21） | **新锚点（`ce26015e`）** | 变化 |
-|---|---:|---:|---:|
+|---|---:|---:|---|
 | S1 | 69 µs | **55 µs** | **−20.3%** |
 | S2 | 85 µs | **42 µs** | **−50.6%** |
 | S3 | 13 µs | **10 µs** | **−23.1%** |
 
-**若 llama 的 52.25/56.71/15.41 仍成立**（⚠️ 跨构建，不可引用）：
+**⇒ 三条后果：**
 
-| shape | 新比值 | 原记录 | 含义 |
-|---|---:|---:|---|
-| **S1** | **1.053** | 1.13 | **还慢，但只慢 5.3%（原 13%）** |
-| S2 | 0.741 | 0.92 | 快 26%（原 8%） |
-| S3 | 0.649 | 0.58 | 快 35%（原 73%） |
-
-> ⛔ **这张表整列是 `N=1000` 口径（含一次性成本 `B/N`），而 llama 那一列是稳态口径
-> （24576~81920 runs）。** 逐行的口径修正见本节末尾的勘误：
->
-> | shape | 本表（`N=1000`） | **稳态 `A`** | llama | 稳态比值 |
-> |---|---:|---:|---:|---:|
-> | **S1** | 1.053 | **52.87 µs** | 52.25 | **1.012**（持平） |
-> | S1 + `enableWorkspaceResident` | — | **47.89 µs** | 52.25 | **0.917**（我们快 8.3%） |
-> | S2 | 0.741 | 38.84 | 56.71 | 0.685 |
-> | S3 | 0.649 | 7.89 | 15.41 | 0.512 |
->
-> ⚠️ 上面的 `52.87` 用的是**更正后的 `B ≈ 2 700 µs`**；用旧的 2 105 是 52.89
-> ⇒ **差异 < 0.002 µs，比值不变。**
-> ⇒ **⇒ 「S1 还慢 5.3%」这句话本身要按 1.012（持平）读，配 `ws` 则是 0.917（我们快）。**
-
-#### ⇒ 三条后果
-
-1. **§1.2「推翻二」的全部动机是「S1 输 13%」。若那是 5%，可摘的果子小 2.6 倍。**
-   S3 的验收写的是「吃掉 S1 差距的**全部或大部**」⇒ **目标本身变小了。**
+1. **§1.2「推翻二」的全部动机是「S1 输 13%」。按稳态口径 S1 是 52.87/52.25 = 1.012（持平）；
+   配 `enableWorkspaceResident` 是 0.917（我们快 8.3%）⇒ 可摘的果子比原设想小。**
 2. **§5.1.5② 的判断只会更糟**（S2-class 自己已有一笔 1.92× staging 重叠，
    而 S3 首发形状就是 S2-class）⇒ **真实上限远低于 47.2%。**
 3. **⇒ `87ae8df9`（Phase 0.4+0.5：S1 对象码计数 + 真机 PMU）从「重要」升为「决定性」。**
-   **在知道「S1 那 5% 里跨线程机制占多少」之前，本方案不该开工。**
+   **在知道「S1 那几个百分点里跨线程机制占多少」之前，本方案不该开工。**
 
-#### ⚠️ 两条限制，必须一起说
+**⚠️ 两条限制，必须一起说：**
 
 - **分辨率**：`perf` 的量化步长是 **1.0 µs**（全部取值只有
   `{6,10,34,38,41,42,43,51,55}`）⇒ S3 的 −40% 实际是 **−40% ± 7%**；
@@ -543,822 +501,77 @@ Triton → TTIR → Linalg
   `AGENTS.md:131` 记 −25.0%（S1/S2 都复现良好，差 1.2 / 0.8 个百分点）
   ⇒ **S3 上还有别的变量没控住，不要把 −40% 当定论。**
 
-#### ⛔ 未做（下一步的第一优先）
-
-**没重测 llama.cpp 那一侧** ⇒ 上面的比值是**条件句**。
-**且 depth 3/1/2 三臂没测**（kStage 地板那条）—— 已在同一次窗口补跑，结果见
-`logs/phase0-1-anchor-2026-10-02/depth_ab_N1000.log`。
+**⛔ 未做**：没重测 llama.cpp 那一侧 ⇒ 上面的一切比值都是**条件句**
+（bench 在手机 Termux 上，本机跑不了）。depth 3/1/2 三臂已在同一次窗口补跑，
+结果见 `logs/phase0-1-anchor-2026-10-02/depth_ab_N1000.log`。
 
 ---
 
-## 5.1 ⛔ 验收判据：必须带 N，且判决分三类（2026-10-02 定）
-
-> **这一节是对 S3 / S4b 两行的前置修正。原表只写「≥ max(3×CV,15%)」，漏了量纲。**
+## 5.1 ⛔ 验收判据：必须带 N，且判决分三类
 
 ### 5.1.1 为什么：那条判据量的不是性能
 
 稳态口径下（`docs/hmx/hmx-next-round-plan.md:226`）：
 
 ```
-Perf(N) = A + B/N          A = 真稳态边际 · B ≈ 1470 µs = 每调用一次性 bring-up
+Perf(N) = A + B/N          A = 真稳态边际 · B = 每调用一次性 bring-up
 ```
 
 ⇒ **对 `Perf(N)` 施加固定百分比，测的东西取决于 N**：
 N 小 ⇒ 百分比里 `B/N` 占比大，实际在测「一次性开销变小了」；N 大 ⇒ 在测「边际变小了」。
 **两个不同的物理量被同一个数字回答。**
 
-已实测的后果：RoPE trig 那次效应 **27.76%**（> 15% 地板，效应本身够大），
-但 sd 4.99 ⇒ **CV 17.96%** ⇒ 阈值 `max(53.9,15) = 53.9%` ⇒ 三趟全 NOT-PROVEN。
-`docs/hmx/rope-trig-share-device-result-2026-10-01.md:56`：**加样本救不回来**
-（CV 的分子 sd 估的是散布不是标准误）。
+⚠️ **`B` 的来源已查清并已消除（2026-10-02，commit `cabc7ff`）：**
+它是 harness 缺陷，不是后端性质 —— `hexagon_launcher_base.py` 每次 launch 的计时循环之前
+**没有预热调用**，而 `HexagonAPI::AcquireResources()`（`HexagonAPI.h:52`→`:72`）在**每次 launch** 里
+调 `initialize_and_acquire_hmx()`（`HexagonAPI.cpp:220`），做 `HAP_power_set(...)`（`:231-238`）与
+**`HAP_compute_res_acquire(..., 100000)`（`:261`，阻塞最长 100 ms）**
+⇒ **HMX 上电与拉频每次 launch 重做一遍，kernel 的第一次调用正好落在这次 bring-up 里。**
 
-### 5.1.2 ⛔ 硬规则：`once_share ≤ 2%` 才许下判决
+**修法一行**：在 `benchmark_time_and_pcycles` **之前**加一次被丢弃的 `{function_call}`。
+
+| | 修之前 | **修之后** |
+|---|---:|---:|
+| `t(N=3)` | 928 µs | **57 µs** |
+| `B` | 2 624 ~ 2 880 µs | **15 µs** |
+| `A` | 53.4 µs | **52.0 µs** |
+| **`once_share@1000`** | 4.7 ~ 5.2% | **0.029%** |
+
+⇒ ⭐ **`once_share` 降到门槛的 1/69；`N=3` 就已合规。**
+⇒ ⚠️ **`A` 几乎不动（53.4 → 52.0）⇒ 所有历史 `N=1000` 的稳态读数本来就是对的，
+错的只是那个一次项。** ⇒ **比值型结论不受影响；受影响的只是「绝对水平」类陈述。**
+⇒ ⚠️ **⇒ `N ≤ 100` 的历史 `Perf` 全部作废**（`N=10` 那一档被 262 µs 的一次项污染）。
+⇒ 该改动是 Python codegen 模板，**不进 `libtriton.so` ⇒ 不作废设备锚点**。
+
+⚠️ **一条可迁移的教训**：拟合残差小 ≠ 参数可信。在有量化噪声的数据上，最紧的那一段
+往往正好落在量子上 —— 曾把 `N≥1000` 拟合区间（残差 0.5%）当成「最准的估计」，
+而它恰是量子档（`B` 被量化成 1053 的整数倍），真实值 ≈ **2 700 µs**。
+
+### 5.1.2 硬规则：`once_share ≤ 2%` 才许下判决
 
 ```
 once_share(N) = (B/N) / (A + B/N) ≤ 0.02   ⇔   N ≥ 50·B/A
 ```
 
-按本方案三个形状的 `A`（`hmx-next-round-plan.md:268`，S1 69 / S2 85 / S3 13 µs）：
-
-| 形状 | A | N≥300 | **N≥1000** | N≥3000 |
-|---|---:|---:|---:|---:|
-| S1-class | 69 | 6.63% | **2.09%** | 0.71% |
-| **S2-class**（S3 首发形状） | 85 | 5.45% | **1.70%** ✅ | 0.57% |
-| S3-class | 13 | 27.37% | 10.16% | 3.63% |
-
-⇒ **S3 用 `N ≥ 1000`**（S2-class，once_share 1.70%）。
-⚠️ `hmx-next-round-plan.md:240` 建议的 `ITERS≥300` **不够**（5.45%）⇒ 此处上调。
-⚠️ **S3-class 要 2% 需 N ≥ 5654**——若将来在 S3-class 上做，门槛另算。
+⚠️ **`N ≥ 50·B/A` 不是常数，每个形状类、每个构建都要重算** —— 它取决于 `B/A`，而两者都在变。
+⇒ **预热修复之后 `B ≈ 15 µs`，`once_share` 在任何常规 `N` 下都已合规** ⇒
+**`N ≥ 1000` 这条门槛不再是约束**（门槛本身是否还该保留，另议）。
+⇒ 若某个构建/形状的 `B` 反弹（重建、换 launch 路径），**必须重测 `B`，不能沿用常数**。
 
 **`once_share > 2%` 时唯一允许的判决是 `PROVEN (wrong quantity)`。**
 
-### 5.1.2 的勘误（2026-10-02，真机实测）：**`N ≥ 1000` 这个结论不成立**
-
-**上面那张表（含 `:546` 唯一标 ✅ 的 S2-class 1.70%）按本节自己的定义被实测否掉。原文保留。**
-
-**做法**：`Perf:` 随 `ITERS` 下降 ⇒ 用两点解 `t(N) = A + B/N`
-（`B=(t1−t2)/(1/N1−1/N2)`、`A=t1−B/N1`），第三点独立校验，最大偏差 **0.42 µs**。
-
-| 形状 | A 稳态 | B 一次性 | `once_share@1000` | `@20000` | **合规需 N ≥** |
-|---|---:|---:|---:|---:|---:|
-| S3-class 128×128×128 | 7.89 µs | 2105 µs | **21.05%** | 1.316% | **13 333** |
-| 256×512×64 | 16.84 | 3158 | **15.79%** | 0.929% | **9 375** |
-| 256×512×256 | 18.84 | 3158 | **14.35%** | 0.831% | **8 380** |
-| **S2-class 256×64×2048** | 38.84 | 3158 | **7.52%** | 0.405% | **4 065** |
-| S1 / 1024×512×64 | 52.89 | 2105 | **3.83%** | 0.199% | **1 990** |
-
-⇒ ⛔ **五个形状在 N=1000 下全部超标。**
-⇒ ⛔ **`:546` 的 S2-class「1.70% ✅」实测 7.52%，超标 3.8 倍。**
-⇒ ✅ **N=20000 全部合规（≤1.32%）。**
-
-**根因**：这张表给三个 class **共用同一个 `B = 1470 µs`**（三档验算吻合到 0.01%）
-⇒ **那是假设，不是逐形状实测。**
-而实测里 **A 缩小（优化见效）而 B 相对变大** ⇒ `B/A` 从 ~17 涨到 ~81。
-
-⇒ ⭐ **修正后的规则：`N ≥ 50·B/A` 不是常数，每个形状类、每个构建都要重算。**
-**`:549` 那句「⇒ S3 用 `N ≥ 1000`」按实测应是 **`N ≥ 4065`**（S2-class）。**
-
-**⚠️ 但「比值型」结论不受影响**：同一形状同一 N 下比两臂时 `B` 是共模、会完全抵消
-（`base − ws = A_base − A_ws`）。⇒ 今晚的 `ws` 效应、`staging` 效应、
+**⚠️ 但「比值型」结论不受 `B` 影响**：同一形状同一 N 下比两臂时 `B` 是共模、会完全抵消
+（`base − ws = A_base − A_ws`）⇒ `ws` 效应、`staging` 效应、
 `kStageMinKTiles=32` 钉值**都是同形状同 N 的臂间比较，依然有效**。
-⇒ ⛔ **要重跑的是「绝对水平」类陈述，不是「效应量」类。**
 
-**⚠️ 连带发现：`docs/README.md:37` 与本文件的比值表把「我们」那一列和
-llama 那一列放在不同口径下比** —— llama 侧用 24576~81920 runs（`B/N` 可忽略 ⇒ 稳态），
-我们用 N=1000（含 `B/N`）。**稳态口径下 S1 是 52.89/52.25 = 1.012×，
-而 N=1000 口径下是 1.053×。**
-⇒ ⚠️ **「S1 是唯一真差距（1.14×）」可能是口径伪像** ——
-但 llama 侧仍是 2026-09 的数（本机跑不了，bench 在手机 Termux 上）⇒ **只是条件性线索，不是判决。**
+⚠️ **一条口径陷阱**：`docs/README.md:37` 与本文件的比值表曾把「我们」那一列
+（N=1000，含 `B/N`）和 llama 那一列（24576~81920 runs，稳态）放在一起比。
+**稳态口径下 S1 是 52.89/52.25 = 1.012×，而 N=1000 口径下是 1.053×**
+⇒ **「S1 是唯一真差距（1.14×）」可能是口径伪像**。
+⇒ 但 llama 侧仍是 2026-09 的数 ⇒ **只是条件性线索，不是判决。**
 
-> **⚠️ 追加勘误（2026-10-02 06:45）：上表里那个 `B = 2 105 µs` 是量化的产物，真实值 ≈2 700 µs。**
->
-> 九个形状的 `B` 只取 **2105 / 3158 / 4211** 三个值，而它们**都是 1053 的整数倍** ——
-> 1053 µs 正是「`Δ = t(1000) − t(20000) = 1 µs`」对应的量子
-> （`1 / (1/1000 − 1/20000) = 1053`）⇒ **那不是三个物理值，只是 `Δ` 被量化成 2、3、4。**
->
-> `B` 只出现在 `B/N` 里 ⇒ **N 越小分辨率越高**。把 S1 的 `t(N)`（N=1…20000，已扫）
-> 换区间重拟合：
->
-> | 拟合区间 | `B` | 最大残差 |
-> |---|---:|---:|
-> | N=1..30 | **2 665** | 9.6% |
-> | N=1..3000 | **2 683** | 11.7% |
-> | 全部 10 点 | **2 684** | 10.4% |
-> | N≥100 | **2 827** | 0.9% |
-> | N≥1000 | **1 992** | **0.5%** ← 残差最小，**却恰是量子档** |
->
-> ⇒ ⭐ **九档里九档指向 2 650~2 830；唯一给出 1 992 的那档残差最小（0.5%），**
-> **最容易被当成「更准的估计」，实际是最粗的。**
-> ⇒ **⇒ `B ≈ 2 700 µs（±100）`；`once_share@1000 = 4.80%`；`N ≥ 2 519`。**
-> ⇒ 上文那三行「S1-class 合规需 N ≥ 1 990」应读作 **`N ≥ 2 500 ~ 2 700`**。
-> ⇒ ✅ **超标的方向与倍数不变**（S2-class 的 `1.70% ✅` 实测 7.52%）。
->
-> ⭐ **顺带一条可迁移的教训：拟合残差小 ≠ 参数可信；在有量化噪声的数据上，
-> 最紧的那一段往往正好落在量子上。**
->
-> ⛔ **另：上表「五个形状的 A / B」那一列的 `B` 值同样受此影响** ⇒ 五个形状的
-> `once_share` 与门槛都要按上面这个 `B` 重算一遍才能引用。
-
-> **🟣 勘误七（2026-10-02 13:11–13:13）：`:465` 那句「两个 patch 都只对 `build/bin/opt` 生效」**
-> **已过时 —— install 树已刷新，`libtriton.so` 已重链，设备锚点已作废并更换。**
->
-> **做了什么（用户 2026-10-02 12:20 批准 S0b）：**
->
-> | 步 | 命令 | 结果 |
-> |---|---|---|
-> | 0 | 备份 `libtriton.so` + `libhmxapi.a` 到 `logs/anchor-backup-2026-10-02/` | ✅ 两个 md5 都等于旧锚点 |
-> | 1 | `ninja install`（`llvm_triton/build`） | ✅ RC=0 |
-> | 2 | `ninja`（`triton/build/cmake.linux-x86_64-cpython-3.10`） | ✅ RC=0，58/58 步 |
->
-> **⇒ 设备锚点：`ce26015e8efb75cc047515000c8ad70f` → `20342db00d287f29a22490762ca38066`**
-> （`libhmxapi.a` **未变**，仍 `97af133e81fbc361bca3be10164b7bc8` —— 只重编了 host 侧）
-> ⇒ **旧锚点可一行回滚**：`cp logs/anchor-backup-2026-10-02/libtriton.so.ce26015e
->   hexagon-mlir/triton/python/triton/_C/libtriton.so`
->
-> ### ⭐ 真正卡住的不是重建，是 `clang++` 缺 `libtinfo.so.5`
->
-> 第 2 步第一次跑 **61 步里 30 步 FAILED**，全部同一个错：
-> `HOST_TOOLCHAIN/bin/clang++: error while loading shared libraries: libtinfo.so.5`。
-> ⇒ **解法一行**：`LD_LIBRARY_PATH=<workspace>/HOST_TOOLCHAIN/libtinfo5/lib/x86_64-linux-gnu`
-> （`.deb` 早就解包在那里了，只是没在库路径里）⇒ 之后 **58/58 全过、40 秒**。
-> ⇒ ⭐ **⇒ 本项目第一次在本机重建 `libtriton.so` 成功。**
->
-> ### ⚠️ 我自己两处报错，都已更正（append-only 记在这里）
->
-> 1. **「`ninja install` 什么都没装」——错。** 我查了
->    `libLLVMAggressiveInstCombine.a`（Sep 16，**本来就不该变**）就下了结论。
->    实际 `install/lib/libLLVMInstCombine.a` **就是 2026-10-02 13:09** ⇒ **装成功了。**
->    ⇒ **「哪些库该变」这件事本身要先查清，不能只看目录 mtime。**
-> 2. **「patch 在不在新 `.so` 里」——我没能验证。** 判别式两次都没触发收窄路径：
->    第一次 IR 写错（操作数不是 `fpext`），第二次形式对但 InstCombine 不收窄。
->    ⇒ 读了 patch 源码才明白：它在 **`InstCombineCasts.cpp` 的 `narrowBinOp`**，
->    **只在路径上存在 `fptrunc`（`FPT`）时才生效** ⇒ 我两个用例都够不着。
->    **⇒ 结论是「未验证」，不是「在」也不是「不在」。**
->
-> ### ⛔ 因此 S0b 的准确状态是「做完了，但没验完」
->
-> - ✅ install 树与 `libtriton.so` 现在**互相一致**，且都含 10-02 13:09 重编的 `libLLVMInstCombine.a`
-> - ✅ 门全绿（`split_patch` 507 hunks 一致、`doctor` **17 ok / 0 fail**）
-> - ✅ 新 `.so` 能加载、能编译（host `warmup` 探针通过）
-> - ⛔ **`llvm-hexagon-fdiv-ninf-narrowing.patch` 的行为未在真机或 `opt` 上验证**
-> - ⛔ **「f16 除法 194 次 libcall」这个项目当前最大单点，尚未重测**
->   ⇒ 那是 S0b 立项要解决的问题，**现在才第一次具备可测条件**
->
-> 📄 `docs/results/s0b-rebuild-2026-10-02.md`
-> 📄 新锚点基线：`logs/baseline-s0b-2026-10-02/newanchor-N1000.log`
->
-> #### ⛔ 勘误七之更正（2026-10-02 14:22）：**新 `.so` 在 S1 上回归，已回滚**
->
-> 勘误七写的是「锚点已换成 `20342db0`」。**那条只持续了约 1 小时，现已回滚。**
->
-> | 形状 | 新 `.so`（`20342db0`） | 旧 `.so`（`ce26015e`，已恢复） |
-> |---|---|---|
-> | `S3_class` 128×128×128 | ✅ `perf=8.0` | ✅ `perf=8.0` |
-> | `S2_class` 256×64×2048 | ✅ `perf=41.0` | ✅（基线 39） |
-> | **`A_1024x512x64` = S1** | ⛔ **rc=1，零输出** | ✅ `perf=51.0` |
->
-> **失败形态（这是最值得记的一条）**：
->
-> - **host 侧编译通过**（`kern.warmup(...)` 返回正常）
-> - **设备启动 rc=1，`stdout`/`stderr` 一个字都没有** —— 连那条
->   `tl.make_block_ptr` 弃用警告都没出现
-> - ⇒ **与 N 无关**（N=10 与 N=1000 都失败）、**与形状顺序无关**
-> - ⇒ **只有 S1 挂，S2/S3 正常** ⇒ 不是「`.so` 整体不可用」，是**特定形状的回归**
->
-> **⛔ 根因未查**（时间不够）。⚠️ 错误被完全吞掉这一点本身值得单独查：
-> `shape_pair.py` 在 launch 失败时没有把子进程输出带出来。
->
-> ### ⇒ S0b 的净结果要重写
->
-> | | 状态 |
-> |---|---|
-> | ✅ **重建能力已解锁** | `libtinfo.so.5` 的 `LD_LIBRARY_PATH` 修复 ⇒ **本机第一次能重编 `libtriton.so`**，全程 2 分钟 |
-> | ✅ **重建流程已可复现** | 7 步见 `docs/results/s0b-rebuild-2026-10-02.md` §7 |
-> | ✅ **回滚已验证** | 备份 md5 相符；回滚后 S1 `perf=51.0`、`rel=2.2046e-04`、指纹前后一致 |
-> | ⛔ **重建产物不可用** | `20342db0` 在 S1 上回归，已移到 `logs/anchor-backup-2026-10-02/libtriton.so.20342db0.REGRESSES-S1` 作物证 |
-> | ⛔ **fdiv patch 仍未验证** | 「重建成功」**不等于**「patch 生效」，这两件事我分开失败了 |
-> | ⛔ **f16 除法 194 次 libcall 未重测** | 那才是 S0b 立项要解决的，现在仍未解决 |
->
-> #### ⛔ 勘误七之更正之七（2026-10-02 17:25）：**`f16` 除法那个单点，`matmul` 路径上根本不存在**
->
-> 更正之六说「现在才第一次具备可测条件」。**条件具备了，我一测，问题本身就不在这条路径上。**
->
-> **实测（两个 `.so` 各编一次 `matmul` 的 `llir`，逐行对比）**：
->
-> | | `ce26015e`（无 patch） | `20342db0`（有 patch） |
-> |---|---|---|
-> | `matmul_kernel` 函数体 | **160 行** | **160 行** |
-> | 两个函数体逐字节比较 | — | ✅ **完全相同** |
-> | 全文 `fdiv` 出现 | 10 | 10 |
-> | `llvm.fdiv` | 0 | 0 |
-> | `sqrt` | 0 | 0 |
-> | 数学 libcall 的 `declare`（`sqrt`/`sin`/`cos`/`expf`/`logf`/`powf`/`__*f16`） | **0** | **0** |
->
-> ⇒ ⭐⭐⭐ **⇒ `matmul` 路径上没有任何 f16 除法 libcall —— 无论有没有 patch。**
-> ⇒ **⇒ 所以「194 次 libcall vs 2 次」那个数字，不是 `matmul` 的问题。**
->
-> ⚠️ **⚠️ ⇒ 而 `:6` 那个数字的来源，本文件至今没有记录。**
-> **它在 `ROADMAP` 里被当作已知事实引用（`:461` 拿它论证「不给 fdiv 加 `nnan ninf`」），
-> 但：它量的是哪个 kernel？哪个形状？哪条路径？本文件查不到出处。**
-> ⇒ ⭐ **⇒ 按项目自己的纪律，这一项应当记作「出处不明」，
-> 而不是「已证存在、只等重测」。我此前两轮都按后者处理，两轮都错。**
->
-> ### ⇒ 三个可辩护的结论
->
-> **① `hmx-attr` 与 `a576182` 落地但对 `matmul` 产物零影响** —— 已由本条与
-> 勘误七之更正之五的两组独立测量确认（`matmul_kernel` 逐字节相同 + 三形状指令流 md5 相同）。
->
-> **② `fdiv` patch 落地且行为正确**（更正之六的 `narrowed` / `control` 两条分支实测）。
-> **但它在 `matmul` 上无事可做。**
->
-> **③ 「方案 A 改 LLVM」vs「方案 B 插 pass 扩回 f32」这个分野，目前无法用证据裁决** ——
-> 因为**被比较的那个现象本身没能在 `matmul` 上复现**。
-> ⇒ ⇒ **要推进这件事，第一步不是选 A 或 B，而是先找到「194 次」的那个 kernel。**
-> ⇒ 候选：`exp` / `log` / `rsqrt` / `gelu` / `silu` / `softmax` 这类含超越函数的算子
-> （`hexmlir-all` 里就有 `test_gelu.py` / `test_silu.py` / `test_softmax.py`）。
-> ⇒ ⚠️ **⇒ 而今晚的 `hexmlir-all` 7/7 恰好证明这些算子当前都是绿的**
-> ⇒ **⇒ 即「f16 除法」在真机上并没有造成正确性问题，只可能造成性能问题。**
-> ⇒ ⇒ **那就要问：它到底在哪慢？有没有人测过含除法算子的 Perf？**
-> ⇒ 📄 本条的复现：`OUT_DIR=<d> .venv/bin/python tools/hexmlir/dump_codegen.py matmul llir`
-> ⇒ ⚠️ **该脚本的 artifact 只能是 `llir` / `manifest` / `o` / `ttsharedir`（写 `ttir` 会被拒）**
-> ——我为此浪费了三轮，路径也猜错过一次。**它的 usage 在 `dump_codegen.sh:14`。**
->
-
-> #### ✅ 勘误七之更正之六（2026-10-02 17:00–17:20）：**fdiv patch 确实在 `.so` 里，而且它是活的 —— 我上一条更正里的判断是错的**
->
-> 更正之三写「fdiv patch 仍然没进 `.so`」，依据是二进制 Agent 量的 `.text` 只涨 192 B。
-> **那个界不足以否定归档成员级的证据。以归档链路为准：**
->
-> | 环节 | 证据 |
-> |---|---|
-> | 源码含 patch | `InstCombineCasts.cpp:2136/2137/2165/2178`，`NarrowFMF` 命中 **5** 处 |
-> | 源文件被改 | **2026-10-02 02:30:59** |
-> | `InstCombineCasts.cpp.o` 重编 | **2026-10-02 13:09:00**（在 patch 之后） |
-> | `libLLVMInstCombine.a` 重打包 | **2026-10-02 13:09:00** |
-> | `libtriton.so` 链的就是它 | `triton/build/…/build.ninja:363`，`LINK_LIBRARIES` 里是**绝对路径** `llvm_triton/build/install/lib/libLLVMInstCombine.a` |
-> | `20342db0` 链接时刻 | **13:11:34**（归档之后 2.5 分钟） |
-> | `ce26015e` 链接时刻 | **2026-10-01 14:18**（比 patch 落地早 **23 小时**） |
->
-> ⇒ ⭐⭐⭐ **⇒ patch 在 `20342db0` 里，不在 `ce26015e` 里。**
-> ⇒ ⚠️ **⇒ `.text` 只涨 192 B 与此不矛盾**：patch 落在 `narrowBinOp`（一个 421 KB 目标文件里的
-> `static` 成员）内，只改动 5 条指令、且发生在已存在的符号里 ⇒ **不产生新符号名，
-> 也几乎不改变总 `.text` 尺寸**。**我用总量界去否定成员级证据，是错的推断方向。**
->
-> ### ⭐ 而且 patch 的行为已实测正确 —— 但我之前那个判别式本身是错的
->
-> `:6` 记的判别式用 **`fdiv`**。**而 `fdiv` 根本不会触发这条路径**：
-> `narrowBinOp`（`:841`）的 opcode 列表是 `and/or/xor/add/sub/mul`（整数 `:856-862`）
-> 与 FP 的 **`FAdd` / `FSub` / `FMul`**（`:2129` 起）⇒ **`Fdiv` 不在其中。**
-> ⇒ ⚠️ **⇒ 这就是为什么我前面两次"判别式没反应"——不是 patch 没生效，是用例选错了 opcode。**
->
-> **正确的触发条件**（`:851`）：`match(Trunc.getOperand(0), m_OneUse(m_BinOp(BinOp)))`
-> ⇒ **`fptrunc` 的操作数必须只有一个 use，且那个 use 是一个 binop。**
->
-> **实测（`fadd`，BO 带 `ninf` 而 `FPT` 不带）：**
->
-> ```
-> define <4 x half> @narrowed(<4 x half> %h) {
->   %e = fpext <4 x half> %h to <4 x float>
->   %b = fadd nnan ninf <4 x float> %e, %e
->   %t = fptrunc <4 x float> %b to <4 x half>       ; ← 故意不带 ninf
->   ret <4 x half> %t
-> }
-> ```
->
-> | opt | `@narrowed` 的结果 | 判决 |
-> |---|---|---|
-> | `install/bin/opt`（13:09 重装） | `fadd nnan <4 x half>` | ✅ **`ninf` 被清 ⇒ patch 生效** |
-> | `build/bin/opt` | `fadd nnan <4 x half>` | ✅ 同上 |
-> | 对照组 `@control`（`FPT` 也带 `ninf`） | `fadd nnan ninf <4 x half>` | ✅ **`ninf` 保留**，正是 patch 的第二条 |
->
-> ⇒ ⭐⭐⭐ **⇒ patch 的两条语义分支都实测正确。**
-> ⇒ 复现：`llvm_triton/build/install/bin/opt -passes=instcombine -S` + 上面的 IR。
->
-> ### ⇒ 于是 S0b 的账终于平了
->
-> | | 状态 |
-> |---|---|
-> | ✅ 重建能力 | 解锁，2 分钟 |
-> | ✅ `hmx-attr` 落地 | 是，但**可证 no-op**（`hexagon_hmx` 后端零命中，`IsHMX` 恒 false） |
-> | ✅ **fdiv patch 落地且行为正确** | **本条** |
-> | ✅ `a576182` K-fusion 落地 | 是，但**默认关**（`croutons-per-mma` 选项），产物逐字节不变 |
-> | ⛔ `f16` 除法 194 次 libcall **未重测** | **现在才第一次具备可测条件** |
-> | ⛔ 13:14 的 S1 失败 | 仍是环境/瞬态，非任何构建的性质 |
->
-> ⇒ ⭐ **⇒ 下一件事很具体：在 `20342db0` 上重测 `fdiv <64 x half>` 的 libcall 计数。**
-> **预期：仍 > 2**（因为 patch 只修 miscompile，**不取消收窄**）
-> ⇒ **若仍是 194 左右 ⇒ 「方案 A 改 LLVM」这条路已被证明只能修对、不能提速，
-> 「方案 B（InstCombine 之后插一个 pass 扩回 f32）」才是提速的那条。**
-> ⇒ 那正是 `ROADMAP` 里 `:dad3f375`（方案 A）与 `:2f1ffef4`（方案 B）的分野，
-> **而这个分野至今没有证据。**
->
-
-> #### 🟧 勘误七之更正之五（2026-10-02 16:35）：**两个构建生成的设备指令流逐字节相同 —— 整条 LLVM/后端链路全部出局**
->
-> 更正之四把机制候选换成「`a576182` 的 K-fusion」。**那个候选现在也出局了**，而且是被
-> **产物**出局的，不是被推理出局的。
->
-> **两个构建各自的真机对象码都在，可以直接对拍：**
->
-> | 来源 | 由哪个构建产出 |
-> |---|---|
-> | `exp/hmx/phase0_4_s1_objectcode/*.o`（mtime 10-02 04:11–04:29） | **`ce26015e`**（好的那个） |
-> | `logs/.triton-cache/1790919750-679996768/*/matmul.o` | **`20342db0`**（重建那个；缓存键 = `%Y-%s` of the `.so`，`env.sh:64-72`） |
->
-> **归一化后的指令流 md5：**
->
-> ```
-> S1  OLD=14613f87e8f5   NEW=14613f87e8f5   -> IDENTICAL
-> S2  OLD=a9e0415c97e8   NEW=a9e0415c97e8   -> IDENTICAL
-> S3  OLD=0a9a9ff1c099   NEW=0a9a9ff1c099   -> IDENTICAL
-> ```
->
-> ⇒ ⭐⭐⭐ **⇒ 两个构建生成的设备指令流逐字节相同。**
-> ⇒ **⇒ 因此：任何 codegen 变化（LLVM 指令选择、调度、内联，或后端 pass）
-> 都不可能是 13:14 那次失败的原因 —— 因为它没有改变任何一条指令。**
-> ⇒ **⇒ 更正之二/三/四依次排除的「脏缓存」「hmx-attr」「`a576182` K-fusion」，
-> 现在全部被同一条证据一次性关掉了。**
->
-> ### ⇒ 连 `a576182` 为什么无害，也一并解释了
->
-> 它的标题是 "Fuse the K traversal into one HMX mma **via the croutons-per-mma option**"，
-> 而**产物逐字节不变** ⇒ **那个选项默认关闭** ⇒ 它确实被链进了 `.so`（`.o` 时间戳 13:11:18 可证），
-> **但对默认路径零影响**。这与本仓已有的记录一致：**新 pass 及其 lit 全部默认关 ⇒ 产物不变**。
->
-> ### ⇒ 而 `hmx-attr` 为什么无害，本仓**自己的记录早就写过**
->
-> `hexagon-mlir-local.patch:64792`：
-> **「本仓源码里 `hexagon_hmx` 零命中 ⇒ 没有任何函数带该属性 ⇒ `IsHMX` 恒 `false`
-> ⇒ 今天不重建就完全不生效。」**
-> ⇒ 独立复核：`hexagon_hmx` 在 `logs/codegen-dumps/` 全部 60 个 `.mlir` 里**零命中**。
-> ⇒ ⭐ **⇒ 重建激活了那条代码路径，但没给它任何可作用的对象。**
-> ⇒ ⚠️ **⇒ 而这条记录本来就在仓里。我做 S0b 之前没有先读它。**
->
-> ### ⇒ 于是只剩一个量在 S1 上是全矩阵里独有的
->
-> | 维度 | S1 | S2 | S3 |
-> |---|---:|---:|---:|
-> | 输出字节 `2MN` | **1,048,576（正好 1 MiB）** | 32,768 | 32,768 |
-> | `Mt` | **32** | 8 | 4 |
-> | FLOP | 67,108,864 | 67,108,864（**与 S1 并列**） | 4,194,304 |
-> | VTCM 峰值 / 8 MiB 预算 | 14.8% | **16.0%（更高却正常）** | 1.2% |
-> | `pipeline.reason` | `shallow-k` | `None` | **`shallow-k`（与 S1 相同）** |
->
-> - ⛔ **「S1 超过某个 VTCM 预算」被实测否掉** —— S2 的占比更高且正常。
-> - ⛔ **`shallow-k` 不是判别式** —— S3 同样是 `shallow-k` 且正常。
-> - ⛔ **FLOP 不区分 S1 与 S2** —— 两者**完全相等**。
-> - ⚠️ **唯一真正在阈值上的量**：`MemoryOffsetsPass` 的 `bufferSize` 默认
->   **1048576**（`Passes.td:380-382`），检查是 `totalRequiredSize > bufferSize`
->   ⇒ `signalPassFailure()`（`MemoryOffsetsPass.cpp:250-257`）。
->   **S1 的输出正好是 1,048,576** ⇒ **恰好等于阈值，不大于它** ⇒ 通过。
->   ⚠️ **但这是 host 编译期检查，而 host 编译现在成功 ⇒ 不能解释设备端的 rc=1。**
->
-> ### ⇒ 结论（这一条我认为是最终的了）
->
-> **13:14 那次 S1 失败不是任何一个构建的性质。** 两个构建生成同一条指令流、
-> 都在 9/9 上通过（`rel` 全 2.2e-04）、S1 单独跑也通过。
-> ⇒ **它是一次环境/瞬态事件**，而**唯一让我为它做过重大决定的，是那条空日志。**
->
-> ⇒ ⭐⭐⭐ **⇒ 方法上最终的一条：功能测试与产物对拍回答的是两个不同问题，
-> 而我先做了功能测试就下了结论。**
-> 「9/9 通过」说明不了「代码有没有变」；**「指令流 md5 相同」才说明得了。**
-> ⇒ 而**早一步做产物对拍，就能省掉回滚、以及随后三条越来越长的勘误更正。**
->
-> ⇒ 📄 `docs/results/s1-regression-not-reproducible-2026-10-02.md` §10
->
-
-> #### 🟦 勘误七之更正之四（2026-10-02 16:25）：**真正的差异不是 LLVM 补丁，是 `a576182`（K-fusion）——而它一直躺在源码里没被编译**
->
-> 更正之二与之三都把差异归到 LLVM 侧。**那是不完整的：`libtriton.so` 里还链进了后端自己的改动，
-> 而那些改动比 LLVM 补丁大得多。**
->
-> ### 三条硬证据（本机复核，非转述）
->
-> | | |
-> |---|---|
-> | 工作 `.so`（`ce26015e`）构建 | **2026-10-01 14:18** |
-> | `a576182` 落地 | **2026-10-01 22:54** —— **晚 8.5 小时** |
-> | `HmxPartitionPass.cpp.o`（`obj.HmxTransforms.dir`）重建 | **2026-10-02 13:11:18**（我那次 `ninja`） |
->
-> ⇒ ⭐⭐⭐ **⇒ `ce26015e` 从来不含 `a576182`。今天的重建是它第一次被编进 `.so`。**
->
-> `a576182` = **"Fuse the K traversal into one HMX mma via the croutons-per-mma option"**，
-> 改动面：`HmxPartitionPass.cpp` **388 行** · `LinalgToLLVMPass.cpp` · `MLLVMIRTranslation.cpp` ·
-> `hexagon_options.py` 74 行 · 新增两个 lit（`mma-deep-croutons.mlir` 与
-> **`mma-deep-croutons-reject.mlir`**）。
->
-> ⚠️ **⚠️ ⇒ 这才是「只有 S1 挂」最合理的机制候选：**
-> K-fusion **按 `kt` 与 croutons 批大小分支**，且**改 packet 数与 VTCM 占用** ——
-> 而 K = 64（S1）/ 128（S3）/ 2048（S2）走的是不同路径。
-> ⇒ **⚠️ 那个 `*-reject.mlir` 的存在说明作者自己预期过边界情况。**
->
-> ### 四个 LLVM 补丁的处境（一条被证否、三条出局）
->
-> | 补丁 | 判决 | 依据 |
-> |---|---|---|
-> | **`hmx-attr`** | ⛔ **可证是 no-op** | `hexagon_hmx` 在**后端源码里零命中** ⇒ `IsHMX` 恒 false；且 `BaseT::areInlineCompatible` 本来就落到 `BasicTTIImpl.h:396` 的等价检查 |
-> | **`fdiv-ninf`** | ⛔ 对 f16 matmul **不可达** | 只清 `ninf` 旗标（IR 更保守），且只在「`fptrunc` 喂 binop」的路径上，f16 matmul 不走 |
-> | `ps-aligna` / `fmaxnum-nnan` | ⛔ **出局** | 全部 obj 是 09-23，**已含在工作 `.so` 里**，不在 delta 内 |
->
-> ⚠️ **顺带一条仍然重要的提醒**：`ps-aligna` 是四个里**唯一有硬失败模式**的
-> （它修的是被破坏的 callee-saved AP，`needsAligna` 对变长对象触发，**确实与代码大小相关**）。
-> **⇒ 若哪天它进了 delta，它要排第一。**
->
-> ### ⛔ 一处两个独立调查互相矛盾，**必须记作未决**
->
-> | | 「fdiv patch 在不在 `20342db0` 里」 |
-> |---|---|
-> | 二进制取证（**实测**：`.text` 仅 +192 B、438,124 个符号名只差 1 个） | ⛔ **不在** |
-> | patch 审计（**从 ninja 日志重建**） | ✅ 在，但 inert |
->
-> ⇒ **⇒ 我不替它们裁决。** 实测优先，但 `.text` 总量约束很强（+192 B 装不下
-> `InstCombineCasts.cpp` 的改动）⇒ **最可能是「日志口径与链接口径不同」**，
-> 例如 cmake 那棵树链的是自己那份 LLVM 归档。**这一条要查清才能算 S0b 的账。**
->
-> ### ⇒ 于是 S0b 的账是这样记的
->
-> | | |
-> |---|---|
-> | ✅ **重建能力解锁** | 2 分钟，已验证 |
-> | ⚠️ **重建悄悄带进了一个从未编译过的后端改动** | `a576182` K-fusion，8.5 小时的源码-二进制漂移 |
-> | ⛔ **f16 除法那个单点仍然没动** | 取决于上面那条矛盾怎么解 |
-> | ⛔ **13:14 那次 S1 失败仍未定** | 已被证明**不是** `.so` 的性质（同一 `.so` 现在 9/9），但机制候选从「LLVM 补丁」换成了「`a576182` 的 K-fusion」 |
->
-> ### ⇒ ⭐ 下一件该做的实验（比之前任何提案都便宜）
->
-> **`20342db0` 上跑 9 形状 × N=1000。**
->
-> 理由：9/9 的通过是在 **N=10** 测的，而**原始失败第一次出现在 N=1000**；
-> 且 `a576182` 改的是 **VTCM 占用** ⇒ **N 相关的内存行为是剩下的主要未排除变量**。
-> ⇒ 这一轮同时也是「换回 `20342db0` 之前必须做的那份同口径基线」。
->
-> ⇒ 📄 `docs/results/s1-regression-not-reproducible-2026-10-02.md` §9
-> ⇒ 📄 物证：`logs/anchor-backup-2026-10-02/libtriton.so.20342db0.9of9-OK`
->
-
-> #### 🟥 勘误七之更正之三（2026-10-02 16:10）：**更正之二里「产物可用、回滚不必要」这句又要收窄**
->
-> 更正之二说「不是代码回归、两个 `.so` 读数逐位相同」。
-> **「读数相同」是对的**（那是 15:39–15:42 三次 S1 实测）；
-> **但由此推出「产物可用」是错的** —— 我拿**一个形状**的读数去否定一个**内联行为**的改变。
->
-> **二进制取证（`nm` / `objdump` 逐符号，两个 `.so` 都在 `logs/anchor-backup-2026-10-02/`）**
-> 证明两个 `.so` **确实不同，且差异恰好只有一处**：
->
-> | 证据 | `ce26015e` | `20342db0` |
-> |---|---|---|
-> | 字符串字面量 `hexagon_hmx` 出现次数 | **0** | **1** |
-> | `llvm::HexagonTTIImpl::areInlineCompatible` | **不存在** | **存在**（234 B） |
-> | `BasicTTIImplBase<HexagonTTIImpl>::areInlineCompatible` | 存在（166 B） | **不存在** |
-> | `useHVX` 指令 | 27 B | 32 B，末尾 `cmpb $0x0,0x20(%rdi); sete %al` ← **就是 patch 的 `&& !IsHMX`** |
-> | `.text` 增量 | — | **仅 +192 B** |
->
-> ⇒ ⭐⭐⭐ **⇒ 差异 = `llvm-hexagon-hmx-attr.patch`，且它做的是
-> `areInlineCompatible`：当两个函数的 `hexagon_hmx` 属性不同时返回 false。**
-> ⇒ **这是内联决策的改变，而内联决策是形状相关的。**
-> ⚠️ **⇒ 所以「S1 读数相同」只证明 S1 这个形状的最终代码没变，
-> 不证明其它形状不变，更不证明原来 13:14 的失败不是它造成的。**
-> ⇒ **必须以 9 形状复验为准**，不能以单形状读数下结论。
->
-> ### ⚠️ 同时查实一件对 S0b 更要紧的事：**fdiv patch 仍然没进 `.so`**
->
-> `.text` 只涨 192 B，且 438,124 个符号名里**只多/少了那 1 个**
-> ⇒ **`llvm-hexagon-fdiv-ninf-narrowing.patch`（在 `libLLVMInstCombine.a` @ 10-02 13:09）
-> 并没有被链进 `libtriton.so`。**
-> ⇒ ⭐ **⇒ 我 13:0x 写的「install 树已刷新 ⇒ patch 已进 install 树的库」是对的，
-> 但「⇒ 所以进了 `.so`」是错的 —— 库换了，`.so` 并没有真的重链进去那一部分。**
-> ⇒ **⇒ 「f16 除法 194 次 libcall」这个项目当前最大单点，仍然完全未测。**
->
-> ### ⇒ 三条结论按证据强度重排
->
-> | 结论 | 强度 |
-> |---|---|
-> | `.so` 与旧 `.so` **不同**，差异 = hmx-attr patch 的 `areInlineCompatible` | ✅ **字节级证明** |
-> | 该 patch **不在**旧 `.so` 里（`hexagon_hmx` 字面量 0 次） | ✅ **字节级证明** |
-> | fdiv patch **不在**新 `.so` 里 | ✅ `.text` 仅 +192 B + 符号集只差 1 个 |
-> | Hexagon CodeGen 本身**没变** | ✅ `createPassConfig` 逐指令相同，只有 6 B 位移因符号移动而变 |
-> | hmx-attr patch **是否造成** 13:14 那次 S1 失败 | ⛔ **未定**（需 9 形状复验 + 一个不含该 patch 的链接） |
-> | 13:14 那次失败本身的原因 | ⛔ **仍未定**（更正之二 §4 的结论不变） |
->
-> ⇒ 📄 `docs/results/s1-regression-not-reproducible-2026-10-02.md`（含取证细节）
-> ⇒ ⭐ **⇒ 下一件事不是「换回 `.so`」，是「把 9 形状复验跑完」；
-> 换回之前必须先回答「hmx-attr patch 改变了哪些形状的代码」。**
->
-
-> #### 🟩 勘误七之更正之二（2026-10-02 15:40–16:0x）：**「S1 回归」不可复现 —— 那不是代码回归，回滚是不必要的**
->
-> 上面那条更正（14:22）说 `20342db0` 在 S1 上回归、产物不可用。**那个结论是错的。**
->
-> **受控 A/B（两个 `.so` 都在 `logs/anchor-backup-2026-10-02/`，可直接对拍）**：
->
-> | 跑 | `.so` | 缓存 | S1 结果 |
-> |---|---|---|---|
-> | 15:39 | `ce26015e`（好） | 各自命名空间 | ✅ `perf=55.0` `rel=2.2046e-04` |
-> | 15:40 | **`20342db0`（曾判「坏」）** | 各自命名空间 | ✅ **`perf=55.0` `rel=2.2046e-04`** |
-> | 15:42 | **`20342db0`** | **全新空目录 `/tmp/opencode/coldcache-badso`** | ✅ **`perf=55.0`** |
->
-> ⇒ ⭐⭐⭐ **⇒ 三个假设被逐一排除：**
->
-> 1. **不是代码回归** —— 同一形状、同一设备、同一脚本，两个 `.so` 读数**逐位相同**。
-> 2. **不是脏 Triton 缓存** —— `env.sh:60` 的缓存键**包含后端库自身身份**，
->    命名规则实测为 `<epoch>-<libtriton.so 字节数>`
->    （`1790917894-679996768` = 坏那个；`1790918392-679997440`、`1790919630-679997440` = 好的）
->    ⇒ **两个 `.so` 各有独立命名空间**；且**连全新空缓存目录也照样成功**。
-> 3. **不是「第一次跑必然失败」** —— 13:14 / 13:17 / 13:19 三次全败、13:40 起全成，
->    两次之间**唯一变化的是时间与缓存内容，不是任何输入**。
->
-> ### ⇒ 那 13:14 的失败到底是什么？——**查不出来；现有证据不足以定论**
->
-> 时间线（用缓存目录名的 epoch 前缀钉死，非推测）：
-> `13:11:34` 坏 `.so` 命名空间建立 → `13:14:34` 失败跑落盘（指纹 `20342db0`）
-> → `13:17:11` 该命名空间被写 → `13:19:52` 回滚。
->
-> ⚠️ **可排除**：输入（`torch.manual_seed(0)`，`shape_pair.py:195`）、
-> 设备（`S2`/`S3` 同时段正常）、缓存（上面第 2 条）、代码（第 1 条）。
-> ⚠️ **不可排除**：13:11–13:19 之间**是否有别的东西在写那个 `.so` 或占用设备**
-> —— 那段时间我在跑 S0b 的门与 `ninja` 收尾，**我没有当时的完整进程/设备日志**。
-> ⇒ ⭐ **⇒ 按项目自己的纪律（`AGENTS.md`：可复算证据），这一条应记作
-> 「原因未确定」，而不是「已定位为 fdiv patch / hmx-attr patch / 冷缓存」。**
->
-> ### ⇒ 由此产生的三个更正
->
-> **① S0b 其实成功了。** `20342db0` 可用 ⇒ **回滚是不必要的**，
-> `libtriton.so` 可以换回 `20342db0`（⚠️ 换回前先跑一遍 9 形状复验）。
->
-> **② 「重建成功」与「patch 生效」仍要分开验。** 复验只证明**产物能跑**，
-> **不证明 fdiv patch 的行为** —— 判别式至今仍未跑通
-> （它在 `InstCombineCasts.cpp` 的 `narrowBinOp`，只在路径上有 `fptrunc` 时才走到）。
-> ⇒ **但它现在确实在 install 树的库里（`libLLVMInstCombine.a` @ 10-02 13:09），
-> 所以「patch 有没有进 `.so`」已从「不知道」变成「几乎必然进了」，
-> 只差一个能触发 `narrowBinOp` 的用例。**
->
-> **③ 真正值得记住的教训比原来那条更强：**
-> ⭐⭐⭐ **我因为一次「不可复现的失败」做了回滚，并把「产物不可用」写进了勘误。**
-> 而触发回滚的那次失败**日志里一个字都没有** —— 根因是
-> `shape_pair.py:205` 把 launch 的 stdout 吞进 buffer、`:241` 的 assert 直接死掉、
-> **buffer 从未打印**。
-> ⇒ ⭐ **静默失败不只是「查起来麻烦」，它会让人做出错误的重大决定。**
-> ⇒ ✅ 已修：同时捕获 stdout+stderr，失败时打印 `LAUNCHFAIL` / `NOPERF` 与两个流的内容。
-> ⇒ 📄 `docs/results/s1-regression-not-reproducible-2026-10-02.md`
->
-
-> ⇒ ⭐⭐⭐ **⇒ 下一个人该做的第一件事不是「再重建一次」，**
-> **而是查清两件独立的事：**
-> **① `20342db0` 为什么在 S1 上回归（先让失败说话，见下）；**
-> **② `llvm-hexagon-fdiv-ninf-narrowing.patch` 的行为到底进没进那个 `.so`。**
-> **在 ① 之前不要把新 `.so` 当成可用的基线。**
->
-> ### ⚠️ 顺带一条：`shape_pair.py` 的失败不可见，是今晚第 N 次同一形状的坑
->
-> 今晚已经踩了两次「静默失败」：① 插桩里 `\n` 只写一个反斜杠 ⇒ 编译失败**无报错**；
-> ② 探针在 `/tmp` 被清 ⇒ 结论无法复现。
-> **这次是第三次：设备 launch 失败，日志里什么都没有。**
-> ⇒ 已在 `exp/hmx/shape_attribution/dump_generated.py` 修过一次（让静默失败出声），
-> **但 `shape_pair.py` 这条路径还没修** ⇒ 下一个碰到设备侧失败的人会再栽一次。
->
-> **🔵 勘误六（2026-10-02 12:35）：本文件第一条方案（T_HMX 专属线程 + HVX 池）
-> 的收益估算，缺一块它现在才拿到的输入。**
->
-> 勘误五找到：**staging 成本是被 VTCM 预算卡的离散决策**
-> （`HmxPartitionPass.cpp:1651-1653`），且 `scratchBytes ∝ Kt`、`room` 里的 `actBytes ∝ Mt`。
->
-> ⇒ ⭐⭐⭐ **⇒ 这正是本方案要动的那一个量。**
-> 今天 `T_HMX` 与 HVX 池线程共享同一份 VTCM 预算与同一个 HMX 资源；
-> 拆成专属线程后 **HMX 侧不再与 HVX 竞争** ⇒ `budgetDepth` 可能从 1 升到 2
-> ⇒ 而 **`S2`（`Kt=64`）的 39 µs 里有 19.7 µs 落在那一项上**
-> ⇒ **「拆线程能救回多少」这个卖点，现在第一次有了可算的形式。**
->
-> ⚠️ **但要定量，缺一块：哪些形状现在落在 `budgetDepth = 1`。**
->
-> - ⛔ **本构建的 envelope 是 v1** ⇒ `metadata["hmx_manifest"]` 实跑 15 个形状全是 `None`
->   （`utils.py:1881` 明写 v1 无 manifest；决策本该写进 `hmx.kernel_manifest`，
->   见 `HmxPartitionPass.cpp:296-316`）
-> - ⛔ **手工复现不做**：要经 `vtcmBytesCommitted`（`MatmulToHmxPass.cpp:993-1032`）
->   与 `HmxTarget::planBridge` 的 M-blocking 及权重驻留路径
->   ⇒ **一个复现错的机制解释比没有解释更糟**
->
-> ⇒ **⇒ 因此本方案现在能做的是设计评审，**不能**有可信的收益估计。**
-> 本文件 `:69` 那句「输的恰是它的跨线程流水这一步是推断，不是实测」**至今仍然成立**。
->
-> **解锁顺序**（两条都在 `:6` 的 S0b 那个窗口之后）：
->
-> ```
-> S0b 重建后端（会改 libtriton.so，作废设备锚点）
->   └─ 建一个 v2/v3 envelope 的版本 ⇒ 读出逐形状 budgetDepth
->        └─ 才能给 T_HMX 分线程定量：拆线程救回多少 µs
-> ```
->
-> ⭐ **顺带一条与本方案无关但同源的**：`Kt ≥ kStageMinKTiles` 那个门（`603163c`）
-> **已被留出数据独立确认**（`Kt=16` 那点判别力 4.5 倍，勘误四 §3），
-> ⇒ **S2/S3 走 staged 路径这件事不再是「按推理定的」，而是有真机证据的。**
->
-> 📄 `docs/results/output-term-is-rows-not-bytes-2026-10-02.md` §4.2–§4.3
-> 📄 `exp/hmx/shape_attribution/dump_pipeline_decision.py`（读 `metadata["hmx_manifest"]` 的尝试；
-> **保留，因为它记录了「v1 envelope 读不到」这个事实本身**）
-
-> **⛔ 勘误九（2026-10-02 16:50）：上面那条「已被留出数据独立确认」的三条里，第一条的前提被推翻，
-> 而被钉住的那个常量从未在真实算子上生效过。T_HMX 的 staging 前提两条路径都已测死。**
->
-> **① `kStageMinKTiles = 32` 的溯源表把一个合成形状当成了 real。**
-> `HmxPartitionPass.cpp:198-201` 写「one real shape sits exactly ON the boundary
-> (**FA PV, 1024x128x1024, Kt=32**) … PV's K is seq (large, allowed)」。
-> **而仓库里真实的 FA kernel 不是这个形状**：`test_flash_attention.py:105` 的
-> `acc = tl.dot(p, v, acc)`，`p=(BLOCK_M, BLOCK_N)`、`v=(BLOCK_N, BLOCK_DMODEL)`
-> ⇒ **op 的 K = `BLOCK_N` = 64**；kv 的循环在 dot **外面**，seq 是循环 trip count、不是 op 的 K。
-> ⇒ **判据（实测）**：FA 在 `D_HEAD`/`BLOCK_N` = 64/64、128/64、128/128、256/128 四个配置下，
-> 两个 matmul **全部 `shallow-k` / `budget_depth=0`**。若 PV 的 op-K 真是 1024，它会 staged。
-> ⇒ **⇒ 溯源表里唯一那个「正好在门槛上」的条目是合成的**；`:202` 自己也写了
-> 「Nothing real lands strictly inside Kt 9..31」——真实算子全在 `Kt ≤ 8` 那一侧。
->
-> **② 门槛判的是 op-K（切块步长），不是矩阵 K；且改谓词救不了。**
-> `:381` `getTileShape()` 读 `lhs.getDimSize(1)`（activation crouton 阵列的 K），
-> `:431-433` 除以 `kTileEdge=32` ⇒ `kTiles` = **这个 op** 的 K/32 ⇒ 门槛 = op-K ≥ 1024。
-> 实测：固定逻辑 K=14336，只改 K 循环步长 ⇒ `BK`=32/64/128/256/512 全 `shallow-k`，
-> `BK`=1024/2048 才 `staged`。**判定完全跟着 `BK` 走。**
-> ⇒ **原因**：staging 环预取的是同一输出 tile 的下一个 K-tile，只能跨**同一个 op 内部**预取；
-> 而 Triton 的 `for k0 in range(0, K, BK)` 降在 op **外面** ⇒ 每个 op 的 K 就是 `BK`。
-> ⇒ ⛔ **「改读逻辑 K」这个修法不存在**：manifest 里 `matmul.logical.k.value` 同样是 per-op
-> （逻辑 K=14336 时它报 64 或 1024，从不报 14336）⇒ **IR 里根本没有更大的 K**。
-> 要让门槛看见矩阵 K，必须让一个 `MatmulOp` 跨越整个 K 循环 —— 那是 lowering 设计变更。
->
-> **③ ⛔ 决定性：VTCM 预算从来不是约束（host-only，已测实）。**
-> `:1681` `budgetDepth = fits(2) ? 2 : (fits(1) ? 1 : 0)` ⇒ **`budget_depth==2` 在定义上就等于
-> 「预算装得下 depth 2」**。统计全部 **103** 份 manifest 的 `pipeline.reason`：
-> `vtcm-budget` 出现 **0 次**；凡是放行的（那 2 个 `tile-count`）`budget_depth` 都是 2。
-> ⇒ 且 ring 本身极便宜（`:1647-1672` 原式 `slotBytes=32·K·2`、`ringBytes=slot+4`、
-> `scratchBytes=Kt·2048`，预算 8 MiB @ `HmxTarget.h:118`）：
-> **op-K=1024（门槛正上方）时 depth 2 只占预算 2.34%**；即使 op-K=16384 也只有 37.5%。
-> ⇒ 算术自检：同式复算 FA 两个 matmul = 3.22% / 合计 6.45%，与此前记录的 3.2% / 6.4% 一致。
-> ⇒ **depth 的真正上限是几何不是钱**（`:1697-1700` ring 深度追上 tile 数即无稳态；`:1688` 硬夹 2）。
->
-> **⇒ 对本方案（§5 S2/S3/S4b）的影响**：上面 `:1147-1153` 那条「先读出逐形状 `budgetDepth`，
-> 才能给 T_HMX 分线程定量」的前置，**其输入量恒为 2** ⇒ **可隐藏的 µs 计算不出非零值**。
-> ⇒ ⭐ **建议把 T_HMX 从「暂停等数据」改判为「关闭」**，理由按强弱排序：③ > ② > 深度封顶。
-> **⇒ 失效条件**：出现 `BK ≥ 1024` 的 `tl.dot`、或 K 循环被改进 op 内部、或 `defaultVtcmBudget`
-> 大幅下调、或出现单 kernel 多 matmul（`vtcmBytesCommitted` 会吃掉 `room`）——任一条成立则本勘误作废、必须重测。
->
-> 📄 `docs/results/t-hmx-staging-gate-dead-2026-10-02.md`（含逐档数据、traceback 与复现命令）
-> 📄 顺带：`exp/hmx/accumulator_budget_headroom.py:90-94` 是**同一处 2^20 误读**的第二个副本
-> （「caps EVERY tensor's numel at 2^20」）⇒ 该脚本的 "decisive question" 段结论需重算
-
-> **🟢 勘误五（2026-10-02 09:51）：勘误四里那个 `g = 0.30 µs/Kt-tile` 系数
-> **不是 Kt 的函数**，机制是一个被 VTCM 预算卡的**离散决策**。**
->
-> **触发点**：`H7_kt128` = 128×128×4096（`Kt=128`、张量 2^19）实测 **44.0**，
-> 而带 `Kt²` 的模型预测 **63.5** ⇒ **高出 19.5 µs，把 `Kt²` 直接否掉。**
->
-> **但它指出了正确的结构**：把「staged 成本」=（实测 − 不含任何 `Kt` 项的模型）单列，
-> 同为 `Kt=128` 的两点：
->
-> | 形状 | `Mt` | `(M/32)·Kt` | staged 成本 |
-> |---|---:|---:|---:|
-> | `H5_bigM256` | 8 | 1024 | **39.09** |
-> | `H7_kt128` | **4** | 512 | **14.56** |
->
-> ⇒ **按 `Kt` 算差 2.7 倍；按 `(M/32)·Kt` 算只差 1.3 倍**
-> ⇒ ⭐ **⇒ 它是 `(M-tile 数) × (K-tile 数)` 的函数，不是 `Kt` 的函数。**
->
-> **代码给出了为什么会跳**（`HmxPartitionPass.cpp`）：
->
-> ```cpp
-> int64_t scratchBytes = Kt * layout::kCroutonBytes;                        // :1619  ∝ Kt
-> int64_t room         = vtcmBudget - vtcmBytesCommitted(func) + actBytes; // :1644  actBytes ∝ Mt
-> auto fits = [&](int64_t d) { return scratchBytes + d * ringBytes <= room; };   // :1651
-> int64_t budgetDepth = fits(2) ? 2 : (fits(1) ? 1 : 0);                   // :1652
-> ```
->
-> ⇒ ⭐⭐⭐ **⇒ 流水深度被 VTCM 预算卡住，按 2 / 1 / 0 **跳变** ⇒ 关系里有间断
-> ⇒ ⇒ **任何多项式项都补不上，这不是拟合能力不足。**
->
-> ⚠️ **⇒ 勘误四那句「`g = 0.30 µs/Kt-tile` 是唯一被留出验证过的 staging 独有成本」
-> 要改读法：它的**形式**（staging 独有、与 `K` 深度相关）被验证了，
-> 但**它的量纲不是 `Kt`** ⇒ 那个系数是拟合产物，不是测量值。
->
-> ⛔ **逐形状的深度未证实**：这个构建的 envelope 是 **v1**
-> ⇒ `metadata["hmx_manifest"]` 实跑 15 个形状全是 `None`（`utils.py:1881`：v1 无 manifest）；
-> 手工复现要经 `vtcmBytesCommitted`（`MatmulToHmxPass.cpp:993-1020`）与 `planBridge` 的
-> M-blocking 与权重驻留路径 ⇒ **不做无法验证的复现。**
->
-> **⚠️ 另一条实验硬约束（值得写进任何后续实验设计）**：
-> **所有 matmul 维度必须是 2 的幂**（`tl.make_block_ptr` 要求，否则
-> `arange's range must be a power of 2`）⇒ **张量大小也只能是 2 的幂**
-> ⇒ **`2^19` 与 `2^20` 之间没有任何可用尺寸 ⇒ 模型在张量到 `2^20` 处的边界无法二分。**
->
-> 📄 `docs/results/output-term-is-rows-not-bytes-2026-10-02.md` §4.1–§4.3（285 行）
-> 📄 `exp/hmx/shape_attribution/README.md`（2 的幂约束 + 可直接跑的形状检查清单）
-
-> **🟢 勘误四（2026-10-02 09:25）：「S1 受限于输出读出」方向对，但**量的形式错了** ——
-> 那个量是**输出行数 `M`**，不是输出字节数。**
->
-> **判决来自留出验证，不是拟合优度**：12 个干净 `A`（`B` 已按勘误三消除），
-> 只用 9 个拟合，在 3 个从未参与拟合的形状上测。
->
-> | 第二项 | 拟合集最大绝对残差 | **留出集最大绝对残差** |
-> |---|---:|---:|
-> | **输出字节** `2·M·N` | 1.6 µs | **21.0 µs** |
-> | ⭐ **输出行数 `M`** | 1.6 µs | **9.8 µs** |
->
-> ⇒ **拟合集分不出两者；留出集差 2.1 倍。**
->
-> **决定性的一对**：`256×128×1024` 与 `128×256×1024` 的 **M·N、输出字节、FLOP、Kt
-> 四个量全同**，只把 M 与 N 互换 ⇒ **28.0 vs 21.0 µs（差 33%）** ⇒ 字节数解释不了。
->
-> **模型**（拟合集 ≤1.6 µs，留出集 ≤9.8 µs）：
->
-> ```
-> t ≈ F + s·M + f·FLOP + g·Kt·[Kt ≥ 32]
->   F = 3.11 µs   s = 0.0431 µs/行   f = 0.0740 µs/MFLOP   g = 0.300 µs/Kt-tile
-> ```
->
-> ⚠️ **`f` 折合 13.5 TFLOP/s > HMX 硬件量级（~4）⇒ `f` 不是吞吐，不要这样引用。**
-> ⚠️ **一个留出点（`H3` = 512×128×2048，最大张量正好在 Triton 上限）仍差 −13% ⇒ 模型不完整。**
->
-> ### ✅ 一条被**确认**而非推翻的 pin
->
-> **`H1_gate16` = 256×256×512 的 `Kt = 16`，正好落在 `Kt=8`（非 staged）与 `Kt=32`（staged）
-> 之间的空档** ⇒ 唯一能说清门在哪的形状。实测 16.0 µs：
-> 「无 `Kt` 项」预测 14.7（差 **8.2%**）vs「有 `Kt` 项」预测 21.9（差 37.1%）
-> ⇒ ⭐ **`kStageMinKTiles = 32`（`603163c`）被留出数据独立确认，判别力 4.5 倍。**
->
-> ### ⭐ 最有价值的新信息：`g = 0.30 µs/Kt-tile`
->
-> 它是**目前唯一被留出验证过的、staging 独有的成本**：
->
-> - **`S2`（`Kt=64`）的 39 µs 里有 19.2 µs（49%）落在这一项上**
-> - `S3_class`（`Kt=4`）几乎不落在这一项上 ⇒ **S2/S3 那 5 倍差主要就是这一项**
->
-> ⇒ **⇒ 该被攻击的是 staging 的 per-tile 成本，不是输出字节，也不是 FLOP。**
-> ⇒ **⇒ 这改变了 S 系列的优先级排序依据**，但**不改变**「S1 是唯一真差距」那个结论
-> ——后者是比值型，而勘误三已证明比值型完全不受影响。
->
-> 📄 `docs/results/output-term-is-rows-not-bytes-2026-10-02.md`（158 行，13 项断言 + 系数独立重算）
-> 📄 `docs/state/CURRENT.md` §3.14
-
-> **🔴🔴 勘误三（2026-10-02 08:42）：上面两份勘误的「超标」结论本身被推翻了 ——
-> 超标的是测量 harness，不是后端。**
->
-> **`t(N) = A + B/N` 里的 `B ≈ 2,700 µs` 不是后端的性质，而是 wrapper 的缺陷：
-> `hexagon_launcher_base.py` 每次 launch 的计时循环之前没有预热调用。**
->
-> **直接证据**（逐次 pcycle + qtimer 插桩，S1 = 1024×512×64，`N ∈ {10,30,60}`）：
->
-> | | iteration 0 | 稳态 | 比值 |
-> |---|---:|---:|---:|
-> | pcycles | 2,539,310 / 2,501,152 / 2,662,809 | ~112,000 | **22~24×** |
-> | qtimer | 2,704 / 2,711 / 2,851 µs | ~53 µs | **50~54×** |
-> | 隐含频率 | **0.92~0.94 GHz** | **2.08~2.14 GHz** | 0.44× |
->
-> ⇒ **`B` 在 `N` 上恒定**（真的一次性），且**频率是双峰的、没有爬坡**。
->
-> **机制**：`HexagonAPI::AcquireResources()`（`HexagonAPI.h:52` → `:72`）在
-> **每次 launch** 里调 `initialize_and_acquire_hmx()`（`HexagonAPI.cpp:220`），
-> 它做 `HAP_power_set(HMX_v2, set_clock=TRUE, target_corner=VCORNER_MAX,
-> perf_mode=CLK_PERF_HIGH)`（`:231/:234/:235/:238`）与
-> **`HAP_compute_res_acquire(..., 100000)`（`:261`，阻塞最长 100 ms）**。
-> ⇒ **HMX 上电与拉频每次 launch 重做一遍，kernel 的第一次调用正好落在这次 bring-up 里。**
->
-> **两个旁证**：
-> - `WARMAB_WARMUP=1` **消不掉** `B`（2,880 vs 2,624 µs）——它是**另一次独立 launch**。
-> - `B` **不随 kernel 工作量走**：四个形状 FLOP 跨 8×、输出跨 32×，
->   而 `Δ`pcycles 只跨 3×；且**第一次调用越久、隐含频率越高**（0.87 → 1.41 GHz）
->   ⇒ 这是时钟在第一次调用*期间*仍在爬，不是额外计算。
->
-> **修法（一行）**：在 `benchmark_time_and_pcycles` **之前**加一次被丢弃的
-> `{function_call}`。实测同一形状：
->
-> | | 修之前 | **修之后** |
-> |---|---:|---:|
-> | `t(N=3)` | 928 µs | **57 µs** |
-> | `B` | 2,624 ~ 2,880 µs | **15 µs** |
-> | `A` | 53.4 µs | **52.0 µs** |
-> | **`once_share@1000`** | 4.7 ~ 5.2% | **0.029%** |
->
-> ⇒ ⭐ **`once_share` 降到门槛的 1/69；`N=3` 就已合规。**
-> ⇒ ⇒ **本节 `N ≥ 1000` 的门槛在预热后不再是约束**（门槛本身是否还该保留，另议）。
->
-> ⚠️ **但「`A` 几乎不动（53.4 → 52.0）」这句话同时意味着：
-> 前面所有 `N=1000` 的**稳态**读数本来就是对的，错的只是那个一次项。
-> ⇒ 比值型结论不受影响；受影响的只是「绝对水平」类陈述。**
->
-> ⚠️ **未签认**：该改动在 `qcom_hexagon_backend/backend/hexagon_launcher_base.py`，
-> **尚未提交**。它是 Python codegen 模板（生成的 C++ 每次 launch 在设备上现编），
-> **不进 `libtriton.so` ⇒ 不作废设备锚点**（加改动后的 5 次设备跑指纹 5/5 全一致）。
-> ⇒ **但它改变 `Perf` 的语义 ⇒ 仓库与本文件里所有历史 `Perf` 数字都是「含冷启动」口径。
-> 是否采纳、以及是否重跑历史基线，需用户签认。**
->
-> 🔴 **⇒ 因此：勘误一与勘误二的「五形状在 `N=1000` 全部超标 3.8~7.5×
-> 「`S2-class` 的 `1.70% ✅` 实测 7.52%」这些「超标」判定，
-> 测的是 harness 缺陷，不是后端。原文按 append-only 保留，但不再成立。**
->
-> 📄 `docs/results/b-is-per-launch-hmx-warmup-2026-10-02.md`（204 行）
-> 📄 `docs/analysis/b-is-nearly-constant-2026-10-02.md`（那份「近似常数」的结论方向对、归因错）
-> 📄 `docs/analysis/b-not-idle-dependent-2026-10-02.md`（那条排除仍然成立，且现在有了解释）
-
-📄 `docs/results/once-share-compliance-2026-10-02.md`（引用逐条复验）
-· `docs/results/s1-readout-bound-2026-10-02.md`
-· 日志 `logs/shape-attribution-2026-10-02/`（5 份，指纹 md5 出现 10 次全一致）
-
----
+📄 `docs/results/once-share-compliance-2026-10-02.md` · `docs/results/s1-readout-bound-2026-10-02.md`
+📄 `logs/shape-attribution-2026-10-02/`（5 份，指纹 md5 出现 10 次全一致）
 
 ### 5.1.3 判决词表：**三类**，不是两类
 
@@ -1402,20 +615,54 @@ RoPE 那 9 个样本是**单调斜坡不是噪声**（`32.57 / 27.24 / 23.29`，
 ⇒ **唯一信号是交互项** `A_both − max(A_topo, A_softmax)`，**它被合并门吃掉了**。
 ⇒ S4b 报告时**必须单独列交互项**，不许只报合并值。
 
-### 5.1.7 ⛔ 环吃 VTCM 预算 ⇒ 这是 **reject 判据**，不是性能判据
+### 5.1.7 ⛔ staging 环吃 VTCM 预算 —— reject 判据，以及它为什么几乎不会触发
 
-线程创建 / ensure 属一次性（`§4.2`，进程单例）⇒ 进 `B`，不是 `A`。
-**真正的边际风险不是环的建立成本，是环吃 VTCM 预算压低 `budgetDepth`**：
-`HmxPartitionPass.cpp:1626-1631` 的 `fits(d) = scratchBytes + d*ringBytes <= room`
+线程创建 / ensure 属一次性（§4.2，进程单例）⇒ 进 `B`，不是 `A`。
+**边际风险不是环的建立成本，是环吃 VTCM 预算压低 `budgetDepth`**：
+`HmxPartitionPass.cpp:1680` 的 `fits(d) = scratchBytes + d*ringBytes <= room`
 —— 加第二个环会让 `fits(2)` 可能变 `fits(1)`。
-⇒ **新增判据：若 role-split 使 `budgetDepth` 下降，本 kernel 直接 reject**
+⇒ **判据：若 role-split 使 `budgetDepth` 下降，本 kernel 直接 reject**
 （落 `role-split-nobudget`），**不进入 A/B**。**这是正确性/可行性判据，不是性能判据。**
+
+**⚠️ 但实测下来，这条判据几乎不会触发，而且它不是性能机会（2026-10-02 实测）：**
+
+| 量 | 读数 |
+|---|---|
+| staging 环在**门槛正上方**（op-K=1024，depth 2）的成本 | **VTCM 预算的 2.34%** |
+| op-K=4096 时 | 9.38% |
+| op-K=16384 时 | 37.5% |
+| 全部 **103** 份 manifest 里 `pipeline.reason == "vtcm-budget"` | **0 次** |
+| 凡是门槛放行的（`reason == "tile-count"`）的 `budget_depth` | **恒为 2** |
+
+⇒ `budget_depth == 2` 在定义上（`:1681` `budgetDepth = fits(2) ? 2 : ...`）就等于
+**「预算装得下 depth 2」** ⇒ **VTCM 预算从来不是约束。**
+⇒ **depth 的真正上限是几何**（`:1697-1700`：ring 深度追上 tile 数就没有稳态值得第二个 slot；
+`:1688` 硬夹 2），不是钱。
+⇒ **⇒ 因此「拆线程能让 `budgetDepth` 从 1 升到 2、从而救回若干 µs」这条路已经死了**：
+**输入量恒为 2，可隐藏的 µs 计算不出非零值。**
+
+⚠️ **同时，`kStageMinKTiles = 32` 那道门本身在真实算子上不触发**（详见 ERRATA.md 勘误九）：
+
+- 门槛判的是**单个 HMX `MatmulOp` 的归约深度**（`HmxPartitionPass.cpp:381` 读
+  `lhs.getDimSize(1)`，`:431-433` 除以 `kTileEdge=32`），**不是矩阵的 K**。
+  实测：固定逻辑 K=14336、只改 K 循环步长 ⇒ `BK`=32/64/128/256/512 全 `shallow-k`，
+  `BK`=1024/2048 才 `staged`。**判定完全跟着 `BK`（切块步长）走。**
+- **原因**：staging 环预取的是同一输出 tile 的下一个 K-tile，只能跨**同一个 op 内部**预取；
+  而 Triton 的 `for k0 in range(0, K, BK)` 降在 op **外面** ⇒ 每个 op 的 K 就是 `BK`。
+- **改谓词救不了**：manifest 里 `matmul.logical.k.value` 同样是 per-op（逻辑 K=14336 时它报
+  64 或 1024，从不报 14336）⇒ **IR 里根本没有更大的 K**。要让门槛看见矩阵 K，
+  必须让一个 `MatmulOp` 跨越整个 K 循环 —— 那是 lowering 设计变更。
+
+⚠️ **⚠️ 这两条只否掉了「用 staging 给 T_HMX 定量」这条路，
+没有否掉 T_HMX 本身** —— T_HMX 的收益来源是**引擎级 co-scheduling**
+（§2 的 `pack_act(i+1) ‖ unpack(i)` vs `mma`），不在 staging 环上。
+**T_HMX 的判决仍挂在 §6 第 11 条那个已预登记的净增量门上。**
+
+📄 `docs/results/t-hmx-staging-gate-dead-2026-10-02.md`（逐档数据、traceback、复现命令）
 
 ---
 
 ## 5.2 ⛔ 设备窗口：S3 / S4a / S4b 的硬前置
-
-**原稿全文搜「run_tests.sh lock / 用户授权 / 设备窗口」= 0 命中。补上：**
 
 1. ⛔ **要用户签认**（设备窗口）。**S3 / S4a / S4b 三条都要。**
 2. ⛔ 必须走
@@ -1423,20 +670,21 @@ RoPE 那 9 个样本是**单调斜坡不是噪声**（`32.57 / 27.24 / 23.29`，
 3. ⛔ **禁止重建**——会作废设备锚点。
 4. ⚠️ **每样本前后各盖一次指纹**（`libtriton.so` + `libhmxapi.a` 的 md5）。
 5. ⚠️ **`kernel.warmup(...)` = 只编译；`kernel[grid](...)` = 真启动。**
-   曾把编译写成启动，无意触碰设备（已披露两起，见 `docs/state/CURRENT.md`）。
+   曾把编译写成启动，无意触碰设备（已披露多起，见 `docs/state/CURRENT.md`）。
+   ⇒ **共享守卫已落 `tools/hexmlir_device_guard.py`；新探针必须在写的时候就装上它。**
 
-**锚点（2026-10-02 复核，未变）**：
-`libtriton.so ce26015e8efb75cc047515000c8ad70f`（2026-10-01 14:18）
-· `libhmxapi.a 97af133e81fbc361bca3be10164b7bc8`（2026-10-01 12:46）
+**锚点（2026-10-02 复核）：**
+`libtriton.so 9cb82a944092bbc54ee36ccf85c7b550`（S0b 重建后）
+· `libhmxapi.a 97af133e81fbc361bca3be10164b7bc8`（全天未变）
 
 ---
 
-## 5.3 ⚠️ 「`pack_weight ≈ 0`」的适用边界（此前未划界）
+## 5.3 ⚠️ 「`pack_weight ≈ 0`」的适用边界
 
 **可藏量 47.2% 压在这个假设上**：`enableWeightResident` 默认开
-（`backend/hexagon_options.py:105` `enableWeightResident: bool = True`）⇒ `pack_weight ≈ 0`。
+（`backend/hexagon_options.py:105` `enableWeightResident: bool = True`）⇒ `pack_weight` ≈ 0。
 
-⚠️ **但「默认开」不等于「对每个 kernel 都成立」**，本方案从未划界：
+⚠️ **但「默认开」不等于「对每个 kernel 都成立」**：
 
 | 情况 | `pack_weight` | 证据 |
 |---|---|---|
@@ -1494,7 +742,7 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 ⇒ 想拿它当判据就必须手工剔掉这两个 = **engine 白名单**，
 而 `HmxToLLVMPass.cpp:113-115` **明令禁止**（「omission hangs the device」）。
 
-### ⑤ ⛔ 结构性发现：**有���个决策点，方案的切分点写空了**
+### ⑤ ⛔ 结构性发现：**有 5 个决策点，方案的切分点写空了**
 
 - `createHmxPartitionPass` 在 `LinalgToLLVMPass.cpp:536`
 - `createHmxToLLVMPass` 在 `LinalgToLLVMPass.cpp:640`（**在后**）
@@ -1531,50 +779,49 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 
 ## 6. 风险与未验证（预登记，S2 探针优先级从上到下）
 
-1. [未验证] pinned LLVM 是否已含 PR #222340（llvm_triton 子仓在 Linux 侧，本仓不可见）。
-2. [未验证] DMA 事件跨线程等待语义（UserDMA 描述符由谁 poll、能否在另一线程 await）。
-3. [未验证] VTCMPool 并发 alloc/free 真实覆盖（`bin/runtime/include/VTCMPool.h:15` 有 `#include <mutex>`，`:444` 有 `mutable std::mutex mutex_`，但所有权交接语义需探针）。
-4. [未验证] `HAP_compute_res_hmx_lock` 长期持有与其他进程/驱动的交互（探针：独占 N 分钟 + 释放重取）。
-5. [未验证] accumulator 跨 kernel 持久的正确性前提（acc_clear 显式化不变量是否处处成立）。
-6. [未验证] Hexagon 内存序下环索引的 fence 选型。
-7. 已知约束：单 HMX 线程使"多实例并发 HMX"更不可能——与既有 single-instance 立场一致（workspace-resident grid>1 硬拒同款契约）。
-8. ✅ **[已决 2026-10-02] S4 门不可达 —— 接受物理，拆成 S4a / S4b。**
-   **原发现（保留在案）**：**原 S4** 的机制是「softmax 链（HVX）‖ QK·PV（HMX）」
-   ⇒ **可隐藏量 = HMX 引擎在 FA 时间里的份额**，而该份额 LWP **两轮实测为 0.6%**
-   （`docs/history/hmx/fa-time-attribution-2026-09-21.md:97` `hmx.acc_clear`/`mma`/`acc_read`
-   合计 0.6%；`:101`「引擎彻底无关（0.6%）——第二轮再次确认」；`docs/state/STATE-OF-PLAY.md:600` 复述）。
-   项目门是 `max(3×CV,15%)`（`ROADMAP.md:46`）⇒ **0.6% ≪ 15%，纯拓扑收益路径在物理上不可达该门。**
-   **决策（门和机制描述都改）**：
+1. [未验证] DMA 事件跨线程等待语义（UserDMA 描述符由谁 poll、能否在另一线程 await）。
+2. [未验证] VTCMPool 并发 alloc/free 真实覆盖（`bin/runtime/include/VTCMPool.h:15` 有 `#include <mutex>`，`:444` 有 `mutable std::mutex mutex_`，但所有权交接语义需探针）。
+3. [未验证] `HAP_compute_res_hmx_lock` 长期持有与其他进程/驱动的交互（探针：独占 N 分钟 + 释放重取）。
+4. [未验证] accumulator 跨 kernel 持久的正确性前提（acc_clear 显式化不变量是否处处成立）。
+5. [未验证] Hexagon 内存序下环索引的 fence 选型。
+6. 已知约束：单 HMX 线程使"多实例并发 HMX"更不可能——与既有 single-instance 立场一致（workspace-resident grid>1 硬拒同款契约）。
+7. ✅ **S4 门不可达 —— 接受物理，拆成 S4a / S4b。**
+   原 S4 的机制是「softmax 链（HVX）‖ QK·PV（HMX）」⇒ **可隐藏量 = HMX 引擎在 FA 时间里的份额**，
+   而该份额 LWP **两轮实测为 0.6%**
+   （`docs/history/hmx/fa-time-attribution-2026-09-21.md:97`；`:101`「引擎彻底无关（0.6%）——第二轮再次确认」；
+   `docs/state/STATE-OF-PLAY.md:600` 复述）。项目门是 `max(3×CV,15%)`（`ROADMAP.md:46`）
+   ⇒ **0.6% ≪ 15%，纯拓扑收益路径在物理上不可达该门。**
    - **S4a（观测台架，无 FA 性能门）**：验收改为 **LWP 归因的重叠率报告**，
      **只有 M3.2 减税那项**套 `max(3×CV,15%)`。
    - **S4b（真收益）**：组合门 = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座**。
      **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。**
-   ⇒ 43.7% 的来源：`fa-time-attribution:222`，`maxnumf` 归约的 running-max 依赖。
-9. ✅ **[已决 2026-10-02] S3 目标形状不匹配 —— 采信 S2.5 前置 + 首发改 S2-class。**
-   **原发现（保留在案）**：S3 原定打「S1-class matmul」，但 `HmxPartitionPass.cpp:679-706`
-   的 `emitSerialTileLoop` **循环体内无 pack**（详见 §3.1 `role-split-nopack`）
-   ⇒ **「第 i+1 块 pack」在 S1-class 上没有对象。**
-   ⚠️ 另注（一个曾被推翻的推论，保留以免重犯）：`HmxPartitionPass.cpp:1589` 的 `shallow-k` 判定
-   **只管 `emitStageLoop` 的 DMA staging 环**（DDR→VTCM 传输），**管不到 pack‖mma**；
-   且 `ROADMAP.md:113` 记载 `pipeline-depth=1/2` 可绕过它
+     ⇒ 43.7% 的来源：`fa-time-attribution:222`，`maxnumf` 归约的 running-max 依赖。
+8. ✅ **S3 目标形状不匹配 —— 采信 S2.5 前置 + 首发改 S2-class。**
+   S3 原定打「S1-class matmul」，但 `HmxPartitionPass.cpp:679-706` 的 `emitSerialTileLoop`
+   **循环体内无 pack**（详见 §3.1 `role-split-nopack`）⇒ **「第 i+1 块 pack」在 S1-class 上没有对象。**
+   ⚠️ 另注：**`shallow-k` 判定只管 `emitStageLoop` 的 DMA staging 环**（DDR→VTCM 传输），
+   **管不到 pack‖mma**；且 `ROADMAP.md:113` 记载 `pipeline-depth=1/2` 可绕过它
    ⇒ **「K=1024 的门让 S1 摊不上跨线程环」这个推理不成立。真正的障碍是 S1 的 tile 循环里没有 pack。**
    **决策**：S2.5 升为**硬前置**；S3 首发形状 = **S2-class**（`pack_act_sites` 1→2 对齐 `s2_anchor`）；
    **S1-class 的 A/B 待 S2.5 完成后再补。**
-10. ✅ **[已决 2026-10-02] 「pack 还是 unpack」两难已消解 —— 方案 A 下两者都归 HVX 侧。**
-    **原发现（保留在案）**：S1 的 LWP 分区（`hmx-next-round-plan.md:61-70`）：**`unpack` 37.4%** vs
-    **`pack_act` 9.8% + `pack_weight` 4.7% = 14.5%**（`exp/hmx/leaf_bw_probe/RESULTS.md:89` 独立复核 14.5%）。
-    原稿 §0/§2/§5 三处互相矛盾（`:15` pack · `:70` pack+unpack 列 T_HMX · `:163` pack），
-    而唯一有数的那个（§5 S3）选了天花板低 2.6 倍的那一半。
-    **决策（§2 方案 A）**：`pack_act` 与 `unpack_acc` **都归 T_HVX**
-    ⇒ **两难自动消失，不必二选一**；可重叠对象 ≈ `pack_act` 9.8% + `unpack` 37.4% = **47.2%**
-    （`pack_weight` 已被 `enableWeightResident` 默认开消掉）。
-    ⚠️ **仍是跨构建 LWP（`5cea8231`/125 µs），仅方向参考；S3 须同构建重测 A/B 才能定。**
-11. ✅ **[已决 2026-10-02] 净增量 —— 定为 S3 的第一等验收输出，不作为立项前置。**
-    **原发现（保留在案）**：`docs/hmx/hmx-hvx-co-scheduling.md:104-117` 实测
-    **真实核比它自己各部分的上界之和还低 37%** ⇒ **单线程内已经在重叠**。
-    **决策**：**开工前无法知道净增量，把它当前提等于自我否决；S3 的 A/B 两臂本身就是测量。**
+9. ✅ **「pack 还是 unpack」两难已消解 —— 方案 A 下两者都归 HVX 侧。**
+   S1 的 LWP 分区：**`unpack` 37.4%** vs **`pack_act` 9.8% + `pack_weight` 4.7% = 14.5%**
+   （`exp/hmx/leaf_bw_probe/RESULTS.md:89` 独立复核 14.5%）⇒ 天花板差 2.6 倍。
+   **决策（§2 方案 A）**：`pack_act` 与 `unpack_acc` **都归 T_HVX**
+   ⇒ **两难自动消失**；可重叠对象 ≈ **47.2%**。
+   ⚠️ **仍是跨构建 LWP（`5cea8231`/125 µs），仅方向参考；S3 须同构建重测 A/B 才能定。**
+10. ✅ **净增量 —— 定为 S3 的第一等验收输出，不作为立项前置。**
+    `docs/hmx/hmx-hvx-co-scheduling.md:104-117` 实测**真实核比它自己各部分的上界之和还低 37%**
+    ⇒ **单线程内已经在重叠**。
+    **决策**：**开工前无法知道净增量，把它当前置等于自我否决；S3 的 A/B 两臂本身就是测量。**
     ⇒ **S3 新增一条 LWP 归因探针臂**，显式输出「**跨线程相对单线程已有 37% 重叠的净增量**」。
     ⇒ **若净增量 < 门 ⇒ 默认保持 OFF + 负结果收档**（正落在 NOT-PROVEN 框架内）。
+11. ⛔ **「用 staging 的 `budgetDepth` 给 T_HMX 定量」这条路已死。**
+    §5.1.7 的实测：`budget_depth` 恒为 2、staging 环只占预算 2.34%、`vtcm-budget` 零出现；
+    且 staging 门在真实算子上不触发（判的是切块步长，IR 里没有更大的 K）。
+    ⇒ **可隐藏的 µs 计算不出非零值。**
+    ⚠️ **这不否掉 T_HMX 本身** —— 它的收益来源是引擎级 co-scheduling（§2），
+    **判决仍挂在第 10 条那个净增量门上。** 两件事必须分开。
 
 ---
 
@@ -1593,3 +840,20 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 1. 四次线程证伪不覆盖角色切分（锁无竞争）；
 2. M3.1 退役支持零成本模型判据（本方案判据=能力+依赖）；
 3. M3.2（固定税）与 M3.3（共调度）正是本方案的两个收益面；stage/await 与 HmxDmaOnly 极性是现成地基。
+
+---
+
+## 8. 勘误在哪
+
+**本文只写当前成立的结论。** 被推翻过的判断——原文照抄、推翻它的证据、以及它现在落在哪一节——
+全部在同目录的 **`ERRATA.md`**，共 9 条（勘误七含七层更正）。
+
+其中与本文关系最直接的两条：
+
+| 勘误 | 内容 | 现在的落点 |
+|---|---|---|
+| **九** | staging 门的前提从未在真实算子上生效；VTCM 预算从来不是约束 | 本文 §5.1.7 + §6 第 11 条 |
+| **六** | T_HMX 的收益估算缺一块输入（逐形状 `budgetDepth`） | 那块输入已进 manifest（commit `2c3ebb9`），而读数把它自己否掉了 ⇒ §5.1.7 |
+
+⚠️ **勘误九自身有一处越界已撤回**（详见 ERRATA.md 末尾）：它原本建议「关闭 T_HMX」，
+但它测的是 staging 环、而 T_HMX 的收益来自引擎级 co-scheduling，两者不是同一件事。
