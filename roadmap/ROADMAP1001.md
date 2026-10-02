@@ -633,6 +633,52 @@ llama 那一列放在不同口径下比** —— llama 侧用 24576~81920 runs�
 > ⛔ **另：上表「五个形状的 A / B」那一列的 `B` 值同样受此影响** ⇒ 五个形状的
 > `once_share` 与门槛都要按上面这个 `B` 重算一遍才能引用。
 
+> **🟢 勘误五（2026-10-02 09:51）：勘误四里那个 `g = 0.30 µs/Kt-tile` 系数
+> **不是 Kt 的函数**，机制是一个被 VTCM 预算卡的**离散决策**。**
+>
+> **触发点**：`H7_kt128` = 128×128×4096（`Kt=128`、张量 2^19）实测 **44.0**，
+> 而带 `Kt²` 的模型预测 **63.5** ⇒ **高出 19.5 µs，把 `Kt²` 直接否掉。**
+>
+> **但它指出了正确的结构**：把「staged 成本」=（实测 − 不含任何 `Kt` 项的模型）单列，
+> 同为 `Kt=128` 的两点：
+>
+> | 形状 | `Mt` | `(M/32)·Kt` | staged 成本 |
+> |---|---:|---:|---:|
+> | `H5_bigM256` | 8 | 1024 | **39.09** |
+> | `H7_kt128` | **4** | 512 | **14.56** |
+>
+> ⇒ **按 `Kt` 算差 2.7 倍；按 `(M/32)·Kt` 算只差 1.3 倍**
+> ⇒ ⭐ **⇒ 它是 `(M-tile 数) × (K-tile 数)` 的函数，不是 `Kt` 的函数。**
+>
+> **代码给出了为什么会跳**（`HmxPartitionPass.cpp`）：
+>
+> ```cpp
+> int64_t scratchBytes = Kt * layout::kCroutonBytes;                        // :1619  ∝ Kt
+> int64_t room         = vtcmBudget - vtcmBytesCommitted(func) + actBytes; // :1644  actBytes ∝ Mt
+> auto fits = [&](int64_t d) { return scratchBytes + d * ringBytes <= room; };   // :1651
+> int64_t budgetDepth = fits(2) ? 2 : (fits(1) ? 1 : 0);                   // :1652
+> ```
+>
+> ⇒ ⭐⭐⭐ **⇒ 流水深度被 VTCM 预算卡住，按 2 / 1 / 0 **跳变** ⇒ 关系里有间断
+> ⇒ ⇒ **任何多项式项都补不上，这不是拟合能力不足。**
+>
+> ⚠️ **⇒ 勘误四那句「`g = 0.30 µs/Kt-tile` 是唯一被留出验证过的 staging 独有成本」
+> 要改读法：它的**形式**（staging 独有、与 `K` 深度相关）被验证了，
+> 但**它的量纲不是 `Kt`** ⇒ 那个系数是拟合产物，不是测量值。
+>
+> ⛔ **逐形状的深度未证实**：这个构建的 envelope 是 **v1**
+> ⇒ `metadata["hmx_manifest"]` 实跑 15 个形状全是 `None`（`utils.py:1881`：v1 无 manifest）；
+> 手工复现要经 `vtcmBytesCommitted`（`MatmulToHmxPass.cpp:993-1020`）与 `planBridge` 的
+> M-blocking 与权重驻留路径 ⇒ **不做无法验证的复现。**
+>
+> **⚠️ 另一条实验硬约束（值得写进任何后续实验设计）**：
+> **所有 matmul 维度必须是 2 的幂**（`tl.make_block_ptr` 要求，否则
+> `arange's range must be a power of 2`）⇒ **张量大小也只能是 2 的幂**
+> ⇒ **`2^19` 与 `2^20` 之间没有任何可用尺寸 ⇒ 模型在张量到 `2^20` 处的边界无法二分。**
+>
+> 📄 `docs/results/output-term-is-rows-not-bytes-2026-10-02.md` §4.1–§4.3（285 行）
+> 📄 `exp/hmx/shape_attribution/README.md`（2 的幂约束 + 可直接跑的形状检查清单）
+
 > **🟢 勘误四（2026-10-02 09:25）：「S1 受限于输出读出」方向对，但**量的形式错了** ——
 > 那个量是**输出行数 `M`**，不是输出字节数。**
 >
