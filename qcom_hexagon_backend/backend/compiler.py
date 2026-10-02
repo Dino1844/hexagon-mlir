@@ -14,6 +14,7 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 import subprocess
+import warnings
 from typing import Any, Dict, no_type_check
 from types import ModuleType
 
@@ -290,6 +291,27 @@ class HexagonBackend(BaseBackend):
         #   real qurt hardware threads (handled at wrapper generation time).
         # Users do not need to set these flags manually when scratch > 0.
         if hexagon_opts.scratch > 0:
+            # The override below is deliberate and documented, but until this
+            # warning it was also silent: the manifest came back `hvx` /
+            # `vtcm-allocator-disabled` with zero diagnostics, so a caller who
+            # passed scratch>0 and nothing else got every op on HVX and no sign
+            # of it. The override itself stays -- VTCMPool must not allocate
+            # alongside the external pool, and threaded dispatch avoids the DMA
+            # and thread conflicts. What was missing was saying so.
+            #
+            # Shape copied from an existing precedent in the same backend:
+            # triton_hexagon_launcher.py warns and then disables
+            # enableHexagonmemCopyToDMA for a grid>1 launch, for the same class
+            # of reason (trading one switch away for stability).
+            if hexagon_opts.enableConvertToHexagonmem:
+                warnings.warn(
+                    "Disabling enableConvertToHexagonmem because scratch > 0 "
+                    "configures an external VTCM pool; with it off, matmuls that "
+                    "would have gone to HMX fall back to HVX "
+                    "(manifest: hmx -> hvx, vtcm-allocator-disabled). Pass "
+                    "scratch=0 if the intent was HMX.",
+                    stacklevel=2,
+                )
             hexagon_opts = replace(
                 hexagon_opts,
                 enableMultiThreading=False,
