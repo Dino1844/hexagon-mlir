@@ -447,6 +447,32 @@ Triton → TTIR → Linalg
 
 **与本方案无关，但它是项目当前已知最大的单点，登记在此备查：**
 `fdiv <64 x half>` → **194 次 libcall**；`fdiv <64 x float>` → **2 次**。
+
+> **⚠️ 勘误八（2026-10-02 17:30）：上面这个数字在当前构建上复现不出来，且其机制在本流水线上没有入口。**
+>
+> 全仓搜「194」：**本仓没有更早的出处、没有量它的脚本、没有它对应的那份 IR**
+> （`docs/` 里其余 5 处命中全部是 2026-10-02 我自己写的）。
+>
+> **用当前构建（含 patch 的 `20342db0`）扫遍 `dump_codegen.py` 支持的全部 7 个算子**：
+> `matmul` / `silu` / `softmax` / `rms_norm` / `vec_add` 的 **`x half` 均为 0、数学 libcall 均为 0**；
+> `flash_attention` 有 8 处 `x half`，**逐处看全是 `load <64 x half>` + `fpext` 到 f32**
+> （输入布局转换，不是算术）；全篇**没有一个数学函数被 call**。
+>
+> **机制上它也走不通**：`narrowBinOp` 的入口守卫是
+> `match(Trunc.getOperand(0), m_OneUse(m_BinOp(BinOp)))` ⇒ **必须有 `fptrunc`**，
+> 而 HVX→HMX 这条流水线上 `f16` 只出现在**输入侧**、算术全在 f32 ⇒ **永不收窄**。
+> 且 opcode 列表里**没有 `Fdiv`**（只有 `and/or/xor/add/sub/mul` 与 `FAdd/FSub/FMul`）。
+>
+> ⇒ **⇒ 这一项应当记作「出处不明」，不是「已证存在、只等重测」。**
+> ⇒ ⇒ **「方案 A 改 LLVM」vs「方案 B 插 pass 扩回 f32」这个分野目前无法用证据裁决**，
+> 因为**被比较的现象本身没能在任何可达 kernel 上复现**。
+> ⇒ ⇒ **下一步不是选 A 或 B，而是先找到「194 次」的那个 kernel**
+> ——候选是 `exp` / `log` / `rsqrt` / `gelu`，**它们不在 `dump_codegen.py` 的支持列表里，从没被扫过**。
+> ⇒ ⚠️ 反向证据：今晚 `hexmlir-all` **7/7**（含 `test_gelu` / `test_silu` / `test_softmax`）
+> ⇒ **⇒ 它在真机上没有造成正确性问题，只可能造成性能问题；而含除法算子的 Perf 从未有过对照。**
+>
+> 📄 `docs/results/f16-division-194-unreproducible-2026-10-02.md`（含逐算子数据与复现命令）
+
 根因是 LLVM InstCombine 的 binop 收窄把 `<64 x float>` 变成 `<64 x half>`
 （HVX 没有向量 f16 除法 ⇒ 192 次 libcall）。
 
@@ -713,6 +739,120 @@ llama 那一列放在不同口径下比** —— llama 侧用 24576~81920 runs�
 > | ⛔ **fdiv patch 仍未验证** | 「重建成功」**不等于**「patch 生效」，这两件事我分开失败了 |
 > | ⛔ **f16 除法 194 次 libcall 未重测** | 那才是 S0b 立项要解决的，现在仍未解决 |
 >
+> #### ⛔ 勘误七之更正之七（2026-10-02 17:25）：**`f16` 除法那个单点，`matmul` 路径上根本不存在**
+>
+> 更正之六说「现在才第一次具备可测条件」。**条件具备了，我一测，问题本身就不在这条路径上。**
+>
+> **实测（两个 `.so` 各编一次 `matmul` 的 `llir`，逐行对比）**：
+>
+> | | `ce26015e`（无 patch） | `20342db0`（有 patch） |
+> |---|---|---|
+> | `matmul_kernel` 函数体 | **160 行** | **160 行** |
+> | 两个函数体逐字节比较 | — | ✅ **完全相同** |
+> | 全文 `fdiv` 出现 | 10 | 10 |
+> | `llvm.fdiv` | 0 | 0 |
+> | `sqrt` | 0 | 0 |
+> | 数学 libcall 的 `declare`（`sqrt`/`sin`/`cos`/`expf`/`logf`/`powf`/`__*f16`） | **0** | **0** |
+>
+> ⇒ ⭐⭐⭐ **⇒ `matmul` 路径上没有任何 f16 除法 libcall —— 无论有没有 patch。**
+> ⇒ **⇒ 所以「194 次 libcall vs 2 次」那个数字，不是 `matmul` 的问题。**
+>
+> ⚠️ **⚠️ ⇒ 而 `:6` 那个数字的来源，本文件至今没有记录。**
+> **它在 `ROADMAP` 里被当作已知事实引用（`:461` 拿它论证「不给 fdiv 加 `nnan ninf`」），
+> 但：它量的是哪个 kernel？哪个形状？哪条路径？本文件查不到出处。**
+> ⇒ ⭐ **⇒ 按项目自己的纪律，这一项应当记作「出处不明」，
+> 而不是「已证存在、只等重测」。我此前两轮都按后者处理，两轮都错。**
+>
+> ### ⇒ 三个可辩护的结论
+>
+> **① `hmx-attr` 与 `a576182` 落地但对 `matmul` 产物零影响** —— 已由本条与
+> 勘误七之更正之五的两组独立测量确认（`matmul_kernel` 逐字节相同 + 三形状指令流 md5 相同）。
+>
+> **② `fdiv` patch 落地且行为正确**（更正之六的 `narrowed` / `control` 两条分支实测）。
+> **但它在 `matmul` 上无事可做。**
+>
+> **③ 「方案 A 改 LLVM」vs「方案 B 插 pass 扩回 f32」这个分野，目前无法用证据裁决** ——
+> 因为**被比较的那个现象本身没能在 `matmul` 上复现**。
+> ⇒ ⇒ **要推进这件事，第一步不是选 A 或 B，而是先找到「194 次」的那个 kernel。**
+> ⇒ 候选：`exp` / `log` / `rsqrt` / `gelu` / `silu` / `softmax` 这类含超越函数的算子
+> （`hexmlir-all` 里就有 `test_gelu.py` / `test_silu.py` / `test_softmax.py`）。
+> ⇒ ⚠️ **⇒ 而今晚的 `hexmlir-all` 7/7 恰好证明这些算子当前都是绿的**
+> ⇒ **⇒ 即「f16 除法」在真机上并没有造成正确性问题，只可能造成性能问题。**
+> ⇒ ⇒ **那就要问：它到底在哪慢？有没有人测过含除法算子的 Perf？**
+> ⇒ 📄 本条的复现：`OUT_DIR=<d> .venv/bin/python tools/hexmlir/dump_codegen.py matmul llir`
+> ⇒ ⚠️ **该脚本的 artifact 只能是 `llir` / `manifest` / `o` / `ttsharedir`（写 `ttir` 会被拒）**
+> ——我为此浪费了三轮，路径也猜错过一次。**它的 usage 在 `dump_codegen.sh:14`。**
+>
+
+> #### ✅ 勘误七之更正之六（2026-10-02 17:00–17:20）：**fdiv patch 确实在 `.so` 里，而且它是活的 —— 我上一条更正里的判断是错的**
+>
+> 更正之三写「fdiv patch 仍然没进 `.so`」，依据是二进制 Agent 量的 `.text` 只涨 192 B。
+> **那个界不足以否定归档成员级的证据。以归档链路为准：**
+>
+> | 环节 | 证据 |
+> |---|---|
+> | 源码含 patch | `InstCombineCasts.cpp:2136/2137/2165/2178`，`NarrowFMF` 命中 **5** 处 |
+> | 源文件被改 | **2026-10-02 02:30:59** |
+> | `InstCombineCasts.cpp.o` 重编 | **2026-10-02 13:09:00**（在 patch 之后） |
+> | `libLLVMInstCombine.a` 重打包 | **2026-10-02 13:09:00** |
+> | `libtriton.so` 链的就是它 | `triton/build/…/build.ninja:363`，`LINK_LIBRARIES` 里是**绝对路径** `llvm_triton/build/install/lib/libLLVMInstCombine.a` |
+> | `20342db0` 链接时刻 | **13:11:34**（归档之后 2.5 分钟） |
+> | `ce26015e` 链接时刻 | **2026-10-01 14:18**（比 patch 落地早 **23 小时**） |
+>
+> ⇒ ⭐⭐⭐ **⇒ patch 在 `20342db0` 里，不在 `ce26015e` 里。**
+> ⇒ ⚠️ **⇒ `.text` 只涨 192 B 与此不矛盾**：patch 落在 `narrowBinOp`（一个 421 KB 目标文件里的
+> `static` 成员）内，只改动 5 条指令、且发生在已存在的符号里 ⇒ **不产生新符号名，
+> 也几乎不改变总 `.text` 尺寸**。**我用总量界去否定成员级证据，是错的推断方向。**
+>
+> ### ⭐ 而且 patch 的行为已实测正确 —— 但我之前那个判别式本身是错的
+>
+> `:6` 记的判别式用 **`fdiv`**。**而 `fdiv` 根本不会触发这条路径**：
+> `narrowBinOp`（`:841`）的 opcode 列表是 `and/or/xor/add/sub/mul`（整数 `:856-862`）
+> 与 FP 的 **`FAdd` / `FSub` / `FMul`**（`:2129` 起）⇒ **`Fdiv` 不在其中。**
+> ⇒ ⚠️ **⇒ 这就是为什么我前面两次"判别式没反应"——不是 patch 没生效，是用例选错了 opcode。**
+>
+> **正确的触发条件**（`:851`）：`match(Trunc.getOperand(0), m_OneUse(m_BinOp(BinOp)))`
+> ⇒ **`fptrunc` 的操作数必须只有一个 use，且那个 use 是一个 binop。**
+>
+> **实测（`fadd`，BO 带 `ninf` 而 `FPT` 不带）：**
+>
+> ```
+> define <4 x half> @narrowed(<4 x half> %h) {
+>   %e = fpext <4 x half> %h to <4 x float>
+>   %b = fadd nnan ninf <4 x float> %e, %e
+>   %t = fptrunc <4 x float> %b to <4 x half>       ; ← 故意不带 ninf
+>   ret <4 x half> %t
+> }
+> ```
+>
+> | opt | `@narrowed` 的结果 | 判决 |
+> |---|---|---|
+> | `install/bin/opt`（13:09 重装） | `fadd nnan <4 x half>` | ✅ **`ninf` 被清 ⇒ patch 生效** |
+> | `build/bin/opt` | `fadd nnan <4 x half>` | ✅ 同上 |
+> | 对照组 `@control`（`FPT` 也带 `ninf`） | `fadd nnan ninf <4 x half>` | ✅ **`ninf` 保留**，正是 patch 的第二条 |
+>
+> ⇒ ⭐⭐⭐ **⇒ patch 的两条语义分支都实测正确。**
+> ⇒ 复现：`llvm_triton/build/install/bin/opt -passes=instcombine -S` + 上面的 IR。
+>
+> ### ⇒ 于是 S0b 的账终于平了
+>
+> | | 状态 |
+> |---|---|
+> | ✅ 重建能力 | 解锁，2 分钟 |
+> | ✅ `hmx-attr` 落地 | 是，但**可证 no-op**（`hexagon_hmx` 后端零命中，`IsHMX` 恒 false） |
+> | ✅ **fdiv patch 落地且行为正确** | **本条** |
+> | ✅ `a576182` K-fusion 落地 | 是，但**默认关**（`croutons-per-mma` 选项），产物逐字节不变 |
+> | ⛔ `f16` 除法 194 次 libcall **未重测** | **现在才第一次具备可测条件** |
+> | ⛔ 13:14 的 S1 失败 | 仍是环境/瞬态，非任何构建的性质 |
+>
+> ⇒ ⭐ **⇒ 下一件事很具体：在 `20342db0` 上重测 `fdiv <64 x half>` 的 libcall 计数。**
+> **预期：仍 > 2**（因为 patch 只修 miscompile，**不取消收窄**）
+> ⇒ **若仍是 194 左右 ⇒ 「方案 A 改 LLVM」这条路已被证明只能修对、不能提速，
+> 「方案 B（InstCombine 之后插一个 pass 扩回 f32）」才是提速的那条。**
+> ⇒ 那正是 `ROADMAP` 里 `:dad3f375`（方案 A）与 `:2f1ffef4`（方案 B）的分野，
+> **而这个分野至今没有证据。**
+>
+
 > #### 🟧 勘误七之更正之五（2026-10-02 16:35）：**两个构建生成的设备指令流逐字节相同 —— 整条 LLVM/后端链路全部出局**
 >
 > 更正之四把机制候选换成「`a576182` 的 K-fusion」。**那个候选现在也出局了**，而且是被
@@ -1015,6 +1155,51 @@ llama 那一列放在不同口径下比** —— llama 侧用 24576~81920 runs�
 > 📄 `docs/results/output-term-is-rows-not-bytes-2026-10-02.md` §4.2–§4.3
 > 📄 `exp/hmx/shape_attribution/dump_pipeline_decision.py`（读 `metadata["hmx_manifest"]` 的尝试；
 > **保留，因为它记录了「v1 envelope 读不到」这个事实本身**）
+
+> **⛔ 勘误九（2026-10-02 16:50）：上面那条「已被留出数据独立确认」的三条里，第一条的前提被推翻，
+> 而被钉住的那个常量从未在真实算子上生效过。T_HMX 的 staging 前提两条路径都已测死。**
+>
+> **① `kStageMinKTiles = 32` 的溯源表把一个合成形状当成了 real。**
+> `HmxPartitionPass.cpp:198-201` 写「one real shape sits exactly ON the boundary
+> (**FA PV, 1024x128x1024, Kt=32**) … PV's K is seq (large, allowed)」。
+> **而仓库里真实的 FA kernel 不是这个形状**：`test_flash_attention.py:105` 的
+> `acc = tl.dot(p, v, acc)`，`p=(BLOCK_M, BLOCK_N)`、`v=(BLOCK_N, BLOCK_DMODEL)`
+> ⇒ **op 的 K = `BLOCK_N` = 64**；kv 的循环在 dot **外面**，seq 是循环 trip count、不是 op 的 K。
+> ⇒ **判据（实测）**：FA 在 `D_HEAD`/`BLOCK_N` = 64/64、128/64、128/128、256/128 四个配置下，
+> 两个 matmul **全部 `shallow-k` / `budget_depth=0`**。若 PV 的 op-K 真是 1024，它会 staged。
+> ⇒ **⇒ 溯源表里唯一那个「正好在门槛上」的条目是合成的**；`:202` 自己也写了
+> 「Nothing real lands strictly inside Kt 9..31」——真实算子全在 `Kt ≤ 8` 那一侧。
+>
+> **② 门槛判的是 op-K（切块步长），不是矩阵 K；且改谓词救不了。**
+> `:381` `getTileShape()` 读 `lhs.getDimSize(1)`（activation crouton 阵列的 K），
+> `:431-433` 除以 `kTileEdge=32` ⇒ `kTiles` = **这个 op** 的 K/32 ⇒ 门槛 = op-K ≥ 1024。
+> 实测：固定逻辑 K=14336，只改 K 循环步长 ⇒ `BK`=32/64/128/256/512 全 `shallow-k`，
+> `BK`=1024/2048 才 `staged`。**判定完全跟着 `BK` 走。**
+> ⇒ **原因**：staging 环预取的是同一输出 tile 的下一个 K-tile，只能跨**同一个 op 内部**预取；
+> 而 Triton 的 `for k0 in range(0, K, BK)` 降在 op **外面** ⇒ 每个 op 的 K 就是 `BK`。
+> ⇒ ⛔ **「改读逻辑 K」这个修法不存在**：manifest 里 `matmul.logical.k.value` 同样是 per-op
+> （逻辑 K=14336 时它报 64 或 1024，从不报 14336）⇒ **IR 里根本没有更大的 K**。
+> 要让门槛看见矩阵 K，必须让一个 `MatmulOp` 跨越整个 K 循环 —— 那是 lowering 设计变更。
+>
+> **③ ⛔ 决定性：VTCM 预算从来不是约束（host-only，已测实）。**
+> `:1681` `budgetDepth = fits(2) ? 2 : (fits(1) ? 1 : 0)` ⇒ **`budget_depth==2` 在定义上就等于
+> 「预算装得下 depth 2」**。统计全部 **103** 份 manifest 的 `pipeline.reason`：
+> `vtcm-budget` 出现 **0 次**；凡是放行的（那 2 个 `tile-count`）`budget_depth` 都是 2。
+> ⇒ 且 ring 本身极便宜（`:1647-1672` 原式 `slotBytes=32·K·2`、`ringBytes=slot+4`、
+> `scratchBytes=Kt·2048`，预算 8 MiB @ `HmxTarget.h:118`）：
+> **op-K=1024（门槛正上方）时 depth 2 只占预算 2.34%**；即使 op-K=16384 也只有 37.5%。
+> ⇒ 算术自检：同式复算 FA 两个 matmul = 3.22% / 合计 6.45%，与此前记录的 3.2% / 6.4% 一致。
+> ⇒ **depth 的真正上限是几何不是钱**（`:1697-1700` ring 深度追上 tile 数即无稳态；`:1688` 硬夹 2）。
+>
+> **⇒ 对本方案（§5 S2/S3/S4b）的影响**：上面 `:1147-1153` 那条「先读出逐形状 `budgetDepth`，
+> 才能给 T_HMX 分线程定量」的前置，**其输入量恒为 2** ⇒ **可隐藏的 µs 计算不出非零值**。
+> ⇒ ⭐ **建议把 T_HMX 从「暂停等数据」改判为「关闭」**，理由按强弱排序：③ > ② > 深度封顶。
+> **⇒ 失效条件**：出现 `BK ≥ 1024` 的 `tl.dot`、或 K 循环被改进 op 内部、或 `defaultVtcmBudget`
+> 大幅下调、或出现单 kernel 多 matmul（`vtcmBytesCommitted` 会吃掉 `room`）——任一条成立则本勘误作废、必须重测。
+>
+> 📄 `docs/results/t-hmx-staging-gate-dead-2026-10-02.md`（含逐档数据、traceback 与复现命令）
+> 📄 顺带：`exp/hmx/accumulator_budget_headroom.py:90-94` 是**同一处 2^20 误读**的第二个副本
+> （「caps EVERY tensor's numel at 2^20」）⇒ 该脚本的 "decisive question" 段结论需重算
 
 > **🟢 勘误五（2026-10-02 09:51）：勘误四里那个 `g = 0.30 µs/Kt-tile` 系数
 > **不是 Kt 的函数**，机制是一个被 VTCM 预算卡的**离散决策**。**
