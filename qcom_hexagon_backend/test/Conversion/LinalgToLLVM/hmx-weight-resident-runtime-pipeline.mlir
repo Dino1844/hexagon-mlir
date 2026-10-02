@@ -20,7 +20,7 @@
 // CHECK: hmx.kernel_manifest =
 // CHECK-DAG: function = "runtime_weight"
 // CHECK-DAG: pack_weight_sites = 0 : i64
-// CHECK-DAG: pipeline = {depth = 0 : i64, reason = "shallow-k", requested = 0 : i64, selected = "serial"}
+// CHECK-DAG: pipeline = {budget_depth = 0 : i64, depth = 0 : i64, reason = "shallow-k", requested = 0 : i64, selected = "serial"}
 // CHECK-DAG: plan = "full-hmx"
 // CHECK-DAG: reason = "selected-aligned"
 // CHECK-DAG: weight_policies = [{consumers = [0], function = "runtime_weight", policy = "resident-prepack", reason = "eligible-aligned-f16", slot = 1 : i64}]

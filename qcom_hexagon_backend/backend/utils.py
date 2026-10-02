@@ -798,7 +798,10 @@ def _validate_execution(entry, path, logical_values):
 def _validate_hmx_pipeline(entry, path):
     pipeline = _require_object(entry.get("pipeline"), f"{path}.pipeline")
     _require_exact_fields(
-        pipeline, f"{path}.pipeline", ("requested", "selected", "depth"), ("reason",)
+        pipeline,
+        f"{path}.pipeline",
+        ("requested", "selected", "depth"),
+        ("reason", "budget_depth"),
     )
     _require_nonnegative_int(pipeline["requested"], f"{path}.pipeline.requested")
     depth = _require_nonnegative_int(pipeline["depth"], f"{path}.pipeline.depth")
@@ -813,6 +816,20 @@ def _validate_hmx_pipeline(entry, path):
         raise ValueError(f"{path}.pipeline.depth must be positive for staged selection")
     if "reason" in pipeline:
         _require_code(pipeline["reason"], f"{path}.pipeline.reason", HMX_PIPELINE_REASONS)
+    if "budget_depth" in pipeline:
+        # 2026-10-02: the depth the VTCM budget allowed, which is what makes a
+        # clamped ring readable. Optional because a manifest that predates the
+        # field is still valid -- it just does not say why the depth is what it
+        # is. A budget below the selected depth would mean the pass chose deeper
+        # than the budget permitted, which cannot happen.
+        budget_depth = _require_nonnegative_int(
+            pipeline["budget_depth"], f"{path}.pipeline.budget_depth"
+        )
+        if budget_depth < depth:
+            raise ValueError(
+                f"{path}.pipeline.budget_depth {budget_depth} is below "
+                f"{path}.pipeline.depth {depth}"
+            )
 
 
 def _validate_hmx_matmul_contract(entry, path, *, selected):

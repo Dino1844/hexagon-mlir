@@ -87,6 +87,13 @@ constexpr StringLiteral kKeyPipelineRequested = "requested";
 constexpr StringLiteral kKeyPipelineSelected = "selected";
 constexpr StringLiteral kKeyPipelineDepth = "depth";
 constexpr StringLiteral kKeyPipelineReason = "reason";
+// 2026-10-02: the depth the VTCM budget actually allowed, as opposed to the
+// depth that was selected. These differ exactly when the budget clamped a
+// staged pipeline down to a shallower ring (HmxPartitionPass.cpp:1652), and
+// until this field existed the clamp was invisible from outside: the manifest
+// recorded the outcome ("depth": 1) but not the constraint that produced it, so
+// there was no way to tell "Kt was small" from "the ring did not fit".
+constexpr StringLiteral kKeyPipelineBudgetDepth = "budget_depth";
 constexpr StringLiteral kKeyBridgeCounts = "bridge_counts";
 constexpr StringLiteral kKeyPackActSites = "pack_act_sites";
 constexpr StringLiteral kKeyPackWeightSites = "pack_weight_sites";
@@ -615,7 +622,8 @@ LogicalResult validatePipeline(ModuleOp module, DictionaryAttr pipeline,
   if (failed(rejectUnknownFields(
           module, pipeline,
           {StringRef(kKeyPipelineRequested), StringRef(kKeyPipelineSelected),
-           StringRef(kKeyPipelineDepth), StringRef(kKeyPipelineReason)},
+           StringRef(kKeyPipelineDepth), StringRef(kKeyPipelineReason),
+           StringRef(kKeyPipelineBudgetDepth)},
           report, "pipeline")))
     return failure();
   if (!hasI64(pipeline, kKeyPipelineRequested) ||
@@ -1637,7 +1645,7 @@ mlir::hmx::addOrReplaceHmxManifestRecords(ModuleOp module,
 
 LogicalResult mlir::hmx::setHmxManifestPipelineDecision(
     ModuleOp module, StringRef functionName, int64_t id, int64_t requested,
-    StringRef selected, int64_t depth, StringRef reason) {
+    StringRef selected, int64_t depth, StringRef reason, int64_t budgetDepth) {
   FailureOr<DictionaryAttr> current =
       readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true);
   if (failed(current))
@@ -1678,6 +1686,16 @@ LogicalResult mlir::hmx::setHmxManifestPipelineDecision(
   pipeline.set(kKeyPipelineRequested, IntegerAttr::get(i64, requested));
   pipeline.set(kKeyPipelineSelected, StringAttr::get(ctx, selected));
   pipeline.set(kKeyPipelineDepth, IntegerAttr::get(i64, depth));
+  if (budgetDepth >= 0) {
+    // The budget may only relax the selected depth, never deepen it: a pipeline
+    // deeper than the budget allowed would not have been chosen in the first
+    // place, so budgetDepth < depth means the caller and the pass disagree.
+    if (budgetDepth < depth)
+      return emitManifestError(module, true,
+                               "HMX pipeline budget depth is below the selected "
+                               "depth in manifest");
+    pipeline.set(kKeyPipelineBudgetDepth, IntegerAttr::get(i64, budgetDepth));
+  }
   if (!reason.empty())
     pipeline.set(kKeyPipelineReason, StringAttr::get(ctx, reason));
   else

@@ -30,19 +30,31 @@
 // The explicit decision-id attribute is the hand-off used when tensor
 // bufferization rebuilds the op. The module manifest is updated in place before
 // hmx.matmul is erased.
+//
+// DEPTH1 is the forced-depth-1 arm, and budget_depth = 2 there is the whole
+// point of the field: the knob asked for 1 while the budget would have paid for
+// 2, so budget_depth > depth says "chose shallower on purpose". Contrast
+// DOWNGRADE below, where budget_depth == depth == 1 and the reason is
+// vtcm-budget, which says "the budget would not pay for more". With only depth,
+// those two arms were the same number and only the reason told them apart.
 // DEPTH1: hmx.kernel_manifest = {
-// DEPTH1: pipeline = {depth = 1 : i64, requested = 1 : i64, selected = "staged"}
+// DEPTH1: pipeline = {budget_depth = 2 : i64, depth = 1 : i64, requested = 1 : i64, selected = "staged"}
 
 // DEPTH2: hmx.kernel_manifest = {
-// DEPTH2: pipeline = {depth = 2 : i64, requested = 2 : i64, selected = "staged"}
+// DEPTH2: pipeline = {budget_depth = 2 : i64, depth = 2 : i64, requested = 2 : i64, selected = "staged"}
 
 // A requested depth-2 ring that the budget cannot pay for remains staged, but
 // the selected depth and canonical reason describe the downgrade.
+// budget_depth is 1 here, not 2: it records what the VTCM budget allowed,
+// which is the one number that was previously unobservable and is what
+// separates "clamped by the budget" from "chose depth 1 anyway". Kept as plain
+// comments on purpose: a DOWNGRADE-prefixed line is a FileCheck assertion that
+// the text appears in the tool's output, and prose never does.
 // DOWNGRADE: hmx.kernel_manifest = {
-// DOWNGRADE: pipeline = {depth = 1 : i64, reason = "vtcm-budget", requested = 2 : i64, selected = "staged"}
+// DOWNGRADE: pipeline = {budget_depth = 1 : i64, depth = 1 : i64, reason = "vtcm-budget", requested = 2 : i64, selected = "staged"}
 
 // DEPTH3: hmx.kernel_manifest = {
-// DEPTH3: pipeline = {depth = 0 : i64, reason = "serial-requested", requested = 3 : i64, selected = "serial"}
+// DEPTH3: pipeline = {budget_depth = 0 : i64, depth = 0 : i64, reason = "serial-requested", requested = 3 : i64, selected = "serial"}
 
 // Forced depth 1: one scratch, one slot, one status word, and the serial
 // source loop -- issue, await, compute -- left unpipelined (no iter_args, no

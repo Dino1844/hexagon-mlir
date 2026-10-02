@@ -303,6 +303,45 @@ class TranslationMetadataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "pipeline.reason"):
             _UTILS.validate_hmx_manifest(_manifest([bad]))
 
+    def test_pipeline_budget_depth_is_optional_but_never_below_depth(self):
+        # 2026-10-02: budget_depth records the depth the VTCM budget allowed,
+        # which is what makes a clamped ring readable. It is optional so a
+        # manifest written before the field stays valid, and it is never allowed
+        # to sit below depth: a pass that chose deeper than the budget permitted
+        # would be a contradiction, not a clamped run.
+        #
+        # Every variant re-stamps plan_fingerprint because
+        # _plan_fingerprint_payload hashes the whole record minus the digest, so
+        # editing pipeline without re-stamping fails on the fingerprint check
+        # before the pipeline check is ever reached. The existing tests do the
+        # same (see the peeled-reason test above).
+        def with_pipeline(**updates):
+            record = _hmx_record(plan="full-hmx", shape=(64, 64, 64), block_m=64)
+            record["execution"]["pipeline"].update(updates)
+            record["plan_fingerprint"] = _UTILS.compute_hmx_plan_fingerprint(record)
+            return record
+
+        # Absent: a manifest written before the field is still valid.
+        _UTILS.validate_hmx_manifest(_manifest([with_pipeline()]))
+
+        # The clamped case this field exists for: staged, clamped from 2 to 1.
+        _UTILS.validate_hmx_manifest(
+            _manifest([with_pipeline(requested=2, selected="staged", depth=1, budget_depth=2)])
+        )
+
+        # A budget deeper than the selection is normal: the budget allowed more
+        # than the schedule needed.
+        _UTILS.validate_hmx_manifest(_manifest([with_pipeline(budget_depth=3)]))
+
+        # A budget below the selected depth is a contradiction, not a clamp.
+        with self.assertRaisesRegex(ValueError, "pipeline.budget_depth"):
+            _UTILS.validate_hmx_manifest(
+                _manifest([with_pipeline(requested=2, selected="staged", depth=2, budget_depth=1)])
+            )
+
+        with self.assertRaisesRegex(ValueError, "pipeline.budget_depth"):
+            _UTILS.validate_hmx_manifest(_manifest([with_pipeline(budget_depth=-1)]))
+
     def test_tail_plan_arithmetic_is_checked(self):
         record = _hmx_record(plan="hmx-tail", shape=(65, 47, 70), block_m=65)
         manifest = _manifest([record])

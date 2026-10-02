@@ -239,11 +239,18 @@ LogicalResult addOrReplaceHmxManifestRecords(ModuleOp module,
 
 /// Update the pipeline fields of one attributed HMX record. `reason` is omitted
 /// when empty.
+///
+/// `budgetDepth` is the depth the VTCM budget permitted, which is >= `depth`
+/// whenever a staged pipeline was clamped down to a shallower ring. It is
+/// recorded separately because the clamp is the one decision here whose cause
+/// is otherwise unobservable after the fact: with only `depth`, a clamped run
+/// and an unclamped run of the same depth are indistinguishable.
 LogicalResult setHmxManifestPipelineDecision(ModuleOp module,
                                              StringRef functionName, int64_t id,
                                              int64_t requested,
                                              StringRef selected, int64_t depth,
-                                             StringRef reason = {});
+                                             StringRef reason = {},
+                                             int64_t budgetDepth = -1);
 
 /// Verify the explicit decision-id hand-off after tensor-form HMX operations
 /// have been rebuilt in memref form. A manifest-backed function must contain

@@ -209,7 +209,21 @@ struct PipelineDecision {
   int64_t depth = 0;
   PipelineReason reason = PipelineReason::None;
   int64_t neededBytes = 0;
+  /// Bytes of VTCM the budget had room for. Only meaningful for
+  /// PipelineReason::VtcmBudget; zero for every other reason.
   int64_t freeBytes = 0;
+  /// K tiles, the staging unit the floor is expressed in. Only meaningful for
+  /// PipelineReason::ShallowK; zero for every other reason.
+  ///
+  /// 2026-10-02: this used to be carried in `freeBytes`, because
+  /// declineStageLoop took a single positional `detail`. That made one field
+  /// mean bytes in one arm and a tile count in another, and the ShallowK remark
+  /// duly printed "Kt <bytes>". The printed number was still right -- nothing
+  /// read the field except that one remark -- but any future consumer that read
+  /// freeBytes without switching on `reason` first would have been wrong in a
+  /// way that compiles cleanly. recordPipelineDecision now rejects the
+  /// mismatched combinations so the union cannot be reintroduced.
+  int64_t kTiles = 0;
   int64_t budgetDepth = 0;
 };
 
@@ -241,7 +255,7 @@ InFlightDiagnostic &renderPipelineRemark(InFlightDiagnostic &diag,
     return diag << "HMX pipeline not applied: the source, activation and "
                    "weight grids disagree on the staging tile shape";
   case PipelineReason::ShallowK:
-    return diag << "HMX pipeline not applied: Kt " << decision.freeBytes
+    return diag << "HMX pipeline not applied: Kt " << decision.kTiles
                 << " is below the staging floor of " << kStageMinKTiles
                 << " -- one transfer is too small to hide the DMA engine's "
                    "fixed cost behind the tile's compute";
@@ -295,6 +309,18 @@ LogicalResult readDecisionId(Operation *op, std::optional<int64_t> &id) {
 
 LogicalResult recordPipelineDecision(MatmulOp op,
                                      const PipelineDecision &decision) {
+  // 2026-10-02: kTiles is meaningful for exactly one reason. freeBytes is not
+  // constrained, because the staged path sets it to the room it measured for
+  // every decision it records, not only for the VtcmBudget decline -- it is
+  // "bytes considered", not "bytes that caused a downgrade". kTiles used to
+  // ride in that same field, which is how the ShallowK remark came to print a
+  // tile count labelled as bytes. The check below is what stops the union from
+  // being reintroduced.
+  if (decision.kTiles != 0 && decision.reason != PipelineReason::ShallowK) {
+    op.emitError("hmx pipeline decision carries a K-tile count for the wrong "
+                 "reason");
+    return failure();
+  }
   std::optional<int64_t> id;
   if (failed(readDecisionId(op.getOperation(), id)))
     return failure();
@@ -312,7 +338,8 @@ LogicalResult recordPipelineDecision(MatmulOp op,
     if (failed(setHmxManifestPipelineDecision(
             module, func.getName(), *id, decision.requestedDepth,
             decision.staged ? kHmxPipelineStaged : kHmxPipelineSerial,
-            decision.depth, pipelineReasonCode(decision.reason))))
+            decision.depth, pipelineReasonCode(decision.reason),
+            decision.budgetDepth)))
       return failure();
   }
   if (hasPipelineRemark(decision.reason)) {
@@ -323,15 +350,16 @@ LogicalResult recordPipelineDecision(MatmulOp op,
 }
 
 LogicalResult declineStageLoop(MatmulOp op, int64_t requestedDepth,
-                               PipelineReason reason, int64_t detail = 0,
-                               int64_t neededBytes = 0,
-                               int64_t budgetDepth = 0) {
+                               PipelineReason reason, int64_t freeBytes = 0,
+                               int64_t neededBytes = 0, int64_t budgetDepth = 0,
+                               int64_t kTiles = 0) {
   PipelineDecision decision;
   decision.requestedDepth = requestedDepth;
   decision.staged = false;
   decision.depth = 0;
   decision.reason = reason;
-  decision.freeBytes = detail;
+  decision.freeBytes = freeBytes;
+  decision.kTiles = kTiles;
   decision.neededBytes = neededBytes;
   decision.budgetDepth = budgetDepth;
   return recordPipelineDecision(op, decision);
@@ -1607,7 +1635,8 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   // on the constant). An explicit `pipeline-depth=1/2` skips the floor -- those
   // are the A/B arms -- and `3` never reaches this emitter.
   if (requestedDepth <= 0 && Kt < kStageMinKTiles)
-    return declineStageLoop(op, requestedDepth, PipelineReason::ShallowK, Kt);
+    return declineStageLoop(op, requestedDepth, PipelineReason::ShallowK, 0, 0, 0,
+                           Kt);
 
   // The staged loop allocates, on top of the arrays the attribution already
   // counted: one crouton-row scratch (the pack destination, reused by every
