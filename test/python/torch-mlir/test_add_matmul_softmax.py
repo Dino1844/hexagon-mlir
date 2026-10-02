@@ -37,6 +37,14 @@ def test_add_matmul_softmax_torch(enablelwp):
 
     # Instantiate the model and run the forward pass
     model = AddMatmulSoftmax()
+    # 2026-10-02: these three were bare torch.randn(shape) with no seed, so the
+    # set of elements that fell outside allclose changed between two runs of the
+    # same test on the same build (133 vs 128). A test whose failing set moves
+    # cannot gate anything: no tolerance proves anything about it, in either
+    # direction. Seed first, then choose a tolerance -- widening rtol before the
+    # input is fixed just hides the instability.
+    # Value 42 matches test_hexkl_macro_matmul.py:35 in this directory.
+    torch.manual_seed(42)
     x = torch.randn(shape)
     y = torch.randn(shape)
     z = torch.randn(shape)
