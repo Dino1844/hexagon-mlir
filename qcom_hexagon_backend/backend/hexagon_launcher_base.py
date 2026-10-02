@@ -79,6 +79,48 @@ struct FuncResult
 
         self.func_call_and_benchmarking = """
 uint64_t avg_time_us = 0, avg_pcycles = 0;
+
+// One discarded call before the timed loop. Adopted 2026-10-02.
+//
+// Measured on the phone (1024x512x64 f16, per-iteration pcycle trace): the first
+// matmul_kernel call inside a launch costs about 2.5M cycles and 2.7 ms, every
+// later call in the same launch about 112k cycles and 53 us -- a 22x cycle and
+// 50x wall-clock gap. The gap is bimodal with no ramp: the first call implies
+// 0.92-0.97 GHz against 2.08-2.14 GHz for all later ones, so the HMX clock is
+// not at its final corner yet.
+//
+// Why the clock is low on that first call: HexagonAPI::AcquireResources() runs
+// per launch, not per process -- its constructor calls it (HexagonAPI.h:52) and
+// it calls initialize_and_acquire_hmx() (HexagonAPI.h:72), which asks
+// HAP_power_set for HMX_v2 with set_clock = TRUE, target_corner =
+// HAP_DCVS_EXP_VCORNER_MAX and perf_mode = HAP_CLK_PERF_HIGH
+// (HexagonAPI.cpp:231, :234, :235, :238) and then blocks in
+// HAP_compute_res_acquire with a 100 ms timeout (HexagonAPI.cpp:261). The
+// power-up and clock ramp therefore happen inside every launch, and the
+// kernel's first call pays for them.
+//
+// Two consequences that make this worth doing rather than documenting:
+//   * Every Perf before this change divided that one-off cost by iterations, so
+//     at N=10 a shape read 320 us instead of 52 us -- a 6x error that shrinks
+//     as 1/N, which is exactly the t(N) = A + B/N shape that made B look like
+//     a per-kernel property for so long. Historical Perf numbers are
+//     cold-start-inclusive; see docs/state/CURRENT.md 3.11.
+//   * It cannot be warmed away from outside. WARMAB_AB_WARMUP=1 runs a
+//     discarded case in a SEPARATE launch (shape_pair.py:187-189) and leaves B
+//     unchanged (2,880 us with it, 2,624 us without, measured 2026-10-02). Only
+//     a call inside this launch can.
+//
+// After the change, across nine shapes, B falls from 2,624-2,880 us to -10..+20
+// us -- inside the 30 us noise floor implied by a 3 us rep spread over a 0.099
+// span -- and once_share at N=1000 drops from 4.7-5.2% (over the 2% threshold)
+// to at most 0.106%. The steady-state value A moves only 53.4 -> 52.0 us, so
+// ratio-type conclusions are untouched; what was wrong was the once term.
+//
+// The call is discarded, so the reported number is the warm steady state that
+// the roadmap's comparisons intend. Reverting this line restores the
+// cold-start-inclusive number.
+{function_call}
+
 benchmark_time_and_pcycles({iterations}, [&]() {{
     {function_call}
 }}, &avg_time_us, &avg_pcycles);
