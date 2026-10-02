@@ -190,17 +190,48 @@ constexpr int64_t kSerialPipelineDepth = 3;
 // required just above, so the floor of 32 flips at **K = 1024 exactly**.
 // Observed: 256x256x512 -> reason "shallow-k"; 256x256x1024 -> staged, depth 2.
 //
-// Real-workload proximity (2026-09-30 survey over logs/real-shapes-2026-09-29/;
-// the six non-synthetic manifests there are attn_pv_s1024, attn_pv_s4096,
-// attn_qk_d128, attn_qk_d256, s1_anchor, s2_anchor -- the other seven files in
-// that directory are a synthetic K-sweep ladder, not workloads):
-// 3 below / 3 at-or-above. The band is THIN:
-// one real shape sits exactly ON the boundary (FA PV, 1024x128x1024, Kt=32)
-// and one at the low edge (FA QK, 1024x1024x256, Kt=8). Nothing real lands
-// strictly inside Kt 9..31. The same attention op straddles the gate -- QK^T's
-// K is head_dim (small, refused) while PV's K is seq (large, allowed).
-// => Priority is moderate, not high. A better predicate would move the Kt=8
-// case at most. See docs/codegen/constants-traceability-2026-09-30.md.
+// Real-workload proximity -- RETRACTED 2026-10-02, see below. The constant
+// stays at 32; what was wrong is the evidence that was offered for it.
+//
+// The earlier note here claimed a 2026-09-30 survey over
+// logs/real-shapes-2026-09-29/ found "one real shape sitting exactly ON the
+// boundary (FA PV, 1024x128x1024, Kt=32)" plus one at Kt=8, and that "the same
+// attention op straddles the gate -- QK^T's K is head_dim (small, refused)
+// while PV's K is seq (large, allowed)". That survey does not support the
+// claim. Its attn_pv_s1024/s4096 entries were produced by
+// exp/hmx/tmp-archive-2026-10-02/sweep.sh:14, which passes MATMUL_M/N/K to
+// `dump_codegen.py matmul` -- a synthetic probe whose block_shape is the whole
+// matrix. So those entries are single-tile matmuls of shape 1024x128x1024 and
+// 256x128x4096, wearing an "attn_pv" name. No attention kernel was compiled.
+//
+// Compiling this repo's actual FA kernel
+// (test/python/triton/test_flash_attention.py) gives, for both of its matmuls:
+//
+//     m=1024  n=64  k=64  Kt=2  selected=serial  reason=shallow-k
+//
+// The n and k do not match the survey's 128 / 1024, so the Kt=32 row is not
+// this workload. `test_flash_attention.py:105` is `tl.dot(p, v, acc)` with
+// p=(BLOCK_M, BLOCK_N) and v=(BLOCK_N, BLOCK_DMODEL), so the op's K is
+// BLOCK_N; the kv loop is outside the dot, which makes seq a loop trip count
+// rather than an op dimension. Same result at D_HEAD/BLOCK_N of 64/64,
+// 128/64, 128/128 and 256/128: all shallow-k, budget_depth 0. A real op-K of
+// 1024 would have staged.
+//
+// The gate also follows the K-loop step, not the matrix K. Holding logical
+// K=14336 and varying only BK: BK 32..512 are all shallow-k, 1024 and 2048
+// are staged. That is structural -- the ring prefetches the next K-tile of the
+// same output tile, so it can only stage across K-tiles inside one op, and
+// `for k0 in range(0, K, BK)` lowers outside it. Reading the logical K instead
+// is not a predicate fix either: matmul.logical.k.value in the manifest is
+// per-op too (64 or 1024 for logical 14336), so no larger K exists in this IR.
+//
+// What this leaves: kStageMinKTiles=32 is still a defensible conservative
+// pick inside (4, 64) with no measurement between Kt 5 and 63, and the flip at
+// K=1024 above is confirmed. What it does NOT have is a real workload sitting
+// anywhere near it -- every measured operator lands at Kt <= 8. Re-derive the
+// proximity evidence from compiled real kernels before citing it.
+// See docs/results/t-hmx-staging-gate-dead-2026-10-02.md and
+// docs/results/b3-voided-baselines-2026-10-02.md.
 constexpr int64_t kStageMinKTiles = 32;
 
 struct PipelineDecision {
