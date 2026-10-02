@@ -23,12 +23,14 @@
 
 // The destination is an N-block of a 32x512 row-major matrix: width 256,
 // row stride 512. The unpack must receive rows, width and stride separately.
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// unpack_acc is HmxLayoutHvx: layout work on the vector unit, no engine
+// instruction, so no lock.
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 // CHECK: %[[ROWS:.*]] = llvm.mlir.constant(32 : i32)
 // CHECK: %[[COLS:.*]] = llvm.mlir.constant(256 : i32)
 // CHECK: %[[STRIDE:.*]] = llvm.mlir.constant(512 : i32)
 // CHECK: llvm.call @hmx_unpack_acc_f16({{.*}}, %[[ROWS]], %[[COLS]], %[[STRIDE]], {{.*}}) : (i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
 func.func @nsplit_store(%ar: memref<1x2x16x32x2xf16, 1>,
                         %dst: memref<32x256xf16, strided<[512, 1]>>,
                         %row: index, %col: index) {

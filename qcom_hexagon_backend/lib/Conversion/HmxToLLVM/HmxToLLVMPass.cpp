@@ -530,16 +530,35 @@ static bool issuesHmxEngineLeaves(Operation *fn) {
     Dialect *dialect = op->getDialect();
     if (dialect &&
         dialect->getNamespace() == HmxDialect::getDialectNamespace() &&
-        !op->hasTrait<OpTrait::HmxDmaOnly>())
+        !op->hasTrait<OpTrait::HmxDmaOnly>() &&
+        !op->hasTrait<OpTrait::HmxLayoutHvx>())
       found = true;
   });
   return found;
 }
 
-/// The symbol prefix of the runtime HMX leaves (all of HmxExternalFnNames.cpp).
-/// Used only by verifyHmxLeafCallers below -- never to decide where a pair
-/// goes.
-static constexpr const char *kHmxLeafPrefix = "hmx_";
+/// The five runtime leaves that issue an HMX instruction, by symbol name.
+///
+/// Narrowed from a `hmx_` prefix test on 2026-10-02. The prefix covered the 37
+/// layout symbols in HMXLayout.c as well as these 5, so once pack/unpack stop
+/// counting as engine ops (HmxLayoutHvx) every pack-only function became an
+/// unverifiable "engine" caller. Verified disjoint: HMXAPI.c and HMXLayout.c
+/// share no symbol name, so this predicate separates them without ambiguity.
+/// Naming all five also makes the check strictly stronger than the prefix
+/// test -- it fires on exactly the leaves that need the pair, not on a
+/// superset -- while still never selecting a function for insertion.
+///
+/// Do not turn this into a whitelist for `issuesHmxEngineLeaves`. That
+/// decision is made on dialect ops, before conversion, and its polarity is
+/// "unmarked means engine": omission there costs one harmless lock
+/// round-trip, and every one of these five is an engine instruction.
+static bool isHmxEngineLeaf(StringRef callee) {
+  return callee == hmx::getBiasInitUnitF16FnName() ||
+         callee == hmx::getBiasLoadF16FnName() ||
+         callee == hmx::getAccClearF16FnName() ||
+         callee == hmx::getAccStoreF16FnName() ||
+         callee == hmx::getMmaF16FnName();
+}
 
 /// Post-conversion invariant check, deliberately run *before* ensureHmxEngine
 /// so a diagnostic sees IR the insertion has not touched yet. A function that
@@ -549,13 +568,13 @@ static constexpr const char *kHmxLeafPrefix = "hmx_";
 /// EnsureHmxLockForThisThread) -- so that state must fail the build loudly
 /// instead of shipping a kernel that hangs the device.
 ///
-/// The `hmx_` callee prefix appears here **for verification only, never for the
-/// decision**: which functions get the pair is decided solely by
-/// issuesHmxEngineLeaves, on the hmx dialect ops, before the conversion. The
-/// dialect test is strictly narrower than the old prefix test -- it cannot see
-/// a leaf call that exists without a dialect op behind it -- and this check
-/// turns exactly that one direction, which used to be a *silent* missing pair,
-/// into a compile-time error. It never selects a function for insertion.
+  /// The engine-leaf names appear here **for verification only, never for the
+  /// decision**: which functions get the pair is decided solely by
+  /// issuesHmxEngineLeaves, on the hmx dialect ops, before the conversion. The
+  /// dialect test cannot see a leaf call that exists without a dialect op
+  /// behind it -- and this check turns exactly that one direction, which used
+  /// to be a *silent* missing pair, into a compile-time error. It never
+  /// selects a function for insertion.
 static void verifyHmxLeafCallers(ModuleOp moduleOp,
                                  const llvm::StringSet<> &engineKernels) {
   auto verify = [&](auto fn) {
@@ -564,13 +583,14 @@ static void verifyHmxLeafCallers(ModuleOp moduleOp,
     bool found = false;
     fn->walk([&](LLVM::CallOp call) {
       if (std::optional<StringRef> callee = call.getCallee())
-        found |= callee->starts_with(kHmxLeafPrefix);
+        found |= isHmxEngineLeaf(*callee);
     });
     if (found)
       fn.emitError()
-          << "function '" << fn.getName() << "' issues HMX leaf calls ('"
-          << kHmxLeafPrefix
-          << "...') but issuesHmxEngineLeaves did not recognise it from its "
+          << "function '" << fn.getName()
+          << "' calls an HMX engine leaf (" << hmx::getMmaF16FnName()
+          << " and its four siblings) but issuesHmxEngineLeaves did not "
+             "recognise it from its "
              "hmx dialect ops, so it gets no "
              "hexagon_runtime_hmx_ensure_dsp/hexagon_runtime_hmx_unlock_dsp "
              "pair: it would execute HMX instructions without the engine "

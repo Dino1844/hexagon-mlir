@@ -25,11 +25,13 @@
 // Strided source: rows=2048, cols=256, row stride=512. `cols` (the 4th
 // argument) must stay 256, and `src_stride` (the 5th) must be 512 -- not 256.
 // CHECK-LABEL: func.func @pack_weight_strided
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// pack_weight is HmxLayoutHvx, so this function touches no engine instruction
+// and takes no lock.
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 // CHECK: %[[N:.*]] = llvm.mlir.constant(256 : i32)
 // CHECK: %[[S:.*]] = llvm.mlir.constant(512 : i32)
 // CHECK: llvm.call @hmx_pack_weight_f16({{.*}}, {{.*}}, {{.*}}, %[[N]], %[[S]], {{.*}}, {{.*}}) : (i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
 func.func @pack_weight_strided(%wsrc: memref<2048x256xf16, strided<[512, 1]>>,
                                %wt: memref<8x64x16x32x2xf16, 1>,
                                %kt: index, %nt: index) {

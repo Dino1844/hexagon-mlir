@@ -127,8 +127,13 @@ func.func @tile(%bias: memref<256xi8, 1>, %act: memref<2x4x16x32x2xf16, 1>,
 // the op carries a `count`): the layout work the engine needs is a vectorised
 // pack, not a general transpose. Without this the bridge lowers into element-wise
 // moves that measured at 99.3% of the kernel's runtime.
+// The bridge is pack_act + pack_weight + unpack_acc and nothing else, so it
+// carries no ensure/unlock pair: all three ops are HmxLayoutHvx (HMX layout,
+// HVX implementation) and none of them issues an engine instruction. The lock
+// they used to take was one round-trip per kernel for nothing.
 // CHECK-LABEL: func.func @bridge
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 // Activation pack address = act_base + descriptor_offset * CR_ESZ
 //                           + (row * COL_STRIDE + col) * CR_BYTES.
 // COL_STRIDE = 2 is the crouton-count row stride; CR_BYTES = 2048.
@@ -225,7 +230,7 @@ func.func @tile(%bias: memref<256xi8, 1>, %act: memref<2x4x16x32x2xf16, 1>,
 // CHECK: %[[OUT_ROW:.*]] = llvm.trunc
 // CHECK: %[[OUT_COL:.*]] = llvm.trunc
 // CHECK: llvm.call @hmx_unpack_acc_f16(%[[DST_BASE]], %[[AR_ADDR]], %[[OUT_ROWS]], %[[OUT_COLS]], %[[OUT_COLS]], %[[OUT_ROW]], %[[OUT_COL]]) : (i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 func.func @bridge(%src: memref<64x64xf16>, %wsrc: memref<64x32xf16>,
                   %act: memref<2x2x16x32x2xf16, 1>,
                   %wt: memref<1x2x16x32x2xf16, 1>,
@@ -248,7 +253,8 @@ func.func @bridge(%src: memref<64x64xf16>, %wsrc: memref<64x32xf16>,
 // result whose error grew with the number of K blocks. `@bridge` above only uses
 // offset 0 and therefore cannot catch it.
 // CHECK-LABEL: func.func @bridge_offset
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// pack_weight is HmxLayoutHvx -- layout on the vector unit, no engine
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
 // CHECK: %[[VDESC:.*]] = builtin.unrealized_conversion_cast %{{.*}} : memref<64x64xf16, strided<[64, 1], offset: ?>> to
 // CHECK: %[[PTR:.*]] = llvm.extractvalue %[[VDESC]][1] : {{.*}}
 // CHECK: %[[BASE:.*]] = llvm.ptrtoint %[[PTR]] : {{.*}} to i32
@@ -260,7 +266,7 @@ func.func @bridge(%src: memref<64x64xf16>, %wsrc: memref<64x32xf16>,
 // CHECK: %[[ADDR:.*]] = llvm.add %[[BASE]], %[[OFF]]
 // CHECK-SAME: : i32
 // CHECK: llvm.call @hmx_pack_weight_f16({{.*}}, %[[ADDR]], {{.*}}) : (i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 func.func @bridge_offset(%base: memref<128x64xf16>, %o: index,
                          %wt: memref<2x2x16x32x2xf16, 1>, %kt: index,
                          %nt: index) {

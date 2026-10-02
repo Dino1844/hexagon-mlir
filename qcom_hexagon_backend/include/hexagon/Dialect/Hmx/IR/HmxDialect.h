@@ -158,6 +158,43 @@ namespace OpTrait {
 /// a wrapper) or with an engine whitelist (omission hangs the device).
 template <typename ConcreteType>
 struct HmxDmaOnly : public TraitBase<ConcreteType, HmxDmaOnly> {};
+  //===----------------------------------------------------------------------===//
+  // Marker trait: HMX data layout, implemented by the vector unit
+  //===----------------------------------------------------------------------===//
+
+  /// Marks an `hmx` op that moves data in and out of HMX layout but issues no
+  /// HMX instruction. Today the four pack/unpack ops, and nothing else.
+  ///
+  /// `pack_act`/`pack_weight`/`unpack_acc`/`unpack_acc_f32` are HVX code: the HMX
+  /// API translation unit has zero engine intrinsics, while every `Q6_*` symbol
+  /// in the layout unit is a HVX vector intrinsic. So the engine ensure/unlock
+  /// pair they used to carry bought nothing -- one lock round-trip per kernel,
+  /// and a NON_SHARED unlock that also cleared the accumulator
+  /// (bin/runtime/src/HexagonCAPI.cpp:212-213).
+  ///
+  /// Polarity, re-audited 2026-10-02 in both directions:
+  ///
+  ///   mis-marked as layout  -> no lock, engine instruction issued anyway ->
+  ///                             device abort. Loud, and it names the function.
+  ///   mis-marked as engine  -> one extra ensure/unlock, self-released, so the
+  ///                             function still behaves exactly as it does today.
+  ///
+  /// So "unmarked means engine" still holds, and the new error direction is the
+  /// easier one to diagnose.
+  ///
+  /// SCOPE: this only answers "does this function touch the engine". It is NOT
+  /// the trait a thread-role predicate should read -- that one needs the
+  /// opposite default (unmarked means HVX), because a layout op left unmarked
+  /// there would be placed on a thread that holds no VTCM and hang. One bit
+  /// cannot serve both, which is why this one is a negative exemption and that
+  /// other one has to be positive. See roadmap/ROADMAP1001.md section 5.4.
+  ///
+  /// Pinned by test/Conversion/HmxToLLVM/hmx-tail-leaves.mlir (@tail_pack_f16 and
+  /// its five siblings must carry no ensure pair) and by hmx-to-llvm.mlir
+  /// @bridge, which mixes all four with no engine op.
+
+  template <typename ConcreteType>
+struct HmxLayoutHvx : public TraitBase<ConcreteType, HmxLayoutHvx> {};
 
 } // namespace OpTrait
 } // namespace mlir

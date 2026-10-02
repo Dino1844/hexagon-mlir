@@ -20,12 +20,15 @@
 // The leaf is declared as llvm.func, never func.func: the latter would wrap
 // the symbol in an _mlir_ciface_* shim and the .so would not resolve it.
 // CHECK-DAG: llvm.func @hmx_unpack_acc_f32(i32, i32, i32, i32, i32, i32, i32, i32, i32, i32)
-// The lock spans the whole kernel: one ensure at entry, one unlock at exit.
-// CHECK-DAG: llvm.func @hexagon_runtime_hmx_ensure_dsp()
-// CHECK-DAG: llvm.func @hexagon_runtime_hmx_unlock_dsp()
+// None of this file's functions contains an engine op -- unpack_acc_f32 is
+// HmxLayoutHvx -- so the runtime never brings the engine up and no lock symbol
+// is declared at all.
+// CHECK-NOT: llvm.func @hexagon_runtime_hmx_ensure_dsp
+// CHECK-NOT: llvm.func @hexagon_runtime_hmx_unlock_dsp
 
 // CHECK-LABEL: func.func @tail_plain
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 // dst address = dst_base + descriptor_offset * F32_ESZ (4 bytes/f32).
 // CHECK: %[[DST_OFF:.*]] = llvm.trunc
 // CHECK: %[[F32_ESZ:.*]] = llvm.mlir.constant(4 : i32)
@@ -62,7 +65,8 @@
 // CHECK: %[[ROW_ARG:.*]] = llvm.trunc
 // CHECK: %[[BLOCK_ARG:.*]] = llvm.trunc
 // CHECK: llvm.call @hmx_unpack_acc_f32(%[[DST_ADDR]], %[[RES_ADDR]], %[[HAS_RES]], %[[CR_ADDR]], %[[ROWS]], %[[COLS]], %[[COLS]], %[[RES_STRIDE]], %[[ROW_ARG]], %[[BLOCK_ARG]]) : (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
+// unpack_acc_f32 is HmxLayoutHvx -- no engine instruction, so no lock
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 func.func @tail_plain(%ar: memref<2x1x16x32x2xf16, 1>,
                       %dst32: memref<64x32xf32>,
                       %row: index, %col: index) {
@@ -72,7 +76,8 @@ func.func @tail_plain(%ar: memref<2x1x16x32x2xf16, 1>,
 }
 
 // CHECK-LABEL: func.func @tail_residual
-// CHECK: llvm.call @hexagon_runtime_hmx_ensure_dsp(
+// unpack_acc_f32 is HmxLayoutHvx -- no engine instruction, so no lock
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_ensure_dsp
 // dst address = dst_base + descriptor_offset * F32_ESZ (4 bytes/f32).
 // CHECK: %[[DST_OFF:.*]] = llvm.trunc
 // CHECK: %[[F32_ESZ:.*]] = llvm.mlir.constant(4 : i32)
@@ -115,7 +120,7 @@ func.func @tail_plain(%ar: memref<2x1x16x32x2xf16, 1>,
 // CHECK: %[[ROW_ARG:.*]] = llvm.trunc
 // CHECK: %[[BLOCK_ARG:.*]] = llvm.trunc
 // CHECK: llvm.call @hmx_unpack_acc_f32(%[[DST_ADDR]], %[[RES_ADDR]], %[[HAS_RES]], %[[CR_ADDR]], %[[ROWS]], %[[COLS]], %[[COLS]], %[[RES_STRIDE]], %[[ROW_ARG]], %[[BLOCK_ARG]]) : (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 func.func @tail_residual(%ar: memref<2x1x16x32x2xf16, 1>,
                          %dst32: memref<64x32xf32>,
                          %res: memref<64x32xf32>,
@@ -133,7 +138,8 @@ func.func @tail_residual(%ar: memref<2x1x16x32x2xf16, 1>,
 // operand.
 // CHECK-LABEL: func.func @tail_ranged
 // CHECK: llvm.call @hmx_unpack_acc_f32_bulk({{.*}}) : (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32) -> ()
-// CHECK: llvm.call @hexagon_runtime_hmx_unlock_dsp(
+// unpack_acc_f32 is HmxLayoutHvx -- no engine instruction, so no lock
+// CHECK-NOT: llvm.call @hexagon_runtime_hmx_unlock_dsp
 func.func @tail_ranged(%ar: memref<2x1x16x32x2xf16, 1>,
                        %dst32: memref<64x32xf32>,
                        %row: index, %col: index) {

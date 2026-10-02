@@ -155,7 +155,8 @@ def Hmx_AllocCroutonOp : Hmx_Op<"alloc_crouton", [MemoryEffects<[MemAlloc]>]> {
 
 def Hmx_PackActOp
   : Hmx_Op<"pack_act",
-      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>,
+           NativeOpTrait<"HmxLayoutHvx">]> {
   let hasVerifier = 1;
 
   let summary = "Pack one row-major 32x32 block into an AH crouton";
@@ -227,7 +228,8 @@ def Hmx_PackActOp
 
 def Hmx_PackWeightOp
   : Hmx_Op<"pack_weight",
-      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>,
+           NativeOpTrait<"HmxLayoutHvx">]> {
   let hasVerifier = 1;
 
   let summary = "Pack one row-major 32x32 block into a WH crouton";
@@ -287,7 +289,8 @@ def Hmx_PackWeightOp
 
 def Hmx_UnpackAccOp
   : Hmx_Op<"unpack_acc",
-      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>,
+           NativeOpTrait<"HmxLayoutHvx">]> {
   let hasVerifier = 1;
 
   let summary = "Unpack one AR crouton into a row-major fp16 block";
@@ -348,7 +351,8 @@ def Hmx_UnpackAccOp
 
 def Hmx_UnpackAccF32Op
   : Hmx_Op<"unpack_acc_f32",
-      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>,
+           NativeOpTrait<"HmxLayoutHvx">]> {
   let hasVerifier = 1;
 
   let summary = "Unpack one AR crouton row-pair into row-major f32, optionally adding a residual";
