@@ -1066,6 +1066,7 @@ def validate_hmx_manifest(manifest, field_name="hmx_manifest"):
             "unpack_sites",
             "count_semantics",
         ),
+        optional=("topology", "thread_role_regions"),
     )
     matmuls = manifest["matmuls"]
     if not isinstance(matmuls, list):
@@ -1078,6 +1079,25 @@ def validate_hmx_manifest(manifest, field_name="hmx_manifest"):
     totals = {"pack_act_sites": 0, "pack_weight_sites": 0, "unpack_sites": 0}
     for field in totals:
         _require_nonnegative_int(manifest[field], f"{field_name}.{field}")
+    # The five canonical `topology` verdicts. This list and
+    # isCanonicalHmxTopology (HmxManifest.cpp) are the same five by contract: a
+    # value the C++ writer rejects must not be accepted here, or a kernel the
+    # device could not compile would still validate on the host.
+    if "topology" in manifest or "thread_role_regions" in manifest:
+        topology = manifest.get("topology")
+        if topology not in (
+            "topology-single-role-hmx",
+            "topology-single-role-hvx",
+            "role-split-ok",
+            "role-mixed-irreducible",
+            "role-split-nopack",
+        ):
+            raise ValueError(
+                f"{field_name}.topology is not a canonical verdict: {topology!r}"
+            )
+        _require_nonnegative_int(
+            manifest["thread_role_regions"], f"{field_name}.thread_role_regions"
+        )
     if manifest["count_semantics"] != "ir_sites":
         raise ValueError(
             f"{field_name}.count_semantics must be 'ir_sites', got "

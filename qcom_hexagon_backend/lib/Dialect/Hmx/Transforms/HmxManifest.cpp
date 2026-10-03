@@ -8,6 +8,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
@@ -16,6 +17,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/SHA256.h"
@@ -99,6 +101,13 @@ constexpr StringLiteral kKeyPackActSites = "pack_act_sites";
 constexpr StringLiteral kKeyPackWeightSites = "pack_weight_sites";
 constexpr StringLiteral kKeyUnpackSites = "unpack_sites";
 constexpr StringLiteral kKeyCountSemantics = "count_semantics";
+
+  // Thread-role classification (thread-role-partition). `topology` is the
+  // kernel-level verdict and `thread_role_regions` the number of regions it was
+  // derived from, so a reader can tell a single-region kernel from a 40-region
+  // one that happened to land on the same verdict.
+  constexpr StringLiteral kKeyTopology = "topology";
+  constexpr StringLiteral kKeyTopologyRegions = "thread_role_regions";
 constexpr StringLiteral kCountSemantics = "ir_sites";
 
 constexpr StringLiteral kKeyWeightBinding = "weight_binding";
@@ -1308,7 +1317,8 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
           {StringRef(kKeySchema), StringRef(kKeyMatmuls),
            StringRef(kKeyWeightPolicies), StringRef(kKeyPackActSites),
            StringRef(kKeyPackWeightSites), StringRef(kKeyUnpackSites),
-           StringRef(kKeyCountSemantics)},
+             StringRef(kKeyCountSemantics), StringRef(kKeyTopology),
+             StringRef(kKeyTopologyRegions)},
           reportErrors, "manifest")))
     return failure();
   auto schema = stringField(manifest, kKeySchema);
@@ -1642,6 +1652,48 @@ mlir::hmx::addOrReplaceHmxManifestRecords(ModuleOp module,
     fields.set(kKeyCountSemantics, StringAttr::get(ctx, kCountSemantics));
   return writeManifest(module, fields);
 }
+
+namespace {
+// The canonical `topology` strings. Kept next to the manifest writer so the
+// writer and the pass that produces them cannot drift: the pass includes this
+// header, and a value the writer does not know is a build-time-visible gap
+// rather than a string that only fails on a device.
+constexpr StringLiteral kTopologySingleRoleEngine = "topology-single-role-hmx";
+constexpr StringLiteral kTopologySingleRoleVector = "topology-single-role-hvx";
+constexpr StringLiteral kTopologySplitOk = "role-split-ok";
+constexpr StringLiteral kTopologyMixedIrreducible = "role-mixed-irreducible";
+constexpr StringLiteral kTopologySplitNoPack = "role-split-nopack";
+} // namespace
+
+bool mlir::hmx::isCanonicalHmxTopology(StringRef topology) {
+  return topology == kTopologySingleRoleEngine ||
+         topology == kTopologySingleRoleVector ||
+         topology == kTopologySplitOk ||
+         topology == kTopologyMixedIrreducible ||
+         topology == kTopologySplitNoPack;
+}
+
+LogicalResult mlir::hmx::setHmxManifestTopology(ModuleOp module,
+                                                StringRef topology,
+                                                int64_t regions) {
+  if (!isCanonicalHmxTopology(topology))
+    return emitManifestError(module, true,
+                             "invalid HMX topology in manifest");
+  if (regions < 0)
+    return emitManifestError(module, true,
+                             "negative region count in HMX topology");
+  FailureOr<DictionaryAttr> current =
+      readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true);
+  if (failed(current))
+    return failure();
+  MLIRContext *ctx = module.getContext();
+  NamedAttrList top(*current);
+  top.set(kKeyTopology, StringAttr::get(ctx, topology));
+  top.set(kKeyTopologyRegions,
+          IntegerAttr::get(IntegerType::get(ctx, 64), regions));
+  return writeManifest(module, top);
+}
+
 
 LogicalResult mlir::hmx::setHmxManifestPipelineDecision(
     ModuleOp module, StringRef functionName, int64_t id, int64_t requested,
@@ -2109,6 +2161,59 @@ LogicalResult mlir::hmx::restoreHmxManifestDecisionIds(ModuleOp module,
   return success();
 }
 
+// The outlined vector read-out belongs to ANOTHER function's record.
+//
+// hmx-vector-readout moves a kernel's `hmx.unpack_acc` out of the kernel and into
+// `__hmx_readout`, which the resident vector executor calls. A manifest record is
+// keyed by (function name, decision id), and this function has neither an
+// attributed `hmx.matmul` nor a name any record could carry -- so looking the op
+// up under its own function is guaranteed to fail, with or without the attribute.
+//
+// The producer already publishes the pairing: `hmx.readout.handoffs` names, for
+// each outlined function, the kernel whose publishes it serves
+// (`kHmxReadoutWorkField` / `kHmxReadoutEngineField`, HmxReadoutHandoff.h), and
+// it stamps `kHmxReadoutOutlinedAttr` on the outlined function itself. So the map
+// is read from the record the producer already writes rather than from a name
+// convention, and the marker's job here is only to say "this function is one of
+// those", which is the same question HmxToLLVMPass's wiring asks.
+//
+// This ATTRIBUTES the outlined site to the engine's record rather than skipping
+// it, and that is the choice that keeps the manifest true:
+//
+//   * skipping would report `unpack_sites = 0` for a record whose read-out is
+//     still in the module, i.e. a bridge that disappeared from the accounting
+//     without disappearing from the kernel;
+//   * and the justification usually offered for skipping -- "the op was already
+//     counted at its original site" -- is factually false here: hmx-vector-readout
+//     ERASES the original sites (`rewriteLoop` erases both the in-loop
+//     `hmx.unpack_acc` and the peeled one). Skipping therefore under-counts
+//     rather than avoiding a double count.
+//
+// What the counts become is stated rather than assumed, and
+// test_hmx_vector_readout_object_gate.py pins both numbers: for the 1024x512x64
+// matmul at pipeline-depth 2, `pack_act_sites` is 2 with the option off and 2 with
+// it on (the split never creates or destroys a pack), and `unpack_sites` goes from
+// 2 inline sites to 1 -- DOWN, which is the direction a double count cannot take.
+static FailureOr<llvm::StringMap<llvm::StringRef>>
+readReadoutEngineNames(ModuleOp module) {
+  llvm::StringMap<llvm::StringRef> owners;
+  auto raw = module->getAttrOfType<ArrayAttr>(kHmxReadoutHandoffsAttr);
+  if (!raw)
+    return owners;
+  for (Attribute item : raw) {
+    auto record = dyn_cast<DictionaryAttr>(item);
+    if (!record)
+      return failure();
+    auto work = record.getAs<StringAttr>(kHmxReadoutWorkField);
+    auto engine = record.getAs<StringAttr>(kHmxReadoutEngineField);
+    if (!work || !engine)
+      return failure();
+    if (!owners.insert({work.getValue(), engine.getValue()}).second)
+      return failure();
+  }
+  return owners;
+}
+
 LogicalResult mlir::hmx::refreshHmxManifestBridgeCounts(ModuleOp module) {
   FailureOr<DictionaryAttr> current =
       readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true);
@@ -2126,6 +2231,15 @@ LogicalResult mlir::hmx::refreshHmxManifestBridgeCounts(ModuleOp module) {
   Counts total;
   LogicalResult status = success();
 
+  // Read ONCE: the outlined-read-out owners do not change during the walk, and
+  // `findRecord` below is already O(records) per bridge op.
+  FailureOr<llvm::StringMap<llvm::StringRef>> readoutOwners =
+      readReadoutEngineNames(module);
+  if (failed(readoutOwners))
+    return module.emitError(
+        "hmx.readout.handoffs is malformed; the bridge recount cannot tell "
+        "which kernel each outlined vector read-out belongs to");
+
   auto recordIndex = [&](Operation *op) -> std::optional<size_t> {
     if (failed(status))
       return std::nullopt;
@@ -2134,6 +2248,24 @@ LogicalResult mlir::hmx::refreshHmxManifestBridgeCounts(ModuleOp module) {
       op->emitError("HMX bridge operation is not inside a function");
       status = failure();
       return std::nullopt;
+    }
+    // The name the record is keyed by: the op's own function, unless that
+    // function is the executor's work function, in which case it is the kernel
+    // the handoff record pairs it with.
+    StringRef ownerName = function.getName();
+    if (function->hasAttr(kHmxReadoutOutlinedAttr)) {
+      auto found = readoutOwners->find(ownerName);
+      if (found == readoutOwners->end()) {
+        op->emitError()
+            << "HMX bridge operation is inside the outlined vector read-out '"
+            << ownerName
+            << "', which no hmx.readout.handoffs record pairs with a kernel. "
+               "The read-out cannot be attributed to a manifest record, so its "
+               "bridge site would go uncounted";
+        status = failure();
+        return std::nullopt;
+      }
+      ownerName = found->second;
     }
     Attribute raw = op->getAttr(kHmxDecisionIdAttr);
     if (!raw) {
@@ -2147,8 +2279,12 @@ LogicalResult mlir::hmx::refreshHmxManifestBridgeCounts(ModuleOp module) {
       status = failure();
       return std::nullopt;
     }
-    std::optional<size_t> index =
-        findRecord(matmuls, function.getName(), id.getInt());
+    // `ownerName`, not `function.getName()`: for an op inside the executor's
+    // work function the record is keyed by the KERNEL's name. Passing the
+    // function's own name here would look the id up under `__hmx_readout` and
+    // report "decision id has no manifest record" -- which is exactly the second
+    // half of the failure that the attribute alone does not fix.
+    std::optional<size_t> index = findRecord(matmuls, ownerName, id.getInt());
     if (!index) {
       op->emitError("HMX bridge decision id has no manifest record");
       status = failure();

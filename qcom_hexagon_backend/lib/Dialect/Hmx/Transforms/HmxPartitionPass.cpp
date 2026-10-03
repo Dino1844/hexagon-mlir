@@ -90,6 +90,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h" // mlir::isPure, for the read-out hoist
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
@@ -987,6 +988,210 @@ static std::optional<UnpackBridge> findUnpackBridge(MatmulOp matmul) {
   return bridge;
 }
 
+/// NOT-A-DECISION: a safety bound on the pure-definition walk below, for the
+/// reason `kFoldDepth` in HmxVectorReadoutPass.cpp gives. The chains that matter
+/// in production are one or two ops -- a Triton block-pointer offset is
+/// `arith.muli` under `memref.reinterpret_cast` -- so 16 is an order of magnitude
+/// of headroom, and a deeper chain declines rather than relocating an unbounded
+/// amount of IR above the matmul.
+constexpr unsigned kHoistDepth = 16;
+
+/// The ops that would have to move above `anchor` for `value` to be defined
+/// there, in dependency order, or "cannot be made available".
+///
+/// WHY THIS EXISTS. A `memref.reinterpret_cast` is `Pure`
+/// (mlir/Dialect/MemRef/IR/MemRefOps.td:1490), so it can always be evaluated
+/// earlier. Nothing forces it to be *evaluated* earlier, and no canonicalizer
+/// runs between `convert-bufferization-to-memref` and this pass (see the pass
+/// order in LinalgToLLVMPass.cpp:502-537), so where the op was materialised is
+/// where it stays. A destination whose offset is the constant 0 happens to be
+/// materialised in the entry block, which is why the whole-matrix matmul hoists;
+/// a destination offset by `tl.program_id` is materialised where
+/// `materialize_in_destination` put it, *after* the matmul, which is why the
+/// grid-tiled matmul of the same 1024x512x64 shape did not. Measured 2026-10-03:
+/// the only IR difference between the two was that destination's position, and
+/// moving it above the matmul is what turned the vector read-out on for the
+/// grid shape.
+///
+/// `out` receives the ops in post-order -- an op always follows every op it
+/// reads -- so splicing them in list order above `anchor` is correct.
+/// `dominance` MUST be built over the IR as it stands now. It is the only thing
+/// that distinguishes "already available" from "must be moved", and reading it
+/// after a relocation would answer for the wrong block.
+static bool collectHoistableDefs(Value value, Operation *anchor,
+                                 DominanceInfo &dominance,
+                                 SmallVectorImpl<Operation *> &out,
+                                 unsigned depth = 0) {
+  // Already available: nothing to move, and this is the whole reason the
+  // dominance test comes FIRST rather than only at the leaves. A function
+  // argument is a block argument with no defining op, and it is the operand
+  // every production destination is ultimately built from; treating "no
+  // defining op" as a decline before asking about dominance rejects exactly the
+  // case this function exists for.
+  if (dominance.dominates(value, anchor))
+    return true;
+  if (depth > kHoistDepth)
+    return false;
+  Operation *def = value.getDefiningOp();
+  // Available by neither route and with no definition to move: an induction
+  // variable or a loop-carried value, whose region would have to move instead.
+  if (!def)
+    return false;
+  // Only same-block definitions are movable. A definition in an ENCLOSING block
+  // already dominates, so it is answered above; a definition in a NESTED region
+  // belongs to an op this pass does not own and must not be dragged out of it.
+  if (def->getParentOp() != anchor->getParentOp())
+    return false;
+  // Pure, speculatable, and region-free. `mlir::isPure` does not look inside
+  // regions, so the region check is not redundant with it: an op whose trait says
+  // pure but whose body has effects would pass the trait and fail here.
+  if (!mlir::isPure(def) || def->getNumRegions() != 0)
+    return false;
+  for (Value operand : def->getOperands())
+    if (!collectHoistableDefs(operand, anchor, dominance, out, depth + 1))
+      return false;
+  // Two operands can share a chain. Moving an op twice is harmless, but this list
+  // is read as the set of ops to move, so it is kept a set.
+  if (!llvm::is_contained(out, def))
+    out.push_back(def);
+  return true;
+}
+
+/// The accumulator read-out a staged tile loop may absorb into its M
+/// iterations: the one unpack loop that walks AR row `m` for `m` in [0, Mt).
+struct RowUnpack {
+  UnpackAccOp op;
+  scf::ForOp loop;
+};
+
+/// Find the read-out that `emitStageLoop` can hoist, or nothing.
+///
+/// The read-out is a strictly serial tail in the unstaged shape: the matmul
+/// retires, then a second loop walks every AR row and unpacks it. LWP measured
+/// that tail at 39.79% of a 1024x512x64 kernel at depth 2 -- ~24 us of vector
+/// work that overlaps nothing, because there is nothing left to overlap with.
+///
+/// Moving it inside the M loop is safe by construction, not by scheduling luck:
+///
+///   * `hmx.mma` writes no memory at all -- its accumulator is the implicit
+///     engine register on `Hmx_EngineResource` (HmxOps.td:498-502). The
+///     accumulator's *memory* image is written only by `hmx.acc_read`, at AR
+///     (row m, col n), and `unpack_acc` reads AR (row m, col c). `croutonAddr`
+///     is `base + (row * rowStride + col) * 2048` (HmxToLLVMPass.cpp:731-761),
+///     so two different `m` are byte-disjoint croutons.
+///   * `hmx.unpack_acc` carries only `MemRead, MemWrite` on the default
+///     resource (HmxOps.td:290-293) -- no `Hmx_EngineResource` effect -- so it
+///     neither conflicts with nor has to be ordered against `acc_clear`, `mma`
+///     or `acc_read` on the implicit register.
+///   * Within one iteration the unpack is emitted *after* the inner N loop,
+///     which is where the `acc_read`s that fill AR row `m` live. So the read
+///     follows the write in the same block, with no cross-iteration edge.
+///
+/// Row coverage then needs no new argument: the hoisted unpack sits in the same
+/// iteration body as the `acc_read` it reads, so it inherits exactly the rows
+/// the pipeliner already guarantees `acc_read` covers -- the kernel's
+/// `m` in [0, Mt-1) and, at depth 2, the peeled epilogue's last row. Every AR
+/// row is unpacked once and once only.
+///
+/// Nothing here is required. Anything other than this one shape leaves the
+/// original loop exactly where it was, which is why every condition below is a
+/// decline rather than a repair: `findUnpackBridge` already accepts several
+/// read-out forms, and reinterpreting a form it did not recognise as this one
+/// would move an op whose coverage nobody has checked.
+///
+/// The ONE thing this function does move is the pure chain that computes a
+/// captured value (see `collectHoistableDefs`). That is not a repair of the
+/// read-out's shape; it is a relocation of descriptor arithmetic the anchor
+/// could have used all along, and it is what the production grid shape needs.
+/// Everything is decided before anything moves: the walk below only appends to
+/// `hoistable`, and the move happens once every other condition has passed, so a
+/// shape that declines for any other reason leaves the IR byte-identical.
+static std::optional<RowUnpack> findRowUnpack(IRRewriter &rewriter, MatmulOp matmul,
+                                              Value ar, int64_t Mt,
+                                              Operation *anchor) {
+  auto bridge = findUnpackBridge(matmul);
+  // No loop means the read-out is a bare op or a carried (DPS) loop; both are
+  // forms this pass does not rewrite. The fused f32 residual form is the
+  // diagnostic tail ABI, whose read-out is emitted by the diagnostic emitters
+  // and must stay where they put it.
+  if (!bridge || !bridge->loop || bridge->fused)
+    return std::nullopt;
+  scf::ForOp loop = bridge->loop;
+  // The loop must carry no result and no region argument: the hoisted op is a
+  // clone that outlives the loop, so a threaded value would have nowhere to go.
+  if (loop.getNumResults() != 0 || loop.getNumRegionIterArgs() != 0)
+    return std::nullopt;
+  // Exactly one unpack, so "one per row" is a statement about one op and not
+  // about a body this function has not fully understood.
+  if (bridge->ops.size() != 1 || !isa<UnpackAccOp>(bridge->ops.front()))
+    return std::nullopt;
+  auto unpack = cast<UnpackAccOp>(bridge->ops.front());
+
+  // It must read the accumulator this matmul writes, and the induction variable
+  // must be the row -- that identity is the whole hoist. Reject any other use
+  // of the induction variable, so the clone's remaining operands are provably
+  // loop-invariant.
+  Value iv = loop.getInductionVar();
+  if (unpack.getSrc() != ar || unpack.getRow() != iv)
+    return std::nullopt;
+  // `row` and `col` are the only operands that could be the induction variable;
+  // `col` must not be, or the clone would keep a use of a value that does not
+  // exist inside the tile loop.
+  if (unpack.getCol() == iv)
+    return std::nullopt;
+
+  // The traversal must be exactly [0, Mt) step 1, which is what makes
+  // "unpack row m" mean "unpack the row `acc_read` wrote for tile m". A bound
+  // the tile loop cannot match is a mismatch to decline, not to clamp.
+  std::optional<int64_t> lower = constantIndexValue(loop.getLowerBound());
+  std::optional<int64_t> upper = constantIndexValue(loop.getUpperBound());
+  std::optional<int64_t> step = constantIndexValue(loop.getStep());
+  if (!lower || !upper || !step || *lower != 0 || *upper != Mt || *step != 1)
+    return std::nullopt;
+
+  // The clone is emitted at the matmul, which in production is *before* the
+  // read-out loop, so everything it captures must be available there.
+  //
+  // "AVAILABLE", not merely "already defined there": a destination materialised
+  // *after* the matmul but out of pure, region-free ops is MOVED above it
+  // rather than declined. That is the production grid case and it is not a
+  // repair -- `memref.reinterpret_cast` is `Pure`, so the clone computes exactly
+  // the same descriptor either way; only its position in the block changes. The
+  // two shapes are otherwise identical: measured 2026-10-03, the whole-matrix
+  // and grid-tiled forms of the same 1024x512x64 matmul differ in the emitted
+  // read-out by nothing except where the destination's `reinterpret_cast` sat,
+  // and that difference alone decided whether `hmx-vector-readout` had anything
+  // to rewrite (the grid form kept a separate read-out loop, whose loop carries
+  // no `acc_read`, which that pass requires in the loop it attaches to).
+  //
+  // A value that cannot be moved -- a block argument, anything defined inside a
+  // nested region, anything with a side effect -- is still a decline, and it
+  // declines with the IR untouched.
+  DominanceInfo dominance(anchor);
+  SmallVector<Operation *> hoistable;
+  for (Value operand : unpack->getOperands())
+    if (operand != iv &&
+        !collectHoistableDefs(operand, anchor, dominance, hoistable))
+      return std::nullopt;
+
+  // Every condition has passed, so relocating the captured chain cannot
+  // invalidate a decision this function made: nothing is rebuilt or re-checked,
+  // two pure ops change position, and `hoistable` is in dependency order. The
+  // DominanceInfo above is not consulted again -- it was built for the
+  // pre-move IR and would answer for the wrong block.
+  for (Operation *def : hoistable)
+    rewriter.moveOpBefore(def, anchor);
+  LLVM_DEBUG({
+    for (Operation *def : hoistable)
+      llvm::dbgs() << "hmx-partition: hoisting the read-out's "
+                   << def->getName().getStringRef()
+                   << " above the matmul so the read-out can ride the tile "
+                      "loop\n";
+  });
+
+  return RowUnpack{unpack, loop};
+}
+
 /// Emit one rectangular tile region. The region is deliberately a plain SCF
 /// loop nest: a tail edge is outside the ordinary activation staging pipeline,
 /// so it must not be accidentally handed to `scf::pipelineForLoop`.
@@ -1750,6 +1955,32 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
                           << room << " B, scratch " << scratchBytes
                           << " B, ring/depth " << ringBytes << " B)\n");
 
+  // The accumulator read-out, if it has the one shape this loop can absorb (see
+  // `findRowUnpack`). Resolved HERE, after every `declineStageLoop` above and
+  // before the first op this function creates, for two reasons that pull in
+  // opposite directions and both matter:
+  //
+  //   * It relocates the pure chain that computes the read-out's destination
+  //     (see `collectHoistableDefs`). On a shape that then declines for some
+  //     other reason that move would be IR churn with no reader, so it must not
+  //     happen before the declines.
+  //   * It reads dominance with a `DominanceInfo` of its own, which would answer
+  //     for the wrong block if built over the IR this function is midway through
+  //     constructing.
+  //
+  // So: after the declines, before any creation.
+  std::optional<RowUnpack> rowUnpack =
+      findRowUnpack(rewriter, op, ar, Mt, op.getOperation());
+  LLVM_DEBUG({
+    if (rowUnpack)
+      llvm::dbgs() << "hmx-partition: hoisting the accumulator read-out into "
+                      "the tile loop (Mt="
+                   << Mt << ")\n";
+    else
+      llvm::dbgs() << "hmx-partition: accumulator read-out not hoistable; the "
+                      "separate read-out loop stays\n";
+  });
+
   OpBuilder::InsertionGuard guard(rewriter);
   rewriter.setInsertionPoint(op);
   Location loc = opLoc;
@@ -1834,6 +2065,18 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   emitTileCompute(rewriter, loc, bias, scratch, wt, ar, m, ready, c0, c1, Kt,
                   batch, cNt, decisionId);
 
+  // The read-out rides at the tail of the iteration, after the inner N loop
+  // whose `acc_read`s filled AR row `m` -- `emitTileCompute` leaves the
+  // insertion point exactly there. The op is cloned, not rebuilt: the clone
+  // keeps `count`, `valid_rows`/`valid_cols` and `hmx.decision_id` verbatim,
+  // and only the row is remapped, so the attribution record this site carries
+  // survives the move without a renumbering.
+  if (rowUnpack) {
+    IRMapping remap;
+    remap.map(rowUnpack->op.getRow(), m);
+    rewriter.clone(*rowUnpack->op.getOperation(), remap);
+  }
+
   // The pipeliner owns the schedule from here: everything through the
   // `hmx.stage` is stage 0, the await and the compute are stage 1. With the
   // epilogue peeled it emits the prologue (the issue of tile 0), the kernel
@@ -1875,6 +2118,13 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
     // of the body the compute left it in, so what follows follows the loop.
     rewriter.setInsertionPointAfter(mLoop);
   }
+
+  // The separate read-out loop has done its work: every row it used to walk is
+  // unpacked by the iteration that wrote it. Retire it here, where the
+  // insertion point already sits after the last tile loop -- so nothing this
+  // loop owned (its constants, its result) is still live at the erasure.
+  if (rowUnpack)
+    rewriter.eraseOp(rowUnpack->loop);
 
   PipelineDecision decision;
   decision.requestedDepth = requestedDepth;

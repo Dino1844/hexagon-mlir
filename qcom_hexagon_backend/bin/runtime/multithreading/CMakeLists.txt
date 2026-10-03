@@ -42,12 +42,20 @@ if(NOT DEFINED LLVM_ROOT OR NOT LLVM_ROOT)
 endif()
 
 # Include directories for QURT libraries
+#
+# ../include is the runtime ABI header directory. It was not on this target's
+# path before: multithreading/*.cpp only ever included headers sitting next to
+# themselves, which the quoted-include rule resolves without -I. HmxVectorExecutor.cpp
+# needs it because its ABI header lives in ../include, and matching
+# bin/runtime/CMakeLists.txt:56 keeps the two halves of the runtime looking at the
+# same headers.
 include_directories(
     ${HEXAGON_SDK_ROOT}/incs
     ${HEXAGON_SDK_ROOT}/incs/stddef
     ${HEXAGON_SDK_ROOT}/rtos/qurt/computev${Q6_VERSION}/include/posix
     ${HEXAGON_SDK_ROOT}/rtos/qurt/computev${Q6_VERSION}/include/qurt
     ${HEXAGON_TOOLCHAIN}/Tools/target/hexagon/include/c++/v1/__bit
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 
 # Make a directory for fake includes to avoid issues with missing system headers
@@ -69,10 +77,20 @@ include_directories(
 
 
 # Source files
+#
+# HmxVectorExecutor.cpp is the two-thread HMX read-out split: one resident qurt
+# thread plus a lock-free SPSC ring of HmxReadoutBatch, entered from the engine
+# thread through hexagon_runtime_hmx_exec_{configure,publish,drain,shutdown}.
+# Its ABI header is include/HmxVectorExecutor.h. Note this target is compiled
+# with -fvisibility=hidden, inherited from the parent Triton CMake scope rather
+# than from this file, so that source marks its four extern "C" entries with
+# __attribute__((visibility("default"))) -- the same mechanism AsyncRuntime.h:33
+# and HexagonCustomDefs.cpp:93 use. Nothing else in this library needs it.
 set(SOURCES
     AsyncRuntime.cpp
     HexagonThreadPool.cpp
     HexagonCustomDefs.cpp
+    HmxVectorExecutor.cpp
     StringMap.cpp
     MemAlloc.cpp
 )

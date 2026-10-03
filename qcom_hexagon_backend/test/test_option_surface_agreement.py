@@ -386,11 +386,11 @@ def test_hmx_parser_sees_every_option():
     opts = hmx_options()
     fields = {field for _p, field, _f, _d in opts}
     assert len(opts) >= 8, f"only found {len(opts)} Hmx options across {len(fields)} fields"
-    # Five are filled by the pipeline, two are CLI-only. If this number moves, one
-    # of the two states changed and the classification below needs a human.
-    assert len(fields) == 7, f"unexpected Hmx option field set: {sorted(fields)}"
+    # Seven are filled by the pipeline, two are CLI-only. If this number moves,
+    # one of the two states changed and the classification below needs a human.
+    assert len(fields) == 9, f"unexpected Hmx option field set: {sorted(fields)}"
     assert {p for p, _f, _fl, _d in opts} == {
-        "MatmulToHmx", "HmxPartition", "WeightResident",
+        "MatmulToHmx", "HmxPartition", "WeightResident", "HmxVectorReadout",
     }, "the pass-block regex picked up a different set of passes"
 
 

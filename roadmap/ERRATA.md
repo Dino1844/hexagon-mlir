@@ -874,3 +874,413 @@
 ⇒ **勘误九成立的范围**：**「用 `budgetDepth` 给 T_HMX 定量」这条路死了**（③ ② 都成立）。
 ⇒ **勘误九不成立的范围**：**T_HMX 本身没有被证伪**。
 ⇒ **T_HMX 的判决仍挂在 ROADMAP §6 第 11 条那个已预登记的净增量门上。**
+---
+
+## 勘误十（2026-10-03 下午）— T_HMX 首次得到**可信的负结果**，以及它推翻的五个假设
+
+本条只追加，不改动上面任何既有文本。
+
+### 1. 先修两个把测量变成噪声的故障（都不是功能问题）
+
+**(a) 设备侧 DSP 进程泄漏。** 每次启动失败都会留下一个 `./run_main_on_hexagon`，
+占住一个 unsigned PD domain。domain 数量有限，所以**第一次失败之后所有测量都是假的**，
+症状是 `Error -2147482611: Failed to call main() on DSP`，与「没有加速」无法区分。
+
+- 14:08 抓到 4 个残留（PID 18570/20514/23092/24543），杀掉后同一 kernel 立刻
+  `Perf:62.000000 / PerfPcycles:132604`（对照 11:40 基线 61 µs / 129,972 ⇒ 无回归）。
+- **`ps -A` 输出是 `PID ? ELAPSED CMD`，PID 在 `$1`；`$2` 是 `?`。**
+  `readout_sweep2.py:reap_dsp` 最初取 `$2`，因此**静默什么都没杀**，白费 40 分钟。
+
+**(b) Triton 后端用 `sys.exit(1)` 报设备失败。**
+`triton/backends/qcom_hexagon_backend/hexagon_executor.py:752` ——
+这是 `BaseException`，会**穿透 `contextlib.redirect_stdout` 直接杀掉进程**。
+未加保护时扫描脚本只打印表头然后 `rc=1` 退出，一行结果都没有。
+这解释了此前多次「OFF 臂没打出 Perf 就退出」。
+
+### 2. 可信的负结果（1024×512×64 fp16, depth=2, `tools/run_tests.sh lock`）
+
+| arm | Perf µs | PerfPcycles | read-out 符号 |
+|---|---|---|---|
+| OFF | 64 | 135742 | 0 |
+| ON G=1 | 2090 | 1332669 | **5** |
+| ON G=2 | 2085 | 1344103 | **5** |
+
+- **符号 = 5 ⇒ 改写在对象里。** 这是今天第一个可信的负结果。
+- **G=1 与 G=2 几乎相同（2090 / 2085）⇒ 完全平坦。**
+  批量模型 `24300 ns / handoff_ns` 预言 G=8 → 1.51×；实测 **0.03×**。
+- Perf 对 ITERS **平坦**（1/10/100/1000 → 2062/2306/2217/2093 µs）⇒ 是**每 iteration** 成本。
+- **G=4 挂死**：14:21 起未完成，直到 15:14 被超时杀掉（单臂 >53 min）。
+
+### 3. 读出工作量是对的，多出来的 cycle 不在读出上
+
+记账文件 `/data/data/com.termux/files/home/csm/op/hmx_readout_acct.txt`
+相邻两条 `drain` 记录做差：批数 +16、pcyc +51132 ⇒ **3196 pcyc/batch**，
+一次 launch 的读出 = 16×3196 = 51132 pcyc = OFF 臂的 **37.7%**，
+与原始测得的 **39.79%** 同量级 ⇒ **`__hmx_readout` 本身没有变慢。**
+
+引擎侧多烧 1332669 − 135742 = **1196927 pcyc/iteration**。
+若每 iteration 16 次 publish ⇒ **~74800 pcyc/publish**，
+而 publish 全部内容只是 24 字节拷贝 + 2 次原子操作 + 1 次 futex wake。
+
+### 4. 隐含频率暴露了真正的形态
+
+| | Perf µs | pcyc | 隐含频率 |
+|---|---|---|---|
+| OFF | 64 | 135742 | **2.12 GHz** |
+| ON | 2093 | 1332669 | **0.64 GHz** |
+
+32× 墙钟里只有 9.8× 是真实 cycle，**约 1465 µs 是纯等待**。
+⇒ 瓶颈**不是读出算力，是等另一个线程**。
+
+### 5. 本条推翻的五个假设（全部保留记录）
+
+1. **「grid 形状的 row 链带 `program_id` 项，折叠不掉」** — 错。
+   两种形状 row 链**完全相同**（都是 `%iv + 0`），`program_id` 只出现在目标偏移里。
+2. **「grid 形状生成不了、符号=0」** — 测量为真但归因错。
+   `HmxPartitionPass.cpp` 的 late-dst hoist 在 **12:02:53** 生效
+   （缓存对象：11:46 / 12:00 为 0 符号，12:02:53 起为 5）；早前扫描跑在 hoist 之前。
+3. **`tailStart` 的 `+1` 少一行 AR** — 是被**种进树里的变异**（早前 agent 做变异测试时留下），
+   不是发布缺陷。`.bak`/`.good` 均为正确公式且无 MUTATION 注释。
+4. **「publish 的开销是 `qurt_futex_wake`」** — 错。
+   `llama.cpp/ggml/src/ggml-hexagon/htp/hmx-queue.h:87-88` **完全一样**：
+   每次 push 都 `atomic_fetch_add(&seqn,1)` + `qurt_futex_wake(&seqn,1)`，
+   且 `HMX_QUEUE_POLL_COUNT` 在 v79 上**也是 1**（`:20-24`）。
+5. **「线程优先级 / HVX 上下文取得方式有差异」** — 也没有。
+   本实现 `HmxVectorExecutor.cpp:473-482` 与 `hmx-queue.c:131-138` 逐行对应；
+   `:345` 同样取 HVX 锁，`:416` 同样在空闲时 `qurt_hvx_unlock()`。
+
+⇒ **结构性的关键差异只剩一处**，且尚未测量：
+llama.cpp 的 `matmul-ops.c:2601-2623` 是 `push(i)/pop(i-1)` 的**单深流水**，
+生产者恒定只领先一格，消费者因此**几乎永不 park**，futex 等待路径走不到；
+本实现的消费者会 park 进 futex 并付调度延迟。
+
+### 6. 尚未测量的下一步（不得再凭推测动手）
+
+**给执行器加两个计数器并在设备上打印：消费者 park 次数、引擎 futex 等待次数。**
+这直接判定「futex 路径到底有没有被走到」。在此之前不得声称已定位。
+
+### 7. 门与基线（未提交）
+
+`ninja` rc=0 · lit **328/0/1** · pytest **202** · object gate **8 passed**
+（门已重写为读**实际发出**的 `rowStart`/`rowCount`，不再按期望公式重算；
+变异验证：`tailStart` 改回 `+1` 时 **1 failed / 7 passed**，
+报错点名丢失的行 `[28]`，而所有符号检查仍绿 —— 只有新读取器看得见）。
+
+**四块改动全部未提交**：S1（629 行）/ 抬 unpack（130 行）/ S2 运行时+ABI（~1900 行）/ readout pass。
+
+---
+
+## 勘误十一（2026-10-03 19:00–20:10）— §6 那个 0.03× 是**缓存假象**，真实结果是 **1.27×–1.33×**
+
+本条追加，不改动上面任何既有文本。**勘误十 §2 的负结果已被本条推翻**；
+本条只保留勘误十里仍然成立的部分（两个故障、隐含频率分析、五个被推翻的假设）。
+
+### 1. 根因：Triton 缓存不按运行时库做键，陈旧 `.so` 被当成命中
+
+`readout_sweep2.py` 的每臂缓存隔离是**无效的**：
+
+```python
+os.environ["TRITON_CACHE_DIR"] = cache    # 在 import triton 之后设置 ⇒ 不生效
+```
+
+triton 在 import 时就解析了缓存目录，所以所有臂共用同一个默认缓存。
+更关键的是 **triton 的缓存键覆盖 kernel 源码与编译选项，但不覆盖
+`libhexagon_mlir_async_runtime.a`** —— 改了 `HmxVectorExecutor.cpp` 并重新 ninja
+之后，缓存命中仍会发给你一个**链接着旧运行时**的二进制。
+
+**受控验证**（同 kernel、同选项、同 iters=1，只差缓存冷热）：
+
+| 缓存 | Perf µs | pcycles | 对象符号 |
+|---|---|---|---|
+| 默认（陈旧 runtime） | 2062 | 1332669 | 5 |
+| 全新（当前 runtime） | **49** | 103030 | 5 |
+
+⇒ 勘误十 §2 的 2090 µs、32× 变慢、G 平坦、G=4 挂死，**全部是这一个原因**，
+不是交接代价、不是 futex、不是 HVX 锁、也不是优先级。
+
+**已修**（`exp/hmx/t3_overlap_ab/readout_sweep2.py`）：
+`TRITON_CACHE_DIR` 在 import triton **之前**用 `setdefault` 设置；
+并新增 `_runtime_stamp()`，把 `libhexagon_mlir_async_runtime.a` 的 **mtime**
+放进缓存路径 ⇒ **运行时一改就自动冷缓存**，不必靠人记得清目录。
+
+### 2. 修好之后的真实测量
+
+`1024×512×64 fp16, depth=2, iters=1`，`llvm-nm` 逐臂确认符号：
+
+| arm | Perf µs | pcycles | read-out 符号 | |
+|---|---|---|---|---|
+| OFF | 61–63 | ~130000 | 0 | 基线 |
+| ON G=1 | **48** | 102528 | **5** | **+21.3% (1.27×)** |
+| ON G=2 | **46** | 97237 | **5** | **+24.6% (1.33×)** |
+
+两个 ON 臂的对象里都有 5 个 read-out 符号 ⇒ **不是"读出没发生"**。
+
+**T_HMX 方向被证伪了，批量模型的形状也被证实了**：G=2 > G=1，
+正是 `24300 ns / handoff_ns` 预言的单调上升。G=4/8 尚未测完（见 §4）。
+
+### 3. 编译从来不是瓶颈（实测拆解）
+
+| 阶段 | 耗时 |
+|---|---|
+| import 模块 + triton + MLIR 插件 | 1.3 s |
+| `warmup` → `.o` 冷编译 | **5.7 s** |
+| `warmup` → `.o` 缓存命中 | **0.00 s** |
+| **kernel launch（缓存命中也是）** | **20 s** |
+| 宿主 `torch.matmul` 参考比较 | 0.03 s |
+| `adb shell` 往返 | 0.32 s |
+| `reap_dsp`（一次 ps） | 0.44 s |
+
+⇒ **每臂硬下限 20 s，全在 `hexagon_executor.py:583-589`**：
+每次 launch **无条件 `adb push`** 输入张量 + `run_main_on_hexagon` + 全部 .so，
+**没有哈希比对**。3 MB 输入走 `adb reverse` 隧道，每次重来。
+**这是 Triton 传输层的问题，不是本项目的问题，也不是扫描脚本的问题。**
+
+### 4. 扫描脚本已加固（后续 agent 直接用，不要重写）
+
+`exp/hmx/t3_overlap_ab/readout_sweep2.py` + 新增 `exp/hmx/t3_overlap_ab/sweep_readout.sh`：
+
+- **`--arm off|g<N>`：一臂一进程**，每臂独立超时（`PER_ARM_TIMEOUT`，默认 420 s）。
+  理由实测：单进程跑全部臂时 G=4 挂了 53 分钟，把已完成的臂一起赔进去。
+- 结果**增量追加**到 `/tmp/opencode/readout_results.tsv`，挂掉不丢已完成结果。
+- 臂间清 `run_main_on_hexagon` 残留（否则下一次 launch 报
+  `Failed to call main() on DSP`，与"没加速"无法区分）。
+- `readout_sweep2.py` 顶部注释记录了缓存键这个坑，`sweep_readout.sh` 顶部记录了
+  一臂一进程的由来。**改这个脚本前先读那两段。**
+
+### 5. 交给下一个 agent 的下一步（按顺序）
+
+1. **补齐 G=4/8/16/32**：`ARMS="off g1 g2 g4 g8" bash exp/hmx/t3_overlap_ab/sweep_readout.sh 1`。
+   批量模型预言 G=8 → **1.51×（40.3 µs）**。已测的 G=1 1.27×、G=2 1.33×
+   已落在模型的形状上，**G=4/8 是判定模型成立与否的决定性数据**。
+   缓存现在按 runtime mtime 分目录，**必须确认缓存路径里出现了新的时间戳目录**，
+   否则测的还是陈旧二进制。
+2. **撤掉诊断计数器**：`HmxVectorExecutor.cpp` 里新增的
+   `nPark/nHvxLock/nHvxUnlock/nPublish`（结构体约 :124-131，
+   `publish` 入口、`vectorThreadEntry` 的 park/hvx 点、`reportReadoutAccounting`）
+   **在定位完成前保留**；一旦 G 曲线确认，要么留着当长期诊断（开销是 4 个 relaxed
+   原子加，实测未改变结果），要么连同两条 `hmxExecTrace("mech*")` 一起删。
+   **它们没有让 ON 从 1.27× 掉回 0.03×，也不是原因。**
+3. **不要再查 futex / HVX 锁 / 优先级**：勘误十 §5 已经用 llama.cpp 源码逐条排除，
+   三处实现都是对的。唯一仍成立的机制线索是 §4 里那条 —
+   `matmul-ops.c:2601-2623` 的 `push(i)/pop(i-1)` 单深流水让消费者几乎永不 park，
+   而本实现会 park。**但那只在 park 计数证明确有大量 park 时才值得动手，现在没有该计数。**
+4. **不要碰设备**除非走 `tools/run_tests.sh lock`；`adb` 在 `tools/hexmlir/adb`，不在 PATH。
+5. **四块改动全部未提交**（用户明确指示过两次"先不提交"）：
+   S1 ThreadRolePartition（629 行）/ 抬 unpack（130 行）/ S2 运行时+ABI（~1900 行）/ readout pass。
+   门：ninja 0 · lit **328/0/1** · pytest **202** · object gate **8 passed**。
+
+### 6. 今天的方法论收获（比任何单个数字都值钱）
+
+**六次拿间接信号当结论，六次被推翻**，但这次终于收敛到一个可复跑的判据：
+
+| # | 错误结论 | 被什么推翻 |
+|---|---|---|
+| 1 | 输出正确 ⇒ 执行器跑过 | 输出来自没被改掉的代码 |
+| 2 | 符号消失 ⇒ visibility 丢弃 | `sym_visibility` 到不了 LLVM IR |
+| 3 | 门 7 passed ⇒ 功能实现 | 门只测整矩阵 kernel |
+| 4 | row 链带 `program_id` 项 | 两种形状 row 链完全相同 |
+| 5 | publish 贵在 `qurt_futex_wake` | llama.cpp `hmx-queue.h:87-88` 一模一样 |
+| 6 | 线程优先级 / HVX 取得方式有差异 | 本实现 `:473-482` 与 `hmx-queue.c:131-138` 逐行对应 |
+
+**唯一正确的是受控实验：只改一个变量，其余全同。** 而本条最关键的一课是：
+**"受控"还不够，两个臂必须真的用了同一份被测物。** 本条 §1 里两个臂的
+kernel 源码、选项、iters 全同、符号都是 5，唯一差别是**缓存里那份 `.so` 链的运行时不同**。
+⇒ **动手前的第一个实验应该是：确认被测二进制里含你要测的东西，
+并让它的失效条件覆盖你会改的一切。** 这就是 `_runtime_stamp()` 存在的理由。
+
+---
+
+## 勘误十二（2026-10-03 23:00–23:45）— G≥4 "灾难性变慢" 是 **drain 屏障的过冲死锁**；"318 ms/iter" 从未存在过；批量模型否证
+
+本条追加，不改动上面任何既有文本。**勘误十 §2 / 勘误十一遗留的
+"G=4 每 iteration ~318 ms、G=8 ≥420 s 超时" 之谜在本条收口。**
+
+### 1. "318 ms/iteration" 是把"被外层杀掉的挂死"硬除出来的虚构数字
+
+iters 语义（代码链：`hexagon_options.py:51` → `compiler.py:185` → `driver.py:157` →
+`hexagon_launcher_base.py:124-126` → `hexagon_benchmark.h:57-71`）：**一次 launch 在设备上
+把 kernel 完整执行 N+1 次**（+1 是 `hexagon_launcher_base.py:122` 丢弃的暖机调用），
+Perf = 每次调用的平均。所以：
+
+- **G=4/G=8 在 iters=1 时也没落结果行** ⇒ 第一次 launch 就没能完成 ⇒ 不是慢，是死锁；
+- 53 分钟 = 挂死被外层超时杀掉（勘误十 §2 的 14:21 事件本身就是这么记录的），
+  "53 min / 10000 iters = 318 ms/iter" 没有任何一次完成测量作支撑；
+- 318 ms 恰 ≈ 8 × 39.75 ms 曾被当成"~40 ms 系统节律救活"的证据——机制上不成立：
+  过冲楔死连虚假唤醒都救不了（生产者卡在 drain 里不再 publish，消费者追平后 park，
+  谁也不会再动）。[此前的 40 ms 节律假说随之作废]
+
+### 2. 根因：drainLocked 的屏障是**模 16 环位置相等**，消费者跑过头一格即永久楔死
+
+每调用 publish 数 = `floor(31/G)+1` = **32/16/8/4**（G=1/2/4/8），环容量 16
+（`HmxVectorExecutor.cpp:72`）。旧 `drainLocked`（已删）逐槽等
+`idxRead == next`：`processAvailable` 背靠背 retire 多批中间不 park（每批 ~0.76 µs/行），
+消费者越过 `next` 位置后，模 16 相等永远无法满足；生产者卡在 drain ⇒ 不再 publish，
+消费者追平后 park 在 seqn ⇒ **双侧永久 park**。probe3 在设备上两次实测同形状楔死
+（`exp/hmx/s2_handoff/probe3.cpp:289-311`），probe 当时改成了单调计数器——
+**但 shipped `HmxVectorExecutor.cpp` 一直是环相等版**。
+
+**G=1/2 为什么"幸免"**：32/16 ≡ 0（mod 16）⇒ `idxDrain == target` 恒成立 ⇒
+drain 是**数学空操作** ⇒ 内核返回时尾批读出还在飞。⇒ **勘误十一 §2 的 G=1/G=2 数字
+（49/47 µs）是无屏障数字**：正确性靠 "host 往返（ms 级）≫ 在飞读出（≤24 µs）"
+的时序运气，不是正确性保证；且它与大 iters 下的行为不可比。
+
+### 3. 修复（只改 `.cpp`，冻结的 `HmxVectorExecutor.h` 未动）
+
+照 probe3 设备验证过的形状（`probe3.cpp:223-244, 289-311`）：
+
+1. **单调屏障**：新增 `publishedTotal`（publish 按 accepted 累加）；drain 等
+   `retireSeqn == publishedTotal`（两个都是全量单调计数，永不越过）；删除 `idxDrain`。
+2. **消费者 park 前 re-load**：旧注释声称 futex 值检查能关丢失唤醒窗口——
+   probe3 设备日志证明不能；加显式 re-load（窗口不再依赖 `qurt_futex_wait` 的内部实现）。
+
+干预性确认：修复前 G=4 iters=1 挂死（120 s 超时杀，23:23 诊断扫描）；修复后（archive
+md5 `71d6460d197007c6a988f3d4b3209a84`，旧 `109c522bc13cfe1fed8c05f30bc14274`）
+G=4 iters=1 = 49 µs 数值对，且 iters=1000（= 每 launch 1001 次跨活屏障）零楔死。
+
+### 4. 修复后的完整曲线（iters=1000，数值全对，`/tmp/opencode/readout_results.tsv`）
+
+| arm | Perf µs | pcyc | 符号 |
+|---|---|---|---|
+| OFF | 63 | 133703 | 0 |
+| G=1 | 49 | 104927 | 5 |
+| G=2 | 49 | 104136 | 5 |
+| G=4 | 48 | 102458 | 5 |
+| G=8 | 49 | 104567 | 5 |
+| G=16 | 53 | 113962 | 5 |
+| G=32 | 64 | 135566 | 5 |
+
+（G=16/32 为首次实测，此前从未跑成过。23:36 那次 g16 "挂死" 是伪影：sweep 父进程
+被外层 shell 超时杀掉后，孤儿臂的输出拉取挂在半死的 ssh ControlMaster 上——设备上
+输出张量其实已全部写出（内核跑完了全部 1000 次迭代）；干净重跑 53 µs 通过。）
+
+**曲线形状的物理解释**：收益 = 被重叠掉的读出比例。总读出 ≈ 24 µs（32 行 × 0.76 µs），
+G 决定尾批行数 = 32 mod G（不重叠、drain 干等的部分）：G≤8 时尾批 ≤8 行，
+几乎全部读出被重叠（49 µs 地板）；G=16 尾批 16 行，重叠一半（63 − 24×16/32 ≈ 51，
+实测 53）；G=32 整批 32 行全在尾部，零重叠（≈ OFF，实测 64）。
+**G 不是"批量越大越好"的旋钮，是"愿意把多少读出推迟到不重叠的尾部"的旋钮**；
+本形状最优区间是 G∈[1,8] 的平地板。
+
+**批量模型否证**：交接的 "G=8 → 1.51×" 不成立。实测 G∈{1,2,4,8} 全部 ~48–49 µs
+（vs OFF 63 µs，**1.29×**，iters=1000）：**收益来自拆分本身，批量 G 不改变收益**
+（唤醒/发布开销在此形状下本就不是大头）。注意 G=1/2 现在付的是**真屏障**
+（旧 49/47 是空操作数字），仍 49 µs ⇒ 屏障成本 ≤2 µs。
+
+### 5. 两个附带发现
+
+1. **accounting 文件对 FastRPC-launched kernel 是死通道**：`hmxExecTrace` 的
+   `fopen` 在 launch 上下文静默失败（同 printf 被吞一类）。对照实验：g1 完成、数值对、
+   `HMX_EXEC_ACCT=1` 已传，`hmx_readout_acct.txt` 仍空。⇒ ① 诊断挂死不能靠它
+   （本条用屏障形状 + 设备目录时间戳定位）；② `HmxVectorExecutor.cpp` 里
+   "3×684 µs 记账 I/O 解释 2090 µs 回归" 的旧注释是错的（写入从未发生，684 µs
+   是 probe 进程里测的），已改；勘误十一 §1 的陈旧缓存归因不受影响。
+2. **对象码"错译"假说被 ISA 手册否证**：G4/G8 的 `{ call publish; memw(rowStart);
+   memw(rowCount) }` 同 packet 是合法调度——V75 PRM §3.3.2："packets execute to
+   completion – including updating all registers and memory – before the next
+   packet begins"，call 目标就是下一 packet。同模式在数值全对的 OFF/G1/G2 对象里
+   各 208 处。AGENTS.md 第 7/9 条（仪器无分辨力/探针旗标）的又一例：
+   把 packet 内的指令序读成串行序，差点又立一个 miscompile 假说。
+
+### 6. 测量基建（本条顺手修掉的三样）
+
+1. **`HEXAGON_FAST_LAUNCH=1`**（默认关，仅 sweep 用）：稳定设备目录
+   （`create_timestamped_folder` 去时间戳）+ adb shim 按 md5 只推差异文件
+   + executor 不删设备库/目录。实测：输入/skel/libc++ 只推一次，其后每臂只推
+   变化的 `libmatmul_kernel.so`（~1 MB），8.8 MB/launch → ~1 MB/launch。
+   （libc++.so.1 一个文件 4.5 MB，此前交接文档只算了 3 MB 输入。）
+2. **runtime 戳真正进了缓存路径**：勘误十一 §1 声称已修的 `_runtime_stamp()`
+   实际从未进 `TRITON_CACHE_DIR` 的值（import 时 setdefault + 从未生效的 makedirs）；
+   现在在 import triton 之前拼进路径。
+3. **sweep 两个自伤 bug**：`rc=${pipestatus[0]...}` 是 zsh 惯用法（bash 是
+   `PIPESTATUS`），HUNG 行与 acct 拉取从未执行过；python stdout 块缓冲把被杀臂的
+   诊断输出全部吞掉（现在 `PYTHONUNBUFFERED=1`）。
+
+## 勘误十三（2026-10-04）— 读出拆分六项收口：交接开销机制上消光，组合最优 61→36 µs（1.69×）；两处旧结论修正
+
+上一节遗留的六个"没做"全部做完（六份报告在 `exp/hmx/{t6_live_counters,t3_engine_split,t4_shapes,t5_hvx_contention,t1_deferred_drain,t2_handoff}/REPORT.md`，
+设计文档 `docs/hmx/deferred-drain-design-2026-10-04.md`）。除注明外全部
+iters=1000、1024×512×64 f16 d2 grid=1、数值全对（TOL 5e-2）。
+
+### 0. 定稿数字（父 agent 最终确认扫描，archive `a903487c…` 全程一致）
+
+| 臂 | µs | pcycles | 符号 | vs OFF |
+|---|---:|---:|---:|---|
+| OFF | 61 | 129634 | 0 | 1× |
+| G=4（拆分） | 45 | 96745 | 5 | 1.36× |
+| G=4+WSR+延迟drain+T2运行时 | **36** | 77201 | 4 | **1.69×** |
+
+### 1. 勘误十二 §5.1 修正："fopen 静默失败"是错误推断
+
+perf.txt 由 wrapper 模板 C 代码用**绝对路径** fopen 写出且每次都回得来
+（`hexagon_launcher_base.py:146`）——同一 launch 上下文文件 I/O 本来就是通的。
+T6 的判定臂三证互印：DSP 进程 `getenv("HMX_EXEC_ACCT")` → `(null)`；**同一进程**
+对 accounting 路径 fopen 探针**成功**；Perf 不含任何记账写成本。**真因：env 止步于
+CPU 侧进程，不跨 FastRPC。** 其操作性结论（该通道对 launched kernel 不可用）不变，
+死因改写如上。⇒ 所有"设备侧 getenv 控制开关"的方案同病：launch 上下文里 env 通道
+是死的，别再设计依赖它的东西。
+
+### 2. T6 活体计数器通道（新基建，零扰动）
+
+`HmxVectorExecutor.cpp` 加有界诊断环（256 条，单调序号索引，relaxed 纯诊断，
+无同槽竞争——数据环背压 15 < 256）+ 新导出 `hexagon_runtime_hmx_exec_dump(path)`
+（visibility default，不进冻结头）；wrapper 模板在**计时区外** weak 调用它写进
+perf.txt（`hexagon_launcher_base.py`）。零扰动验证：OFF 61 / G4 48（基线内），
+vec_add（weak→null 路径）PASS。**从此交接机制不必曲线反推**：交接延迟、park 次数、
+末次 drain 等待全部直读。
+
+### 3. T3 引擎侧分解（63 µs OFF = mma 24.3 + unpack 22.4 + VTCM alloc/free 8.8 + pack_act 3.5 + dma ~3 + 杂项 1）
+
+- **搬 pack_act 不值**：上限 5.5%（3.5/63），离 15% 判据差 3 倍；扣交接后净收益 0-2 µs。
+- **新杠杆：每次 launch 的 VTCM alloc/free ≈8.2-8.8 µs（13.9%），几乎全在 1 MB AR 数组**——
+  比 pack 大 2.4 倍。已被 T1 的 WSR 组合顺手拿掉（见 §5）。
+- LWP 对本内核无分辨力（单一 do-while 直线循环，LWP pass 只括 scf.for ⇒ 1 个 region），
+  改用 probe 隔离法（对象反汇编逐参数解码 + 独立进程复刻计时，总体闭合差 2.0%）。
+- **读出总量口径修正**：T3 的 22.4 是 probe 形态；T4 用 T6 dump 直读 = **24.8 µs**
+  （行数×0.77 @N=512，与 K/depth 无关；0.43 @N=256）。以后以 dump 直读为准。
+
+### 4. T4 多形状验证 + T5 双单元（模型与硬件边界）
+
+- **模型结构项跨 6 形状成立**（24/24 ON 臂吻合），两补丁：①净收益要减**残差
+  H ≈ 0.27 µs/AR行 @G=4**（六形状一致；机制未分解）；②**depth=1 时"尾批"要重定义**——
+  最后一个环内发布若恰落在最终迭代（G 整除 upper），其 G 行同样全暴露
+  （实测 73 vs 天真预测 42.8，修正后 63.8 ✓）。**G=4-8 是全形状共同最优**，净收益
+  12.8-26.5%。
+- **双 HVX 单元真并行**（T5）：两线程 100%+100% 满负荷并发吞吐 1.969/2.0，
+  两窗口各自满频 2112 pcyc/µs（非分时）；`qurt_hvx_lock+unlock` 一对 372 pcyc；
+  内核内每批读出比隔离慢 ~9%（**大头不是 HVX 单元**，疑访存干扰 [假设]）。
+  `HmxVectorExecutor.cpp` 的 "OPEN HAZARD"（单单元即挂死）就此关闭。
+  **墙是访存（unpack 单独已 ~100 GB/s），不是 HVX 单元**。
+
+### 5. T1 延迟 drain（默认关原型）+ T2 交接削减（机制消光）
+
+- **T1**：`hmxReadoutDeferredDrain`（默认关）内核出口不发 drain；下一次调用的
+  configure drain（已有）成为入口屏障；wrapper 循环后 weak drain 兜底末次调用。
+  **AR 生命期暗坑**（延迟后消费者读已释放内存）由 **workspace-resident 覆盖 AR**
+  解掉——对象级证据：WSR 开时出口 `free_1d_dsp`×4 全部消失变 resident。**两机制
+  部分冗余**（各删 alloc/free 的一半）：G4 47 → +延迟 44 → +WSR 40 → 三开 39。
+  iters=1 单调用语义 PASS。风险表（barrier 是移动非删除、grid>1 契约外、ring 压力）
+  见 `docs/hmx/deferred-drain-design-2026-10-04.md`。
+- **T2**：consumer **持锁跨有界自旋**（只在真正 futex park 前释放，第三方最多等
+  ~10.5 µs 窗口）+ **kPollCount 1→2000**（实测标定：11.12 pcyc/poll 迭代，反汇编
+  对形；2000×5.27ns≈10.5 µs 盖住 G=8 批间隙+drain 等待；偏离 llama.cpp v79=1 的
+  理由=T5 双单元真并行+第二核空闲，其 v79=1 是省电端选择）。机制前后（dump 直读，
+  G=4）：交接延迟 **0.50→0.04 µs**、nPark **7950→1002**（残余=调用间空隙）、
+  nHvxLock **7994→1001**、末次 drain 等待 **3.74→2.54 µs**（残余=尾批真实读出）。
+  端到端每臂 −2~3 µs（**低于 15% 判据，如实声明**：主判据是机制数字；端到端是辅证）。
+
+### 6. 待用户拍板
+
+1. **组合默认开否**：G=4+WSR+延迟drain（36-37 µs，vs OFF −41%）——三个开关的组合
+   最优已实测过门，但 grid=1 契约边界（WSR grid>1 已知失败、延迟drain grid>1 契约外）。
+2. T2 自旋的**功耗/热未测**；≥3 并发 HVX 使用者未测（现持锁窗口 ≤10.5 µs 有界）。
+3. 看板验收：T1-T6 与 S2 待移 Done（WIP 已满，等这批验收放行）。
+4. 验收后：重跑 `python3 tools/hexmlir/split_patch.py`，再由用户 commit
+   （工作树含 S1/S2 未提交改动 + 本轮全部改动，agent 不代 commit）。
+
+### 7. 指纹与方法
+
+- 最终树指纹：`libtriton.so` `10a4186768b6af45195353f4d0f931f5`、
+  `libhmxapi.a` `97af133e…`、`libhexagon_mlir_async_runtime.a`
+  `a903487c5f6b19a05f2f3b02bbefcbd7`（T2 后；T2 前为 `d4cf4ebc…`，T1/T4/T5 期间）。
+- 每臂一进程 + 超时 + 指纹前后核对的模式沿用勘误十二 §6；所有百分比 iters=1000。
+- 流程披露（T2）：一次 iters=1 复测直接调 python 未包设备锁（当时无并发），
+  已记录于 `exp/hmx/t2_handoff/REPORT.md` §6.7。

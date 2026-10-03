@@ -46,7 +46,7 @@ class Hmx_Op<string mnemonic, list<Trait> traits = []> :
 
 def Hmx_MatmulOp
   : Hmx_Op<"matmul",
-      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>]> {
+      [DestinationStyleOpInterface, MemoryEffects<[MemRead, MemWrite]>, NativeOpTrait<"HmxEngineIns">]> {
   let hasVerifier = 1;
 
   let summary = "Matrix multiplication scheduled for the HMX engine";
@@ -109,7 +109,7 @@ def Hmx_MatmulOp
   }];
 }
 
-def Hmx_AllocCroutonOp : Hmx_Op<"alloc_crouton", [MemoryEffects<[MemAlloc]>]> {
+def Hmx_AllocCroutonOp : Hmx_Op<"alloc_crouton", [MemoryEffects<[MemAlloc]>, NativeOpTrait<"HmxEngineIns">]> {
   let hasVerifier = 1;
 
   let summary = "Allocate the VTCM crouton array an HMX matmul reads and writes";
@@ -420,7 +420,7 @@ def Hmx_UnpackAccF32Op
 }
 
 def Hmx_BiasInitOp
-  : Hmx_Op<"bias_init", [MemoryEffects<[MemWrite, MemWrite<Hmx_EngineResource>]>]> {
+  : Hmx_Op<"bias_init", [MemoryEffects<[MemWrite, MemWrite<Hmx_EngineResource>]>, NativeOpTrait<"HmxEngineIns">]> {
   let hasVerifier = 1;
 
   let summary = "Write the identity conversion state the read-out loads";
@@ -448,7 +448,7 @@ def Hmx_BiasInitOp
 }
 
 def Hmx_AccClearOp
-  : Hmx_Op<"acc_clear", [MemoryEffects<[MemWrite<Hmx_EngineResource>]>]> {
+  : Hmx_Op<"acc_clear", [MemoryEffects<[MemWrite<Hmx_EngineResource>]>, NativeOpTrait<"HmxEngineIns">]> {
   let summary = "Clear the HMX accumulator";
 
   let description = [{
@@ -469,7 +469,7 @@ def Hmx_AccClearOp
 def Hmx_MmaOp
   : Hmx_Op<"mma",
       [MemoryEffects<[MemRead, MemRead<Hmx_EngineResource>,
-                      MemWrite<Hmx_EngineResource>]>]> {
+                      MemWrite<Hmx_EngineResource>]>, NativeOpTrait<"HmxEngineIns">]> {
   let hasVerifier = 1;
 
   let summary = "Multiply-accumulate one position of two crouton arrays";
@@ -520,7 +520,7 @@ def Hmx_MmaOp
 def Hmx_AccReadOp
   : Hmx_Op<"acc_read",
       [MemoryEffects<[MemRead, MemWrite, MemRead<Hmx_EngineResource>,
-                      MemWrite<Hmx_EngineResource>]>]> {
+                      MemWrite<Hmx_EngineResource>]>, NativeOpTrait<"HmxEngineIns">]> {
   let hasVerifier = 1;
 
   let summary = "Load the bias registers and convert the accumulator out";

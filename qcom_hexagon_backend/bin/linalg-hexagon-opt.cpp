@@ -98,8 +98,10 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerMatmulToHexKLPass();
   mlir::hmx::registerMatmulToHmxPass();
   mlir::hmx::registerHmxPartitionPass();
+  mlir::hmx::registerThreadRolePartitionPass();
   mlir::hmx::registerWeightResidentPass();
   mlir::hmx::registerHmxWorkspaceResidentPass();
+  mlir::hmx::registerHmxVectorReadoutPass();
   mlir::hmx::registerHmxVtcmAccountingPass();
   mlir::hmx::registerHmxRecordV3Pass();
   mlir::hexagon::registerDecomposeHexKLMatmulPass();

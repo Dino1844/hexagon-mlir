@@ -166,6 +166,10 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "pack bridge and reads them from a resident VTCM buffer. On by "
           "default: the generated launcher always pre-packs, and only a "
           "caller that honours hmx.weight_prepack can run this kernel.">,
+  Option<"enableThreadRolePartition", "enable-thread-role-partition", "bool",
+           /*default=*/"false",
+           "Classify each region's thread role and record the decision "
+           "(thread-role-partition). Off by default; adds no runtime behaviour.">,
     Option<"enableHmxPipelineDepth", "enable-hmx-pipeline-depth", "int64_t",
           /*default=*/"0",
           "HMX tile-level staging ring depth (hmx-partition): 0 = auto, "
@@ -177,6 +181,30 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "0 = the hardware maximum (32), 1 = one mma per crouton, 32 = the "
           "maximum. 0 and 32 are the same request. Anything outside {0} u "
           "[1, 32] is rejected by hmx-partition rather than clamped.">,
+    Option<"enableHmxVectorReadout", "enable-hmx-vector-readout", "bool",
+           /*default=*/"false",
+           "Hand a lowered HMX matmul's accumulator read-out to a second "
+           "thread, in batches of hmx-readout-batch rows (hmx-vector-readout). "
+           "Off by default: the rewrite itself is exercised, but the "
+           "configure() handoff that gives the executor its function pointer "
+           "cannot be emitted before convert-func-to-llvm, so a rewritten "
+           "kernel is not yet runnable.">,
+    Option<"hmxReadoutBatch", "hmx-readout-batch", "int64_t",
+          /*default=*/"4",
+          "How many AR rows one hmx vector-executor handoff names (G). Must be "
+          ">= 1; 0 or negative is rejected by hmx-vector-readout rather than "
+          "clamped. Measured on this device: G=1 loses to the handoff cost, "
+          "G=4 is 1.39x, G=8 is 1.51x.">,
+    Option<"hmxReadoutDeferredDrain", "hmx-readout-deferred-drain", "bool",
+          /*default=*/"false",
+          "Drop the kernel-exit drain of hmx-vector-readout and let the next "
+          "call's configure() barrier (plus one wrapper-side drain after the "
+          "last call, outside the timed region) wait for the tail batch, so "
+          "the tail read-out overlaps the function epilogue instead of "
+          "serialising behind it. Declined with a remark for a function with "
+          "more than one readout loop. Off by default: a batch may still be "
+          "in flight after the kernel returns, which is only sound for "
+          "sequential single-instance (grid=1) launches.">,
     Option<"enableWorkspaceResident", "enable-workspace-resident", "bool",
           /*default=*/"false",
           "Make every per-launch VTCM workspace of an HMX kernel a "

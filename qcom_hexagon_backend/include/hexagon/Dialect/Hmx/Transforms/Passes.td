@@ -79,6 +79,67 @@ def MatmulToHmx : InterfacePass<"matmul-to-hmx", "mlir::FunctionOpInterface"> {
   let constructor = "mlir::hmx::createMatmulToHmxPass()";
 }
 
+def ThreadRolePartition : InterfacePass<"thread-role-partition",
+    "mlir::FunctionOpInterface"> {
+  let summary = "Decide which thread each region belongs on, and record it";
+
+  let description = [{
+    Make "which thread runs this code" a compile-time fact instead of a runtime
+    accident. Two decisions, kept orthogonal on purpose -- they are separate
+    attributes, not two values of one enum, because a dual-role kernel
+    legitimately holds both:
+
+      region level, one per region: does it contain an op that must run where
+        the HMX resource is held? Read off the positive `HmxEngineIns` marker.
+      kernel level, one per kernel: single-role (and which engine), or mixed,
+        and if mixed whether there is anything to hand across.
+
+    The kernel verdict is one of:
+
+      `topology-single-role-hmx`    engine only; an HMX thread is required
+      `topology-single-role-hvx`    no engine work at all
+      `role-split-ok`               a pack shares a loop with an engine op, so
+                                    there is a per-tile producer stream to
+                                    overlap: while tile i is in the matrix
+                                    engine, another thread builds tile i+1
+      `role-mixed-irreducible`      layout work is co-located with engine work
+                                    but is only `unpack_acc`/`unpack_acc_f32`.
+                                    It consumes what the engine op just wrote,
+                                    so there is no producer stream, only a
+                                    dependency
+      `role-split-nopack`           layout work exists but in disjoint regions:
+                                    the pack loop ran to completion before the
+                                    engine work began, so there is no per-tile
+                                    granularity to stream at all
+
+    Note what is NOT a criterion: "this kernel touches both engines". Nearly
+    every one does, so that predicate splits nothing. Producer layout work
+    co-located with engine work is the criterion, and `HmxLayoutHvx` cannot
+    express it -- that one trait covers `pack_act`, `pack_weight`,
+    `unpack_acc` and `unpack_acc_f32` alike, and only the first two can be
+    hoisted onto the other thread ahead of time.
+
+    `role-split-ok` is the one that decides real workloads, and it is decided
+    by a single existing knob: `enable-hmx-pipeline-depth`. At depth 1 the pack
+    loop completes before the tile loop and the verdict is `role-split-nopack`;
+    at depth 2 hmx-partition moves the pack inside the tile loop and the
+    verdict becomes `role-split-ok`. That is the same switch the measured A/B
+    turns on, where staging overlap is worth 14% (1024x512x64) to 35%
+    (256x64x2048) -- docs/results/t1c-residual-and-thmx-real-ceiling-2026-10-02.md.
+
+    It runs AFTER hmx-partition, and that order is load-bearing. Before
+    hmx-partition every HMX kernel looks the same: one `hmx.matmul` between two
+    independent pack loops, so the predicate has one answer for all of them and
+    the verdict carries no information. hmx-partition is what creates the tile
+    loop and, at depth 2, what puts the pack inside it. Running after it is what
+    lets the pass observe that difference instead of re-deriving it.
+
+    The manifest topology field is module-level, so it describes the kernel the
+    backend emits -- one per module in this pipeline.
+  }];
+}
+
+
 def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
   let summary = "Partition hmx.matmul into the tile loop";
 
@@ -154,6 +215,101 @@ def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
   ];
 
   let constructor = "mlir::hmx::createHmxPartitionPass()";
+}
+
+def HmxVectorReadout : InterfacePass<"hmx-vector-readout",
+    "mlir::FunctionOpInterface"> {
+  let summary = "Hand a lowered HMX read-out to a second thread in batches";
+
+  let description = [{
+    A lowered HMX matmul issues its accumulator read-out (`hmx.unpack_acc`) on
+    the same thread as the matrix engine, so the two Hexagon engines take turns.
+    At pipeline-depth 2 the read-out of a 1024x512x64 matmul is 39.79% of the
+    kernel -- ~24.3 us of 61 us -- and it overlaps nothing. This pass moves it
+    onto a second thread.
+
+    What makes the move affordable is a layout fact, not a scheduling trick: the
+    AR crouton array is allocated once *before* the m-tile loop and released
+    *after* it (verified post-partition, `pp-1024x512x64.mlir` lines 11 and 95),
+    so every AR row is live for the whole loop. Deferring the read-out of a
+    group of G rows therefore costs no extra VTCM and needs no double buffering.
+    And because the destination is a loop-invariant `memref.reinterpret_cast`
+    with a zero offset -- addressing is done entirely by the `row` operand, whose
+    lowering selects AR row `m` and destination rows `m*32` through `m*32+31` -- one
+    descriptor can name a whole group of rows.
+
+    The cost that makes per-tile deferral a loss is the handoff: measured
+    0.9 us for a descriptor with a `qurt_signal` wake against 760 ns of read-out
+    per m-tile. Batching divides the handoff by G:
+
+        G=1 -> 28.8 us of handoff, loses.  G=2 -> 14.4 us, 1.19x.
+        G=4 ->  7.2 us, 1.39x.            G=8 ->  3.6 us, 1.51x.
+
+    which is why `batch` defaults to 4 rather than 1.
+
+    The shape recognised is exactly one `scf.for` over m whose body holds exactly
+    one `hmx.unpack_acc` reading an AR value that an `hmx.acc_read` in the same
+    body writes, whose destination is defined outside the loop, and whose AR
+    allocation dominates the loop and is released only after it. EVERY further
+    requirement is a decline and never a repair: an unread row leaves the
+    caller's output buffer holding stale bytes, which is a plausible-looking
+    wrong answer and strictly worse than leaving the read-out where it was. A
+    shape this pass does not fully understand comes out byte-identical.
+
+    Row coverage is the argument the whole rewrite rests on, so it is made
+    structurally rather than assumed. The loop must run from 0 to `ub` step 1 and
+    its `row` operand must fold to exactly the induction variable, so the kernel
+    publishes `G*floor(ub/G)` rows in groups of G and the tail batch publishes
+    the rows from `G*floor(ub/G)` up to `Mt`. Those two ranges are adjacent and
+    together they are every row from 0 through `Mt-1`, so each AR row is read once and
+    once only. That is only a rewrite when the original IR covered the same rows:
+    with a peeled epilogue read-out the kernel must stop at exactly `Mt-1` (one
+    peeled row), and without one it must reach `Mt`. A kernel that leaves a gap is
+    declined, not repaired -- reading a row no `acc_read` wrote would publish
+    whatever the previous launch left in the array.
+
+    Note that the tail is gated on the computed tail range, not on `Mt % G`: at
+    depth 2 the kernel peels a row, so the loop stops at `Mt-1` and the tail is
+    never empty even when `Mt` is a multiple of G (1024 rows at G=4: the loop
+    covers rows 0..27 and the tail names 28..31, the peeled row included). A test
+    on `Mt % G` alone would drop that row, which is the stale-bytes bug this pass
+    exists to avoid.
+
+    `drain` runs after the last publish and before the AR array is released, so
+    the vector thread never reads freed VTCM and the caller never observes the
+    destination before it is written.
+
+    KNOWN INCOMPLETE: the three runtime entry points are called, but the
+    `configure` call that hands the executor its function pointer is NOT emitted
+    -- a function's address is not expressible before `convert-func-to-llvm`
+    (`llvm.mlir.addressof` rejects a `func.func` symbol). The pass is therefore
+    off by default and the kernel is not runnable until that call is emitted from
+    a pass that runs after the func-to-llvm conversion. See the comments on
+    `kReadoutFnPrefix` in the implementation.
+  }];
+
+  let options = [
+    Option<"batch", "hmx-readout-batch", "int64_t", /*default=*/"4",
+           "How many AR rows one handoff names (G). Must be >= 1; 0 or a "
+           "negative value is an error rather than a clamp, because a clamped "
+           "request would look honoured when it is not (measured: G=1 loses, "
+           "G=4 is the default, G=8 is 1.51x).">,
+    Option<"deferDrain", "defer-drain", "bool", /*default=*/"false",
+           "Drop the kernel-exit drain and let the NEXT call's configure() "
+           "barrier wait for the tail batch instead, so the tail read-out "
+           "overlaps the function epilogue (AR release, return) rather than "
+           "serialising behind it. The LAST call of a launch is drained by "
+           "the wrapper, outside the timed region. Only takes effect when "
+           "the function has exactly ONE readout loop: a second loop would "
+           "publish into a ring whose only barrier this pass just removed, "
+           "and a full ring drops batches, so a multi-loop function keeps "
+           "the per-loop drain and is reported with a remark. Off by "
+           "default: it changes the cross-call contract (a batch may still "
+           "be in flight after the kernel returns), which is only sound for "
+           "sequential single-instance launches.">
+  ];
+
+  let constructor = "mlir::hmx::createHmxVectorReadoutPass()";
 }
 
 def WeightResident : InterfacePass<"weight-resident", "mlir::FunctionOpInterface"> {

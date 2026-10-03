@@ -33,6 +33,10 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>> createWeightResidentPass(
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
 createHmxWorkspaceResidentPass();
 
+std::unique_ptr<InterfacePass<FunctionOpInterface>>
+createHmxVectorReadoutPass(const HmxVectorReadoutOptions &options =
+                              HmxVectorReadoutOptions());
+
 std::unique_ptr<Pass> createHmxVtcmAccountingPass();
 
 std::unique_ptr<Pass> createHmxRecordV3Pass();

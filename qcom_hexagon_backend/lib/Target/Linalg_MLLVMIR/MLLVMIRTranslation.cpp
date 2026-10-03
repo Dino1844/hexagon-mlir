@@ -150,6 +150,11 @@ void setLinalgToLLVMOptions(
   options.enableWeightResident =
       weightResident == arch_kwargs.end() ||
       !weightResident->second.compare(TRUE);
+  // Tolerant read: absent = the declared default (off), so a probe that builds a
+  // partial options map keeps today's single-thread behaviour.
+  auto threadRole = arch_kwargs.find("enableThreadRolePartition");
+  options.enableThreadRolePartition =
+      threadRole != arch_kwargs.end() && !threadRole->second.compare(TRUE);
   // Tolerant read for the same reason: absent = 0 (auto).
   auto hmxPipelineDepth = arch_kwargs.find("enableHmxPipelineDepth");
   options.enableHmxPipelineDepth =
@@ -171,6 +176,26 @@ void setLinalgToLLVMOptions(
   options.enableWorkspaceResident =
       workspaceResident != arch_kwargs.end() &&
       !workspaceResident->second.compare(TRUE);
+  // Move the HMX accumulator read-out onto a second thread. Tolerant read for
+  // the same reason: absent = off, so a probe that builds a partial options map
+  // keeps the single-thread behaviour.
+  auto hmxVectorReadout = arch_kwargs.find("enableHmxVectorReadout");
+  options.enableHmxVectorReadout =
+      hmxVectorReadout != arch_kwargs.end() &&
+      !hmxVectorReadout->second.compare(TRUE);
+  // Rows per handoff. Tolerant read: absent = 4, the batch size this device
+  // measured best (1.39x). The range is not checked here; hmx-vector-readout
+  // owns the >= 1 domain so that one place decides what an out-of-domain value
+  // means, whoever supplied it.
+  auto readoutBatch = arch_kwargs.find("hmxReadoutBatch");
+  options.hmxReadoutBatch =
+      readoutBatch == arch_kwargs.end() ? 4 : std::stoll(readoutBatch->second);
+  // Drop the kernel-exit drain of the read-out split. Tolerant read for the
+  // same reason: absent = off, the drain stays where the rewrite put it.
+  auto readoutDeferredDrain = arch_kwargs.find("hmxReadoutDeferredDrain");
+  options.hmxReadoutDeferredDrain =
+      readoutDeferredDrain != arch_kwargs.end() &&
+      !readoutDeferredDrain->second.compare(TRUE);
   // Row reductions as vector fold + hvx.vror butterfly. Tolerant read for the
   // same reason: absent = off.
   auto vectorRowReduce = arch_kwargs.find("enableVectorRowReduce");

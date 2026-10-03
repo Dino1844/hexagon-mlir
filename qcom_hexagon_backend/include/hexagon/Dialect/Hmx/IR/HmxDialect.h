@@ -196,6 +196,44 @@ struct HmxDmaOnly : public TraitBase<ConcreteType, HmxDmaOnly> {};
   template <typename ConcreteType>
 struct HmxLayoutHvx : public TraitBase<ConcreteType, HmxLayoutHvx> {};
 
+  //===----------------------------------------------------------------------===//
+  // Marker trait: must run on the HMX thread
+  //===----------------------------------------------------------------------===//
+
+  /// Marks an `hmx` op that issues an engine instruction and therefore may only
+  /// run on a thread that holds the HMX resource. Today `matmul`,
+  /// `alloc_crouton`, `bias_init`, `acc_clear`, `mma` and `acc_read`.
+  ///
+  /// This exists because `HmxLayoutHvx` cannot serve both predicates at once
+  /// (roadmap section 5.4). Its polarity is "unmarked means engine", which is
+  /// what the ensure/unlock decision wants: forgetting a marker there costs one
+  /// harmless lock round-trip. A thread-role predicate reading the same trait
+  /// would send an unmarked LAYOUT op to the HMX thread, which holds no VTCM and
+  /// hangs with no diagnostic -- the deadlock
+  /// HexagonTargetTransformInfo.cpp:453-458 describes. So this predicate is
+  /// positive instead, and the failure direction is the survivable one:
+  ///
+  ///   engine op left unmarked   -> runs on the HVX thread -> it acquires the
+  ///                                HMX lock, so there is contention and a
+  ///                                possible loss of parallelism, but no deadlock
+  ///   layout op wrongly marked  -> also the survivable direction above, since
+  ///                                marking is per-op and explicit
+  ///
+  /// `matmul` and `alloc_crouton` are included deliberately: they exist at
+  /// hmx-partition's decision point and are gone by HmxToLLVM's, because
+  /// HmxToLLVMPass.cpp:1999 adds the dialect as illegal. A thread-role pass that
+  /// runs after hmx-partition therefore reads `mma` (and `bias_init`,
+  /// `acc_clear`, `acc_read`) and never sees those two; that is fine, because
+  /// `mma` is the op that actually issues the matrix instruction.
+  ///
+  /// Read by ThreadRolePartition (thread-role-partition) as its engine-thread
+  /// predicate. The predicate there wants the opposite default from
+  /// HmxToLLVMPass's engine-leaf scan -- unmarked means vector, not engine --
+  /// which is why this positive trait exists next to `HmxDmaOnly` and
+  /// `HmxLayoutHvx` instead of being derived from them.
+  template <typename ConcreteType>
+struct HmxEngineIns : public TraitBase<ConcreteType, HmxEngineIns> {};
+
 } // namespace OpTrait
 } // namespace mlir
 

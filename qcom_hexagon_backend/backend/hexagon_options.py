@@ -156,6 +156,13 @@ class HexagonOptions:
     # no hmx.stage/hmx.await, the activation bridge is kept).
     enableHmxPipelineDepth: int = 0
 
+    # Compile-time thread-role split (thread-role-partition). Off by default: with
+    # the option off the pass is not added to the pipeline and nothing about the
+    # kernel changes. On, the pass decides each region's role and records the
+    # decision in the manifest; it does not yet outline or move code, so the
+    # recorded topology is what a later stage would act on.
+    enableThreadRolePartition: bool = False
+
     # K croutons walked by one `hmx.mma` (hmx-partition's croutons-per-mma).
     # 0 = the hardware maximum, 32, which is also what 32 means -- so this field
     # left at its default emits exactly the code it emitted before the option
@@ -178,6 +185,41 @@ class HexagonOptions:
     # single-instance execution -- a grid>1 launch would run several kernel
     # instances over the same buffers.
     enableWorkspaceResident: bool = False
+
+    # Move a lowered HMX matmul's accumulator read-out (`hmx.unpack_acc`) onto a
+    # second thread, in batches (hmx-vector-readout). At pipeline-depth 2 that
+    # read-out is 39.79% of a 1024x512x64 kernel (~24.3 us of 61 us) and it
+    # overlaps nothing, because it shares a thread with the matrix engine.
+    # Batching exists because a per-row handoff would LOSE: measured 0.9 us per
+    # descriptor against 760 ns of read-out per m-tile. The accumulator array is
+    # allocated before the m-tile loop and released after it, so a group of rows
+    # can be deferred at no VTCM cost, which divides the handoff by the group
+    # size (G=4 -> 1.39x, G=8 -> 1.51x).
+    # Off by default: the rewrite itself is exercised, but the `configure()`
+    # handoff that gives the executor its function pointer cannot be emitted
+    # before convert-func-to-llvm, so a rewritten kernel is not yet runnable.
+    enableHmxVectorReadout: bool = False
+
+    # AR rows one handoff names (G, `hmx-vector-readout`'s batch). 4 is the
+    # measured best of {1, 2, 4, 8}: G=1 loses to the handoff cost. Must be >= 1;
+    # 0 or negative is rejected by the pass rather than clamped, because a clamped
+    # request would look honoured when it is not.
+    hmxReadoutBatch: int = 4
+
+    # Drop the read-out split's kernel-exit drain and let the next call's
+    # configure() barrier wait for the tail batch instead, so the tail read-out
+    # overlaps the function epilogue (AR release + return) instead of
+    # serialising behind it. The wrapper drains the last call of a launch
+    # outside the timed region (weak symbol, skipped by non-readout kernels).
+    # Declined with a remark for a function holding more than one readout
+    # loop (the per-loop drain is the only ring barrier such a function has).
+    # Off by default: a batch may still be in flight after the kernel
+    # returns, which is only sound for sequential single-instance (grid=1)
+    # launches -- the AR is released while the consumer may still read it,
+    # safe only because nothing else allocates before the next call's
+    # configure-drain and the VTCM free path keeps bookkeeping out of the
+    # released block.
+    hmxReadoutDeferredDrain: bool = False
 
     # `enableSeedLayoutConversions` was removed from this surface 2026-09-30.
     # It is an UPSTREAM pass option and it still works when driven directly

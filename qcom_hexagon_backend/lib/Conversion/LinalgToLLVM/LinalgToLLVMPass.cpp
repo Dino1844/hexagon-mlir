@@ -529,11 +529,50 @@ public:
       // the knob exists to make "batch fewer croutons per instruction"
       // measurable inside one build instead of by editing a constant and
       // rebuilding (docs/hmx/ncroutons-k-fusion-2026-10-01.md §3.5.3).
+
       mlir::hmx::HmxPartitionOptions hmxPartitionOpts;
       hmxPartitionOpts.pipelineDepth = enableHmxPipelineDepth;
       hmxPartitionOpts.croutonsPerMma = hmxCroutonsPerMma;
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createHmxPartitionPass(hmxPartitionOpts));
+        // Thread-role classification runs AFTER hmx-partition, and that order is
+        // load-bearing in the other direction from the obvious guess. Before
+        // hmx-partition every HMX kernel looks the same: one `hmx.matmul` sitting
+        // between two independent pack loops, so "is there a pack to stream" has
+        // the same answer for all of them and the verdict carries no information.
+        // hmx-partition is what creates the tile loop and, at pipeline-depth 2,
+        // moves the pack inside it -- which is exactly the difference the measured
+        // depth-1-vs-depth-2 A/B turns on (14-35%). Running here is what lets the
+        // pass see that difference instead of predicting it.
+        if (enableThreadRolePartition)
+          pm.addNestedPass<func::FuncOp>(
+              mlir::hmx::createThreadRolePartition());
+
+        // Hand the accumulator read-out to a second thread. It runs HERE, after
+        // hmx-partition, because hmx-partition is what creates the m-tile loop
+        // and hoists the read-out into it (see HmxPartitionPass.cpp:990-1083) --
+        // before that, the read-out is a separate loop after the matmul and the
+        // batching has nothing to attach to. It must run before the residency and
+        // convert-to-hexagonmem rewrites below, which are about VTCM placement
+        // and have nothing to say about which thread runs the vector work.
+        //
+        // Off by default, and that is a deliberate shipping decision rather than
+        // an unfinished feature: turning it on is the device A/B step, and the
+        // option stays off until that measurement is taken.
+        //
+        // The pass itself cannot emit the `configure()` call that hands the
+        // executor its function pointer, because a function's address is not
+        // expressible before convert-func-to-llvm (`llvm.mlir.addressof` rejects
+        // a `func.func` symbol). HmxToLLVMPass emits it instead, after the
+        // conversion -- see wireVectorReadout there, and the handoff record the
+        // readout pass publishes for it in HmxReadoutHandoff.h.
+        if (enableHmxVectorReadout) {
+          mlir::hmx::HmxVectorReadoutOptions readoutOpts;
+          readoutOpts.batch = hmxReadoutBatch;
+          readoutOpts.deferDrain = hmxReadoutDeferredDrain;
+          pm.addNestedPass<func::FuncOp>(
+              mlir::hmx::createHmxVectorReadoutPass(readoutOpts));
+        }
 
       // Per-launch VTCM workspace becomes a process-resident buffer. Opt-in:
       // residency shares one buffer across every launch in the process, which

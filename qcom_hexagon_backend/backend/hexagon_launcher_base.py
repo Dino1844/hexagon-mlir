@@ -126,6 +126,20 @@ benchmark_time_and_pcycles({iterations}, [&]() {{
 }}, &avg_time_us, &avg_pcycles);
 TestReport tr("{func_name}", avg_time_us, "us", Result::Pass, "{save_path}");
 tr.save();
+// Deferred-drain barrier for the HMX read-out split (2026-10-04). When the
+// kernel was compiled with hmx-readout-deferred-drain, the LAST call of the
+// loop above returned with its tail batch still in flight; this is the drain
+// that would otherwise have sat inside every iteration. It must run before
+// anything reads this launch's outputs, and it is OUTSIDE the timed region
+// by construction. Weak for the same reason as the dump hook below: kernels
+// that do not reference the executor ABI strongly (every non-readout kernel)
+// resolve it to null and skip the call; readout kernels already pull the
+// HmxVectorExecutor object into their .so through configure/publish, so the
+// symbol resolves at static link time. For a readout kernel compiled
+// WITHOUT deferral this is a no-op: its own exit drain already emptied the
+// ring, and drainLocked on an empty ring returns without parking.
+if (hexagon_runtime_hmx_exec_drain != nullptr)
+  hexagon_runtime_hmx_exec_drain();
 // The processor-cycle average, from the SAME pass as the microsecond one above.
 // APPENDED to the same report file rather than printed: the device's stdout is
 // not captured by the executor, so a printf here is silently lost -- the
@@ -145,6 +159,16 @@ tr.save();
   FILE *pcf = fopen("{save_path}", "a");
   if (pcf) {{ fprintf(pcf, "PerfPcycles:%llu\\n", (unsigned long long)avg_pcycles); fclose(pcf); }}
 }}
+// Live-counter dump for the HMX read-out split diagnostics: appends the
+// executor's accumulated counters and timing rings to this same report file,
+// from the same launch context that demonstrably has working file I/O --
+// unlike the executor's own accounting path, which never came back from a
+// FastRPC-launched kernel (roadmap/ERRATA.md errata 12 section 5.1). Placed
+// here, AFTER benchmark_time_and_pcycles returned, so the file I/O cannot
+// perturb Perf. Null-guarded: the declaration in the headers block is weak,
+// and kernels that do not link the async runtime leave it null.
+if (hexagon_runtime_hmx_exec_dump != nullptr)
+  hexagon_runtime_hmx_exec_dump("{save_path}");
 """
 
         # Codegen string for the Headers in the generated CPP file.
@@ -164,6 +188,23 @@ tr.save();
 #include "prof_utils.h"
 extern "C" int hexagon_runtime_resident_scope_enter_v2_dsp(uint64_t low64,
                                                             uint64_t high64)
+    __attribute__((weak));
+// Deferred-drain barrier for the HMX read-out split (2026-10-04). Weak for
+// the same reason as the declaration above and the dump hook below: kernels
+// that do not reference the executor ABI strongly (every non-readout kernel)
+// resolve it to null and the guarded call in the benchmarking template is
+// skipped. Readout kernels reference hexagon_runtime_hmx_exec_{configure,
+// publish} strongly from their LLVM object, so the archive member defining
+// this symbol is already in their .so.
+extern "C" void hexagon_runtime_hmx_exec_drain(void)
+    __attribute__((weak));
+// Live-counter dump hook for the HMX read-out split (2026-10-04). Weak for
+// the same reason as the declaration above: kernels that do not reference the
+// executor ABI strongly (every non-readout kernel) resolve it to null and the
+// guarded call in the benchmarking template below is skipped. Read-out
+// kernels reference hexagon_runtime_hmx_exec_* strongly from their LLVM
+// object, so the archive member defining this symbol is already in their .so.
+extern "C" void hexagon_runtime_hmx_exec_dump(const char *path)
     __attribute__((weak));
 """
 
@@ -513,6 +554,20 @@ def create_timestamped_folder(
         base_dir
     ), f"The base directory {base_dir} ({reason}) isn't a valid directory"
     # --- Part 2: naming and creating the subfolder that will contain all the artifacts ---
+    # HEXAGON_FAST_LAUNCH=1 keeps the folder name stable (no timestamp) so the
+    # device directory -- and every file pushed into it -- keeps its name across
+    # launches, which is what lets the adb shim's md5 push-skip (gated by the
+    # same env var) recognise unchanged files instead of re-pushing 3+ MB every
+    # launch (~20 s measured, for kernels that run in ~50 us). Opt-in: only the
+    # sweep in exp/hmx/t3_overlap_ab sets it. Safe against collisions because
+    # device work is serialised by tools/run_tests.sh lock; a stale file from a
+    # previous launch is either overwritten (same name) or never loaded
+    # (run_main_on_hexagon loads libs by name from this run's push set).
+    if os.getenv("HEXAGON_FAST_LAUNCH") == "1":
+        folder_name = model_name
+        full_path = os.path.join(base_dir, folder_name)
+        os.makedirs(full_path, exist_ok=True)
+        return full_path, folder_name
     # Get the current date and time
     now = datetime.now()
     # Format the folder name

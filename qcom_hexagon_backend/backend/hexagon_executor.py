@@ -548,13 +548,24 @@ class HexagonExecutor:
         #     should_run - Boolean to check if we should run the command
         commands = [
             # Remove the output tensors and kernel.so from any previous run
+            #
+            # HEXAGON_FAST_LAUNCH=1 keeps the shared libs on device so the adb
+            # shim's md5 push-skip (same env var) can recognise them on the
+            # next launch. Outputs/perf/lwp are still removed: a stale result
+            # file must never read as this run's result. A stale extra .so is
+            # harmless -- run_main_on_hexagon loads libs by name from this
+            # run's push set -- so only the libs are conditionally kept.
             (
                 "adb {} -s {} shell 'rm -rf {}'".format(
                     self.config.env_vars["ANDROID_HOST"],
                     self.config.env_vars["ANDROID_SERIAL"],
                     " ".join(
                         output_device_paths
-                        + paths_to_shared_libs_on_device
+                        + (
+                            []
+                            if os.getenv("HEXAGON_FAST_LAUNCH") == "1"
+                            else paths_to_shared_libs_on_device
+                        )
                         + [perf_device_path]
                         + [lwp_device_path]
                     ),
@@ -692,7 +703,12 @@ class HexagonExecutor:
                     self.device_path,
                     self.lib_path,
                 ),
-                self.cleanup_device_post_exec,
+                # HEXAGON_FAST_LAUNCH=1 keeps the device directory alive so the
+                # md5 push-skip has something to compare against on the next
+                # launch; the stable-name half of the same opt-in is in
+                # create_timestamped_folder().
+                self.cleanup_device_post_exec
+                and os.getenv("HEXAGON_FAST_LAUNCH") != "1",
             ),
         ]
 

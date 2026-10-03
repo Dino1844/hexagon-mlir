@@ -24,6 +24,7 @@
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxVtcmAccounting.h"
 
@@ -599,6 +600,492 @@ static void verifyHmxLeafCallers(ModuleOp moduleOp,
   };
   moduleOp.walk([&](LLVM::LLVMFuncOp fn) { verify(fn); });
   moduleOp.walk([&](func::FuncOp fn) { verify(fn); });
+}
+
+//===----------------------------------------------------------------------===//
+// VECTOR-READOUT EXECUTOR HANDOFF
+//===----------------------------------------------------------------------===//
+//
+// HmxVectorReadoutPass moves a matmul's `hmx.unpack_acc` read-out off the matrix
+// engine's thread by handing groups of AR rows to a resident vector thread
+// through `hexagon_runtime_hmx_exec_publish`. It runs while kernels are still
+// `func.func`, which is too early for the one call that makes the split work: the
+// executor has no function to run until something passes it a pointer to the
+// outlined read-out.
+//
+// This is that something. It runs after `convert-func-to-llvm`, so
+// `llvm.mlir.addressof` accepts the outlined symbol, and it owns three jobs:
+//
+//   * build the entry point that adapts the runtime's `HmxReadoutFn`
+//     (`void(const HmxReadoutBatch*, uint32_t)`) onto the outlined read-out;
+//   * call `hexagon_runtime_hmx_exec_configure` with that entry point's address;
+//   * check every `publish` return, because a dropped batch is unwritten output.
+//
+// The design and its measurements are in bin/runtime/include/HmxVectorExecutor.h;
+// the compiler half of the ABI is in HmxReadoutHandoff.h, shared with the
+// producer pass so the symbols and the descriptor layout are spelled once.
+
+/// `configure`'s `numThreads`.
+// TRACEABILITY: kHmxExecNumThreads kHmxExecPublishedBatches
+//   mechanism: `kHmxExecNumThreads` is the `numThreads` argument of
+//     hexagon_runtime_hmx_exec_configure; `kHmxExecPublishedBatches` is the count
+//     each hexagon_runtime_hmx_exec_publish call was given, and the drop check
+//     compares the return against it. Neither steers the generated schedule: the
+//     first is a request the runtime may decline, the second is a property of what
+//     the producer pass emitted.
+//   measurement: kHmxExecNumThreads is fixed by the frozen runtime, not by us:
+//     kVectorThreads == 1 (HmxVectorExecutor.cpp:101) and any other value returns
+//     -2 (HmxVectorExecutor.cpp:462,491), so 1 is the only value that is actually
+//     honoured. kHmxExecPublishedBatches is 1 because the producer emits
+//     `publish(addr, 1)` -- one descriptor, one batch -- and the runtime calls the
+//     read-out once per batch. Its correctness does not rest on the value: the
+//     check is `<` against what was asked, so it fires on any short return, which
+//     is the only failure that matters.
+//   shape set: n/a. Neither is a shape or size threshold; both are fixed by an
+//     interface contract.
+//   workload representativeness: n/a, for the same reason.
+static constexpr int32_t kHmxExecNumThreads = 1;
+static constexpr int32_t kHmxExecPublishedBatches = 1;
+
+/// Append one memref's expanded `convert-func-to-llvm` argument list.
+///
+/// Under the default (non-bare-pointer) convention every memref parameter becomes
+/// `(allocated, aligned, offset, sizes..., strides...)`, each as its own LLVM
+/// value; see `llvm::detail::passFunctionLike` / `convertFuncToLLVM`. That is the
+/// shape the outlined read-out's signature has by the time this runs, so the
+/// entry point has to hand it exactly that.
+///
+/// `address` is the aligned pointer word from the descriptor, which is the base
+/// the leaf addressing arithmetic uses (`asAddress`, below). The producer
+/// publishes `memref.extract_aligned_pointer_as_index` of the two buffers, so the
+/// word is the ALIGNED pointer and the static offset is part of the type --
+/// re-deriving `allocated` from it keeps both words consistent instead of leaving
+/// one of them describing a buffer nobody allocated. The read-out reads only
+/// `aligned` and `offset`; `allocated`, sizes and strides are what the calling
+/// convention requires to be present, and passing the real values (rather than
+/// zeros) means a future reader of them is not reading poison.
+static int64_t memrefAddressSpace(MemRefType type, int64_t fallback);
+
+static void appendMemrefArgs(OpBuilder &rewriter, Location loc,
+                             MemRefType type, Value addressWord,
+                             SmallVectorImpl<Value> &out) {
+  auto i64Ty = rewriter.getI64Type();
+  // The callee's own signature is what decides this, and it carries the
+  // accumulator's VTCM space: `convert-func-to-llvm` turns
+  // `memref<..., 1>` into `!llvm.ptr<1>` here, and the two arguments differ
+  // (`ar` is space 1, `dst` is space 0). Taking the space from the memref type
+  // the producer recorded is what keeps the call type-correct in both positions;
+  // forcing space 0 would be a mismatch the verifier catches, and forcing space
+  // 1 for `dst` would be a claim the surrounding IR does not make.
+  auto ptrTy = LLVM::LLVMPointerType::get(rewriter.getContext(),
+                                         memrefAddressSpace(type, 0));
+  auto constant = [&](int64_t value) -> Value {
+    return LLVM::ConstantOp::create(rewriter, loc, i64Ty,
+                                    rewriter.getI64IntegerAttr(value));
+  };
+
+  // The descriptor word is an i32 ADDRESS, not a pointer: `asAddress` in this file
+  // and `memref.extract_aligned_pointer_as_index` in the producer both speak i32,
+  // because that is how every address crosses into the runtime on this target. So
+  // the word is turned back into a pointer here, in the callee's own address space.
+  Value address = LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, addressWord);
+
+  SmallVector<int64_t, 8> strides;
+  int64_t offset = 0;
+  int64_t rank = type.getRank();
+  bool stridesKnown =
+      succeeded(type.getStridesAndOffset(strides, offset)) && offset >= 0 &&
+      llvm::all_of(strides,
+                   [](int64_t stride) { return !ShapedType::isDynamic(stride); });
+
+  // The allocated pointer is the aligned pointer minus the type's static offset,
+  // which is what a `memref.reinterpret_cast` of a larger buffer would have
+  // produced. A buffer the producer never offset needs no arithmetic at all.
+  Value allocated = address;
+  if (stridesKnown && offset != 0) {
+    // Computed in the width the word arrived in, which is the runtime's own
+    // address ABI (i32 on this target). Widening to i64 to hold the byte count
+    // would need a trunc back, and a byte offset that does not fit the word is
+    // a buffer this ABI cannot address at all -- so it is left alone rather than
+    // wrapped, which would be a pointer to the wrong row.
+    Type addrTy = addressWord.getType();
+    int64_t elementBytes = type.getElementTypeBitWidth() / 8;
+    int64_t byteOffset = offset * elementBytes;
+    unsigned width = addrTy.getIntOrFloatBitWidth();
+    int64_t addrMax = width >= 64
+                          ? std::numeric_limits<int64_t>::max()
+                          : (int64_t{1} << (width - 1)) - 1;
+    if (ShapedType::isDynamic(byteOffset) || byteOffset > addrMax)
+      allocated = address;
+    else {
+      Value shifted = LLVM::SubOp::create(
+          rewriter, loc, addrTy, addressWord,
+          LLVM::ConstantOp::create(rewriter, loc, addrTy,
+                                   rewriter.getIntegerAttr(addrTy, byteOffset)));
+      allocated = LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, shifted);
+    }
+  }
+
+  out.push_back(allocated);
+  out.push_back(address);
+  out.push_back(constant(offset));
+  for (int64_t dim = 0; dim < rank; ++dim)
+    out.push_back(stridesKnown ? constant(type.getDimSize(dim))
+                               : LLVM::UndefOp::create(rewriter, loc, i64Ty)
+                                     .getResult());
+  for (int64_t dim = 0; dim < rank; ++dim)
+    out.push_back(stridesKnown ? constant(strides[dim])
+                               : LLVM::UndefOp::create(rewriter, loc, i64Ty)
+                                     .getResult());
+}
+
+/// Generate the function the executor runs: `void(const HmxReadoutBatch*, u32)`.
+///
+/// WHY AN ADAPTER RATHER THAN THE OUTLINED READ-OUT DIRECTLY. The runtime calls
+/// `HmxReadoutFn = void(*)(const HmxReadoutBatch*, uint32_t)` and the descriptor
+/// is six i32 words, so in principle the outlined read-out could take
+/// `(i8* batch, i32 count)` and load what it needs. It cannot: the words are
+/// runtime values, and turning an `ar`/`dst` address back into a memref requires
+/// the descriptor form (`allocated/aligned/offset/sizes/strides`), and the `func`
+/// dialect has no op that builds a memref from a pointer -- `memref.cast`,
+/// `memref.reinterpret_cast` and `memref.get_global` all need a memref or a
+/// symbol to start from. So the outlined read-out keeps its memref parameters and
+/// this adapter does the translation, at the one pipeline point where an address
+/// is expressible.
+///
+/// What it forwards, and what it does not, is the substantive part:
+///
+///   * `rowStart`/`rowCount` come out of words 0 and 1. These are the group's
+///     bounds, so the adapter can reconstruct them exactly.
+///   * `ar`/`dst` come out of words 4 and 5 as i32 addresses.
+///   * `validRows`/`nCroutons` (words 2 and 3) are NOT forwarded. They are STATIC
+///     specialisation facts on this path: `hmx.unpack_acc` takes `count`,
+///     `valid_rows` and `valid_cols` as attributes (HmxOps.td:329-331), so they
+///     are already baked into the outlined read-out's body, and forwarding them
+///     would require an outlined function that takes parameters the op cannot be
+///     given. Reading them and doing nothing with them would be a lie about the
+///     dependency.
+///   * `count` is not used. The runtime calls the function once per batch with
+///     `count == 1` (HmxVectorExecutor.cpp:576 loads the slot and calls it), and
+///     a descriptor names one group, so looping here would be a second place to
+///     get the batching wrong. The parameter stays because the ABI carries it.
+///
+/// If the outlined signature ever stops being `(memref, memref, index, index)`
+/// this stops being correct, so the shape is verified rather than assumed:
+/// `emitReadoutEntry` reads the actual parameter count and requires the two
+/// trailing `index` parameters to have become two i64s (what `index` lowers to
+/// at the default bitwidth).
+static LLVM::LLVMFuncOp emitReadoutEntry(OpBuilder &builder, ModuleOp moduleOp,
+                                         LLVM::LLVMFuncOp work,
+                                         MemRefType arType,
+                                         MemRefType dstType, StringRef name) {
+  MLIRContext *context = moduleOp.getContext();
+  auto i32Ty = builder.getI32Type();
+  auto i64Ty = builder.getI64Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(context, 0);
+  // The descriptor as a value: six i32 words in the frozen field order. Reading
+  // it as one struct rather than six GEP+load pairs is both shorter and a
+  // statement about the layout -- the same `HmxReadoutBatch` the runtime's own
+  // `slots[]` array is, so the two agree by construction rather than by
+  // convention.
+  auto batchTy = LLVM::LLVMStructType::getLiteral(
+      context, SmallVector<Type>(kHmxReadoutBatchWords, i32Ty));
+
+  LLVM::LLVMFunctionType fnType = LLVM::LLVMFunctionType::get(
+      LLVM::LLVMVoidType::get(context), {ptrTy, i32Ty}, /*isVarArg=*/false);
+  OpBuilder funcBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
+  LLVM::LLVMFuncOp entry =
+      LLVM::LLVMFuncOp::create(funcBuilder, moduleOp.getLoc(), name, fnType);
+  // Private for the same reason the outlined read-out is: neither symbol is part
+  // of the kernel's ABI, and `configure` takes the address, so nothing resolves
+  // them from outside the module.
+  entry.setVisibility(SymbolTable::Visibility::Private);
+  Block *block = entry.addEntryBlock(funcBuilder);
+  OpBuilder body = OpBuilder::atBlockEnd(block);
+  Location loc = moduleOp.getLoc();
+
+  Value batch = LLVM::LoadOp::create(body, loc, batchTy, block->getArgument(0));
+  auto word = [&](int64_t index) -> Value {
+    return LLVM::ExtractValueOp::create(body, loc, i32Ty, batch,
+                                        ArrayRef<int64_t>{index});
+  };
+  Value rowStart = word(kHmxReadoutRowStart);
+  Value rowCount = word(kHmxReadoutRowCount);
+  Value ar = word(kHmxReadoutAr);
+  Value dst = word(kHmxReadoutDst);
+
+  SmallVector<Value> args;
+  appendMemrefArgs(body, loc, arType, ar, args);
+  appendMemrefArgs(body, loc, dstType, dst, args);
+  // `rowStart`/`rowCount` are `uint32_t` in the ABI and `index` in the outlined
+  // read-out, and `index` lowers to i64 at this pipeline's default bitwidth. Zero
+  // extension is the faithful conversion of an unsigned 32-bit word to i64.
+  args.push_back(LLVM::ZExtOp::create(body, loc, i64Ty, rowStart));
+  args.push_back(LLVM::ZExtOp::create(body, loc, i64Ty, rowCount));
+
+  LLVM::CallOp::create(body, loc, TypeRange{},
+                       FlatSymbolRefAttr::get(work), args);
+  LLVM::ReturnOp::create(body, loc, ValueRange{});
+  return entry;
+}
+
+/// Call `hexagon_runtime_hmx_exec_configure(addressOf(entry), 1)` at the top of
+/// `engine`.
+///
+/// The call must precede the FIRST publish, because a publish before configure
+/// hands the executor a batch it will never run (the runtime drops everything
+/// until a function is registered, HmxVectorExecutor.cpp:551-562). Putting it at
+/// the start of the entry block rather than next to the loop is deliberate:
+/// `configure` is idempotent and re-stores the function, but it also costs a
+/// `drainLocked` wait, so a per-iteration call would be wrong even though it
+/// would be "before the first publish" from the first iteration only.
+///
+/// The return is not tested. A negative return means the executor is unusable,
+/// and the first `publish` after it returns 0 for every one of its reasons
+/// (null/zero argument, not configured, stopped, ring full), all of which the
+/// publish check below turns into a trap. Testing one of them twice buys
+/// nothing; testing neither would be the actual bug.
+static FailureOr<LLVM::LLVMFuncOp>
+emitConfigure(ModuleOp moduleOp, LLVM::LLVMFuncOp engine,
+              LLVM::LLVMFuncOp entry) {
+  MLIRContext *context = moduleOp.getContext();
+  OpBuilder builder(context);
+  auto i32Ty = builder.getI32Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(context, 0);
+  Location loc = moduleOp.getLoc();
+
+  // Same declaration the producer pass made, seen from the LLVM side: `lookupOrCreateFn`
+  // reuses it, and the i32 result is the ABI's (`int32_t`, HmxVectorExecutor.h:122).
+  FailureOr<LLVM::LLVMFuncOp> configure = LLVM::lookupOrCreateFn(
+      builder, moduleOp, kHmxExecConfigureFn, ArrayRef<Type>{i32Ty, i32Ty}, i32Ty);
+  if (failed(configure))
+    return failure();
+
+  Block *start = &engine.getBody().front();
+  builder.setInsertionPointToStart(start);
+  Value address = LLVM::AddressOfOp::create(
+      builder, loc, ptrTy, FlatSymbolRefAttr::get(entry.getOperation()));
+  // The runtime takes a C function pointer, which is a 32-bit value on this
+  // target -- the same reason every other address here crosses as i32
+  // (`asAddress`).
+  Value asInt = LLVM::PtrToIntOp::create(builder, loc, i32Ty, address);
+  LLVM::CallOp::create(
+      builder, loc, TypeRange{i32Ty},
+      FlatSymbolRefAttr::get(configure->getOperation()),
+      ValueRange{asInt, LLVM::ConstantOp::create(
+                             builder, loc, i32Ty,
+                             builder.getI32IntegerAttr(kHmxExecNumThreads))});
+  return configure;
+}
+
+/// Turn a short `publish` return into a trap.
+///
+/// This is not an optimisation guard; it is a correctness requirement, and the
+/// runtime's own header says so in as many words: a dropped batch means that
+/// destination region is never written, "so the kernel returns its own
+/// uninitialized output -- a wrong answer, not a slower one", and there is
+/// deliberately no silent inline fallback in the runtime for a caller to lean on.
+/// The return value is the only signal there is, so ignoring it is a
+/// silent-corruption bug waiting for a full ring.
+///
+/// WHAT IS EMITTED, AND WHY IT CANNOT BE REMOVED. The failure edge ends in
+/// `llvm.intr.trap`. That is the whole mechanism, and it is the right one for a
+/// reason worth stating because the obvious alternatives are worse:
+///
+///   * Silently continuing is the failure the ABI forbids. The kernel would
+///     return its own uninitialised output -- a plausible-looking wrong answer.
+///   * Calling back into the runtime to read the tail out inline would be the
+///     documented *fallback*, but the ABI says it must not be silent, and there
+///     is no entry point for it: `HmxVectorExecutor.h` is frozen and declares no
+///     such function, so the compiler cannot invent one.
+///   * Reporting through a diagnostic entry would need one too, for the same
+///     reason.
+///
+/// A trap is unremovable by construction: it is an instruction with a side
+/// effect on every path that reaches it, so no later pass can prove the block
+/// dead. The branch that reaches it is the `publish` return compared against the
+/// count that was asked for, so the edge is live exactly when the runtime would
+/// have dropped a batch. `trap` is also the right severity here: the kernel's
+/// output buffer is the caller's memory, the alternative is returning a wrong
+/// result silently, and the runtime has already logged why at ERROR level
+/// (HmxVectorExecutor.cpp:580,599).
+///
+/// The check is per call site rather than once per function because the two
+/// publishes are different things: the in-loop group and the tail batch. A single
+/// check on the last one would leave the in-loop drops unreported, and those are
+/// the common case.
+///
+/// Ordering is load-bearing and matches the runtime: publish first, then check.
+static LogicalResult checkPublishReturns(LLVM::LLVMFuncOp engine) {
+  MLIRContext *context = engine.getContext();
+  OpBuilder builder(context);
+  Location loc = engine.getLoc();
+  auto i32Ty = builder.getI32Type();
+
+  // Collect before editing: inserting blocks invalidates a walk.
+  SmallVector<LLVM::CallOp> publishes;
+  engine.walk([&](LLVM::CallOp call) {
+    if (std::optional<StringRef> callee = call.getCallee())
+      if (*callee == kHmxExecPublishFn)
+        publishes.push_back(call);
+  });
+
+  for (LLVM::CallOp call : publishes) {
+    if (call->getNumResults() != 1 ||
+        !call->getResult(0).getType().isInteger(32))
+      return call.emitError()
+             << "hexagon_runtime_hmx_exec_publish must return the number of "
+                "batches it accepted (uint32_t); a void declaration here means "
+                "a dropped batch cannot be detected, which is a wrong answer "
+                "rather than a slower one";
+
+    // The check is a BRANCH, and only an LLVM-dialect region can hold one: an
+    // `scf.if`/`scf.for` body must stay structured, and inserting `llvm.cond_br`
+    // plus two bare blocks into one makes the op unverifiable rather than slow.
+    // So a publish still sitting inside structured control flow is refused here
+    // instead of producing malformed IR.
+    //
+    // This is not a restriction the production pipeline can hit: HmxToLLVM runs
+    // after `convert-scf-to-cf` (LinalgToLLVMPass.cpp:651 then :673), so every
+    // publish is already in a plain LLVM block by the time this runs. It is a
+    // guard for anyone driving the pass standalone.
+    // `Block::getParent()` is the op that owns the region the block sits in, so
+    // comparing it to the enclosing LLVMFuncOp answers "is this block directly in
+    // a function body" -- i.e. not nested in an scf region.
+    Region *owner = call->getBlock()->getParent();
+    if (!isa_and_nonnull<LLVM::LLVMFuncOp>(owner->getParentOp()))
+      return call.emitError()
+             << "hexagon_runtime_hmx_exec_publish is inside structured control "
+                "flow, so its return value cannot be branched on here. "
+                "HmxToLLVM must run after convert-scf-to-cf, which is where the "
+                "production pipeline places it";
+
+    Block *block = call->getBlock();
+    Block *continuation = block->splitBlock(call->getNextNode());
+    Block *failure = new Block();
+    engine.getBody().getBlocks().insert(continuation->getIterator(), failure);
+
+    builder.setInsertionPointToEnd(block);
+    Value accepted = call->getResult(0);
+    Value wanted = LLVM::ConstantOp::create(
+        builder, loc, i32Ty, builder.getI32IntegerAttr(kHmxExecPublishedBatches));
+    Value short_ = LLVM::ICmpOp::create(builder, loc, LLVM::ICmpPredicate::ult,
+                                        accepted, wanted);
+    LLVM::CondBrOp::create(builder, loc, short_, failure, ValueRange{},
+                           continuation, ValueRange{});
+
+    builder.setInsertionPointToEnd(failure);
+    // The trap is the guarantee. `llvm.intr.trap` is a real instruction on every
+    // path that reaches it and has no side conditions an optimiser can discharge.
+    LLVM::Trap::create(builder, loc);
+    LLVM::BrOp::create(builder, loc, ValueRange{}, continuation);
+  }
+  return success();
+}
+
+/// Wire every handoff the producer pass recorded: entry point, `configure`, and
+/// the `publish` check. A module with no record is untouched, which is what keeps
+/// the default-off path byte-identical.
+///
+/// Every failure here is a refusal rather than a repair. A handoff that cannot be
+/// wired exactly -- a missing kernel, an outlined function with a signature this
+/// adapter does not model, a `publish` without a return value -- would otherwise
+/// produce a kernel that hands the caller unwritten output while reporting
+/// success, which is the same class of bug as a mis-read accumulator row.
+static LogicalResult wireVectorReadout(ModuleOp moduleOp) {
+  Attribute raw = moduleOp->getAttr(kHmxReadoutHandoffsAttr);
+  if (!raw)
+    return success();
+  auto records = dyn_cast<ArrayAttr>(raw);
+  if (!records)
+    return moduleOp.emitError(
+        "hmx.readout.handoffs must be an array of handoff records");
+
+  OpBuilder builder(moduleOp.getContext());
+  for (Attribute raw : records) {
+    auto record = dyn_cast<DictionaryAttr>(raw);
+    if (!record)
+      return moduleOp.emitError("hmx.readout.handoffs entry must be a dictionary");
+    auto engineName = record.getAs<StringAttr>(kHmxReadoutEngineField);
+    auto workName = record.getAs<StringAttr>(kHmxReadoutWorkField);
+    auto arAttr = record.getAs<TypeAttr>(kHmxReadoutArField);
+    auto dstAttr = record.getAs<TypeAttr>(kHmxReadoutDstField);
+    if (!engineName || !workName || !arAttr || !dstAttr)
+      return moduleOp.emitError(
+          "hmx.readout.handoffs entry needs engine, work, ar and dst");
+    auto arType = dyn_cast<MemRefType>(arAttr.getValue());
+    auto dstType = dyn_cast<MemRefType>(dstAttr.getValue());
+    if (!arType || !dstType)
+      return moduleOp.emitError(
+          "hmx.readout.handoffs ar/dst must be memref types; the outlined "
+          "read-out cannot be reconstructed from a tensor");
+
+    // Both must be `llvm.func` and neither a declaration. This runs after
+    // convert-func-to-llvm in the production pipeline, so the outlined read-out
+    // is already one; a `func.func` here would mean this pass was asked to run
+    // before that conversion, when `llvm.mlir.addressof` cannot name it at all.
+    LLVM::LLVMFuncOp work =
+        moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(workName.getValue());
+    if (!work)
+      return moduleOp.emitError()
+             << "handoff names outlined read-out '" << workName.getValue()
+             << "', which is not an llvm.func. HmxToLLVM must run after "
+                "convert-func-to-llvm, and the read-out must have been "
+                "converted with the rest of the module";
+    if (work.isDeclaration())
+      return work.emitError() << "outlined read-out '" << workName
+                              << "' is a declaration; it has no body to run";
+
+    // The adapter models exactly `(ar: memref, dst: memref, row0: index,
+    // nrows: index)`. Anything else -- a different arity, a non-memref buffer,
+    // a `!llvm.ptr` where a memref was -- would make the emitted call pass the
+    // wrong words in the wrong order, which is a silent mis-read rather than a
+    // crash, so the shape is checked instead of trusted.
+    unsigned expanded = 3 + 2 * static_cast<unsigned>(arType.getRank()) +
+                        3 + 2 * static_cast<unsigned>(dstType.getRank()) + 2;
+    unsigned actual = work.getNumArguments();
+    if (actual != expanded)
+      return work.emitError()
+             << "outlined read-out '" << workName.getValue() << "' has " << actual
+             << " parameters; the vector-readout entry point models exactly "
+                "(memref, memref, index, index) under the default "
+                "convert-func-to-llvm convention, which is "
+             << expanded
+             << ". Refusing to guess which words are which buffer";
+
+    LLVM::LLVMFuncOp engine = moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(engineName);
+    if (!engine || engine.isDeclaration())
+      return moduleOp.emitError()
+             << "handoff names engine '" << engineName
+             << "', which is not an llvm.func definition";
+
+    std::string entryName =
+        (workName.getValue() + kHmxReadoutEntrySuffix).str();
+    // The handoff is consumed here, so the record cannot be acted on twice if a
+    // later pass ever re-runs this one: a second `configure` would re-store the
+    // function and a second entry point would shadow the first.
+    if (moduleOp.lookupSymbol(entryName))
+      return moduleOp.emitError()
+             << "vector-readout entry point '" << entryName
+             << "' already exists; the handoff was already wired";
+
+    LLVM::LLVMFuncOp entry = emitReadoutEntry(builder, moduleOp, work, arType,
+                                              dstType, entryName);
+    if (failed(emitConfigure(moduleOp, engine, entry)))
+      return failure();
+    if (failed(checkPublishReturns(engine)))
+      return failure();
+  }
+
+  // The record is consumed, not left for a later reader. Nothing else may act on
+  // it: the entry point now exists and the `configure` call has been emitted, so a
+  // second consumer would re-configure the executor and shadow the entry point.
+  // Erasing it also means the record cannot outlive what it describes -- if a
+  // later pass rebuilt `__hmx_readout` without republishing, this pass would have
+  // nothing to re-wire and would silently leave the kernel publishing to a
+  // function nobody registered, rather than failing on a stale record.
+  moduleOp->removeAttr(kHmxReadoutHandoffsAttr);
+  return success();
 }
 
 /// Bring the engine up before every HMX accumulator sequence and release it
@@ -2034,6 +2521,16 @@ struct HmxToLLVMPass : public ::impl::HmxToLLVMBase<HmxToLLVMPass> {
     // pass knows whether the engine is needed. The decision was made while the
     // hmx ops it is based on still existed -- by now they are leaf calls.
     ensureHmxEngine(moduleOp, engineKernels);
+
+    // Hand the vector executor the function it runs. This is here rather than in
+    // HmxVectorReadoutPass because only an `llvm.func` has an expressible
+    // ADDRESS, and only this pass runs after convert-func-to-llvm (see the
+    // section comment above wireVectorReadout). A module with no handoff record
+    // is untouched, which is what keeps the default-off path byte-identical.
+    if (failed(wireVectorReadout(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
 
     // This call is a separate diagnostic contract. It is emitted only when
     // the marker-gated compiler sidecar selected one immutable function/site

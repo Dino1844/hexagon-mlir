@@ -4,8 +4,10 @@ add_mlir_dialect_library(HmxTransforms
   HmxRecordV3.cpp
   HmxRecordV3Pass.cpp
   MatmulToHmxPass.cpp
+  ThreadRolePartition.cpp
   HmxPartitionPass.cpp
   WeightResidentPass.cpp
+  HmxVectorReadoutPass.cpp
   HmxWorkspaceResidentPass.cpp
   HmxVtcmAccountingPass.cpp
 

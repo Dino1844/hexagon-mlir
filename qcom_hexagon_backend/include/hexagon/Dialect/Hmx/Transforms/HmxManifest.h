@@ -262,6 +262,19 @@ LogicalResult restoreHmxManifestDecisionIds(ModuleOp module, func::FuncOp func);
 /// not launch-time call counts; the manifest publishes that distinction beside
 /// the numbers. Calling this after residency and partition rewrites keeps the
 /// count aligned with the final bridge IR.
+/// True for the five canonical thread-role topology strings. Exposed so the pass
+/// that produces them and the manifest writer that stores them agree by
+/// construction rather than by two string lists kept in step by hand.
+bool isCanonicalHmxTopology(StringRef topology);
+
+/// Record the kernel-level thread-role verdict produced by
+/// thread-role-partition, together with the number of regions it was derived
+/// from, so a reader can tell a single-region kernel from a forty-region one
+/// that landed on the same verdict. An unknown topology is rejected here rather
+/// than passed through: a typo must not reach the manifest and then a consumer.
+LogicalResult setHmxManifestTopology(ModuleOp module, StringRef topology,
+                                    int64_t regions);
+
 LogicalResult refreshHmxManifestBridgeCounts(ModuleOp module);
 
 /// Rebind one record to the function argument slot proven by the resident
