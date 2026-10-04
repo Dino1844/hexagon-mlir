@@ -92,5 +92,13 @@ uint64_t xxh3_64bits(ArrayRef<uint8_t> data) {
 
 extern "C" __attribute__((visibility("default"))) void *
 aligned_alloc(size_t alignment, size_t size) {
+  // An alignment-8 request is exactly malloc: malloc already returns memory
+  // aligned for any fundamental type on Hexagon (8 bytes), and free() stays
+  // valid either way. This is the async coro-frame path (compiled kernels
+  // allocate every async.execute frame with aligned_alloc(8, size)), and
+  // memalign costs ~2.5K pcyc alloc-only vs ~0.9K for malloc at the same
+  // size (probe exp/hmx/fa_util/dispatch_cut, 2026-10-04).
+  if (alignment <= 8)
+    return malloc(size);
   return memalign(alignment, size);
 }

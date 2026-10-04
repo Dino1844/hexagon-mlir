@@ -50,9 +50,59 @@ namespace mlir {
 namespace runtime {
 namespace {
 
-// Forward declare class defined below.
+// Forward declare classes defined below.
 class RefCounted;
+template <typename T> class PooledFreelist;
 
+// -------------------------------------------------------------------------- //
+// A mutex-guarded free list for recycling AsyncToken / AsyncGroup objects.
+//
+// The dispatch path allocates one token per async.execute on the main
+// thread and destroys it on the worker that emplaces it -- a cross-thread
+// malloc/free pair per execute (measured ~1.9K pcyc for the create+destroy
+// round trip, plus the embedded awaiters vector's own 32-byte malloc per
+// AddTokenToGroup; exp/hmx/fa_util/dispatch_cut, 2026-10-04). Recycling the
+// objects removes both, and keeps the awaiters vector's heap storage warm
+// across reuses. The list mutex is uncontended in steady state (main
+// pushes/pops between group gaps, workers push on destroy) and costs
+// ~0.17K pcyc per op vs ~1K+ for the malloc path.
+//
+// The intrusive link lives in RefCounted::poolNext -- never at offset 0,
+// which is the vtable pointer (a freelist next stored there was caught
+// crashing the virtual destroy() dispatch by the dispatch_cut probe,
+// 2026-10-04).
+// -------------------------------------------------------------------------- //
+
+template <typename T> class PooledFreelist {
+public:
+  // Returns nullptr when the list is empty (caller falls back to new).
+  T *pop() {
+    std::lock_guard<std::mutex> lock(mu);
+    if (!head)
+      return nullptr;
+    T *p = head;
+    head = static_cast<T *>(p->poolNext);
+    --count;
+    return p;
+  }
+
+  // Returns false when the pool is at capacity (caller deletes instead).
+  bool push(T *p) {
+    std::lock_guard<std::mutex> lock(mu);
+    if (count >= kCapacity)
+      return false;
+    p->poolNext = head;
+    head = p;
+    ++count;
+    return true;
+  }
+
+private:
+  static constexpr size_t kCapacity = 512;
+  std::mutex mu;
+  T *head = nullptr;
+  size_t count = 0;
+};
 // -------------------------------------------------------------------------- //
 // AsyncRuntime orchestrates all async operations and Async runtime API is built
 // on top of the default runtime instance.
@@ -64,6 +114,7 @@ public:
 
   ~AsyncRuntime() {
     threadPool.wait(); // wait for the completion of all async tasks
+    drainPools();      // pooled objects still count as alive until deleted
     assert(getNumRefCountedObjects() == 0 &&
            "all ref counted objects must be destroyed");
   }
@@ -74,8 +125,13 @@ public:
 
   HexagonThreadPool &getThreadPool() { return threadPool; }
 
+  PooledFreelist<AsyncToken> &tokenPool() { return tokenFreelist; }
+  PooledFreelist<AsyncGroup> &groupPool() { return groupFreelist; }
+
 private:
   friend class RefCounted;
+
+  void drainPools();
 
   // Count the total number of reference counted objects in this instance
   // of an AsyncRuntime. For debugging purposes only.
@@ -88,6 +144,8 @@ private:
 
   std::atomic<int64_t> numRefCountedObjects;
   HexagonThreadPool threadPool;
+  PooledFreelist<AsyncToken> tokenFreelist;
+  PooledFreelist<AsyncGroup> groupFreelist;
 };
 
 // -------------------------------------------------------------------------- //
@@ -161,10 +219,22 @@ public:
 protected:
   virtual void destroy() { delete this; }
 
+  // Recycles this object through a pool instead of deleting it: the ref
+  // count is reset for the next user. Pool-recycled objects must not have
+  // outstanding references (same discipline as delete).
+  void resetRefCount(int64_t count) { refCount.store(count); }
+
 private:
+  template <typename T> friend class PooledFreelist;
+
   AsyncRuntime *runtime;
   std::atomic<int64_t> refCount;
+
+  // Intrusive free-list link used while the object sits in a pool (see
+  // PooledFreelist). Guarded by the pool's mutex.
+  void *poolNext = nullptr;
 };
+
 
 } // namespace
 
@@ -192,6 +262,23 @@ struct AsyncToken : public RefCounted {
   AsyncToken(AsyncRuntime *runtime)
       : RefCounted(runtime, /*refCount=*/2), state(State::kUnavailable) {}
 
+  // Pool recycling: reset the mutable state for the next user. The embedded
+  // mutex / condition_variable are left as-is (unlocked, no waiters can
+  // remain at refcount zero) and the awaiters vector keeps its heap storage
+  // (cleared, so the next AddTokenToGroup emplace does not allocate).
+  void reinit() {
+    resetRefCount(2);
+    state = State::kUnavailable;
+    awaiters.clear();
+  }
+
+protected:
+  void destroy() override {
+    if (!getDefaultAsyncRuntime()->tokenPool().push(this))
+      delete this;
+  }
+
+public:
   std::atomic<State::StateEnum> state;
 
   // Pending awaiters are guarded by a mutex.
@@ -227,6 +314,22 @@ struct AsyncGroup : public RefCounted {
   AsyncGroup(AsyncRuntime *runtime, int64_t size)
       : RefCounted(runtime), pendingTokens(size), numErrors(0), rank(0) {}
 
+  // Pool recycling: see AsyncToken::reinit.
+  void reinit(int64_t size) {
+    resetRefCount(1);
+    pendingTokens = (int)size;
+    numErrors = 0;
+    rank = 0;
+    awaiters.clear();
+  }
+
+protected:
+  void destroy() override {
+    if (!getDefaultAsyncRuntime()->groupPool().push(this))
+      delete this;
+  }
+
+public:
   std::atomic<int> pendingTokens;
   std::atomic<int> numErrors;
   std::atomic<int> rank;
@@ -236,6 +339,16 @@ struct AsyncGroup : public RefCounted {
   std::condition_variable cv;
   std::vector<std::function<void()>> awaiters;
 };
+
+// Out of line: the pooled types are complete only here, below their
+// definitions; deleting through them runs the RefCounted virtual
+// destructor correctly.
+inline void AsyncRuntime::drainPools() {
+  while (auto *p = tokenFreelist.pop())
+    delete p;
+  while (auto *p = groupFreelist.pop())
+    delete p;
+}
 
 // Adds references to reference counted runtime object.
 extern "C" void mlirAsyncRuntimeAddRef(RefCountedObjPtr ptr, int64_t count) {
@@ -251,8 +364,12 @@ extern "C" void mlirAsyncRuntimeDropRef(RefCountedObjPtr ptr, int64_t count) {
 
 // Creates a new `async.token` in not-ready state.
 extern "C" AsyncToken *mlirAsyncRuntimeCreateToken() { _trc("T0");
-  AsyncToken *token = new AsyncToken(getDefaultAsyncRuntime());
-  return token;
+  AsyncRuntime *runtime = getDefaultAsyncRuntime();
+  if (AsyncToken *token = runtime->tokenPool().pop()) {
+    token->reinit();
+    return token;
+  }
+  return new AsyncToken(runtime);
 }
 
 // Creates a new `async.value` in not-ready state.
@@ -263,54 +380,90 @@ extern "C" AsyncValue *mlirAsyncRuntimeCreateValue(int64_t size) {
 
 // Create a new `async.group` in empty state.
 extern "C" AsyncGroup *mlirAsyncRuntimeCreateGroup(int64_t size) { _trc("G0");
-  AsyncGroup *group = new AsyncGroup(getDefaultAsyncRuntime(), size);
-  return group;
+  AsyncRuntime *runtime = getDefaultAsyncRuntime();
+  if (AsyncGroup *group = runtime->groupPool().pop()) {
+    group->reinit(size);
+    return group;
+  }
+  return new AsyncGroup(runtime, size);
 }
 
 extern "C" int64_t mlirAsyncRuntimeAddTokenToGroup(AsyncToken *token,
-                                                   AsyncGroup *group) { _trc("G1");
+                                                    AsyncGroup *group) { _trc("G1");
   std::unique_lock<std::mutex> lockToken(token->mu);
-  std::unique_lock<std::mutex> lockGroup(group->mu);
+
+  // The ready/not-ready decision must be made under token->mu: racing with
+  // setTokenState (the worker that emplaces this token) otherwise appends
+  // an awaiter to an already-ready token and the group's pendingTokens
+  // never reaches zero (caught as an AwaitAllInGroup hang by the
+  // dispatch_cut probe, 2026-10-04).
+
+  if (State(token->state).isAvailableOrError()) {
+    // The group lock is required on the ready path: onTokenReady changes
+    // the group predicate and runs its awaiters, which must not race with
+    // AwaitAllInGroup's sleep (lost wakeup).
+    std::unique_lock<std::mutex> lockGroup(group->mu);
+
+    // Get the rank of the token inside the group before we drop the reference.
+    int rank = group->rank.fetch_add(1);
+
+    auto onTokenReady = [group, token]() {
+      // Increment the number of errors in the group.
+      if (State(token->state).isError())
+        group->numErrors.fetch_add(1);
+
+      // If pending tokens go below zero it means that more tokens than the group
+      // size were added to this group.
+      assert(group->pendingTokens > 0 && "wrong group size");
+
+      // Run all group awaiters if it was the last token in the group.
+      if (group->pendingTokens.fetch_sub(1) == 1) {
+        group->cv.notify_all();
+        for (auto &awaiter : group->awaiters)
+          awaiter();
+      }
+    };
+
+    // Update group pending tokens immediately and maybe run awaiters.
+    onTokenReady();
+
+    return rank;
+  }
+
+  // Not-ready path: this thread touches no group state guarded by group->mu
+  // (rank and addRef are atomics; the awaiter closure below takes group->mu
+  // itself on the worker), so token->mu above is enough. One uncontended
+  // mutex pair is ~0.33K pcyc (dispatch_cut probe); the async dispatch
+  // always takes this path.
 
   // Get the rank of the token inside the group before we drop the reference.
   int rank = group->rank.fetch_add(1);
 
-  auto onTokenReady = [group, token]() {
-    // Increment the number of errors in the group.
-    if (State(token->state).isError())
-      group->numErrors.fetch_add(1);
+  // Update group pending tokens when token will become ready. Because this
+  // will happen asynchronously we must ensure that `group` is alive until
+  // then.
+  group->addRef();
 
-    // If pending tokens go below zero it means that more tokens than the group
-    // size were added to this group.
-    assert(group->pendingTokens > 0 && "wrong group size");
+  token->awaiters.emplace_back([group, token]() {
+    // Runs on the worker that emplaces the token. Make sure that `dropRef`
+    // does not destroy the mutex owned by the lock.
+    {
+      std::unique_lock<std::mutex> lockGroup(group->mu);
+      // Increment the number of errors in the group.
+      if (State(token->state).isError())
+        group->numErrors.fetch_add(1);
 
-    // Run all group awaiters if it was the last token in the group.
-    if (group->pendingTokens.fetch_sub(1) == 1) {
-      group->cv.notify_all();
-      for (auto &awaiter : group->awaiters)
-        awaiter();
-    }
-  };
+      assert(group->pendingTokens > 0 && "wrong group size");
 
-  if (State(token->state).isAvailableOrError()) {
-    // Update group pending tokens immediately and maybe run awaiters.
-    onTokenReady();
-
-  } else {
-    // Update group pending tokens when token will become ready. Because this
-    // will happen asynchronously we must ensure that `group` is alive until
-    // then, and re-ackquire the lock.
-    group->addRef();
-
-    token->awaiters.emplace_back([group, onTokenReady]() {
-      // Make sure that `dropRef` does not destroy the mutex owned by the lock.
-      {
-        std::unique_lock<std::mutex> lockGroup(group->mu);
-        onTokenReady();
+      // Run all group awaiters if it was the last token in the group.
+      if (group->pendingTokens.fetch_sub(1) == 1) {
+        group->cv.notify_all();
+        for (auto &awaiter : group->awaiters)
+          awaiter();
       }
-      group->dropRef();
-    });
-  }
+    }
+    group->dropRef();
+  });
 
   return rank;
 }
@@ -409,7 +562,7 @@ extern "C" ValueStorage mlirAsyncRuntimeGetValueStorage(AsyncValue *value) {
 
 extern "C" void mlirAsyncRuntimeExecute(CoroHandle handle, CoroResume resume) { _trc("X0");
   auto *runtime = getDefaultAsyncRuntime();
-  runtime->getThreadPool().async([handle, resume]() { (*resume)(handle); });
+  runtime->getThreadPool().enqueueCoro(handle, resume);
 }
 
 extern "C" void mlirAsyncRuntimeAwaitTokenAndExecute(AsyncToken *token,
