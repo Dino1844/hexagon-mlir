@@ -1531,6 +1531,21 @@ static LogicalResult strictWeightPreflight(ModuleOp module,
           continue;
         }
 
+        // A transposed pack source is outside the pre-pack contract: the host
+        // pre-packs a [K, N] row-major argument (backend/hmx_weight_prepack.py)
+        // while `underlyingDenseArgument`/`underlyingSliceArgument` reason
+        // about the source's own geometry -- a [N, K] transpose input could be
+        // misread as a view this pass models and pre-pack the wrong bytes.
+        // Strict mode fails closed on it.
+        if (llvm::any_of(pack->packs,
+                         [](PackWeightOp p) { return p.getSrcTransposed().value_or(false); })) {
+          op.emitError("strict resident contract: a transposed pack source is "
+                       "not in the pre-pack contract, so residency cannot be "
+                       "established; refusing to proceed");
+          result = failure();
+          continue;
+        }
+
         int64_t slot = 0;
         DictionaryAttr sourceView;
         if (failed(validateStrictWeightPack(*pack, type, function,
@@ -1800,6 +1815,12 @@ struct WeightResidentPass
 
         std::optional<WeightPack> pack = findWeightPack(operand.get());
         if (!pack)
+          continue;
+        // Same transposed-source refusal as the strict walk above, minus the
+        // error: decline, and the per-launch `_T` bridge keeps the kernel
+        // correct.
+        if (llvm::any_of(pack->packs,
+                         [](PackWeightOp p) { return p.getSrcTransposed().value_or(false); }))
           continue;
         // The bridge must pack one runtime input, not an internal buffer. It
         // usually reads layout-only views (`reinterpret_cast` from

@@ -1840,7 +1840,10 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
 
 /// `hmx.pack_weight` -> `hmx_pack_weight_f16(...)` for an f16 source and
 /// `hmx_pack_weight_f32(...)` for an f32 one, each in the single-block form or
-/// the ranged `_bulk` form covering `count` consecutive K tiles in one call.
+/// the ranged `_bulk` form covering `count` consecutive K tiles in one call,
+/// and each with a `_T` twin for a `src_transposed` source (the [N, K]
+/// transpose input; HMXAPI.h explains why the transpose is the input plus the
+/// marker, never a strided view).
 /// The dst crouton grid is `[Nt, Kt, ...]`, so the address takes `(n_tile,
 /// k_tile)` even though the source block coordinates the leaf receives stay
 /// `(k, n)`. `src_stride` is the source's own row stride, the same contract as
@@ -1875,10 +1878,14 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                                         /*rowMajor=*/false)))
         return failure();
       bool srcIsF32 = dtype::isF32(srcType.getElementType());
-      auto fn = getVoidLeaf(module,
-                            srcIsF32 ? getPackWeightTailF32FnName()
-                                     : getPackWeightTailF16FnName(),
-                            SmallVector<Type>(9, i32Ty), rewriter);
+      bool srcTransposed = op.getSrcTransposed().value_or(false);
+      auto fn = getVoidLeaf(
+          module,
+          srcIsF32 ? (srcTransposed ? getPackWeightTailF32TFnName()
+                                    : getPackWeightTailF32FnName())
+                   : (srcTransposed ? getPackWeightTailF16TFnName()
+                                    : getPackWeightTailF16FnName()),
+          SmallVector<Type>(9, i32Ty), rewriter);
       if (failed(fn))
         return failure();
       Value dst = croutonAddr(rewriter, loc, adaptor.getDst(), dstType,
@@ -1891,10 +1898,15 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                                         rewriter.getI32IntegerAttr(v))
             .getResult();
       };
-      Value k = dimCst(srcType.getDimSize(0));
-      Value n = dimCst(srcType.getDimSize(1));
+      // A transposed source is the [N, K] transpose input itself, so the
+      // extents swap: K is dim 1 -- the contiguous, crouton-pair axis -- and N
+      // dim 0. The stride fallback width stays dim 1 either way (N row-major,
+      // K transposed).
+      Value k = dimCst(srcType.getDimSize(srcTransposed ? 1 : 0));
+      Value n = dimCst(srcType.getDimSize(srcTransposed ? 0 : 1));
       Value srcStride;
-      if (failed(rowStride(rewriter, loc, srcType, n, op, srcStride)))
+      if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
+                           srcStride)))
         return failure();
       SmallVector<Value> args{dst,
                               src,
@@ -1913,11 +1925,18 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     if (bulk)
       argTys.push_back(i32Ty);
     bool srcIsF32 = dtype::isF32(srcType.getElementType());
+    bool srcTransposed = op.getSrcTransposed().value_or(false);
     auto fn = getVoidLeaf(
         module,
         srcIsF32
-            ? (bulk ? getPackWeightF32BulkFnName() : getPackWeightF32FnName())
-            : (bulk ? getPackWeightF16BulkFnName() : getPackWeightF16FnName()),
+            ? (bulk ? (srcTransposed ? getPackWeightF32TBulkFnName()
+                                     : getPackWeightF32BulkFnName())
+                    : (srcTransposed ? getPackWeightF32TFnName()
+                                     : getPackWeightF32FnName()))
+            : (bulk ? (srcTransposed ? getPackWeightF16TBulkFnName()
+                                     : getPackWeightF16BulkFnName())
+                    : (srcTransposed ? getPackWeightF16TFnName()
+                                     : getPackWeightF16FnName())),
         argTys, rewriter);
     if (failed(fn))
       return failure();
@@ -1934,10 +1953,12 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                                       rewriter.getI32IntegerAttr(v))
           .getResult();
     };
-    Value k = dimCst(srcType.getDimSize(0));
-    Value n = dimCst(srcType.getDimSize(1));
+    // Same transposed-extent swap as the tail branch above.
+    Value k = dimCst(srcType.getDimSize(srcTransposed ? 1 : 0));
+    Value n = dimCst(srcType.getDimSize(srcTransposed ? 0 : 1));
     Value srcStride;
-    if (failed(rowStride(rewriter, loc, srcType, n, op, srcStride)))
+    if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
+                         srcStride)))
       return failure();
 
     SmallVector<Value> args{dst,

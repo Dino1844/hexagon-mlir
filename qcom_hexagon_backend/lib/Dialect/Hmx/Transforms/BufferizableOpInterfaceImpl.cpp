@@ -149,7 +149,7 @@ struct PackWeightOpInterface
         rewriter, packOp.getLoc(), /*result=*/TypeRange{*dstBuffer}, *dstBuffer,
         *srcBuffer, packOp.getKTile(), packOp.getNTile(),
         packOp.getCountAttr(), packOp.getValidRowsAttr(),
-        packOp.getValidColsAttr());
+        packOp.getValidColsAttr(), packOp.getSrcTransposedAttr());
     copyDecisionId(op, bufferized.getOperation());
     replaceOpWithBufferizedValues(rewriter, op, *dstBuffer);
     return success();

@@ -91,3 +91,50 @@ func.func @materialize_ok(%src: tensor<32x32xf16>,
                        outs(%plain : tensor<1x1x16x32x2xf16>) -> tensor<1x1x16x32x2xf16>
   return
 }
+
+// -----
+
+//--- !!! pack: with `src_transposed` the source IS the [N, K] transpose, so
+//--- the crouton logical shape must match it directly -- not its transpose.
+func.func @pack_weight_transposed_logical_mismatch(
+    %src: tensor<64x96xf16>,
+    %dst: tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>,
+    %i: index, %j: index)
+    -> tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>> {
+  // expected-error @+1 {{must match src shape}}
+  %0 = hmx.pack_weight ins(%src, %i, %j : tensor<64x96xf16>)
+                       outs(%dst : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>)
+                       {src_transposed}
+      -> tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
+  return %0 : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
+}
+
+// -----
+
+//--- !!! pack: the `_T` leaf family swaps the source dims in its addressing,
+//--- so the orientation must be decidable -- a static rank-2 source.
+func.func @pack_weight_transposed_dynamic(%src: tensor<?x?xf16>,
+                                          %dst: tensor<2x4x16x32x2xf16>,
+                                          %i: index, %j: index)
+    -> tensor<2x4x16x32x2xf16> {
+  // expected-error @+1 {{src_transposed requires a static rank-2 source}}
+  %0 = hmx.pack_weight ins(%src, %i, %j : tensor<?x?xf16>)
+                       outs(%dst : tensor<2x4x16x32x2xf16>) {src_transposed}
+      -> tensor<2x4x16x32x2xf16>
+  return %0 : tensor<2x4x16x32x2xf16>
+}
+
+// -----
+
+//--- accepted: a `src_transposed` pack whose crouton logical shape is the
+//--- source's own [N, K] shape.
+func.func @materialize_transposed_ok(%src: tensor<64x128xf16>,
+                                     %dst: tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>,
+                                     %i: index, %j: index)
+    -> tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>> {
+  %0 = hmx.pack_weight ins(%src, %i, %j : tensor<64x128xf16>)
+                       outs(%dst : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>)
+                       {src_transposed}
+      -> tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
+  return %0 : tensor<2x4x16x32x2xf16, #hmx.crouton<logical = [64, 128]>>
+}

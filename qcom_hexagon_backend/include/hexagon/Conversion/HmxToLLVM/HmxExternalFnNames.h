@@ -48,6 +48,17 @@ std::string getPackActTailF32FnName();
 std::string getPackWeightTailF32FnName();
 std::string getUnpackAccTailF16FnName();
 std::string getUnpackAccTailF32FnName();
+// Transposed-source weight forms: the source is a K^T view ([N,K] row-major,
+// the direct result of linalg.transpose(x){perm=[1,0]}), so the pack reads the
+// crouton pair axis (K) contiguously instead of the N axis (see the
+// `src_transposed` unit attr on hmx.pack_weight). pack_weight only: activations
+// never arrive transposed.
+std::string getPackWeightF16TFnName();
+std::string getPackWeightF32TFnName();
+std::string getPackWeightF16TBulkFnName();
+std::string getPackWeightF32TBulkFnName();
+std::string getPackWeightTailF16TFnName();
+std::string getPackWeightTailF32TFnName();
 
 // `hmx.stage` / `hmx.await` deliberately reuse the existing DMA runtime entries
 // (the interface plan fixes the cost at "the same one call as today's

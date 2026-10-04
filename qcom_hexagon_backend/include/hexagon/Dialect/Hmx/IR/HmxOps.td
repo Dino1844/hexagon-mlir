@@ -255,6 +255,15 @@ def Hmx_PackWeightOp
     `valid_rows` and `valid_cols` are an optional static pair in [1, 32] for a
     bounds-safe edge block: rows are valid K and columns are valid N. They
     select a single-block tail leaf and are omitted for the full fast path.
+
+    `src_transposed` marks a source that is already the transpose: a
+    row-major [N, K] K^T view (the direct result of
+    `linalg.transpose(x){perm = [1, 0]}` on a [K, N] matrix) instead of the
+    [K, N] source above. The pair (`k_tile`, `n_tile`) then addresses that
+    view directly -- the pack reads K, the crouton pair axis, contiguously --
+    and the lowering selects the `_T` leaf family. It is set only by the
+    matmul bridge on the full-tile path, and the source must be a static
+    rank-2 matrix so the orientation is decidable.
   }];
 
   let arguments = (ins
@@ -267,7 +276,8 @@ def Hmx_PackWeightOp
     Index:$n_tile,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$count,
     OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_rows,
-    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols
+    OptionalAttr<ConfinedAttr<I64Attr, [IntPositive]>>:$valid_cols,
+    OptionalAttr<UnitAttr>:$src_transposed
   );
   // Tensor form: the crouton array. Memref form (DPS): the same `dst` buffer
   // that was written, so the destination is an SSA value.

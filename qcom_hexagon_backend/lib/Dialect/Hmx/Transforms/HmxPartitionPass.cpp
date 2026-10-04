@@ -1529,7 +1529,10 @@ static LogicalResult emitDiagnosticInputBridges(
         weightBridge->source, kLoop.getInductionVar(), nLoop.getInductionVar(),
         IntegerAttr(),
         validRows ? rewriter.getI64IntegerAttr(*validRows) : IntegerAttr(),
-        validCols ? rewriter.getI64IntegerAttr(*validCols) : IntegerAttr());
+        validCols ? rewriter.getI64IntegerAttr(*validCols) : IntegerAttr(),
+        // Rebuilt, not re-decided: the marker rides along from the bridge's
+        // own packs, so a rebuild can never silently drop the orientation.
+        cast<PackWeightOp>(weightBridge->ops.front()).getSrcTransposedAttr());
     setDiagnosticDecisionId(pack.getOperation(), decisionId);
     rewriter.setInsertionPointAfter(nLoop);
     cursor = nLoop.getOperation();

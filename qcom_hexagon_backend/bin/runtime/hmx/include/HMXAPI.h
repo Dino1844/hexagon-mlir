@@ -136,6 +136,48 @@ void hmx_pack_weight_f32_bulk(unsigned dst_addr, unsigned src_addr, unsigned k,
                               unsigned k_tile_start, unsigned n_tile,
                               unsigned n_k_tiles);
 
+/* Transposed-source twins of the weight packs: `src_addr` is a row-major
+ * [n][k] matrix (rows = N, contiguous columns = K, rows `src_stride` elements
+ * apart) holding the transpose of the logical [K][N] weight operand, so the
+ * packed element W[k, n] is src[n * src_stride + k]. `k`/`n` stay the logical
+ * extents and `k_tile`/`n_tile` the logical block coordinates, exactly as in
+ * the non-transposed twins; only the source addressing turns around. The
+ * column-major view of K (a [K][N]-shaped strided<[1, N]> memref) is
+ * deliberately NOT the ABI: the leaf would need a second stride and the
+ * square case could not be told apart from a row-major source, so the
+ * compiler materialises the fact as the transpose's *input* plus the
+ * hmx.pack_weight `src_transposed` marker instead
+ * (docs/hmx/fa-transpose-copy-design-2026-09-30.md, option (e)/knife 1).
+ *
+ * The transposed source's contiguous axis is K -- the crouton's pair axis --
+ * so the pack is one 128 B load plus one offset-table scatter per source row
+ * (the same shape as the activation's pair-scatter), not a strided gather.
+ * Byte-validated against the closed-form layout by
+ * exp/hmx/oracle/pack_weight_leaf_oracle.c (4000 random cases, 0 mismatching,
+ * 0 escaped bytes) before the leaf was written. */
+void hmx_pack_weight_f16_T(unsigned dst_addr, unsigned src_addr, unsigned k,
+                           unsigned n, unsigned src_stride, unsigned k_tile,
+                           unsigned n_tile);
+/* Bulk twin: `n_k_tiles` consecutive K tiles at one fixed `n_tile`, exactly
+ * calling hmx_pack_weight_f16_T with k_tile = k_tile_start + t and the crouton
+ * at dst_addr + t * HMX_TILE_BYTES. Runs of >= 2 full K tiles in a wide
+ * enough row take a two-tile scatter (one load + one scatter per source row
+ * covers both croutons); the guard falls back to the single-tile body. */
+void hmx_pack_weight_f16_T_bulk(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile_start, unsigned n_tile,
+                                unsigned n_k_tiles);
+/* f32 twins: same transposed contract, with the engine's fp16 conversion
+ * folded in exactly as in the row-major f32 packs (two 128 B loads + one
+ * conversion per source row-pair, then the scatter). */
+void hmx_pack_weight_f32_T(unsigned dst_addr, unsigned src_addr, unsigned k,
+                           unsigned n, unsigned src_stride, unsigned k_tile,
+                           unsigned n_tile);
+void hmx_pack_weight_f32_T_bulk(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile_start, unsigned n_tile,
+                                unsigned n_k_tiles);
+
 /* Bounds-safe single-tile forms. The valid extents are in [1, 32] and are
  * explicit on the IR op; these leaves copy only valid elements through a
  * zero-padded temporary before invoking the established pack permutation.
@@ -159,6 +201,18 @@ void hmx_pack_weight_tail_f32(unsigned dst_addr, unsigned src_addr,
                               unsigned k, unsigned n, unsigned src_stride,
                               unsigned k_tile, unsigned n_tile,
                               unsigned valid_rows, unsigned valid_cols);
+/* Transposed-source twins of the bounds-safe weight tails: the source is the
+ * row-major [n][k] transpose input, the valid extents and the zero-padded
+ * temporary are the logical [K][N] block's, exactly as in the row-major
+ * tails. */
+void hmx_pack_weight_tail_f16_T(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile, unsigned n_tile,
+                                unsigned valid_rows, unsigned valid_cols);
+void hmx_pack_weight_tail_f32_T(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile, unsigned n_tile,
+                                unsigned valid_rows, unsigned valid_cols);
 
 /* Unpack one AR crouton row-pair into a row-major fp16 block at `dst_addr`
  * (vectorised; the fp32 image is a widening in the compiler). The destination

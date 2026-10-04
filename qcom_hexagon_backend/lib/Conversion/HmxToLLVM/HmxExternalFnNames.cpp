@@ -55,6 +55,20 @@ std::string hmx::getUnpackAccTailF16FnName() {
 std::string hmx::getUnpackAccTailF32FnName() {
   return "hmx_unpack_acc_tail_f32";
 }
+std::string hmx::getPackWeightF16TFnName() { return "hmx_pack_weight_f16_T"; }
+std::string hmx::getPackWeightF32TFnName() { return "hmx_pack_weight_f32_T"; }
+std::string hmx::getPackWeightF16TBulkFnName() {
+  return "hmx_pack_weight_f16_T_bulk";
+}
+std::string hmx::getPackWeightF32TBulkFnName() {
+  return "hmx_pack_weight_f32_T_bulk";
+}
+std::string hmx::getPackWeightTailF16TFnName() {
+  return "hmx_pack_weight_tail_f16_T";
+}
+std::string hmx::getPackWeightTailF32TFnName() {
+  return "hmx_pack_weight_tail_f32_T";
+}
 
 // The staging ops are DMA runtime calls, so the names are the DMA ones; see the
 // header for why they are re-exported here.

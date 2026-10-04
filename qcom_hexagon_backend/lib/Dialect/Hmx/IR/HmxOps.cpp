@@ -453,10 +453,24 @@ LogicalResult PackActOp::verify() {
 LogicalResult PackWeightOp::verify() {
   // The weight is stored as Wᵀ: the crouton `dst` has logical [N, K] while the
   // row-major `src` is [K, N], so the logical shape is the source's transpose
-  // (unlike `pack_act`, whose logical shape is the source shape).
+  // (unlike `pack_act`, whose logical shape is the source shape). With
+  // `src_transposed` the source is itself that [N, K] transpose, so the
+  // agreement turns into the identity instead.
   if (failed(verifyCroutonDirection(getOperation(), getDst(), getSrc(), "dst",
-                                    "src", /*transposed=*/true)))
+                                    "src",
+                                    /*transposed=*/!getSrcTransposed())))
     return failure();
+  // The `_T` leaf family swaps the source dims in its addressing, so the
+  // orientation has to be decidable: a static rank-2 source in whichever form
+  // the bridge or bufferization left it in.
+  if (getSrcTransposed()) {
+    auto srcType = dyn_cast<ShapedType>(getSrc().getType());
+    if (!srcType || !srcType.hasRank() || srcType.getRank() != 2 ||
+        !srcType.hasStaticShape())
+      return emitOpError()
+             << "src_transposed requires a static rank-2 source, got "
+             << getSrc().getType();
+  }
   if (failed(verifyPackSource(getOperation(), getSrc(), "src")))
     return failure();
   // The bulk range runs along the weight grid's contiguous (K) axis, dim 1 of

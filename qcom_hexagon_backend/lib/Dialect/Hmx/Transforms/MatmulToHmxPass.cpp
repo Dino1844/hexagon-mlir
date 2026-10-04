@@ -1039,12 +1039,17 @@ static int64_t vtcmBytesCommitted(Operation *within) {
 /// (t0=n_tile, t1=k_tile, j, col, h) is src[t1*32 + 2j + h][t0*32 + col]. See
 /// docs/hmx/hmx-weight-layout-plan.md §0. Either way a constant operand (a
 /// weight in inference, where W is baked in) never needs the runtime packer.
-static DenseElementsAttr
-prepackCrouton(DenseElementsAttr src, RankedTensorType crouton, bool isWeight) {
+static DenseElementsAttr prepackCrouton(DenseElementsAttr src,
+                                        RankedTensorType crouton, bool isWeight,
+                                        bool transposed = false) {
   auto srcType = cast<RankedTensorType>(src.getType());
   const int64_t cols = srcType.getDimSize(1);
+  // `transposed`: the source is the [N, K] transpose input itself (see
+  // `resolveTransposedWeight`), so W[k][n] sits at n * K + k -- the same `at`
+  // with the index roles swapped; `cols` is K in that orientation.
   auto at = [&](int64_t k, int64_t n) {
-    return src.getValues<APFloat>()[k * cols + n];
+    return transposed ? src.getValues<APFloat>()[n * cols + k]
+                      : src.getValues<APFloat>()[k * cols + n];
   };
   SmallVector<APFloat> packed;
   packed.reserve(crouton.getNumElements());
@@ -1066,7 +1071,8 @@ prepackCrouton(DenseElementsAttr src, RankedTensorType crouton, bool isWeight) {
 /// The prepacked constant, copied into its VTCM crouton array: the permutation
 /// already ran at compile time, so only a straight elementwise copy is left.
 Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
-                       RankedTensorType crouton, bool isWeight) {
+                       RankedTensorType crouton, bool isWeight,
+                       bool transposed = false) {
   auto cst = src.getDefiningOp<arith::ConstantOp>();
   if (!cst)
     return {};
@@ -1080,8 +1086,8 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
   // means no `arith.constant` has to be rewritten when the encoding is dropped.
   auto plain =
       RankedTensorType::get(crouton.getShape(), crouton.getElementType());
-  Value packed =
-      arith::ConstantOp::create(b, loc, prepackCrouton(dense, plain, isWeight));
+  Value packed = arith::ConstantOp::create(
+      b, loc, prepackCrouton(dense, plain, isWeight, transposed));
   Value out = vtcmEmpty(b, loc, crouton);
   SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(crouton.getRank()));
   SmallVector<utils::IteratorType> iterators(crouton.getRank(),
@@ -1116,8 +1122,9 @@ Value prepackedCrouton(RewriterBase &b, Location loc, Value src,
 /// runtime, while the leaves are the vectorised HVX packers from Phase 0.
 Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
                              RankedTensorType crouton, bool isWeight,
-                             int64_t decisionId) {
-  if (Value folded = prepackedCrouton(b, loc, src, crouton, isWeight))
+                             int64_t decisionId, bool srcTransposed = false) {
+  if (Value folded =
+          prepackedCrouton(b, loc, src, crouton, isWeight, srcTransposed))
     return folded;
   auto srcType = cast<RankedTensorType>(src.getType());
   int64_t rows = srcType.getDimSize(0);
@@ -1126,9 +1133,14 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
   int64_t rowTiles = rows / HmxTarget::tileEdge;
 
   // Outer tile count and K-run length in source-block coordinates. A weight's K
-  // runs down the source rows, an activation's along its columns.
-  int64_t outerTiles = isWeight ? tileCols : rowTiles;
-  int64_t kTiles = isWeight ? rowTiles : tileCols;
+  // runs down the source rows, an activation's along its columns. A transposed
+  // weight source is already the [N, K] the crouton grid names -- the
+  // activation's geometry -- so its outer walk covers N tiles (dim 0) and the
+  // K run the column tiles (dim 1); `src_transposed` tells the lowering which
+  // leaf family addresses it.
+  bool plainWeight = isWeight && !srcTransposed;
+  int64_t outerTiles = plainWeight ? tileCols : rowTiles;
+  int64_t kTiles = plainWeight ? rowTiles : tileCols;
 
   Value dst = vtcmEmpty(b, loc, crouton);
   Value zero = arith::ConstantIndexOp::create(b, loc, 0);
@@ -1146,9 +1158,9 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
     // [0, Kt), n tile = i).
     Value out;
     if (isWeight) {
-      auto pack =
-          hmx::PackWeightOp::create(b, loc, crouton, carried, src, zero, i,
-                                    count, IntegerAttr(), IntegerAttr());
+      auto pack = hmx::PackWeightOp::create(
+          b, loc, crouton, carried, src, zero, i, count, IntegerAttr(),
+          IntegerAttr(), srcTransposed ? b.getUnitAttr() : UnitAttr());
       setDecisionId(pack.getOperation(), decisionId);
       out = pack->getResult(0);
     } else {
@@ -1332,6 +1344,35 @@ static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
   return result;
 }
 
+/// The transposed weight view behind `rhs`, or `rhs` itself. The weight
+/// crouton stores Wᵀ (docs/hmx/hmx-weight-layout-plan.md §0), so a matmul rhs
+/// produced by `linalg.transpose(x){perm = [1, 0]}` is exactly the layout
+/// change the bridge wants: packing straight from `x` -- marked
+/// `src_transposed` on `hmx.pack_weight` -- makes the transpose's result
+/// tensor unnecessary, and under one-shot bufferization that result is a
+/// full-matrix copy (2048 of them in flash attention). Admission is
+/// mechanism-only: the exact 2D swap, a static rank-2 input, and this matmul
+/// as the transpose result's only user (another user still needs the
+/// materialised result). Any refusal keeps the materialised form and says why
+/// in a remark.
+static std::pair<Value, bool> resolveTransposedWeight(Operation *op, Value rhs) {
+  auto view = rhs.getDefiningOp<linalg::TransposeOp>();
+  if (!view)
+    return {rhs, false};
+  auto refuse = [&](const char *why) {
+    op->emitRemark() << "transposed weight view kept materialised: " << why;
+    return std::pair<Value, bool>{rhs, false};
+  };
+  if (view.getPermutation() != ArrayRef<int64_t>{1, 0})
+    return refuse("the permutation is not the 2D swap");
+  if (!rhs.hasOneUse())
+    return refuse("the transpose result has other users");
+  auto inputType = dyn_cast<RankedTensorType>(view.getInput().getType());
+  if (!inputType || inputType.getRank() != 2 || !inputType.hasStaticShape())
+    return refuse("the transpose input is not a static rank-2 matrix");
+  return {view.getInput(), true};
+}
+
 /// Emits the crouton bridge for `src` at a point that dominates `consumer`:
 /// hoisted out of every enclosing loop `src` does not depend on when `hoist`
 /// holds, otherwise right above the consumer (re-packed once per block
@@ -1345,7 +1386,8 @@ static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
 /// correct; only the residency differs.
 Value emitBridgeAbove(RewriterBase &b, Location loc, Value src,
                       RankedTensorType crouton, bool isWeight,
-                      Operation *consumer, bool hoist, int64_t decisionId) {
+                      Operation *consumer, bool hoist, int64_t decisionId,
+                      bool srcTransposed = false) {
   Operation *insertBefore = consumer;
   if (hoist) {
     for (Operation *parent = consumer->getParentOp(); parent;
@@ -1361,7 +1403,8 @@ Value emitBridgeAbove(RewriterBase &b, Location loc, Value src,
   }
   OpBuilder::InsertionGuard guard(b);
   b.setInsertionPoint(insertBefore);
-  return packCroutonsWithLeaves(b, loc, src, crouton, isWeight, decisionId);
+  return packCroutonsWithLeaves(b, loc, src, crouton, isWeight, decisionId,
+                                 srcTransposed);
 }
 
 /// True when `v` is defined outside `loop` (a block argument counts as defined
@@ -1411,6 +1454,12 @@ static LogicalResult emitDiagnosticTailMatmul(Operation *op,
   auto outType = cast<RankedTensorType>(init.getType());
   auto lhsType = cast<RankedTensorType>(lhs.getType());
   auto rhsType = cast<RankedTensorType>(rhs.getType());
+  // The padded tail bridge has no `_T` counterpart and is not on any measured
+  // path, so a transposed rhs keeps its materialised form here -- said out
+  // loud rather than silently.
+  if (rhs.getDefiningOp<linalg::TransposeOp>())
+    op->emitRemark("transposed weight view stays materialised on the "
+                   "diagnostic tail path");
 
   Value paddedLhs = padMatrix(rewriter, loc, lhs, shape.mp, shape.kp);
   Value paddedRhs = padMatrix(rewriter, loc, rhs, shape.kp, shape.np);
@@ -1522,6 +1571,11 @@ struct MatmulToHmx : public RewritePattern {
       return emitDiagnosticTailMatmul(op, decision, target, rewriter);
     }
 
+    // The transposed weight view, resolved once for both bridge forms below:
+    // they pack from the transpose *input* while the diagnostic tail above
+    // keeps the materialised form.
+    auto [rhsSource, rhsTransposed] = resolveTransposedWeight(op, rhs);
+
     // The second question after legality: the crouton bridge must pay for
     // itself. The plan names the M block the bridge allocates for -- the whole
     // M when the contraction fits, a smaller block when only a block does, and
@@ -1559,7 +1613,9 @@ struct MatmulToHmx : public RewritePattern {
     int64_t room = target.vtcmBudget - vtcmUsed;
     int64_t rhsBytes = contract.k * contract.n * inBytes;
     bool aInvariant = isLoopInvariant(lhs, op);
-    bool bInvariant = isLoopInvariant(rhs, op);
+    // Invariance is a property of the bytes the bridge reads: the transpose
+    // input once resolved, not the view on top of it.
+    bool bInvariant = isLoopInvariant(rhsSource, op);
 
     // The crouton bridge is the runtime's vectorised pack leaves. Measured on
     // device: 113 us for the packs against 2064 us for the generic linalg
@@ -1583,9 +1639,10 @@ struct MatmulToHmx : public RewritePattern {
       Value packedLhs =
           emitBridgeAbove(rewriter, loc, lhs, hmx::croutonLayoutType(lhsType),
                           /*isWeight=*/false, op, hoistLhs, decision.id);
-      Value packedRhs =
-          emitBridgeAbove(rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
-                          /*isWeight=*/true, op, hoistRhs, decision.id);
+      Value packedRhs = emitBridgeAbove(rewriter, loc, rhsSource,
+                                        hmx::weightCroutonType(rhsType),
+                                        /*isWeight=*/true, op, hoistRhs,
+                                        decision.id, rhsTransposed);
 
       // The accumulator is read out into VTCM: the engine has nowhere else to
       // write.
@@ -1601,6 +1658,11 @@ struct MatmulToHmx : public RewritePattern {
       Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
                                   empty ? Value{} : init, escapes, decision.id);
       rewriter.replaceOp(op, result);
+      // The transpose's only user was this matmul; with the bridge reading its
+      // input directly the view is dead, and one-shot bufferization does not
+      // DCE -- leaving it would keep the very copy this rewrite removes.
+      if (rhsTransposed)
+        rewriter.eraseOp(rhs.getDefiningOp());
       return success();
     }
 
@@ -1627,9 +1689,10 @@ struct MatmulToHmx : public RewritePattern {
     bool hoistRhs =
         bInvariant && rhsBytes <= room - blockActBytes - blockArBytes;
 
-    Value packedRhs =
-        emitBridgeAbove(rewriter, loc, rhs, hmx::weightCroutonType(rhsType),
-                        /*isWeight=*/true, op, hoistRhs, decision.id);
+    Value packedRhs = emitBridgeAbove(rewriter, loc, rhsSource,
+                                      hmx::weightCroutonType(rhsType),
+                                      /*isWeight=*/true, op, hoistRhs,
+                                      decision.id, rhsTransposed);
 
     Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
     Value cM = arith::ConstantIndexOp::create(rewriter, loc, contract.m);
@@ -1686,6 +1749,10 @@ struct MatmulToHmx : public RewritePattern {
       scf::YieldOp::create(rewriter, loc, ValueRange{inserted});
     }
     rewriter.replaceOp(op, blockLoop.getResult(0));
+    // Same as the whole form: the resolved-away transpose is dead and must not
+    // survive to bufferization.
+    if (rhsTransposed)
+      rewriter.eraseOp(rhs.getDefiningOp());
     return success();
   }
 

@@ -339,6 +339,211 @@ void hmx_pack_weight_f32_bulk(unsigned dst_addr, unsigned src_addr, unsigned k,
                         src_stride, k_tile_start + t, n_tile);
 }
 
+/* ---- transposed-source weight packs --------------------------------------- */
+/*
+ * The source here is the row-major [n][k] *input* of a materialised transpose
+ * (see HMXAPI.h): the packed element W[k, n] is src[n * src_stride + k]. In
+ * the crouton's coordinates the source's contiguous K axis is the pair axis
+ * and N is the stride axis (byte(pair, stride) = 128*(pair>>1) + 4*stride +
+ * 2*(pair&1), WH: pair = K, stride = N), so a contiguous 128 B source row is
+ * one k-run of one n-column scattered across the tile's blocks -- the mirror
+ * image of the row-major pack, which loads a contiguous n-run of one k-row.
+ * The offset tables below are the oracle's kT1/kT2, byte-validated against
+ * the closed-form layout over 4000 random cases before this leaf was written
+ * (exp/hmx/oracle/pack_weight_leaf_oracle.c).
+ *
+ * hmx__pack_T1 pairs TWO source rows (n, n+1) in one scatter: halfword h < 32
+ * is row n's k-run (byte 128*(h>>1) + 2*(h&1)), h >= 32 is row n+1's (the
+ * same + 4); the row-pair's 8*j rides on the scatter base.
+ * hmx__pack_T2 is the two-K-tile scatter: halfword h < 32 lands in the first
+ * crouton, h >= 32 in the second (+ HMX_TILE_BYTES); the n-column's 4*i rides
+ * on the base. */
+static const int16_t hmx__pack_T1[64] __attribute__((aligned(128))) = {
+    0,    2,    128,  130,  256,  258,  384,  386,  512,  514,  640,  642,
+    768,  770,  896,  898,  1024, 1026, 1152, 1154, 1280, 1282, 1408, 1410,
+    1536, 1538, 1664, 1666, 1792, 1794, 1920, 1922, 4,    6,    132,  134,
+    260,  262,  388,  390,  516,  518,  644,  646,  772,  774,  900,  902,
+    1028, 1030, 1156, 1158, 1284, 1286, 1412, 1414, 1540, 1542, 1668, 1670,
+    1796, 1798, 1924, 1926};
+static const int16_t hmx__pack_T2[64] __attribute__((aligned(128))) = {
+    0,    2,    128,  130,  256,  258,  384,  386,  512,  514,  640,  642,
+    768,  770,  896,  898,  1024, 1026, 1152, 1154, 1280, 1282, 1408, 1410,
+    1536, 1538, 1664, 1666, 1792, 1794, 1920, 1922, 2048, 2050, 2176, 2178,
+    2304, 2306, 2432, 2434, 2560, 2562, 2688, 2690, 2816, 2818, 2944, 2946,
+    3072, 3074, 3200, 3202, 3328, 3330, 3456, 3458, 3584, 3586, 3712, 3714,
+    3840, 3842, 3968, 3970};
+
+/* The f32 twin of T1, for the interleaved value the W-form qf32->hf16
+ * conversion emits (layout_oracle.h: "halfword 2c = row 2j, 2c+1 = row 2j+1"
+ * -- the same property the row-major f32 pack's direct store relies on):
+ * halfword 2n is row n's k-element n and 2n+1 row (n+1)'s, so the slots swap
+ * T1[n] <-> T1[32+n]. Feeding the conversion's output to T1 itself scrambles
+ * the tile -- found on device (rel=0.25 on an isolated transposed matmul,
+ * f16 twin exact), proven positionally against the wh_off closed form over
+ * all tile positions in exp/hmx/fa_util/dma_staging/fix_t1f32_proof.c
+ * (T1: 15872/16384 positions wrong, this table: 0). */
+static const int16_t hmx__pack_T1_f32[64] __attribute__((aligned(128))) = {
+    0,    4,    2,    6,    128,  132,  130,  134,  256,  260,  258,  262,
+    384,  388,  386,  390,  512,  516,  514,  518,  640,  644,  642,  646,
+    768,  772,  770,  774,  896,  900,  898,  902,  1024, 1028, 1026, 1030,
+    1152, 1156, 1154, 1158, 1280, 1284, 1282, 1286, 1408, 1412, 1410, 1414,
+    1536, 1540, 1538, 1542, 1664, 1668, 1666, 1670, 1792, 1796, 1794, 1798,
+    1920, 1924, 1922, 1926};
+
+/* Packs one 32x32 crouton from the transposed source. `k`/`n` are the logical
+ * extents; out-of-range K (a partial k-run) and out-of-range N (a missing
+ * source row) read as zero, exactly as in the row-major pack. The source must
+ * be readable for 128 B from each row's tile start (the same contract as
+ * hmx__pack_32x32; the 128 B load uses the low 64 B here). */
+static inline __attribute__((always_inline)) void hmx__pack_32x32_T(
+    unsigned dst, unsigned src, unsigned k, unsigned n, unsigned src_stride,
+    unsigned k_tile, unsigned n_tile) {
+  const unsigned k0 = k_tile * HMX_TILE_COLS;
+  const unsigned n0 = n_tile * HMX_TILE_COLS;
+  const unsigned nk =
+      (k0 >= k) ? 0u
+                : (k - k0 >= HMX_TILE_COLS ? HMX_TILE_COLS : k - k0);
+  if (nk == 0u) {
+    const HVX_Vector z = Q6_V_vzero();
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j)
+      *(HVX_Vector *)(uintptr_t)(dst + j * HMX_BLOCK_BYTES) = z;
+    return;
+  }
+
+  const HVX_Vector offs = *(const HVX_Vector *)hmx__pack_T1;
+  const HVX_Vector zero = Q6_V_vzero();
+  /* A partial k-run is masked after the load, per row, to the first nk
+   * halfwords of the row's low 64 B (the run k0..k0+31). */
+  const HVX_VectorPred keep = Q6_Q_vsetq_R(2u * nk);
+  for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
+    const unsigned r0 = n0 + 2u * j;
+    const unsigned r1 = r0 + 1u;
+    HVX_Vector v0 = zero;
+    HVX_Vector v1 = zero;
+    if (r0 < n)
+      v0 = *(const HVX_UVector *)(const void *)(uintptr_t)(
+          src + (r0 * src_stride + k0) * 2u);
+    if (r1 < n)
+      v1 = *(const HVX_UVector *)(const void *)(uintptr_t)(
+          src + (r1 * src_stride + k0) * 2u);
+    if (nk < HMX_TILE_COLS) {
+      v0 = Q6_V_vmux_QVV(keep, v0, zero);
+      v1 = Q6_V_vmux_QVV(keep, v1, zero);
+    }
+    /* [row r0's k-run | row r1's k-run] is exactly the pair combine the
+     * row-major pack builds from two of its own source rows. */
+    Q6_vscatter_RMVhV((size_t)(uintptr_t)(dst + 8u * j), 2047u, offs,
+                      hmx__pack_pair(v0, v1));
+  }
+}
+
+/* Two consecutive K tiles per pass: one 128 B load (a full 64-halfword k-run)
+ * plus one scatter per source row. Requires a full 64-element k-run (no
+ * masking) and a row at least 64 elements wide, so the load stays inside the
+ * row; anything else takes the single-tile body twice. */
+static inline __attribute__((always_inline)) void hmx__pack_2tiles_T(
+    unsigned dst, unsigned src, unsigned k, unsigned n, unsigned src_stride,
+    unsigned k_tile, unsigned n_tile) {
+  const unsigned k0 = k_tile * HMX_TILE_COLS;
+  const unsigned n0 = n_tile * HMX_TILE_COLS;
+  if (src_stride >= 2u * HMX_TILE_COLS && k - k0 >= 2u * HMX_TILE_COLS) {
+    const HVX_Vector offs = *(const HVX_Vector *)hmx__pack_T2;
+    const HVX_Vector zero = Q6_V_vzero();
+    for (unsigned i = 0; i < HMX_TILE_COLS; ++i) {
+      const unsigned row = n0 + i;
+      HVX_Vector v = zero;
+      if (row < n)
+        v = *(const HVX_UVector *)(const void *)(uintptr_t)(
+            src + (row * src_stride + k0) * 2u);
+      Q6_vscatter_RMVhV((size_t)(uintptr_t)(dst + 4u * i), 4095u, offs, v);
+    }
+    return;
+  }
+  hmx__pack_32x32_T(dst, src, k, n, src_stride, k_tile, n_tile);
+  hmx__pack_32x32_T(dst + HMX_TILE_BYTES, src, k, n, src_stride, k_tile + 1u,
+                    n_tile);
+}
+
+void hmx_pack_weight_f16_T(unsigned dst_addr, unsigned src_addr, unsigned k,
+                           unsigned n, unsigned src_stride, unsigned k_tile,
+                           unsigned n_tile) {
+  hmx__pack_32x32_T(dst_addr, src_addr, k, n, src_stride, k_tile, n_tile);
+}
+
+void hmx_pack_weight_f16_T_bulk(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile_start, unsigned n_tile,
+                                unsigned n_k_tiles) {
+  unsigned t = 0;
+  for (; t + 2u <= n_k_tiles; t += 2u)
+    hmx__pack_2tiles_T(dst_addr + t * HMX_TILE_BYTES, src_addr, k, n,
+                       src_stride, k_tile_start + t, n_tile);
+  for (; t < n_k_tiles; ++t)
+    hmx__pack_32x32_T(dst_addr + t * HMX_TILE_BYTES, src_addr, k, n,
+                      src_stride, k_tile_start + t, n_tile);
+}
+
+/* f32 transposed pack: one 128 B load per source row is exactly one k-run (32
+ * f32), and the pair conversion [conv(row r0) | conv(row r1)] is the same
+ * [k-run | k-run] halfword layout hmx__pack_T1 scatters, so the f32 twin is
+ * two loads + one conversion + one scatter per row-pair -- the same memory-op
+ * count as the row-major f32 pack (32 loads + 16 scatter-stores per 2 KB). */
+static inline __attribute__((always_inline)) void hmx__pack_32x32_T_f32(
+    unsigned dst, unsigned src, unsigned k, unsigned n, unsigned src_stride,
+    unsigned k_tile, unsigned n_tile) {
+  const unsigned k0 = k_tile * HMX_TILE_COLS;
+  const unsigned n0 = n_tile * HMX_TILE_COLS;
+  const unsigned nk =
+      (k0 >= k) ? 0u
+                : (k - k0 >= HMX_TILE_COLS ? HMX_TILE_COLS : k - k0);
+  if (nk == 0u) {
+    const HVX_Vector z = Q6_V_vzero();
+    for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j)
+      *(HVX_Vector *)(uintptr_t)(dst + j * HMX_BLOCK_BYTES) = z;
+    return;
+  }
+
+  const HVX_Vector offs = *(const HVX_Vector *)hmx__pack_T1_f32;
+  const HVX_Vector zero = Q6_V_vzero();
+  const HVX_VectorPred keep = Q6_Q_vsetq_R(4u * nk);
+  for (unsigned j = 0; j < HMX_BLOCK_PAIRS; ++j) {
+    const unsigned r0 = n0 + 2u * j;
+    const unsigned r1 = r0 + 1u;
+    HVX_Vector v0 = zero;
+    HVX_Vector v1 = zero;
+    if (r0 < n)
+      v0 = *(const HVX_UVector *)(const void *)(uintptr_t)(
+          src + (r0 * src_stride + k0) * 4u);
+    if (r1 < n)
+      v1 = *(const HVX_UVector *)(const void *)(uintptr_t)(
+          src + (r1 * src_stride + k0) * 4u);
+    if (nk < HMX_TILE_COLS) {
+      v0 = Q6_V_vmux_QVV(keep, v0, zero);
+      v1 = Q6_V_vmux_QVV(keep, v1, zero);
+    }
+    /* hmx__f32_pair_to_block emits the interleaved pair form (NOT the
+     * concatenated one hmx__pack_pair builds), so the scatter rides the f32
+     * twin of T1 -- see hmx__pack_T1_f32 above. */
+    Q6_vscatter_RMVhV((size_t)(uintptr_t)(dst + 8u * j), 2047u, offs,
+                      hmx__f32_pair_to_block(v0, v1));
+  }
+}
+
+void hmx_pack_weight_f32_T(unsigned dst_addr, unsigned src_addr, unsigned k,
+                           unsigned n, unsigned src_stride, unsigned k_tile,
+                           unsigned n_tile) {
+  hmx__pack_32x32_T_f32(dst_addr, src_addr, k, n, src_stride, k_tile, n_tile);
+}
+
+void hmx_pack_weight_f32_T_bulk(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile_start, unsigned n_tile,
+                                unsigned n_k_tiles) {
+  for (unsigned t = 0; t < n_k_tiles; ++t)
+    hmx__pack_32x32_T_f32(dst_addr + t * HMX_TILE_BYTES, src_addr, k, n,
+                          src_stride, k_tile_start + t, n_tile);
+}
+
 /* ---- bounds-safe diagnostic tail leaves ---------------------------------- */
 /*
  * These are deliberately conservative reference implementations. They stage
@@ -417,6 +622,62 @@ void hmx_pack_weight_tail_f32(unsigned dst_addr, unsigned src_addr, unsigned k,
                               unsigned valid_rows, unsigned valid_cols) {
   hmx__pack_tail_f32_impl(dst_addr, src_addr, k, n, src_stride, k_tile,
                           n_tile, valid_rows, valid_cols);
+}
+
+/* Transposed-source twins of the bounds-safe weight tails: the scratch is the
+ * logical [K][N] block, so the staging copy reads the transposed source
+ * (element (k, n) is src[n][k]) and then hands the scratch to the established
+ * row-major pack, exactly as the row-major tails stage their own source. */
+static inline void hmx__pack_tail_T_f16_impl(
+    unsigned dst, unsigned src, unsigned k, unsigned n, unsigned src_stride,
+    unsigned k_tile, unsigned n_tile, unsigned valid_rows,
+    unsigned valid_cols) {
+  uint16_t scratch[HMX_TILE_ROWS][HMX_TILE_COLS]
+      __attribute__((aligned(128))) = {{0}};
+  const unsigned k_row0 = k_tile * HMX_TILE_ROWS;
+  const unsigned n_col0 = n_tile * HMX_TILE_COLS;
+  const unsigned vr = valid_rows < HMX_TILE_ROWS ? valid_rows : HMX_TILE_ROWS;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  const uint16_t *base = (const uint16_t *)(uintptr_t)src;
+  for (unsigned r = 0; r < vr && k_row0 + r < k; ++r)
+    for (unsigned c = 0; c < vc && n_col0 + c < n; ++c)
+      scratch[r][c] = base[(n_col0 + c) * src_stride + k_row0 + r];
+  hmx_pack_act_f16(dst, (unsigned)(uintptr_t)scratch, HMX_TILE_ROWS,
+                   HMX_TILE_COLS, HMX_TILE_COLS, 0, 0);
+}
+
+static inline void hmx__pack_tail_T_f32_impl(
+    unsigned dst, unsigned src, unsigned k, unsigned n, unsigned src_stride,
+    unsigned k_tile, unsigned n_tile, unsigned valid_rows,
+    unsigned valid_cols) {
+  uint32_t scratch[HMX_TILE_ROWS][HMX_TILE_COLS]
+      __attribute__((aligned(128))) = {{0}};
+  const unsigned k_row0 = k_tile * HMX_TILE_ROWS;
+  const unsigned n_col0 = n_tile * HMX_TILE_COLS;
+  const unsigned vr = valid_rows < HMX_TILE_ROWS ? valid_rows : HMX_TILE_ROWS;
+  const unsigned vc = valid_cols < HMX_TILE_COLS ? valid_cols : HMX_TILE_COLS;
+  const uint32_t *base = (const uint32_t *)(uintptr_t)src;
+  for (unsigned r = 0; r < vr && k_row0 + r < k; ++r)
+    for (unsigned c = 0; c < vc && n_col0 + c < n; ++c)
+      scratch[r][c] = base[(n_col0 + c) * src_stride + k_row0 + r];
+  hmx_pack_act_f32(dst, (unsigned)(uintptr_t)scratch, HMX_TILE_ROWS,
+                   HMX_TILE_COLS, HMX_TILE_COLS, 0, 0);
+}
+
+void hmx_pack_weight_tail_f16_T(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile, unsigned n_tile,
+                                unsigned valid_rows, unsigned valid_cols) {
+  hmx__pack_tail_T_f16_impl(dst_addr, src_addr, k, n, src_stride, k_tile,
+                            n_tile, valid_rows, valid_cols);
+}
+
+void hmx_pack_weight_tail_f32_T(unsigned dst_addr, unsigned src_addr,
+                                unsigned k, unsigned n, unsigned src_stride,
+                                unsigned k_tile, unsigned n_tile,
+                                unsigned valid_rows, unsigned valid_cols) {
+  hmx__pack_tail_T_f32_impl(dst_addr, src_addr, k, n, src_stride, k_tile,
+                            n_tile, valid_rows, valid_cols);
 }
 
 /* One chunk: two column tiles (64 columns) of one row-pair, or the 32-column
