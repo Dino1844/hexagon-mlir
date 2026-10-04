@@ -9,10 +9,10 @@
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(hmx-workspace-resident))' | FileCheck %s
 // CHECK: hmx.kernel_manifest =
-// CHECK: function = "workspace_a", grid_policy = "single-instance"
-// CHECK-SAME: workspace_class = "resident-single-instance"
-// CHECK: function = "workspace_b", grid_policy = "single-instance"
-// CHECK-SAME: workspace_class = "resident-single-instance"
+// CHECK: function = "workspace_a", grid_policy = "legacy-runtime"
+// CHECK-SAME: workspace_class = "resident"
+// CHECK: function = "workspace_b", grid_policy = "legacy-runtime"
+// CHECK-SAME: workspace_class = "resident"
 // CHECK-LABEL: func.func @workspace_a
 // CHECK: hmx.workspace_resident
 // CHECK-LABEL: func.func @workspace_b

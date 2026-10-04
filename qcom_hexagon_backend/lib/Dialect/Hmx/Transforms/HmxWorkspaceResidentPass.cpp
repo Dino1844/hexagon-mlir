@@ -32,15 +32,21 @@
 // stable across recompiles, which is fine -- the runtime's residency map lives
 // in one process running one compiled kernel.
 //
-// Correctness boundary: a resident buffer is shared by every launch in the
-// process. Sequential launches are fine because each one overwrites the whole
-// buffer before reading it (the buffers are all full-overwrite workspaces). A
-// grid>1 launch, however, runs the same kernel on several threads in one
-// process, and those instances would clobber each other's workspace. The pass
-// therefore only runs when the caller opts in (`enableWorkspaceResident`), and
-// that option promises single-instance execution. This is the same
-// process-boundary contract the weight residency documents; a per-instance key
-// would be the alternative and is deliberately not guessed here.
+// Correctness boundary: a resident buffer is shared by every launch whose
+// program instances run under the same flat program id. The lowering passes
+// the caller's flat pid into the resident entry (VtcmPool::Resident's slot,
+// hexagon_runtime_workspace_resident_v2_dsp's instance argument): concurrent
+// instances of a grid>1 launch carry distinct pids and get separate buffers
+// instead of a shared clobbered one, and the same pid across launches reuses
+// the same buffer. A thread id would be the wrong discriminator: the wrapper
+// spawns fresh qurt threads per launch (multithreading.h's "keep the thread
+// pool alive" TODO), so thread-keyed residency would allocate a never-reused
+// buffer set every launch and grow the resident map without bound (measured:
+// mha_fa grid=4, +73%, 2026-10-04). IR without the trailing program-info
+// pack (direct pass invocations) is single-instance by construction: slot 0.
+// Weights keep the process-global slot 0: their content is immutable once
+// copied. Cross-process reuse remains outside the contract, the same
+// boundary the weight residency documents.
 //
 // Runs after `hmx-partition` (so the ring slots/statuses and the scratch exist)
 // and before `convert-to-hexagonmem` (which carries the tag onto the
@@ -479,9 +485,8 @@ struct HmxWorkspaceResidentPass
     // concurrently; do not nest a lock inside the setter.
     std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
     if (module->hasAttr("hmx.kernel_manifest") &&
-        failed(setHmxManifestWorkspaceClass(
-            module, func.getSymName(), kHmxWorkspaceResidentSingleInstance,
-            kHmxGridSingleInstance)))
+        failed(setHmxManifestWorkspaceClass(module, func.getSymName(),
+                                            kHmxWorkspaceResident)))
       return signalPassFailure();
   }
 };

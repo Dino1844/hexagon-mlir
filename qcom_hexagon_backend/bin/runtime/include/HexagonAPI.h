@@ -115,7 +115,16 @@ public:
   /// block. Scope registration is enforced by the C API before this method is
   /// reached.
   void *WeightResidentV2(uint64_t source, size_t nbytes, size_t alignment);
-  void *WorkspaceResidentV2(uint64_t key, size_t nbytes, size_t alignment);
+  /// `instance` is the caller's flat program id: concurrent instances of a
+  /// grid>1 launch carry distinct pids, so each gets its own resident buffer,
+  /// and the same pid across launches reuses the same buffer. A thread id
+  /// would be the wrong discriminator: the wrapper's ThreadManager spawns
+  /// fresh qurt threads per launch (multithreading.h's "keep the thread pool
+  /// alive" TODO), so thread-keyed residency would allocate a never-reused
+  /// buffer set every launch and grow the resident map without bound
+  /// (measured: mha_fa grid=4, +73%, 2026-10-04).
+  void *WorkspaceResidentV2(uint64_t key, size_t nbytes, size_t alignment,
+                            uint32_t instance);
 
   /// Takes a `ptr` to the base of the memref and returns a pointer to the
   /// crouton table

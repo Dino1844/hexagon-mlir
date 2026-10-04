@@ -179,12 +179,15 @@ class HexagonOptions:
 
     # Per-launch VTCM workspace residency (hmx-workspace-resident). When on, the
     # crouton arrays, conversion state, staging ring/scratch and statuses of an
-    # HMX kernel are allocated once per process and reused by every launch
-    # instead of being allocated/freed per launch. Off by default: a resident
-    # buffer is shared by all launches in the process, which is only correct for
-    # single-instance execution -- a grid>1 launch would run several kernel
-    # instances over the same buffers.
-    enableWorkspaceResident: bool = False
+    # HMX kernel are allocated once and reused by every launch instead of being
+    # allocated/freed per launch (~6.3 us per alloc/free pair, size-independent:
+    # on S3 128x128x128 that is more than half the launch, 14 -> 6 us; on S1
+    # 1024x512x64 it is another -17% on top of the readout split; gap-table
+    # 2026-10-04, iters=1000). On by default: the resident entry is keyed by
+    # the caller's flat program id (VtcmPool::Resident's slot), so concurrent
+    # instances of a grid>1 launch get separate buffers instead of a shared
+    # clobbered one, and the same pid across launches reuses the same buffer.
+    enableWorkspaceResident: bool = True
 
     # Move a lowered HMX matmul's accumulator read-out (`hmx.unpack_acc`) onto a
     # second thread, in batches (hmx-vector-readout). At pipeline-depth 2 that
@@ -195,10 +198,14 @@ class HexagonOptions:
     # allocated before the m-tile loop and released after it, so a group of rows
     # can be deferred at no VTCM cost, which divides the handoff by the group
     # size (G=4 -> 1.39x, G=8 -> 1.51x).
-    # Off by default: the rewrite itself is exercised, but the `configure()`
-    # handoff that gives the executor its function pointer cannot be emitted
-    # before convert-func-to-llvm, so a rewritten kernel is not yet runnable.
-    enableHmxVectorReadout: bool = False
+    # On by default since the gap-table measurement (2026-10-04, three shapes,
+    # iters=1000): OFF->G4 is -24% on S1 1024x512x64, and the pass declines
+    # every non-matching structure with a remark (FA/KDA object census: zero
+    # readout symbols), so the default cannot silently rewrite them. The pass
+    # runs after hmx-partition created the m-tile loop; the `configure()`
+    # handoff that gives the executor its function pointer is emitted by
+    # HmxToLLVM after convert-func-to-llvm (wireVectorReadout).
+    enableHmxVectorReadout: bool = True
 
     # AR rows one handoff names (G, `hmx-vector-readout`'s batch). 4 is the
     # measured best of {1, 2, 4, 8}: G=1 loses to the handoff cost. Must be >= 1;
@@ -213,12 +220,13 @@ class HexagonOptions:
     # outside the timed region (weak symbol, skipped by non-readout kernels).
     # Declined with a remark for a function holding more than one readout
     # loop (the per-loop drain is the only ring barrier such a function has).
-    # Off by default: a batch may still be in flight after the kernel
-    # returns, which is only sound for sequential single-instance (grid=1)
-    # launches -- the AR is released while the consumer may still read it,
-    # safe only because nothing else allocates before the next call's
-    # configure-drain and the VTCM free path keeps bookkeeping out of the
-    # released block.
+    # Off by default, deliberately: its single contribution is -6.4% on top of
+    # the readout split (47 -> 44 us, two consistent runs, iters=1000), below
+    # the > max(3*CV, 15%) evidence gate -- and a grid>1 launch has no
+    # barrier between the wrapper's program iterations, so the ring can
+    # overflow and trap. Making it grid-safe needs a per-iteration wrapper
+    # drain (the wrapper is the layer that knows the grid); until that lands,
+    # the deferral stays an explicit opt-in.
     hmxReadoutDeferredDrain: bool = False
 
     # `enableSeedLayoutConversions` was removed from this surface 2026-09-30.

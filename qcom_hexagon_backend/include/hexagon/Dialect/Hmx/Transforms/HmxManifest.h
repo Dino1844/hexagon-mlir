@@ -150,8 +150,11 @@ inline constexpr StringLiteral kHmxShapeStateDynamic = "dynamic";
 inline constexpr StringLiteral kHmxShapeStateUnavailable = "unavailable";
 
 inline constexpr StringLiteral kHmxWorkspaceRuntimeInternal = "runtime-internal";
-inline constexpr StringLiteral kHmxWorkspaceResidentSingleInstance =
-    "resident-single-instance";
+/// A resident workspace is keyed by the caller's flat program id at runtime
+/// (VtcmPool::Resident's slot), so it is sound under grid>1: concurrent
+/// instances get separate buffers and the same pid reuses its buffer across
+/// launches (2026-10-04).
+inline constexpr StringLiteral kHmxWorkspaceResident = "resident";
 inline constexpr StringLiteral kHmxGridSingleInstance = "single-instance";
 inline constexpr StringLiteral kHmxGridLegacyRuntime = "legacy-runtime";
 
@@ -297,10 +300,11 @@ LogicalResult reconcileHmxManifestWeightPolicies(ModuleOp module,
                                                  bool prepackRuntimeWeights);
 
 /// Update the workspace/grid facts after the workspace-residency pass has made
-/// its final decision for a function.
+/// its final decision for a function. The grid policy is derived from each
+/// record's plan (tail: single-instance; full-HMX: legacy-runtime -- a
+/// resident workspace is pid-keyed at runtime and sound under grid>1).
 LogicalResult setHmxManifestWorkspaceClass(ModuleOp module, StringRef function,
-                                           StringRef workspaceClass,
-                                           StringRef gridPolicy);
+                                           StringRef workspaceClass);
 
 /// Complete final-only fields (pipeline presence, weight references, and
 /// fingerprints) and validate the semantic manifest before serialization.

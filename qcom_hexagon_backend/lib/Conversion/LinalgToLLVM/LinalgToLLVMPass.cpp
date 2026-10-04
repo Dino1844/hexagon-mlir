@@ -533,6 +533,14 @@ public:
       mlir::hmx::HmxPartitionOptions hmxPartitionOpts;
       hmxPartitionOpts.pipelineDepth = enableHmxPipelineDepth;
       hmxPartitionOpts.croutonsPerMma = hmxCroutonsPerMma;
+      // The read-out channel of `auto` staging: the staged loop is what the
+      // read-out split's m-tile loop attaches to, and with the split enabled
+      // a shape with at least two read-out batches (m-tiles >= 2 x batch) has
+      // overlap to hide the handoff behind even when K is shallow (the
+      // transfer channel alone would decline it). Wired only when the split
+      // runs, so disabling the split restores the transfer-only floor.
+      hmxPartitionOpts.stagedReadoutMTiles =
+          enableHmxVectorReadout ? 2 * hmxReadoutBatch : 0;
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createHmxPartitionPass(hmxPartitionOpts));
         // Thread-role classification runs AFTER hmx-partition, and that order is
@@ -556,9 +564,9 @@ public:
         // convert-to-hexagonmem rewrites below, which are about VTCM placement
         // and have nothing to say about which thread runs the vector work.
         //
-        // Off by default, and that is a deliberate shipping decision rather than
-        // an unfinished feature: turning it on is the device A/B step, and the
-        // option stays off until that measurement is taken.
+        // On by default since the gap-table measurement (2026-10-04): OFF->G4
+        // is -24% on S1 (iters=1000) and every non-matching structure declines
+        // with a remark, so nothing else is silently rewritten.
         //
         // The pass itself cannot emit the `configure()` call that hands the
         // executor its function pointer, because a function's address is not
@@ -574,12 +582,14 @@ public:
               mlir::hmx::createHmxVectorReadoutPass(readoutOpts));
         }
 
-      // Per-launch VTCM workspace becomes a process-resident buffer. Opt-in:
-      // residency shares one buffer across every launch in the process, which
-      // is safe for sequential single-instance launches (each overwrites the
-      // whole buffer) but wrong under a grid>1 launch. Runs here so the
-      // partition pass's conversion state / ring / scratch exist, and before
-      // convert-to-hexagonmem carries the tag to the lowering.
+      // Per-launch VTCM workspace becomes a resident buffer. On by default:
+      // the runtime keys workspace residency by the calling thread's ordinal
+      // (VtcmPool::Resident's slot), so concurrent instances of a grid>1
+      // launch get separate buffers, and a serial launch shares one buffer
+      // soundly (each instance overwrites the whole workspace before reading
+      // it). Runs here so the partition pass's conversion state / ring /
+      // scratch exist, and before convert-to-hexagonmem carries the tag to
+      // the lowering.
       if (enableWorkspaceResident)
         pm.addNestedPass<func::FuncOp>(
             mlir::hmx::createHmxWorkspaceResidentPass());

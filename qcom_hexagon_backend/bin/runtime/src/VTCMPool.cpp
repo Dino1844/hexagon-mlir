@@ -925,12 +925,13 @@ void *VtcmPool::Allocate(size_t nbytes, size_t alignment,
 
 bool VtcmPool::residentDescriptorsMatch(const ResidentDescriptor &lhs,
                                         const ResidentDescriptor &rhs) {
-  return lhs.kind == rhs.kind && lhs.key == rhs.key && lhs.bytes == rhs.bytes &&
-         lhs.alignment == rhs.alignment && lhs.chargedBytes == rhs.chargedBytes;
+  return lhs.kind == rhs.kind && lhs.key == rhs.key && lhs.slot == rhs.slot &&
+         lhs.bytes == rhs.bytes && lhs.alignment == rhs.alignment &&
+         lhs.chargedBytes == rhs.chargedBytes;
 }
 
 void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,
-                         size_t alignment, const void *src) {
+                         size_t alignment, const void *src, uint64_t slot) {
   std::lock_guard<std::mutex> lock(mutex_);
 
   const size_t chargedBytes = nbytes == 0 ? 0 : alignSize(nbytes);
@@ -948,7 +949,7 @@ void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,
     return nullptr;
   }
 
-  const ResidentDescriptor descriptor{kind, key, nbytes, alignment,
+  const ResidentDescriptor descriptor{kind, key, slot, nbytes, alignment,
                                       chargedBytes};
 
   // A key identifies one process-local resident object. Reuse is allowed only

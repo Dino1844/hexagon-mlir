@@ -655,20 +655,18 @@ class TritonHexagonLauncher(HexagonLauncherBase):
                 f"the Hexagon launcher. Reduce grid size."
             )
 
-        # Safety gate: a resident HMX VTCM workspace is one buffer per process,
-        # shared by every launch. The compiler cannot see the grid (it is a
-        # launch parameter, not a compile-time one), so the launcher enforces
-        # the boundary `enableWorkspaceResident` promises: refuse a grid>1
-        # launch loudly rather than let prod(grid) instances clobber each
-        # other's workspace and compute wrong results.
-        if prod(launch_grid) > 1 and options.get("enableWorkspaceResident", False):
-            raise ValueError(
-                "enableWorkspaceResident makes the HMX VTCM workspace resident "
-                "per process, which is unsafe for an SPMD launch "
-                f"(grid={prod(launch_grid)} > 1): every program instance would "
-                "share the same buffers. Use grid=1 or disable "
-                "enableWorkspaceResident."
-            )
+        # HMX VTCM workspace residency under grid>1 is sound since 2026-10-04:
+        # the resident entry is keyed by the caller's flat program id
+        # (VtcmPool::Resident's slot, computed by the lowering from the
+        # trailing program-info pack), so concurrent instances of an SPMD
+        # launch each get their own buffer, and the same pid across launches
+        # reuses the same buffer. The old refusal (raise on grid>1 with
+        # enableWorkspaceResident) enforced the pre-slot contract and would now
+        # reject every default-option launch, since the option is on by
+        # default. The compiler cannot see the grid; nothing needs to anymore,
+        # because no grid value makes the residency unsound. Device gates:
+        # test_softmax/... grid=4 numerics and the mha_fa grid=4 bench
+        # (docs/results/auto-convergence-2026-10-04.md).
 
         # enableMultiThreading / enableThreadedDispatch are deliberately not
         # cleared for grid==1. Both are compile-time-only flags here (the .o is

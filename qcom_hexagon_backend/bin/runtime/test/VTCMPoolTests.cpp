@@ -285,10 +285,10 @@ TEST_F(VtcmPoolTest, resident_alignment_uses_supported_powers_of_two) {
   alignas(256) uint8_t source[256]{};
   const uint64_t key = reinterpret_cast<uintptr_t>(source);
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                sizeof(source), 3, source),
+                                sizeof(source), 3, source, /*slot=*/0),
             nullptr);
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                sizeof(source), 4096, source),
+                                sizeof(source), 4096, source, /*slot=*/0),
             nullptr);
 }
 
@@ -296,23 +296,43 @@ TEST_F(VtcmPoolTest, resident_descriptor_mismatch_fails_closed) {
   alignas(256) uint8_t source[256]{};
   const uint64_t key = reinterpret_cast<uintptr_t>(source);
   void *first = vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                    sizeof(source), 256, source);
+                                    sizeof(source), 256, source, /*slot=*/0);
   ASSERT_NE(first, nullptr);
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                sizeof(source), 256, source),
+                                sizeof(source), 256, source, /*slot=*/0),
             first);
 
   // Same key, different requested bytes/alignment/kind: each must fail before
   // a second block can be allocated under that key.
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                sizeof(source) + 1, 256, source),
+                                sizeof(source) + 1, 256, source, /*slot=*/0),
             nullptr);
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWeight, key,
-                                sizeof(source), 128, source),
+                                sizeof(source), 128, source, /*slot=*/0),
             nullptr);
   EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
-                                sizeof(source), 256, nullptr),
+                                sizeof(source), 256, nullptr, /*slot=*/0),
             nullptr);
+}
+
+TEST_F(VtcmPoolTest, resident_slots_discriminate_workspaces) {
+  // Same (kind, key, bytes, alignment) from two slots (two threads): each
+  // slot gets its own buffer, and re-asking in the same slot reuses it.
+  alignas(256) uint8_t source[256]{};
+  const uint64_t key = reinterpret_cast<uintptr_t>(source);
+  void *a1 = vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
+                                 sizeof(source), 256, nullptr, /*slot=*/1);
+  void *b1 = vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
+                                 sizeof(source), 256, nullptr, /*slot=*/2);
+  ASSERT_NE(a1, nullptr);
+  ASSERT_NE(b1, nullptr);
+  EXPECT_NE(a1, b1);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
+                                sizeof(source), 256, nullptr, /*slot=*/1),
+            a1);
+  EXPECT_EQ(vtcm_pool->Resident(VtcmPool::ResidentKind::kWorkspace, key,
+                                sizeof(source), 256, nullptr, /*slot=*/2),
+            b1);
 }
 
 TEST_F(VtcmPoolTest, end_allocation_bug_fixed) {

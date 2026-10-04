@@ -199,6 +199,18 @@ def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
            "with a remark, when the budget cannot pay for it), 3 = skip the "
            "staging rewrite and emit the unstaged serial tile loop (no "
            "hmx.stage/hmx.await, the activation array is kept).">,
+    Option<"stagedReadoutMTiles", "staged-readout-m-tiles", "int64_t",
+           /*default=*/"0",
+           "The m-tile floor for `auto` staging's read-out channel: at or "
+           "above this many m-tiles, `auto` may stage a shallow-K shape too, "
+           "because the staged loop is also what the read-out split's m-tile "
+           "loop attaches to, and at least two read-out batches (m-tiles / "
+           "batch) can overlap behind the engine. Honoured only for a "
+           "single-matmul function: hmx-vector-readout declines a "
+           "multi-matmul function whole, so staging it would buy the ring's "
+           "cost with no read-out to hide behind it. 0 keeps the channel "
+           "closed (shallow-K `auto` always declines, the pre-readout "
+           "behaviour).">,
     Option<"croutonsPerMma", "croutons-per-mma", "int64_t", /*default=*/"0",
            "How many K croutons one hmx.mma walks, i.e. the engine's repeat "
            "count. 0 = the hardware maximum (32), which is what 32 itself "

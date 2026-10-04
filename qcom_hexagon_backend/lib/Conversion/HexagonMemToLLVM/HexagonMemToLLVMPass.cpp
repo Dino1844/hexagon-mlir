@@ -472,10 +472,46 @@ public:
         op.emitError("resident workspace is missing its key or byte count");
         return failure();
       }
+      // The resident's instance discriminator: the flat program id of this
+      // launch, computed exactly the way the wrapper does (pid_X * np_Y * np_Z
+      // + pid_Y * np_Z + pid_Z, triton_hexagon_launcher.py's grid_strides).
+      // Concurrent instances of a grid>1 launch carry distinct pids, so each
+      // gets its own resident buffer; the same pid across launches reuses the
+      // same buffer. A thread id would be wrong here: the wrapper's
+      // ThreadManager spawns fresh qurt threads per launch ("keep the thread
+      // pool alive" is still a TODO in multithreading.h), so a thread-keyed
+      // residency would allocate a never-reused buffer set every launch and
+      // grow the resident map without bound (measured: mha_fa grid=4, +73%).
+      // IR without the trailing program-info pack (direct pass invocations,
+      // lit tests) is single-instance by construction: instance 0.
+      auto func = op->getParentOfType<func::FuncOp>();
+      Value instanceValue = getI32Constant(rewriter, loc, 0);
+      if (func && func.getNumArguments() >= 6) {
+        unsigned n = func.getNumArguments();
+        bool pack = true;
+        for (unsigned i = n - 6; i < n; ++i) {
+          auto ty = dyn_cast<IntegerType>(func.getArgument(i).getType());
+          if (!ty || ty.getWidth() != 32) {
+            pack = false;
+            break;
+          }
+        }
+        if (pack) {
+          Value npY = func.getArgument(n - 5), npZ = func.getArgument(n - 4);
+          Value pidX = func.getArgument(n - 3), pidY = func.getArgument(n - 2),
+                 pidZ = func.getArgument(n - 1);
+          Value yz = arith::MulIOp::create(rewriter, loc, npY, npZ);
+          Value xTerm = arith::MulIOp::create(rewriter, loc, pidX, yz);
+          Value yTerm = arith::MulIOp::create(rewriter, loc, pidY, npZ);
+          Value xy = arith::AddIOp::create(rewriter, loc, xTerm, yTerm);
+          instanceValue = arith::AddIOp::create(rewriter, loc, xy, pidZ);
+        }
+      }
       FailureOr<LLVM::LLVMFuncOp> residentFn = LLVM::lookupOrCreateFn(
           rewriter, op->getParentOfType<ModuleOp>(),
           "hexagon_runtime_workspace_resident_v2_dsp",
-          {rewriter.getI64Type(), rewriter.getI32Type(), rewriter.getI32Type()},
+          {rewriter.getI64Type(), rewriter.getI32Type(), rewriter.getI32Type(),
+           rewriter.getI32Type()},
           getPtrTy(rewriter.getContext()));
       if (failed(residentFn))
         return failure();
@@ -492,7 +528,8 @@ public:
         return failure();
       auto callOp = LLVM::CallOp::create(
           rewriter, loc, residentFn.value(),
-          ValueRange({keyValue, bytesValue, residentAlignmentValue}));
+          ValueRange({keyValue, bytesValue, residentAlignmentValue,
+                      instanceValue}));
       if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
         return failure();
 

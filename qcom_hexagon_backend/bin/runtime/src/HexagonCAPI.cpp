@@ -146,18 +146,22 @@ int32_t hexagon_runtime_resident_scope_enter_v2_dsp(uint64_t scopeLow64,
   return 0;
 }
 
-/// Versioned workspace resident ABI: (key, bytes, alignment) with i64/i32/i32
-/// arguments. Registration is mandatory and checked before constructing the
-/// lazy runtime singleton; there is no fallback to the unversioned entry.
+/// Versioned workspace resident ABI: (key, bytes, alignment, instance) with
+/// i64/i32/i32/i32 arguments. `instance` is the caller's flat program id --
+/// the discriminator that keeps concurrent instances of a grid>1 launch on
+/// separate buffers (see HexagonAPI::WorkspaceResidentV2). Registration is
+/// mandatory and checked before constructing the lazy runtime singleton;
+/// there is no fallback to the unversioned entry.
 void *hexagon_runtime_workspace_resident_v2_dsp(uint64_t key, uint32_t bytes,
-                                                uint32_t alignment) {
+                                                uint32_t alignment,
+                                                uint32_t instance) {
   if (!residentScopeRegistered()) {
     FARF(ERROR, "VTCM workspace resident requested before scope entry");
     return requireAllocationResult(nullptr);
   }
   _trc("WS2");
-  return requireAllocationResult(
-      HexagonAPI::Global()->WorkspaceResidentV2(key, bytes, alignment));
+  return requireAllocationResult(HexagonAPI::Global()->WorkspaceResidentV2(
+      key, bytes, alignment, instance));
 }
 
 /// Versioned weight resident ABI: (source, bytes, alignment) with i64/i32/i32

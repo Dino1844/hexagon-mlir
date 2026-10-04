@@ -124,8 +124,7 @@ constexpr StringLiteral kPlanHMXTail = kHmxPlanHMXTail;
 constexpr StringLiteral kPlanHVX = kHmxPlanHVX;
 
 constexpr StringLiteral kWorkspaceRuntimeInternal = kHmxWorkspaceRuntimeInternal;
-constexpr StringLiteral kWorkspaceResidentSingleInstance =
-    kHmxWorkspaceResidentSingleInstance;
+constexpr StringLiteral kWorkspaceResident = kHmxWorkspaceResident;
 constexpr StringLiteral kGridSingleInstance = kHmxGridSingleInstance;
 constexpr StringLiteral kGridLegacyRuntime = kHmxGridLegacyRuntime;
 constexpr StringLiteral kBridgeOnlyAccounting = kHmxVtcmAccountingBridgeOnly;
@@ -169,8 +168,7 @@ bool isCanonicalPipelineReason(StringRef reason) {
 }
 
 bool isCanonicalWorkspaceClass(StringRef value) {
-  return value == kWorkspaceRuntimeInternal ||
-         value == kWorkspaceResidentSingleInstance;
+  return value == kWorkspaceRuntimeInternal || value == kWorkspaceResident;
 }
 
 bool isCanonicalGridPolicy(StringRef value) {
@@ -789,18 +787,15 @@ LogicalResult validateWorkspaceAndVtcm(ModuleOp module, DictionaryAttr record,
       return emitManifestError(module, report,
                                "hmx-tail requires single-instance grid policy");
     if (hasWorkspace && hasGrid) {
-      StringRef workspace = stringField(record, kKeyWorkspaceClass).getValue();
       StringRef grid = stringField(record, kKeyGridPolicy).getValue();
-      if (plan == PlanKind::FullHMX && workspace == kWorkspaceRuntimeInternal &&
-          grid != kGridLegacyRuntime)
+      // A full-HMX workspace keeps the plan's legacy-runtime grid policy
+      // regardless of its class: a resident workspace is keyed by the
+      // caller's flat program id at runtime, so it is sound under grid>1 the
+      // same way the runtime-internal one always was.
+      if (plan == PlanKind::FullHMX && grid != kGridLegacyRuntime)
         return emitManifestError(
             module, report,
-            "full-hmx runtime-internal workspace requires legacy-runtime grid");
-      if (workspace == kWorkspaceResidentSingleInstance &&
-          grid != kGridSingleInstance)
-        return emitManifestError(
-            module, report,
-            "resident-single-instance workspace requires single-instance grid");
+            "full-hmx workspace requires legacy-runtime grid");
     }
   }
 
@@ -2069,13 +2064,10 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
 
 LogicalResult mlir::hmx::setHmxManifestWorkspaceClass(ModuleOp module,
                                                       StringRef function,
-                                                      StringRef workspaceClass,
-                                                      StringRef gridPolicy) {
-  if (!isNonEmptyString(function) ||
-      !isCanonicalWorkspaceClass(workspaceClass) ||
-      !isCanonicalGridPolicy(gridPolicy))
+                                                      StringRef workspaceClass) {
+  if (!isNonEmptyString(function) || !isCanonicalWorkspaceClass(workspaceClass))
     return emitManifestError(module, true,
-                             "invalid HMX workspace/grid classification");
+                             "invalid HMX workspace classification");
   FailureOr<DictionaryAttr> current =
       readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true);
   if (failed(current))
@@ -2092,10 +2084,15 @@ LogicalResult mlir::hmx::setHmxManifestWorkspaceClass(ModuleOp module,
     StringAttr plan = stringField(record, kKeyPlan);
     if (!plan || parsePlan(plan.getValue()) == PlanKind::HVX)
       continue;
-    if (parsePlan(plan.getValue()) == PlanKind::HMXTail &&
-        gridPolicy != kGridSingleInstance)
-      return emitManifestError(
-          module, true, "hmx-tail requires a single-instance grid policy");
+    // The grid policy follows from the record's plan: a tail plan is
+    // single-instance by its own rule; a resident full-HMX workspace keeps
+    // the full plan's legacy-runtime policy, because residency is keyed by
+    // the caller's flat program id at runtime (VtcmPool::Resident's slot) --
+    // concurrent instances of a grid>1 launch get separate buffers and the
+    // same pid reuses its buffer across launches.
+    StringRef gridPolicy = parsePlan(plan.getValue()) == PlanKind::HMXTail
+                               ? kGridSingleInstance
+                               : kGridLegacyRuntime;
     NamedAttrList fields(record);
     fields.set(kKeyWorkspaceClass, StringAttr::get(ctx, workspaceClass));
     fields.set(kKeyGridPolicy, StringAttr::get(ctx, gridPolicy));

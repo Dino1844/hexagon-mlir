@@ -15,7 +15,7 @@
 // RUN: linalg-hexagon-opt %s -hexagonmem-to-llvm | FileCheck %s
 //===----------------------------------------------------------------------===//
 
-// CHECK: llvm.func @hexagon_runtime_workspace_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_workspace_resident_v2_dsp(i64, i32, i32, i32) -> !llvm.ptr
 
 module {
   // CHECK-LABEL: func.func @resident_workspace
@@ -25,7 +25,10 @@ module {
     // CHECK-DAG: %[[KEY:.*]] = arith.constant -5511315095222747136 : i64
     // CHECK-DAG: %[[BYTES:.*]] = llvm.mlir.constant(8192 : i32) : i32
     // CHECK-DAG: %[[ALIGN:.*]] = llvm.mlir.constant(256 : i32) : i32
-    // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp(%[[KEY]], %[[BYTES]], %[[ALIGN]]) : (i64, i32, i32) -> !llvm.ptr
+    // The instance is the flat program id; this IR carries no trailing
+    // program-info pack, so the single-instance constant 0.
+    // CHECK-DAG: %[[INST:.*]] = llvm.mlir.constant(0 : i32) : i32
+    // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp(%[[KEY]], %[[BYTES]], %[[ALIGN]], %[[INST]]) : (i64, i32, i32, i32) -> !llvm.ptr
     // The call's result becomes the buffer's memref descriptor.
     // CHECK: llvm.insertvalue
     %w = hexagonmem.alloc() {alignment = 256 : i64, hmx.workspace_resident = {bytes = 8192 : i64, key = -5511315095222747136 : i64}} : memref<2x2x16x32x2xf16, 1>

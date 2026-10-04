@@ -1821,7 +1821,8 @@ static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
 static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
                                    Value bias, MatmulOp op, func::FuncOp func,
                                    int64_t vtcmBudget, int64_t requestedDepth,
-                                   int64_t batch, bool &staged) {
+                                   int64_t batch, int64_t stagedReadoutMTiles,
+                                   bool &staged) {
   staged = false;
   std::optional<int64_t> decisionId;
   if (failed(readDecisionId(op.getOperation(), decisionId)))
@@ -1868,12 +1869,34 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
     return declineStageLoop(op, requestedDepth,
                             PipelineReason::StagingGridMismatch);
 
-  // `auto` declines a shallow-K shape: below `kStageMinKTiles` the transfer is
-  // too small for the fixed DMA cost to hide behind the tile's compute, so the
-  // overlap does not pay (the threshold's mechanism and the device numbers are
-  // on the constant). An explicit `pipeline-depth=1/2` skips the floor -- those
-  // are the A/B arms -- and `3` never reaches this emitter.
-  if (requestedDepth <= 0 && Kt < kStageMinKTiles)
+  // `auto` declines a shallow-K shape on BOTH channels before it gives up:
+  //
+  //   transfer channel: below `kStageMinKTiles` one staged transfer is too
+  //   small to hide the DMA engine's fixed cost behind the tile's compute
+  //   (the threshold's mechanism and the device numbers are on the constant).
+  //
+  //   read-out channel (stagedReadoutMTiles, wired by the pipeline to
+  //   2 x hmxReadoutBatch when the read-out split is enabled, and honoured
+  //   only for a single-matmul function -- a multi-matmul function is
+  //   declined whole by hmx-vector-readout, see the caller): the staged
+  //   loop is also what the read-out split's m-tile loop attaches to, and
+  //   its first batch cannot overlap anything (pipeline fill), so fewer
+  //   than two batches -- Mt < 2 x G -- is pure handoff cost. The floor is
+  //   twice the calibrated batch, not a new tuned constant: it is where
+  //   overlap becomes possible at all.
+  //   measurement: def-vs-def+depth2 sweep, one build, iters=1000
+  //   (exp/hmx/gap_table/op_side/s23_sweep.py, 2026-10-04): Mt=32 (S1
+  //   1024x512x64) 47 -> 37 us with the read-out fired; Mt=4 (S3
+  //   128x128x128) 3 -> 7 us, the serial ring wins. The boundary itself
+  //   (2 x G = 8) is positioned by the fill mechanism, not measured -- no
+  //   shape between Mt=5 and Mt=31 has been run.
+  //
+  // An explicit `pipeline-depth=1/2` skips both floors -- those are the A/B
+  // arms -- and `3` never reaches this emitter. A closed read-out channel
+  // (stagedReadoutMTiles <= 0) declines exactly as before: the floor is a
+  // second chance to stage, never a licence to stage everything.
+  if (requestedDepth <= 0 && Kt < kStageMinKTiles &&
+      (stagedReadoutMTiles <= 0 || Mt < stagedReadoutMTiles))
     return declineStageLoop(op, requestedDepth, PipelineReason::ShallowK, 0, 0, 0,
                            Kt);
 
@@ -2227,6 +2250,18 @@ struct HmxPartitionPass
     if (matmuls.empty())
       return;
 
+    // The read-out channel of `auto` staging is only real for a function the
+    // read-out split can actually take. A function holding more than one
+    // hmx.matmul is declined whole by hmx-vector-readout: each matmul's
+    // read-out names its own AR, destination and decision id, and that pass
+    // declines rather than model a second descriptor. Opening staging for
+    // such a function buys the ring's cost and nothing else -- measured on
+    // flash attention (two matmuls, Kt=2, iters=1000): staging both with the
+    // read-out declined was +9% (5630/5534 vs 5126/5195 us, 2026-10-04).
+    // So the channel floor is only honoured for a single-matmul function.
+    const int64_t readoutChannelMTiles =
+        matmuls.size() == 1 ? this->stagedReadoutMTiles : 0;
+
     // The engine's budget, with the one field a caller may narrow: 0 means the
     // device default (see HmxTarget).
     const int64_t vtcmBudget = this->vtcmBudgetBytes > 0
@@ -2392,7 +2427,8 @@ struct HmxPartitionPass
       } else {
         bool staged = false;
         if (failed(emitStageLoop(rewriter, opLoc, bias, op, func, vtcmBudget,
-                                 this->pipelineDepth, batch, staged)))
+                                 this->pipelineDepth, batch,
+                                 readoutChannelMTiles, staged)))
           return signalPassFailure();
         if (staged)
           continue;

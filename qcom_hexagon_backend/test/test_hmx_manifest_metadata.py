@@ -82,9 +82,7 @@ def _hmx_record(
         block_m = m
     if grid_policy is None:
         grid_policy = (
-            "legacy-runtime"
-            if plan == "full-hmx" and workspace_class == "runtime-internal"
-            else "single-instance"
+            "single-instance" if plan == "hmx-tail" else "legacy-runtime"
         )
     record = {
         "function": function,
@@ -269,15 +267,21 @@ class TranslationMetadataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single program instance"):
             _UTILS.enforce_hmx_launch_contract(tail_json, (2, 1, 1))
 
+        # A resident full-HMX workspace is keyed by the caller's flat program
+        # id at runtime, so a grid>1 launch is sound and must pass the gate.
         resident = _manifest(
             [
                 _hmx_record(
-                    workspace_class="resident-single-instance",
+                    workspace_class="resident",
                 )
             ]
         )
-        with self.assertRaisesRegex(ValueError, "single program instance"):
-            _UTILS.enforce_hmx_launch_contract(json.dumps(resident), (1, 2, 1))
+        self.assertEqual(
+            _UTILS.enforce_hmx_launch_contract(
+                json.dumps(resident), (1, 2, 1)
+            ),
+            resident,
+        )
 
         # The legacy runtime-internal full plan deliberately retains the old
         # grid behavior; this gate must not silently turn it into single-instance.
@@ -737,9 +741,11 @@ class TranslationMetadataTest(unittest.TestCase):
         _UTILS.validate_hmx_manifest(manifest)
         self.assertEqual(
             manifest["matmuls"][0]["workspace_class"],
-            "resident-single-instance",
+            "resident",
         )
-        self.assertEqual(manifest["matmuls"][0]["grid_policy"], "single-instance")
+        self.assertEqual(
+            manifest["matmuls"][0]["grid_policy"], "legacy-runtime"
+        )
 
     def test_cpp_api_rejects_unconsumed_prepack_without_meta(self):
         fixture_root = _HERE.parent / "Conversion" / "LinalgToLLVM"

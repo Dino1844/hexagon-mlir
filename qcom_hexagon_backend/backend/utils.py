@@ -385,7 +385,7 @@ HMX_TAIL_POLICIES = {
     "k": "zero-pad-both-operands",
     "mn": "padded-edge-tile-bounded-store",
 }
-HMX_WORKSPACE_CLASSES = frozenset({"runtime-internal", "resident-single-instance"})
+HMX_WORKSPACE_CLASSES = frozenset({"runtime-internal", "resident"})
 HMX_GRID_POLICIES = frozenset({"single-instance", "legacy-runtime"})
 HMX_VTCM_ACCOUNTING = frozenset({"bridge-only"})
 HMX_WEIGHT_BINDING_KINDS = frozenset(
@@ -721,17 +721,15 @@ def _validate_workspace(entry, path, plan):
         raise ValueError(f"{path}.grid_policy is not canonical: {grid_policy!r}")
     if plan == "hmx-tail" and grid_policy != "single-instance":
         raise ValueError(f"{path} hmx-tail requires grid_policy='single-instance'")
-    if plan == "full-hmx":
-        expected = (
-            "single-instance"
-            if workspace_class == "resident-single-instance"
-            else "legacy-runtime"
+    # A full-HMX workspace keeps the plan's legacy-runtime grid policy
+    # regardless of class: a resident workspace is keyed by the caller's flat
+    # program id at runtime, so it is sound under grid>1 the same way the
+    # runtime-internal one always was.
+    if plan == "full-hmx" and grid_policy != "legacy-runtime":
+        raise ValueError(
+            f"{path} full-hmx requires grid_policy='legacy-runtime', got "
+            f"{grid_policy!r}"
         )
-        if grid_policy != expected:
-            raise ValueError(
-                f"{path} grid_policy {grid_policy!r} disagrees with workspace_class "
-                f"{workspace_class!r}"
-            )
     vtcm_accounting = entry.get("vtcm_accounting")
     if not isinstance(vtcm_accounting, str) or vtcm_accounting not in HMX_VTCM_ACCOUNTING:
         raise ValueError(
@@ -1705,10 +1703,13 @@ def enforce_hmx_launch_contract(
 
     v2 deliberately carries bridge-only VTCM facts, not a kernel-wide peak.  It
     can nevertheless prove the launch-shape part of the contract: a tail plan
-    (and a resident full-HMX workspace) is single-instance, while the legacy
-    runtime-internal full plan retains the launcher's existing grid behavior.
-    The check lives beside the strict consumer so every launcher entry point can
-    apply the same rule before it creates a wrapper or touches the device.
+    is single-instance.  A resident full-HMX workspace used to be single-
+    instance too; since 2026-10-04 its residency is keyed by the caller's flat
+    program id at runtime (concurrent instances get separate buffers, the same
+    pid reuses its buffer across launches), so it keeps the legacy runtime grid
+    behavior like the runtime-internal full plan.  The check lives beside the
+    strict consumer so every launcher entry point can apply the same rule
+    before it creates a wrapper or touches the device.
     """
     manifest = validate_hmx_manifest_json(manifest_json, field_name)
     if not isinstance(launch_grid, (tuple, list)) or len(launch_grid) != 3:

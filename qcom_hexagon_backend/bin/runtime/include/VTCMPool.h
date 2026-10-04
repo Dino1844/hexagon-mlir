@@ -286,14 +286,25 @@ public:
   };
 #endif
 
-  /// Allocate (once) a resident buffer for `key`. On the first call the buffer
-  /// is allocated and, for a weight, filled from `src`; later calls with the
-  /// exact same descriptor return the same address and do not copy. A
-  /// descriptor mismatch for an existing key fails closed and never allocates
-  /// another block under that key. Resident buffers are never returned to the
-  /// free list by Free, so they survive every per-launch deallocation.
+  /// Allocate (once) a resident buffer for `(slot, key)`. On the first call
+  /// the buffer is allocated and, for a weight, filled from `src`; later
+  /// calls with the exact same descriptor return the same address and do not
+  /// copy. A descriptor mismatch for an existing key fails closed and never
+  /// allocates another block under that key. Resident buffers are never
+  /// returned to the free list by Free, so they survive every per-launch
+  /// deallocation.
+  ///
+  /// `slot` is the residency's instance discriminator. Weights are
+  /// process-global immutable content and always use slot 0. Workspaces use
+  /// the caller's flat program id (HexagonAPI::WorkspaceResidentV2):
+  /// concurrent instances of a grid>1 launch carry distinct pids and get
+  /// separate buffers instead of a clobbered shared one, while the same pid
+  /// across launches reuses the same buffer. A thread id would be the wrong
+  /// discriminator here: the wrapper spawns fresh qurt threads per launch, so
+  /// thread-keyed residency never hits (measured: mha_fa grid=4, +73% from
+  /// the ever-growing resident scan, 2026-10-04).
   void *Resident(ResidentKind kind, uint64_t key, size_t nbytes,
-                 size_t alignment, const void *src);
+                 size_t alignment, const void *src, uint64_t slot);
 
   /// True when `ptr` points at a resident allocation.
   bool IsResident(void *ptr) const;
@@ -460,11 +471,13 @@ private:
 
   /// Resident identity is a process-local descriptor, not just a key. Keeping
   /// every charged field next to the pointer makes duplicate validation exact:
-  /// a same-key request with a different kind, size, alignment, or allocator
-  /// charge cannot accidentally reuse the block or allocate a second one.
+  /// a same-key request with a different kind, size, alignment, slot, or
+  /// allocator charge cannot accidentally reuse the block or allocate a second
+  /// one.
   struct ResidentDescriptor {
     ResidentKind kind;
     uint64_t key;
+    uint64_t slot;
     size_t bytes;
     size_t alignment;
     size_t chargedBytes;

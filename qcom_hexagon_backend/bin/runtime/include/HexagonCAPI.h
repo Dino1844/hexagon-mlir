@@ -37,7 +37,10 @@ void *hexagon_runtime_build_crouton(void *source, size_t nbytes);
 void *hexagon_runtime_get_contiguous_memref(void *source);
 
 /// The sole resident ABI is versioned and scope-gated. Device symbols append
-/// `_dsp`: `(i64 key/source, i32 bytes, i32 alignment) -> ptr`. There is no
+/// `_dsp`: `(i64 key/source, i32 bytes, i32 alignment[, i32 instance]) -> ptr`.
+/// The trailing `instance` (workspace only) is the caller's flat program id:
+/// the discriminator that keeps concurrent instances of a grid>1 launch on
+/// separate resident buffers. There is no
 /// unversioned resident entry point; this keeps one resident-allocation choke
 /// point and prevents legacy callers from bypassing scope registration. The
 /// alignment argument must be one of the powers of two through 2048; the
@@ -45,7 +48,8 @@ void *hexagon_runtime_get_contiguous_memref(void *source);
 int32_t hexagon_runtime_resident_scope_enter_v2(uint64_t scopeLow64,
                                                 uint64_t scopeHigh64);
 void *hexagon_runtime_workspace_resident_v2(uint64_t key, uint32_t bytes,
-                                            uint32_t alignment);
+                                            uint32_t alignment,
+                                            uint32_t instance);
 void *hexagon_runtime_weight_resident_v2(uint64_t src, uint32_t bytes,
                                          uint32_t alignment);
 /// Record a resident deallocation without releasing its pinned block. Returns

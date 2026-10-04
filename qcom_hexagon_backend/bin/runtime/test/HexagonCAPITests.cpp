@@ -16,8 +16,9 @@
 
 static_assert(
     std::is_same<decltype(&hexagon_runtime_workspace_resident_v2),
-                 void *(*)(uint64_t, uint32_t, uint32_t)>::value,
-    "workspace resident v2 ABI must be (i64 key, i32 bytes, i32 alignment)");
+                 void *(*)(uint64_t, uint32_t, uint32_t, uint32_t)>::value,
+    "workspace resident v2 ABI must be (i64 key, i32 bytes, i32 alignment, "
+    "i32 instance)");
 static_assert(
     std::is_same<decltype(&hexagon_runtime_weight_resident_v2),
                  void *(*)(uint64_t, uint32_t, uint32_t)>::value,

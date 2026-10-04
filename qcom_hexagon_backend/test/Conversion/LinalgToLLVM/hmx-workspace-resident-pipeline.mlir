@@ -24,7 +24,7 @@
 // pins a workspace buffer: key + bytes + alignment (there is nothing to copy
 // for a workspace).
 // CHECK: llvm.func @hexagon_runtime_weight_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
-// CHECK: llvm.func @hexagon_runtime_workspace_resident_v2_dsp(i64, i32, i32) -> !llvm.ptr
+// CHECK: llvm.func @hexagon_runtime_workspace_resident_v2_dsp(i64, i32, i32, i32) -> !llvm.ptr
 
 // CHECK-LABEL: llvm.func @runtime_weight
 // The conversion-state allocation keeps its 256-byte alignment through the
@@ -33,8 +33,9 @@
 // CHECK-DAG: %[[STATE_ALIGN:.*]] = llvm.mlir.constant(256 : i32) : i32
 // One resident call per remaining per-launch VTCM workspace: the conversion
 // state, the activation and the output crouton array. The weight is not one of
-// them anymore.
-// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp({{.*}}, {{.*}}, %[[STATE_ALIGN]])
+// them anymore. The trailing argument is the flat program id; this IR has no
+// program-info pack, so it is the constant 0.
+// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp({{.*}}, {{.*}}, %[[STATE_ALIGN]], {{.*}})
 // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // The weight comes from the host pre-pack instead.

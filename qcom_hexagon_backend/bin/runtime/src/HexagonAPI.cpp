@@ -314,15 +314,19 @@ void *HexagonAPI::Alloc(size_t nallocs, size_t nbytes, uint64_t alignment,
 
 void *HexagonAPI::WeightResidentV2(uint64_t source, size_t nbytes,
                                    size_t alignment) {
+  // Weights are process-global immutable content: slot 0 regardless of the
+  // calling thread.
   return runtimeVtcm->Resident(
       VtcmPool::ResidentKind::kWeight, source, nbytes, alignment,
-      reinterpret_cast<const void *>(static_cast<uintptr_t>(source)));
+      reinterpret_cast<const void *>(static_cast<uintptr_t>(source)),
+      /*slot=*/0);
 }
 
 void *HexagonAPI::WorkspaceResidentV2(uint64_t key, size_t nbytes,
-                                      size_t alignment) {
+                                      size_t alignment, uint32_t instance) {
   return runtimeVtcm->Resident(VtcmPool::ResidentKind::kWorkspace, key, nbytes,
-                               alignment, nullptr);
+                               alignment, nullptr,
+                               /*slot=*/static_cast<uint64_t>(instance));
 }
 
 /// Takes a `ptr` to the base of the memref and returns a pointer to the
