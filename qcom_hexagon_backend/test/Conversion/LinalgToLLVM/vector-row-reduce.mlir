@@ -153,15 +153,115 @@ func.func @reduce_dim0(%src: memref<32x256xf32>, %dst: memref<256xf32>) {
 
 // -----
 
-// Negative: a body that is not a single fold of the two block args -- here an
-// extra square -- keeps the scalar path.
-// CHECK-LABEL: func.func @non_fold_body
-func.func @non_fold_body(%src: memref<256x32xf32>, %dst: memref<256xf32>) {
-  // CHECK: linalg.reduce
+// A fused elementwise producer between the input arg and the fold (rms_norm's
+// x*x before the row sum): the chain re-creates on the vector chunk before
+// the butterfly folds it.
+// CHECK-LABEL: func.func @fused_elementwise_producer
+func.func @fused_elementwise_producer(%src: memref<256x32xf32>, %dst: memref<256xf32>) {
+  // CHECK: %[[sq:.*]] = arith.mulf {{%.*}}, {{%.*}} : vector<32xf32>
+  // CHECK: %[[r64:.*]] = hvx.vror %[[sq]], 64 : vector<32xf32>
+  // CHECK: arith.addf %[[r64]]
+  // CHECK-NOT: linalg.reduce
   linalg.reduce ins(%src : memref<256x32xf32>) outs(%dst : memref<256xf32>) dimensions = [1]
     (%in: f32, %init: f32) {
     %0 = arith.mulf %in, %in : f32
+    %1 = arith.addf %0, %init : f32
+    linalg.yield %1 : f32
+  }
+  return
+}
+
+// -----
+
+// A chain constant re-anchors as a broadcast of the row's element type.
+// CHECK-LABEL: func.func @fused_chain_constant
+func.func @fused_chain_constant(%src: memref<256x32xf32>, %dst: memref<256xf32>) {
+  // CHECK: %[[c:.*]] = arith.constant 2.000000e+00 : f32
+  // CHECK: vector.broadcast %[[c]] : f32 to vector<32xf32>
+  // CHECK: %[[m:.*]] = arith.mulf {{%.*}}, {{%.*}} : vector<32xf32>
+  // CHECK: hvx.vror %[[m]], 64 : vector<32xf32>
+  // CHECK-NOT: linalg.reduce
+  linalg.reduce ins(%src : memref<256x32xf32>) outs(%dst : memref<256xf32>) dimensions = [1]
+    (%in: f32, %init: f32) {
+    %cst = arith.constant 2.000000e+00 : f32
+    %0 = arith.mulf %in, %cst : f32
     %1 = arith.maxnumf %0, %init : f32
+    linalg.yield %1 : f32
+  }
+  return
+}
+
+// -----
+
+// An f16 row summed in f32 (Triton's tl.sum on f16 -- rms_norm's production
+// form): the in-body upcast is a chain member. Chunks stay at the row's own
+// width (a full HVX vector of f16), the fold accumulates wide, and one
+// shuffle-fold halves it to the f32-width vector before the butterfly.
+// CHECK-LABEL: func.func @f16_row_f32_fold
+func.func @f16_row_f32_fold(%src: memref<256x64xf16>, %dst: memref<256xf32>) {
+  // CHECK: %[[r:.*]] = vector.transfer_read {{%.*}}, {{%.*}} {in_bounds = [true]} : memref<64xf16, strided<[1], offset: ?>>, vector<64xf16>
+  // CHECK: %[[e:.*]] = arith.extf {{%.*}} : vector<64xf16> to vector<64xf32>
+  // CHECK: %[[lo:.*]] = vector.shuffle {{%.*}}, {{%.*}} [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] : vector<64xf32>, vector<64xf32>
+  // CHECK: %[[hi:.*]] = vector.shuffle {{%.*}}, {{%.*}} [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63] : vector<64xf32>, vector<64xf32>
+  // CHECK: arith.addf %[[lo]], %[[hi]] : vector<32xf32>
+  // CHECK: %[[r64:.*]] = hvx.vror {{%.*}}, 64 : vector<32xf32>
+  // CHECK: %[[r4:.*]] = hvx.vror {{%.*}}, 4 : vector<32xf32>
+  // CHECK: arith.addf %[[r4]]
+  // CHECK-NOT: hvx.vror {{%.*}}, 2
+  // CHECK-NOT: linalg.reduce
+  linalg.reduce ins(%src : memref<256x64xf16>) outs(%dst : memref<256xf32>) dimensions = [1]
+    (%in: f16, %init: f32) {
+    %0 = arith.extf %in : f16 to f32
+    %1 = arith.addf %0, %init : f32
+    linalg.yield %1 : f32
+  }
+  return
+}
+
+// -----
+
+// Negative: a narrowing fold (an f32 row folded in f16) would need a chunk
+// wider than one HVX vector -- the scalar path keeps it.
+// CHECK-LABEL: func.func @f32_row_f16_fold
+func.func @f32_row_f16_fold(%src: memref<256x32xf32>, %dst: memref<256xf16>) {
+  // CHECK: linalg.reduce
+  linalg.reduce ins(%src : memref<256x32xf32>) outs(%dst : memref<256xf16>) dimensions = [1]
+    (%in: f32, %init: f16) {
+    %0 = arith.truncf %in : f32 to f16
+    %1 = arith.addf %0, %init : f16
+    linalg.yield %1 : f16
+  }
+  return
+}
+
+// -----
+
+// Negative: a chain that reads the init arg -- the running accumulator is not
+// a per-element value, so the scalar path keeps the reduce.
+// CHECK-LABEL: func.func @chain_reads_init
+func.func @chain_reads_init(%src: memref<256x32xf32>, %dst: memref<256xf32>) {
+  // CHECK: linalg.reduce
+  linalg.reduce ins(%src : memref<256x32xf32>) outs(%dst : memref<256xf32>) dimensions = [1]
+    (%in: f32, %init: f32) {
+    %0 = arith.mulf %in, %init : f32
+    %1 = arith.maxnumf %0, %init : f32
+    linalg.yield %1 : f32
+  }
+  return
+}
+
+// -----
+
+// Negative: a fold over a value that is neither the input arg nor a chain
+// over it (here a constant folded straight into the fold) -- not a row
+// reduce, the scalar path keeps it.
+// CHECK-LABEL: func.func @constant_fold_body
+func.func @constant_fold_body(%src: memref<256x32xf32>, %dst: memref<256xf32>) {
+  // CHECK: linalg.reduce
+  linalg.reduce ins(%src : memref<256x32xf32>) outs(%dst : memref<256xf32>) dimensions = [1]
+    (%in: f32, %init: f32) {
+    %cst = arith.constant 2.000000e+00 : f32
+    %1 = arith.maxnumf %cst, %init : f32
     linalg.yield %1 : f32
   }
   return

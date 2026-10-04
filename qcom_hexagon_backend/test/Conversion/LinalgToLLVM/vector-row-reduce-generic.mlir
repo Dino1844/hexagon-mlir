@@ -84,17 +84,40 @@ func.func @generic_reduction_not_innermost(%src: memref<32x32xf32>, %dst: memref
 
 // -----
 
-// Body contract: not a single fold of the two block args -> no match.
+// Body contract: a fused elementwise producer between the input arg and the
+// fold matches -- the chain re-creates on the vector chunk, then the
+// butterfly folds it.
 //
-// RR-LABEL: func.func @generic_non_fold_body
-// RR-NOT: hvx.vror
-// RR: linalg.generic
-func.func @generic_non_fold_body(%src: memref<32xf32>, %dst: memref<f32>) {
+// RR-LABEL: func.func @generic_fused_chain
+// RR: arith.mulf {{.*}} : vector<32xf32>
+// RR: hvx.vror
+// RR-NOT: linalg.generic
+func.func @generic_fused_chain(%src: memref<32xf32>, %dst: memref<f32>) {
   linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
                   iterator_types = ["reduction"]}
     ins(%src : memref<32xf32>) outs(%dst : memref<f32>) {
   ^bb0(%in: f32, %acc: f32):
     %t = arith.mulf %in, %in : f32
+    %0 = arith.maxnumf %t, %acc : f32
+    linalg.yield %0 : f32
+  }
+  return
+}
+
+// -----
+
+// Body contract: a chain that reads the running acc is not a per-element
+// value -> no match, the scalar path keeps the generic.
+//
+// RR-LABEL: func.func @generic_chain_reads_acc
+// RR-NOT: hvx.vror
+// RR: linalg.generic
+func.func @generic_chain_reads_acc(%src: memref<32xf32>, %dst: memref<f32>) {
+  linalg.generic {indexing_maps = [affine_map<(d0) -> (d0)>, affine_map<(d0) -> ()>],
+                  iterator_types = ["reduction"]}
+    ins(%src : memref<32xf32>) outs(%dst : memref<f32>) {
+  ^bb0(%in: f32, %acc: f32):
+    %t = arith.mulf %in, %acc : f32
     %0 = arith.maxnumf %t, %acc : f32
     linalg.yield %0 : f32
   }

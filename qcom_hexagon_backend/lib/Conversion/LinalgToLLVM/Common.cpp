@@ -20,6 +20,7 @@
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/Dialect/Utils/StructuredOpsUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/TypeSwitch.h"
 
 namespace mlir {
@@ -70,8 +71,10 @@ std::optional<RowReduceShape> vectorRowReduceShapeOf(Type type) {
   int64_t rows = shaped.getRank() == 2 ? shaped.getDimSize(0) : 1;
   if (rows == 0 || cols == 0)
     return std::nullopt;
-  if ((cols * elemBytes) % kHvxVectorBytes != 0)
-    return std::nullopt;
+  // The row-width divisibility gate lives in matchVectorRowReduce, not here:
+  // the chunk width that a row must be a whole multiple of depends on the
+  // fold's element type (an f16 row summed in f32 chunks at the f32 width),
+  // which only the body contract knows.
   return RowReduceShape{rows, cols, elemBytes};
 }
 
@@ -142,12 +145,126 @@ std::optional<RowReduceFold> matchVectorRowReduce(linalg::LinalgOp op) {
   if (reducePos[0] != inShaped.getRank() - 1)
     return std::nullopt;
 
-  Type elemTy = inShaped.getElementType();
+  // The body contract: one binary fold (maxnumf/addf) whose one operand is
+  // the init block arg and whose other operand is the input block arg,
+  // possibly through a chain of pure elementwise ops fused into the body
+  // (rms_norm's x*x before the row sum -- by the time anyone looks, the
+  // elementwise producer has been fused in and the row chunked). The chain
+  // may upcast (an f16 row summed in f32, Triton's tl.sum on f16); the fold
+  // and accumulator then live at the wider element type. Everything else
+  // stays on the scalar path.
+  Block &block = op->getRegion(0).front();
+  auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
+  if (!yield || yield.getNumOperands() != 1)
+    return std::nullopt;
+  Operation *bin = yield->getOperand(0).getDefiningOp();
+  if (!bin)
+    return std::nullopt;
+  Value blockIn = block.getArgument(0), blockInit = block.getArgument(1);
+
+  bool isMaxNum;
+  arith::FastMathFlags fastmath;
+  if (auto maxnumf = dyn_cast<arith::MaxNumFOp>(bin)) {
+    isMaxNum = true;
+    fastmath = maxnumf.getFastmath();
+  } else if (auto addf = dyn_cast<arith::AddFOp>(bin)) {
+    isMaxNum = false;
+    fastmath = addf.getFastmath();
+  } else {
+    return std::nullopt;
+  }
+  // Exactly one side of the fold is the running init; the other side is the
+  // row value the chain computes.
+  Value folded;
+  if (bin->getOperand(0) == blockInit && bin->getOperand(1) != blockInit)
+    folded = bin->getOperand(1);
+  else if (bin->getOperand(1) == blockInit && bin->getOperand(0) != blockInit)
+    folded = bin->getOperand(0);
+  else
+    return std::nullopt;
+  // The fold's element type: the accumulator's. Must be a scalar f16/f32 the
+  // butterfly can run at, and at least as wide as the row's own element type
+  // (a narrowing fold would need a chunk wider than one HVX vector).
+  Type foldElemTy = blockInit.getType();
+  int64_t foldElemBytes;
+  if (foldElemTy.isF32())
+    foldElemBytes = 4;
+  else if (foldElemTy.isF16())
+    foldElemBytes = 2;
+  else
+    return std::nullopt;
+  if (folded.getType() != foldElemTy)
+    return std::nullopt;
+  if (foldElemBytes < shape->elemBytes)
+    return std::nullopt;
+  // Each chunk the rewrite reads is one HVX vector at the row's own width,
+  // so the row must be a whole number of those (independent of the fold's
+  // width: a widening fold accumulates wide and halves down afterwards).
+  if ((shape->cols * shape->elemBytes) % kHvxVectorBytes != 0)
+    return std::nullopt;
+
+  // The chain: every body op except the fold and the yield, in block order.
+  // A member is either a scalar float constant (f16 or f32 -- the rewrite
+  // re-anchors it as a broadcast) or a pure, single-result,
+  // elementwise-mappable op of a scalar f16/f32 type whose operands are
+  // closed over the input arg and earlier chain results. `Vectorizable` is
+  // the trait contract "all scalar operands and results are replaced by
+  // vectors of the respective element type" -- exactly the re-creation the
+  // rewrite performs -- so an op without it (or an i1-producing compare,
+  // which the element-type gate rejects) keeps the whole reduce scalar. The
+  // init arg may not enter the chain: it is the running accumulator, not a
+  // per-element value.
+  SmallVector<Operation *, 4> chain;
+  auto isChainValue = [&](Value v) {
+    return v == blockIn ||
+           (v.getDefiningOp() && llvm::is_contained(chain, v.getDefiningOp()));
+  };
+  for (auto &bodyOp : block.getOperations()) {
+    if (&bodyOp == bin || isa<linalg::YieldOp>(bodyOp))
+      continue;
+    if (auto cst = dyn_cast<arith::ConstantOp>(&bodyOp)) {
+      if (!isa<FloatAttr>(cst.getValue()) ||
+          (!cst.getType().isF32() && !cst.getType().isF16()))
+        return std::nullopt;
+    } else {
+      Type resTy = bodyOp.getNumResults() == 1
+                       ? bodyOp.getResult(0).getType()
+                       : Type();
+      if (!isMemoryEffectFree(&bodyOp) ||
+          !bodyOp.hasTrait<OpTrait::Vectorizable>() ||
+          bodyOp.getNumResults() != 1 ||
+          (!resTy.isF32() && !resTy.isF16()))
+        return std::nullopt;
+      for (Value operand : bodyOp.getOperands())
+        if (!isChainValue(operand))
+          return std::nullopt;
+    }
+    chain.push_back(&bodyOp);
+  }
+  // The folded row value must be what the chain computes: the input arg
+  // itself (the classic chain-less body) or a chain result -- and it must
+  // actually depend on the input arg, otherwise the body ignores the row it
+  // is reducing (a constant folded straight into the fold).
+  SmallVector<Value, 8> dependsOnIn;
+  auto depends = [&](Value v) {
+    return llvm::is_contained(dependsOnIn, v);
+  };
+  dependsOnIn.push_back(blockIn);
+  for (Operation *op : chain) {
+    bool any = false;
+    for (Value operand : op->getOperands())
+      any = any || depends(operand);
+    if (any)
+      dependsOnIn.push_back(op->getResult(0));
+  }
+  if (!depends(folded))
+    return std::nullopt;
+
   // The init (outs) and, in tensor form, the result carry one value per row
-  // of the same element type. A single-row reduce writes a scalar.
+  // of the fold's element type. A single-row reduce writes a scalar.
   auto perRow = [&](Type t) {
     auto s = dyn_cast<ShapedType>(t);
-    if (!s || !s.hasStaticShape() || s.getElementType() != elemTy)
+    if (!s || !s.hasStaticShape() || s.getElementType() != foldElemTy)
       return false;
     if (shape->rows == 1)
       return s.getRank() == 0 ||
@@ -159,31 +276,7 @@ std::optional<RowReduceFold> matchVectorRowReduce(linalg::LinalgOp op) {
   if (op->getNumResults() == 1 && !perRow(op->getResult(0).getType()))
     return std::nullopt;
 
-  // The body contract: exactly one binary fold over the two block args,
-  // yielded directly.
-  Block &block = op->getRegion(0).front();
-  if (block.getOperations().size() != 2)
-    return std::nullopt;
-  auto yield = dyn_cast<linalg::YieldOp>(block.getTerminator());
-  if (!yield || yield.getNumOperands() != 1)
-    return std::nullopt;
-  Operation *bin = yield->getOperand(0).getDefiningOp();
-  if (!bin)
-    return std::nullopt;
-  Value blockIn = block.getArgument(0), blockInit = block.getArgument(1);
-  auto isArgs = [&](Value v) { return v == blockIn || v == blockInit; };
-
-  if (auto maxnumf = dyn_cast<arith::MaxNumFOp>(bin)) {
-    if (!isArgs(maxnumf.getLhs()) || !isArgs(maxnumf.getRhs()))
-      return std::nullopt;
-    return RowReduceFold{*shape, /*isMaxNum=*/true, maxnumf.getFastmath()};
-  }
-  if (auto addf = dyn_cast<arith::AddFOp>(bin)) {
-    if (!isArgs(addf.getLhs()) || !isArgs(addf.getRhs()))
-      return std::nullopt;
-    return RowReduceFold{*shape, /*isMaxNum=*/false, addf.getFastmath()};
-  }
-  return std::nullopt;
+  return RowReduceFold{chain, *shape, isMaxNum, fastmath, foldElemTy};
 }
 
 // Does the generic body carry an exp-family transcendental?

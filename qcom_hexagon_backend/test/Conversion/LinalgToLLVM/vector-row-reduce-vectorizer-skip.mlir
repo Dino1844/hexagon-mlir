@@ -48,15 +48,56 @@ func.func @rowmax_survives(%src: tensor<256x32xf32>, %out: tensor<256xf32>) -> t
 
 // -----
 
-// Selective: a body that is not a single fold of the two block args does not
-// match the pattern and is still vectorized.
-// CHECK-LABEL: func.func @non_fold_body_still_vectorized
-func.func @non_fold_body_still_vectorized(%src: tensor<1x32xf32>, %out: tensor<1xf32>) -> tensor<1xf32> {
-  // CHECK-NOT: linalg.reduce
-  // CHECK: vector.multi_reduction <maxnumf>
+// The fused producer body (rms_norm's x*x) matches the pattern too -- the
+// butterfly re-creates the chain on the vector chunks -- so it is likewise
+// left for the vector-row-reduce pass.
+// CHECK-LABEL: func.func @fused_body_survives
+func.func @fused_body_survives(%src: tensor<1x32xf32>, %out: tensor<1xf32>) -> tensor<1xf32> {
+  // CHECK: linalg.reduce ins({{.*}} : tensor<1x32xf32>) outs({{.*}} : tensor<1xf32>) dimensions = [1]
+  // CHECK: arith.mulf
+  // CHECK: arith.maxnumf
+  // CHECK-NOT: vector.multi_reduction
   %0 = linalg.reduce ins(%src : tensor<1x32xf32>) outs(%out : tensor<1xf32>) dimensions = [1]
     (%in: f32, %acc: f32) {
     %t = arith.mulf %in, %in : f32
+    %1 = arith.maxnumf %t, %acc : f32
+    linalg.yield %1 : f32
+  }
+  return %0 : tensor<1xf32>
+}
+
+// -----
+
+// The widening form (an f16 row summed in f32) matches too and is likewise
+// left for the vector-row-reduce pass.
+// CHECK-LABEL: func.func @f16_row_f32_fold_survives
+func.func @f16_row_f32_fold_survives(%src: tensor<1x32xf16>, %out: tensor<1xf32>) -> tensor<1xf32> {
+  // CHECK: linalg.reduce ins({{.*}} : tensor<1x32xf16>) outs({{.*}} : tensor<1xf32>) dimensions = [1]
+  // CHECK: arith.extf
+  // CHECK: arith.addf
+  // CHECK-NOT: vector.multi_reduction
+  %0 = linalg.reduce ins(%src : tensor<1x32xf16>) outs(%out : tensor<1xf32>) dimensions = [1]
+    (%in: f16, %acc: f32) {
+    %e = arith.extf %in : f16 to f32
+    %1 = arith.addf %e, %acc : f32
+    linalg.yield %1 : f32
+  }
+  return %0 : tensor<1xf32>
+}
+
+// -----
+
+// Selective: a chain that reads the init arg does not match (the running
+// accumulator is not a per-element value). Upstream vectorization rejects
+// that body too, so the reduce simply stays scalar.
+// CHECK-LABEL: func.func @init_in_chain_stays_scalar
+func.func @init_in_chain_stays_scalar(%src: tensor<1x32xf32>, %out: tensor<1xf32>) -> tensor<1xf32> {
+  // CHECK: linalg.reduce
+  // CHECK: arith.mulf
+  // CHECK-NOT: vector.multi_reduction
+  %0 = linalg.reduce ins(%src : tensor<1x32xf32>) outs(%out : tensor<1xf32>) dimensions = [1]
+    (%in: f32, %acc: f32) {
+    %t = arith.mulf %in, %acc : f32
     %1 = arith.maxnumf %t, %acc : f32
     linalg.yield %1 : f32
   }

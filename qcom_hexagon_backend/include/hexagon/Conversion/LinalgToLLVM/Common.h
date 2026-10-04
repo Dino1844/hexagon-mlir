@@ -12,6 +12,7 @@
 #include "hexagon/Common/Common.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/Operation.h"
+#include "llvm/ADT/SmallVector.h"
 #include <optional>
 #include <string>
 
@@ -101,12 +102,26 @@ std::optional<RowReduceShape> vectorRowReduceShapeOf(Type type);
 /// gate -- both previously kept their own copy.
 inline constexpr int64_t kHvxVectorBytes = 128;
 
-/// The fold a matching row-reduce body must be: one binary maxnumf/addf over
-/// the two block args, yielded directly.
+/// The fold a matching row-reduce body must be: one binary maxnumf/addf whose
+/// one operand is the init block arg and whose other operand is the input
+/// block arg, possibly through a chain of pure elementwise ops fused into the
+/// body (rms_norm's x*x before the row sum), yielded directly.
 struct RowReduceFold {
+  /// The fused elementwise producer between the input block arg and the fold,
+  /// in block order. Empty for the classic chain-less body. Members are
+  /// validated as re-creatable on vectors by the matcher (see
+  /// matchVectorRowReduce); the pass re-creates them per HVX chunk.
+  SmallVector<Operation *, 4> chain;
+
   RowReduceShape shape;
   bool isMaxNum;
   arith::FastMathFlags fastmath;
+  /// The element type of the fold (and of the accumulator/init). Equal to the
+  /// input element type for the classic same-type body; wider when the chain
+  /// upcasts in the body (an f16 row summed in f32 -- Triton's tl.sum on f16,
+  /// e.g. rms_norm). The butterfly runs at this width: the chunk reads are
+  /// lanes = kHvxVectorBytes / foldElemBytes input elements each.
+  Type foldElemTy;
 };
 
 /// Full match of the "row reduce rewritten into a vector fold + hvx.vror

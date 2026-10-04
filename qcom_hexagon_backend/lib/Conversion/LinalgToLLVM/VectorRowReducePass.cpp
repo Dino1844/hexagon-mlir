@@ -15,14 +15,17 @@
 // kernel body.
 //
 // This pass replaces the reduce before that point with explicit vector IR:
-// each row's 128-byte chunks are folded elementwise (one vector max/add per
-// chunk), then a vror butterfly -- rotate the accumulator by half the
-// register and fold, halving the lane span each step, llama.cpp
-// hvx-reduce.h style -- leaves every lane of one HVX vector holding the
-// row's reduction. The original outs init is folded in and lane 0 is stored
-// back, so the scalar contract of the reduce (init folded in, one value per
-// row) is preserved; the butterfly's all-lanes-redundant result is what a
-// later consumer optimization (splats instead of extract) can exploit.
+// each row's chunks -- one HVX vector at the fold's width -- are folded
+// elementwise (one vector max/add per chunk), then a vror butterfly --
+// rotate the accumulator by half the register and fold, halving the lane
+// span each step, llama.cpp hvx-reduce.h style -- leaves every lane of one
+// HVX vector holding the row's reduction. An elementwise producer fused
+// into the body (rms_norm's x*x, an f16 row's upcast to an f32 fold) is
+// re-created on each chunk before it folds in. The original outs init is
+// folded in and lane 0 is stored back, so the scalar contract of the
+// reduce (init folded in, one value per row) is preserved; the
+// butterfly's all-lanes-redundant result is what a later consumer
+// optimization (splats instead of extract) can exploit.
 //
 // Everything it cannot prove static, contiguous and whole-vector is left for
 // the scalar path. Off by default (`enable-vector-row-reduce`): the knob is
@@ -42,7 +45,9 @@
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LogicalResult.h"
 
 using namespace mlir;
 using namespace mlir::hexagon;
@@ -95,6 +100,52 @@ private:
     return arith::AddFOp::create(b, loc, l, r, fold.fastmath).getResult();
   }
 
+  // Re-create the fused elementwise chain (rms_norm's x*x; an f16 row's
+  // upcast to an f32 fold) over one chunk of `lanes` input elements. The
+  // matcher validated every member as pure and elementwise mappable, so each
+  // op re-creates at vector<lanes x its scalar type>; a scalar constant
+  // re-anchors as a broadcast. The classic chain-less body returns the chunk
+  // unchanged.
+  static FailureOr<Value> emitChain(OpBuilder &b, Location loc,
+                                    const RowReduceFold &fold, int64_t lanes,
+                                    Value chunk, Value blockIn) {
+    if (fold.chain.empty())
+      return chunk;
+    auto vecOf = [&](Type scalarTy) {
+      return VectorType::get({lanes}, scalarTy);
+    };
+    llvm::SmallDenseMap<Value, Value> vmap;
+    vmap[blockIn] = chunk;
+    Value last = chunk;
+    for (Operation *op : fold.chain) {
+      if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+        Value scalar = arith::ConstantOp::create(b, loc, cst.getType(),
+                                                 cst.getValue());
+        last = vector::BroadcastOp::create(b, loc, vecOf(cst.getType()),
+                                           scalar);
+      } else {
+        SmallVector<Value, 4> operands;
+        for (Value operand : op->getOperands()) {
+          auto it = vmap.find(operand);
+          if (it == vmap.end()) {
+            // The matcher closes the chain over the input arg and earlier
+            // results; reaching here means that contract was violated.
+            op->emitOpError("row-reduce rewrite: chain operand not mapped");
+            return failure();
+          }
+          operands.push_back(it->second);
+        }
+        OperationState state(loc, op->getName());
+        state.addOperands(operands);
+        state.addTypes(vecOf(op->getResult(0).getType()));
+        state.addAttributes(op->getAttrs());
+        last = b.create(state)->getResult(0);
+      }
+      vmap[op->getResult(0)] = last;
+    }
+    return last;
+  }
+
   LogicalResult rewrite(linalg::LinalgOp op, const RowReduceFold &fold) const {
     // A generalized reduce arrives as linalg.generic (LinalgGeneralize runs
     // earlier), a reduce still as linalg.reduce; the outs carry one value per
@@ -123,11 +174,21 @@ private:
     auto srcTy = cast<MemRefType>(src.getType());
     auto dstTy = cast<MemRefType>(dst.getType());
     Type elemTy = srcTy.getElementType();
+    // The fold (and the accumulator/init) may be wider than the row's own
+    // element type when the fused chain upcasts (an f16 row summed in f32).
+    // Chunks are read at the row's own width (a full HVX vector of input
+    // elements); a widening fold accumulates at the wider lane count and is
+    // halved down to one HVX vector of fold lanes before the butterfly.
+    Type foldElemTy = fold.foldElemTy;
+    int64_t foldElemBytes = foldElemTy.isF32() ? 4 : 2;
     RowReduceShape shape = fold.shape;
 
-    int64_t lanes = kHvxVectorBytes / shape.elemBytes; // f32: 32, f16: 64
-    int64_t chunks = shape.cols / lanes;
-    auto vecTy = VectorType::get({lanes}, elemTy);
+    int64_t lanes = kHvxVectorBytes / foldElemBytes; // f32: 32, f16: 64
+    int64_t chunkLanes = kHvxVectorBytes / shape.elemBytes;
+    int64_t chunks = shape.cols / chunkLanes;
+    auto readTy = VectorType::get({chunkLanes}, elemTy);
+    auto accTy = VectorType::get({chunkLanes}, foldElemTy);
+    auto vecTy = VectorType::get({lanes}, foldElemTy);
 
     Location loc = op.getLoc();
     OpBuilder b(op);
@@ -179,20 +240,47 @@ private:
     }
 
     // Cross-chunk elementwise fold: lane i holds the fold over the same lane
-    // of every 128-byte chunk of the row.
+    // of every chunk of the row (one HVX vector of input elements). A fused
+    // elementwise producer (the chain) is applied to each chunk before it
+    // folds in.
     static constexpr bool kInBounds[] = {true};
+    Value blockIn = op->getRegion(0).front().getArgument(0);
     Value acc;
     for (int64_t k = 0; k < chunks; ++k) {
-      Value col = k == 0 ? c0 : arith::ConstantIndexOp::create(b, loc, k * lanes);
+      Value col = k == 0 ? c0 : arith::ConstantIndexOp::create(b, loc, k * chunkLanes);
       Value chunk = vector::TransferReadOp::create(
-          b, loc, vecTy, row, ValueRange{col}, pad,
+          b, loc, readTy, row, ValueRange{col}, pad,
           llvm::ArrayRef<bool>(kInBounds));
-      acc = k == 0 ? chunk : emitFold(b, loc, fold, acc, chunk);
+      FailureOr<Value> mapped = emitChain(b, loc, fold, chunkLanes, chunk,
+                                          blockIn);
+      if (failed(mapped))
+        return failure();
+      acc = k == 0 ? *mapped : emitFold(b, loc, fold, acc, *mapped);
+    }
+
+    // A widening fold accumulated more lanes than one HVX vector of fold
+    // elements: shuffle the wide accumulator into halves and fold them
+    // together, halving until it is one fold-width vector. (The fold is
+    // commutative, so folding the halves in either order is the same row
+    // value.)
+    for (int64_t wide = chunkLanes; wide > lanes; wide /= 2) {
+      auto halfTy = VectorType::get({wide / 2}, foldElemTy);
+      SmallVector<int64_t, 64> lo, hi;
+      for (int64_t i = 0; i < wide / 2; ++i)
+        lo.push_back(i);
+      for (int64_t i = wide / 2; i < wide; ++i)
+        hi.push_back(i);
+      Value loV = vector::ShuffleOp::create(b, loc, halfTy, acc, acc, lo);
+      Value hiV = vector::ShuffleOp::create(b, loc, halfTy, acc, acc, hi);
+      acc = emitFold(b, loc, fold, loV, hiV);
     }
 
     // Butterfly: rotate the register right by half the remaining span and
-    // fold; after log2(128/elemBytes) steps every lane holds the row value.
-    for (int64_t bytes = kHvxVectorBytes / 2; bytes >= shape.elemBytes;
+    // fold; after log2(128/foldElemBytes) steps every lane holds the row
+    // value. The span bottoms out at the fold's element size -- the register
+    // lanes are fold-typed, so a byte-granularity rotation below that would
+    // misalign them (an f16 row folded in f32 stops at 4 B, not 2 B).
+    for (int64_t bytes = kHvxVectorBytes / 2; bytes >= foldElemBytes;
          bytes /= 2) {
       Value rotated = hvx::VrorOp::create(b, loc, vecTy, acc,
                                           b.getI32IntegerAttr(bytes));
