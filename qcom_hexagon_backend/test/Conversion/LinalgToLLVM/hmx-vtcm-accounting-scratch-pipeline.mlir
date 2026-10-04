@@ -11,7 +11,14 @@
 // the diagnostic must report that structure and fail closed instead of
 // publishing the pre-scratch allocation census.
 //
-// RUN: not linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{scratch=1048576})' 2>&1 | FileCheck %s
+// The workspace-resident option is spelled out as false because this test's
+// subject is the scratch-argument path, and the resident path rewrites the
+// workspace structure it checks (the views become resident addresses). The
+// resident path has its own pipeline coverage (hmx-workspace-resident-
+// pipeline.mlir); the default flipped to on 2026-10-04, so the flag is what
+// keeps this fixture on the path it was written for.
+//
+// RUN: not linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{scratch=1048576 enable-workspace-resident=false})' 2>&1 | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK: HMX VTCM accounting is incomplete: static allocation bytes or resident-byte provenance could not be proven

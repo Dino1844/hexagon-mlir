@@ -56,7 +56,7 @@
 // residency on) is hmx-vtcm-liveness-pipeline.mlir.
 //
 //===----------------------------------------------------------------------===//
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' -split-input-file | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-workspace-resident=false})' -split-input-file | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // -----
@@ -65,6 +65,13 @@
 // weight-resident pass turns it into a resident VTCM buffer and the kernel drops
 // its per-launch pack; the census sees that buffer as a resident site and the
 // bias state, activation bridge and accumulator as transient ones.
+//
+// The workspace-resident option is spelled out as false because this fixture's
+// arithmetic is the MIXED one -- a resident weight against three transient
+// workspace sites -- and the all-resident world (the default since 2026-10-04)
+// zeroes the transient side of every sum below, which would stop checking the
+// census math rather than check it harder. The resident world has its own
+// coverage (hmx-workspace-resident-pipeline.mlir).
 module attributes {hmx.diagnostic_vtcm_accounting,
                     hmx.diagnostic_vtcm_liveness,
                     hmx.diagnostic_v3_record} {

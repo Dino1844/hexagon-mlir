@@ -198,12 +198,14 @@
 // Both halves of the surface are declared: the standalone pass (with its batch
 // knob) and the -linalg-to-llvm options that gate it. `mlir-opt --help` prints
 // each option's description rather than a "default:" field, so the gate is pinned
-// by the pipeline flag's own "Off by default" wording -- the declaration and the
-// documented default together.
+// by the pipeline flag's own "Default on since 2026-10-04" wording -- the
+// declaration and the documented default together. (The wording moved with the
+// default: the Python option flipped first, this .td default followed it so a
+// bare manual pipeline run and a production compile agree.)
 // OPTIONS: --hmx-vector-readout
 // OPTIONS: --hmx-readout-batch=<long>
 // OPTIONS: --enable-hmx-vector-readout
-// OPTIONS-SAME: Off by default
+// OPTIONS-SAME: Default on since 2026-10-04
 func.func @kernel(%bias: memref<256xi8, 1>, %out: memref<1024x512xf16, strided<[512, 1]>>) {
   %c0 = arith.constant 0 : index
   %c1 = arith.constant 1 : index

@@ -360,7 +360,8 @@ def test_alignment_and_charged_units_are_explicit() -> None:
     assert "powers of two through 2048" in _read("include/VTCMPool.h")
     assert re.search(
         r"void\s+\*\s*hexagon_runtime_workspace_resident_v2\s*\(\s*"
-        r"uint64_t\s+key,\s*uint32_t\s+bytes,\s*uint32_t\s+alignment\s*\)",
+        r"uint64_t\s+key,\s*uint32_t\s+bytes,\s*uint32_t\s+alignment,\s*"
+        r"uint32_t\s+instance\s*\)",
         capi,
     )
     assert re.search(
@@ -407,7 +408,8 @@ def test_resident_content_and_address_reuse_remain_not_proven() -> None:
     implementation = _read("src/HexagonCAPI.cpp")
     resident = _function_body(
         source,
-        "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n                         size_t alignment, const void *src) {",
+        "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
+        "                         size_t alignment, const void *src, uint64_t slot) {",
     )
     descriptor = header[
         header.index("struct ResidentDescriptor") : header.index("struct ResidentBlock")
@@ -527,7 +529,7 @@ def test_pool_blocks_have_no_in_pool_header() -> None:
     fill = _function_body(
         pool,
         "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
-        "                         size_t alignment, const void *src) {",
+        "                         size_t alignment, const void *src, uint64_t slot) {",
     )
     assert "std::memcpy(ptr, src, nbytes);" in fill
 

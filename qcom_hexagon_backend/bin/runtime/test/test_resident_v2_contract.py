@@ -38,8 +38,14 @@ def test_v2_c_abi_signatures() -> None:
     implementation = _read("src/HexagonCAPI.cpp")
 
     resident_patterns = (
+        # The workspace entry's 4th parameter is the caller's flat program id,
+        # the discriminator that keeps concurrent instances of a grid>1 launch
+        # on separate resident buffers (2026-10-04; before it, a grid>1 launch
+        # shared one buffer and the wrapper's per-launch threads never reused
+        # theirs).
         r"void\s+\*\s*hexagon_runtime_workspace_resident_v2\s*\(\s*"
-        r"uint64_t\s+key,\s*uint32_t\s+bytes,\s*uint32_t\s+alignment\s*\)",
+        r"uint64_t\s+key,\s*uint32_t\s+bytes,\s*uint32_t\s+alignment,\s*"
+        r"uint32_t\s+instance\s*\)",
         r"void\s+\*\s*hexagon_runtime_weight_resident_v2\s*\(\s*"
         r"uint64_t\s+src,\s*uint32_t\s+bytes,\s*uint32_t\s+alignment\s*\)",
     )
@@ -89,12 +95,16 @@ def test_same_key_descriptor_mismatch_fails_before_allocation() -> None:
     source = _read("src/VTCMPool.cpp")
     body = _function_body(
         source,
-        "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n                         size_t alignment, const void *src) {",
+        "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
+        "                         size_t alignment, const void *src, uint64_t slot) {",
     )
 
-    for field in ("kind", "key", "bytes", "alignment", "chargedBytes"):
+    # `slot` is the resident key's instance discriminator (the flat program id
+    # on the workspace path); a descriptor comparison that omitted it would
+    # let two instances of one grid>1 launch accept each other's buffers.
+    for field in ("kind", "key", "slot", "bytes", "alignment", "chargedBytes"):
         assert re.search(rf"\b{field}\b", header), f"descriptor lacks {field}"
-    for field in ("kind", "key", "bytes", "alignment", "chargedBytes"):
+    for field in ("kind", "key", "slot", "bytes", "alignment", "chargedBytes"):
         assert f"lhs.{field}" in source and f"rhs.{field}" in source, (
             f"descriptor comparison omits {field}"
         )
@@ -120,7 +130,7 @@ def test_resident_alignment_uses_the_vtcm_verifier() -> None:
     resident = _function_body(
         source,
         "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
-        "                         size_t alignment, const void *src) {",
+        "                         size_t alignment, const void *src, uint64_t slot) {",
     )
     assert "!IsSupportedAlignment(alignment)" in resident
     assert resident.index("!IsSupportedAlignment(alignment)") < resident.index(

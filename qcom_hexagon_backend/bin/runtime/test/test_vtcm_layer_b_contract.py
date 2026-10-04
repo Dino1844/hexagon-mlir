@@ -421,7 +421,7 @@ def test_resident_abi_is_labeled_without_changing_key_reuse() -> None:
     match = function_body(
         source,
         "void *VtcmPool::Resident(ResidentKind kind, uint64_t key, size_t nbytes,\n"
-        "                         size_t alignment, const void *src) {",
+        "                         size_t alignment, const void *src, uint64_t slot) {",
     )
     assert "return block.ptr" in match
     assert "std::memcpy" in match

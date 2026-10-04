@@ -625,26 +625,22 @@ static void verifyHmxLeafCallers(ModuleOp moduleOp,
 // the compiler half of the ABI is in HmxReadoutHandoff.h, shared with the
 // producer pass so the symbols and the descriptor layout are spelled once.
 
-/// `configure`'s `numThreads`.
-// TRACEABILITY: kHmxExecNumThreads kHmxExecPublishedBatches
-//   mechanism: `kHmxExecNumThreads` is the `numThreads` argument of
-//     hexagon_runtime_hmx_exec_configure; `kHmxExecPublishedBatches` is the count
-//     each hexagon_runtime_hmx_exec_publish call was given, and the drop check
-//     compares the return against it. Neither steers the generated schedule: the
-//     first is a request the runtime may decline, the second is a property of what
-//     the producer pass emitted.
-//   measurement: kHmxExecNumThreads is fixed by the frozen runtime, not by us:
-//     kVectorThreads == 1 (HmxVectorExecutor.cpp:101) and any other value returns
-//     -2 (HmxVectorExecutor.cpp:462,491), so 1 is the only value that is actually
-//     honoured. kHmxExecPublishedBatches is 1 because the producer emits
+/// The count each `hexagon_runtime_hmx_exec_publish` call was given.
+// TRACEABILITY: kHmxExecPublishedBatches
+//   mechanism: the count each hexagon_runtime_hmx_exec_publish call was given,
+//     which the drop check compares the return against. It does not steer the
+//     generated schedule: it is a property of what the producer pass emitted.
+//     (`configure`'s numThreads is now also a producer fact: the placeholder
+//     call passes 1, the only value the frozen runtime honours --
+//     kVectorThreads == 1, HmxVectorExecutor.cpp; anything else returns -2.)
+//   measurement: kHmxExecPublishedBatches is 1 because the producer emits
 //     `publish(addr, 1)` -- one descriptor, one batch -- and the runtime calls the
 //     read-out once per batch. Its correctness does not rest on the value: the
 //     check is `<` against what was asked, so it fires on any short return, which
 //     is the only failure that matters.
-//   shape set: n/a. Neither is a shape or size threshold; both are fixed by an
-//     interface contract.
+//   shape set: n/a. Not a shape or size threshold; fixed by an interface
+//     contract.
 //   workload representativeness: n/a, for the same reason.
-static constexpr int32_t kHmxExecNumThreads = 1;
 static constexpr int32_t kHmxExecPublishedBatches = 1;
 
 /// Append one memref's expanded `convert-func-to-llvm` argument list.
@@ -829,53 +825,68 @@ static LLVM::LLVMFuncOp emitReadoutEntry(OpBuilder &builder, ModuleOp moduleOp,
   return entry;
 }
 
-/// Call `hexagon_runtime_hmx_exec_configure(addressOf(entry), 1)` at the top of
-/// `engine`.
+/// Write each handoff's entry-point address into the engine's placeholder
+/// `configure` calls, in program order.
 ///
-/// The call must precede the FIRST publish, because a publish before configure
-/// hands the executor a batch it will never run (the runtime drops everything
-/// until a function is registered, HmxVectorExecutor.cpp:551-562). Putting it at
-/// the start of the entry block rather than next to the loop is deliberate:
-/// `configure` is idempotent and re-stores the function, but it also costs a
-/// `drainLocked` wait, so a per-iteration call would be wrong even though it
-/// would be "before the first publish" from the first iteration only.
+/// The producer pass emits one placeholder per matmul group -- before the
+/// group's first tile loop -- because a function's address is not expressible
+/// before `convert-func-to-llvm` (`llvm.mlir.addressof` rejects a `func.func`
+/// symbol). This pass runs after that conversion and is the only one that can
+/// take the address, so the pairing happens here: the engine's k-th configure
+/// call names the k-th handoff record's entry point. The producer emits calls
+/// and records in the same group order, so program order pairs them without
+/// any other identity travelling between the two passes.
 ///
-/// The return is not tested. A negative return means the executor is unusable,
-/// and the first `publish` after it returns 0 for every one of its reasons
-/// (null/zero argument, not configured, stopped, ring full), all of which the
-/// publish check below turns into a trap. Testing one of them twice buys
-/// nothing; testing neither would be the actual bug.
-static FailureOr<LLVM::LLVMFuncOp>
-emitConfigure(ModuleOp moduleOp, LLVM::LLVMFuncOp engine,
-              LLVM::LLVMFuncOp entry) {
-  MLIRContext *context = moduleOp.getContext();
-  OpBuilder builder(context);
+/// For every group but the first, the call's POSITION is load-bearing, not
+/// just its address: `configure` drains the ring before swapping the function
+/// pointer (HmxVectorExecutor.cpp configure), so the previous group's
+/// in-flight batches finish under their own read-out before this group's
+/// batches can run at all. That drain is why multiple handoffs per engine are
+/// sound at all, and why this wiring must not move the calls.
+///
+/// The counts must agree exactly, in both directions: a record without its
+/// call leaves that group's publishes unconfigured (they trap on the first
+/// publish), and a call without its record names an address nobody outlined.
+/// Both are refusals, not repairs.
+static LogicalResult wireConfigureCalls(LLVM::LLVMFuncOp engine,
+                                        ArrayRef<LLVM::LLVMFuncOp> entries) {
+  // Collect before editing: the walk must not observe anything this edit adds.
+  SmallVector<LLVM::CallOp> calls;
+  engine.walk([&](LLVM::CallOp call) {
+    if (std::optional<StringRef> callee = call.getCallee())
+      if (*callee == kHmxExecConfigureFn)
+        calls.push_back(call);
+  });
+  if (calls.size() != entries.size())
+    return engine.emitError()
+           << "engine '" << engine.getName() << "' holds " << calls.size()
+           << " hexagon_runtime_hmx_exec_configure call(s) for "
+           << entries.size()
+           << " readout handoff record(s); the producer emits exactly one"
+              " call per record, in the same order";
+
+  OpBuilder builder(engine.getContext());
   auto i32Ty = builder.getI32Type();
-  auto ptrTy = LLVM::LLVMPointerType::get(context, 0);
-  Location loc = moduleOp.getLoc();
-
-  // Same declaration the producer pass made, seen from the LLVM side: `lookupOrCreateFn`
-  // reuses it, and the i32 result is the ABI's (`int32_t`, HmxVectorExecutor.h:122).
-  FailureOr<LLVM::LLVMFuncOp> configure = LLVM::lookupOrCreateFn(
-      builder, moduleOp, kHmxExecConfigureFn, ArrayRef<Type>{i32Ty, i32Ty}, i32Ty);
-  if (failed(configure))
-    return failure();
-
-  Block *start = &engine.getBody().front();
-  builder.setInsertionPointToStart(start);
-  Value address = LLVM::AddressOfOp::create(
-      builder, loc, ptrTy, FlatSymbolRefAttr::get(entry.getOperation()));
-  // The runtime takes a C function pointer, which is a 32-bit value on this
-  // target -- the same reason every other address here crosses as i32
-  // (`asAddress`).
-  Value asInt = LLVM::PtrToIntOp::create(builder, loc, i32Ty, address);
-  LLVM::CallOp::create(
-      builder, loc, TypeRange{i32Ty},
-      FlatSymbolRefAttr::get(configure->getOperation()),
-      ValueRange{asInt, LLVM::ConstantOp::create(
-                             builder, loc, i32Ty,
-                             builder.getI32IntegerAttr(kHmxExecNumThreads))});
-  return configure;
+  auto ptrTy = LLVM::LLVMPointerType::get(builder.getContext(), 0);
+  Location loc = engine.getLoc();
+  for (unsigned k = 0; k < calls.size(); ++k) {
+    LLVM::CallOp call = calls[k];
+    LLVM::LLVMFuncOp entry = entries[k];
+    if (call.getNumOperands() != 2)
+      return call.emitError()
+             << "hexagon_runtime_hmx_exec_configure takes"
+                " (HmxReadoutFn, int32_t); a different arity here means the"
+                " placeholder was not emitted by hmx-vector-readout";
+    // The address crosses as the same i32 every other address crosses as on
+    // this target (`asAddress`): the ABI takes a C function pointer, which is
+    // 32-bit here.
+    builder.setInsertionPoint(call);
+    Value address = LLVM::AddressOfOp::create(
+        builder, loc, ptrTy, FlatSymbolRefAttr::get(entry.getOperation()));
+    Value asInt = LLVM::PtrToIntOp::create(builder, loc, i32Ty, address);
+    call.setOperand(0, asInt);
+  }
+  return success();
 }
 
 /// Turn a short `publish` return into a trap.
@@ -1002,6 +1013,14 @@ static LogicalResult wireVectorReadout(ModuleOp moduleOp) {
         "hmx.readout.handoffs must be an array of handoff records");
 
   OpBuilder builder(moduleOp.getContext());
+
+  // One engine can now hold SEVERAL handoffs -- one per matmul group -- and
+  // both the configure pairing and the publish check are per engine: the calls
+  // are paired with this engine's records in program order, and the trap
+  // rewrite must visit each publish exactly once. Records for one engine are
+  // collected here in record order, which is the producer's group order.
+  SmallVector<LLVM::LLVMFuncOp> engineOrder;
+  DenseMap<LLVM::LLVMFuncOp, SmallVector<LLVM::LLVMFuncOp>> engineEntries;
   for (Attribute raw : records) {
     auto record = dyn_cast<DictionaryAttr>(raw);
     if (!record)
@@ -1071,7 +1090,13 @@ static LogicalResult wireVectorReadout(ModuleOp moduleOp) {
 
     LLVM::LLVMFuncOp entry = emitReadoutEntry(builder, moduleOp, work, arType,
                                               dstType, entryName);
-    if (failed(emitConfigure(moduleOp, engine, entry)))
+    if (engineEntries.count(engine) == 0)
+      engineOrder.push_back(engine);
+    engineEntries[engine].push_back(entry);
+  }
+
+  for (LLVM::LLVMFuncOp engine : engineOrder) {
+    if (failed(wireConfigureCalls(engine, engineEntries[engine])))
       return failure();
     if (failed(checkPublishReturns(engine)))
       return failure();

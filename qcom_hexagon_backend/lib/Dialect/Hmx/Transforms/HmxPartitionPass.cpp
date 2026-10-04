@@ -2250,17 +2250,29 @@ struct HmxPartitionPass
     if (matmuls.empty())
       return;
 
-    // The read-out channel of `auto` staging is only real for a function the
-    // read-out split can actually take. A function holding more than one
-    // hmx.matmul is declined whole by hmx-vector-readout: each matmul's
-    // read-out names its own AR, destination and decision id, and that pass
-    // declines rather than model a second descriptor. Opening staging for
-    // such a function buys the ring's cost and nothing else -- measured on
-    // flash attention (two matmuls, Kt=2, iters=1000): staging both with the
-    // read-out declined was +9% (5630/5534 vs 5126/5195 us, 2026-10-04).
-    // So the channel floor is only honoured for a single-matmul function.
-    const int64_t readoutChannelMTiles =
-        matmuls.size() == 1 ? this->stagedReadoutMTiles : 0;
+    // The read-out channel of `auto` staging pays only when the tile loop it
+    // stages executes ONCE per launch. The staged ring's fixed cost -- the
+    // peeled prologue and epilogue, the scratch -- is per EXECUTION of the
+    // tile loop, and a matmul sitting inside an outer loop pays it per
+    // iteration of that loop. Measured both ways on shallow-K shapes (Kt=2,
+    // iters=1000, this build, 2026-10-04): a once-per-launch matmul is the
+    // channel's win (S1 61 -> 38 us), while flash attention's per-chunk Q@K
+    // and P@V -- the same shape, executed 16 times per launch -- pay the
+    // ring's fixed cost twice per chunk (staged ring + read-out 5466 us vs
+    // unstaged serial 5230 us; the read-out itself is neutral there, 5466 vs
+    // 5555 with the ring held fixed). The channel therefore opens only for a
+    // matmul that no outer loop re-executes; the single-matmul gate this
+    // replaces was a proxy for exactly this condition, and removing it
+    // without a replacement cost flash attention +5%.
+    auto readoutChannelFor = [&](MatmulOp op) -> int64_t {
+      if (this->stagedReadoutMTiles <= 0)
+        return 0;
+      for (Operation *ancestor = op->getParentOp(); ancestor != nullptr;
+           ancestor = ancestor->getParentOp())
+        if (isa<scf::ForOp, scf::ForallOp>(ancestor))
+          return 0;
+      return this->stagedReadoutMTiles;
+    };
 
     // The engine's budget, with the one field a caller may narrow: 0 means the
     // device default (see HmxTarget).
@@ -2428,7 +2440,7 @@ struct HmxPartitionPass
         bool staged = false;
         if (failed(emitStageLoop(rewriter, opLoc, bias, op, func, vtcmBudget,
                                  this->pipelineDepth, batch,
-                                 readoutChannelMTiles, staged)))
+                                 readoutChannelFor(op), staged)))
           return signalPassFailure();
         if (staged)
           continue;

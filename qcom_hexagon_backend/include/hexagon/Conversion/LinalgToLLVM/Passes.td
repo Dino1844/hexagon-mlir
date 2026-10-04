@@ -182,13 +182,14 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "maximum. 0 and 32 are the same request. Anything outside {0} u "
           "[1, 32] is rejected by hmx-partition rather than clamped.">,
     Option<"enableHmxVectorReadout", "enable-hmx-vector-readout", "bool",
-           /*default=*/"false",
+           /*default=*/"true",
            "Hand a lowered HMX matmul's accumulator read-out to a second "
            "thread, in batches of hmx-readout-batch rows (hmx-vector-readout). "
-           "Off by default: the rewrite itself is exercised, but the "
-           "configure() handoff that gives the executor its function pointer "
-           "cannot be emitted before convert-func-to-llvm, so a rewritten "
-           "kernel is not yet runnable.">,
+           "Default on since 2026-10-04 (the Python option flipped first and "
+           "this .td default follows it, so a bare manual pipeline run and a "
+           "production compile agree; they briefly did not, and a manual run "
+           "then showed no read-out with no diagnostic). What the pass cannot "
+           "take it declines with a remark.">,
     Option<"hmxReadoutBatch", "hmx-readout-batch", "int64_t",
           /*default=*/"4",
           "How many AR rows one hmx vector-executor handoff names (G). Must be "
@@ -206,11 +207,14 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "in flight after the kernel returns, which is only sound for "
           "sequential single-instance (grid=1) launches.">,
     Option<"enableWorkspaceResident", "enable-workspace-resident", "bool",
-          /*default=*/"false",
+          /*default=*/"true",
           "Make every per-launch VTCM workspace of an HMX kernel a "
-          "process-resident buffer (hmx-workspace-resident). Off by default: "
-          "only correct for single-instance execution, since a grid>1 launch "
-          "would run several instances over the same resident buffers.">,
+          "process-resident buffer (hmx-workspace-resident). Default on "
+          "since 2026-10-04: residency slots key on the caller's flat "
+          "program id (the 4th argument of "
+          "hexagon_runtime_workspace_resident_v2_dsp), so a grid>1 launch "
+          "no longer shares one resident buffer across instances -- the "
+          "hazard that once kept this off.">,
     Option<"enableVectorRowReduce", "enable-vector-row-reduce", "bool",
           /*default=*/"false",
           "Lower 2-D last-dim linalg.reduce (f16/f32 max/add) to per-vector "

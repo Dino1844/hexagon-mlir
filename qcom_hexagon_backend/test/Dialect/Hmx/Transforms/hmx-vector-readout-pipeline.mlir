@@ -23,18 +23,22 @@
 // matmul does not always produce it. A test that passed on a synthetic fixture
 // could therefore be testing a shape the pass never sees in production.
 //
-// The two arms are the point. OFF must be byte-identical to the same pipeline run
-// with the option spelled out as false -- not merely "still correct", but
-// unchanged, so every measurement taken before this pass existed still describes
-// the code it measured. ON must show the handoff to the vector executor and the
-// drain. Both directions are checked, so neither arm can pass vacuously.
+// The two arms are the point. OFF (explicitly false) must be byte-identical
+// to ... itself, so the arm the OFF checks describe is pinned by spelling the
+// flag out; the DEFAULT arm is what the bare run now is -- the option flipped
+// to default-on (2026-10-04), so the byte-identity gate moved with it: the
+// bare run must be identical to the explicitly-ON run, or the .td default and
+// the Python default have drifted apart again (the exact drift the option
+// surface contract once caught). ON must show the handoff to the vector
+// executor and the drain. Both directions are checked, so neither arm can
+// pass vacuously.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hmx-pipeline-depth=2})' > %t.off
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hmx-pipeline-depth=2 enable-hmx-vector-readout=false})' > %t.offexplicit
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hmx-pipeline-depth=2})' > %t.default
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hmx-pipeline-depth=2 enable-hmx-vector-readout=false})' > %t.off
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-hmx-pipeline-depth=2 enable-hmx-vector-readout=true})' > %t.on
 // RUN: FileCheck %s --check-prefix=OFF < %t.off
 // RUN: FileCheck %s --check-prefix=ON < %t.on
-// RUN: diff %t.off %t.offexplicit
+// RUN: diff %t.on %t.default
 // RUN: not diff %t.off %t.on
 //
 // That last one is the switch itself: the option ON must produce different
@@ -44,7 +48,7 @@
 
 // OFF arm. FileCheck directives must appear in OUTPUT order, so the NOTs come
 // first: from the start of the output to the first engine leaf there is no executor
-// traffic of any kind, which is what "off by default" has to mean.
+// traffic of any kind, which is what "off" has to mean.
 // OFF-NOT: hexagon_runtime_hmx_exec_publish
 // OFF-NOT: hexagon_runtime_hmx_exec_drain
 // OFF-NOT: __hmx_readout

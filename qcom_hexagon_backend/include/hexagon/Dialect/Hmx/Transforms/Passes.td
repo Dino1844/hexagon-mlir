@@ -205,12 +205,12 @@ def HmxPartition : InterfacePass<"hmx-partition", "mlir::FunctionOpInterface"> {
            "above this many m-tiles, `auto` may stage a shallow-K shape too, "
            "because the staged loop is also what the read-out split's m-tile "
            "loop attaches to, and at least two read-out batches (m-tiles / "
-           "batch) can overlap behind the engine. Honoured only for a "
-           "single-matmul function: hmx-vector-readout declines a "
-           "multi-matmul function whole, so staging it would buy the ring's "
-           "cost with no read-out to hide behind it. 0 keeps the channel "
-           "closed (shallow-K `auto` always declines, the pre-readout "
-           "behaviour).">,
+           "batch) can overlap behind the engine. Honoured only for a matmul "
+           "that no outer loop re-executes: the staged ring's fixed cost is "
+           "per tile-loop execution, and a matmul inside an outer loop (flash "
+           "attention's per-chunk Q@K and P@V) pays it per iteration. 0 keeps "
+           "the channel closed (shallow-K `auto` always declines, the "
+           "pre-readout behaviour).">,
     Option<"croutonsPerMma", "croutons-per-mma", "int64_t", /*default=*/"0",
            "How many K croutons one hmx.mma walks, i.e. the engine's repeat "
            "count. 0 = the hardware maximum (32), which is what 32 itself "

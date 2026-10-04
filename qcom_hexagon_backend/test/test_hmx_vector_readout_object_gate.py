@@ -145,6 +145,38 @@ def matmul_kernel(A, B, C, N_ROWS: tl.constexpr, N_COLUMNS: tl.constexpr,
 
 
 @triton.jit
+def two_matmul_kernel(A, B, C, D, E, N_ROWS: tl.constexpr,
+                      N_COLUMNS: tl.constexpr, N_INNER: tl.constexpr):
+    """Two whole-block matmuls in sequence, both at function top level.
+
+    This is the multi-matmul reach of the split, distilled: two `hmx.matmul`,
+    each naming its own AR, destination and decision id, with no outer loop
+    re-executing either. hmx-vector-readout takes such a function as one GROUP
+    per matmul (since 2026-10-04); before that it declined the whole function
+    on the first disagreement between the matmuls. Both block bodies are
+    `matmul_kernel` verbatim (same reason it is taken verbatim from
+    dump_codegen.py: the shipped kernel is what a reader would measure).
+    """
+    A_block_ptr = tl.make_block_ptr(base=A, shape=(N_ROWS, N_INNER), strides=(N_INNER, 1),
+                                    offsets=(0, 0), block_shape=(N_ROWS, N_INNER), order=(1, 0))
+    B_block_ptr = tl.make_block_ptr(base=B, shape=(N_INNER, N_COLUMNS), strides=(N_COLUMNS, 1),
+                                    offsets=(0, 0), block_shape=(N_INNER, N_COLUMNS), order=(1, 0))
+    C_block_ptr = tl.make_block_ptr(base=C, shape=(N_ROWS, N_COLUMNS), strides=(N_COLUMNS, 1),
+                                    offsets=(0, 0), block_shape=(N_ROWS, N_COLUMNS), order=(1, 0))
+    q = tl.load(A_block_ptr)
+    k_t = tl.load(B_block_ptr)
+    qk = tl.dot(q, k_t, out_dtype=C.type.element_ty)
+    tl.store(C_block_ptr, qk)
+    D_block_ptr = tl.make_block_ptr(base=D, shape=(N_ROWS, N_INNER), strides=(N_INNER, 1),
+                                    offsets=(0, 0), block_shape=(N_ROWS, N_INNER), order=(1, 0))
+    E_block_ptr = tl.make_block_ptr(base=E, shape=(N_ROWS, N_COLUMNS), strides=(N_COLUMNS, 1),
+                                    offsets=(0, 0), block_shape=(N_ROWS, N_COLUMNS), order=(1, 0))
+    q2 = tl.load(D_block_ptr)
+    qk2 = tl.dot(q2, k_t, out_dtype=E.type.element_ty)
+    tl.store(E_block_ptr, qk2)
+
+
+@triton.jit
 def matmul_kernel_grid(A, B, C, N_ROWS: tl.constexpr, N_COLUMNS: tl.constexpr,
                        N_INNER: tl.constexpr, BLOCK_M: tl.constexpr):
     """The same matmul, M tiled by `tl.program_id` -- the shape real code uses.
@@ -224,6 +256,133 @@ GRID = ("grid-tiled", matmul_kernel_grid, (M // BLOCK_M,), dict(BLOCK_M=BLOCK_M)
 GRID_SMALL = ("grid-tiled-small", matmul_kernel_grid, (M // BLOCK_M_SMALL,),
               dict(BLOCK_M=BLOCK_M_SMALL))
 SHAPES = (WHOLE, GRID, GRID_SMALL)
+
+
+# ---------------------------------------------------------------------------
+# The multi-matmul shape, both halves.
+#
+# The split's multi-matmul reach is gate-checked in two directions, because the
+# two directions fail differently and each has failed silently once already:
+#
+#   * A TOP-LEVEL two-matmul function (`two_matmul_kernel` above) must carry
+#     BOTH read-outs: two outlined read-outs, two entry adapters. Until
+#     2026-10-04 hmx-vector-readout declined such a function whole, and the
+#     object carried zero read-out symbols with the option on.
+#   * Flash attention -- the production multi-matmul kernel, two `hmx.matmul`
+#     per chunk of the attention loop -- must carry NONE, and that is the
+#     correct answer, not a missing feature. The chain, each link measured or
+#     read off the IR on 2026-10-04: its matmuls sit inside an outer loop, so
+#     `auto` staging's read-out channel stays closed for them (the staged
+#     ring's fixed cost is per tile-loop execution; flash attention pays it
+#     twice per chunk -- 5466/5555 us staged vs 5230 unstaged, iters=1000),
+#     so its tile loops take the unstaged serial form, where the m-tile loop
+#     (mma, acc_read) and the read-out loop (unpack) are SEPARATE siblings --
+#     and matchReadout declines that form, correctly: with all the engine
+#     work done before the read-out starts and the softmax consumer right
+#     after it, there is no engine work for a second thread to overlap
+#     against. Moving the read-out would be pure handoff cost.
+#
+# The kernel is imported rather than copied (the dump_codegen.py precedent): a
+# transcription slip would gate a kernel the device never ran.
+def _import_fa_kernel():
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    tests = os.path.normpath(os.path.join(here, "..", "..", "test",
+                                          "python", "triton"))
+    if tests not in sys.path:
+        sys.path.insert(0, tests)
+    import test_flash_attention  # noqa: E402  (sys.path must be set first)
+    return test_flash_attention
+
+
+_FA = _import_fa_kernel()
+FA_ABSENT_REQUIRED = ("__hmx_readout", "__hmx_readout_1",
+                      "__hmx_readout_entry", "__hmx_readout_1_entry",
+                      "hexagon_runtime_hmx_exec_configure",
+                      "hexagon_runtime_hmx_exec_publish",
+                      "hexagon_runtime_hmx_exec_drain")
+TWO_MM_DEFINED_REQUIRED = ("__hmx_readout", "__hmx_readout_1",
+                           "__hmx_readout_entry", "__hmx_readout_1_entry")
+
+
+def _two_matmul_compile_obj(**options):
+    """Compile `two_matmul_kernel` to an object, host only, like `_compile_obj`."""
+    a = torch.zeros(M, K, dtype=torch.float16)
+    b = torch.zeros(K, N, dtype=torch.float16)
+    c = torch.zeros(M, N, dtype=torch.float16)
+    d = torch.zeros(M, K, dtype=torch.float16)
+    e = torch.zeros(M, N, dtype=torch.float16)
+    with tempfile.TemporaryDirectory(prefix="hmx-readout-gate-2mm-") as tmp:
+        previous_cache = os.environ.get("TRITON_CACHE_DIR")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(tmp, "cache")
+        captured = os.dup(2)
+        path = os.path.join(tmp, "stderr")
+        sink = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.dup2(sink, 2)
+            kernel_obj = two_matmul_kernel.warmup(
+                a, b, c, d, e, grid=(1,), target_artifact="o",
+                N_ROWS=M, N_COLUMNS=N, N_INNER=K,
+                **{**DEPTH_2, **options},
+            )
+        finally:
+            os.dup2(captured, 2)
+            os.close(sink)
+            os.close(captured)
+            if previous_cache is None:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+            else:
+                os.environ["TRITON_CACHE_DIR"] = previous_cache
+        stderr = Path(path).read_text(errors="replace")
+    return bytes(kernel_obj.asm["o"]), stderr
+
+
+def _fa_compile_obj(**options):
+    """Compile the FA kernel to an object with the FA test's own options.
+
+    Host only (`warmup`), exactly like `_compile_obj` above; the FA options
+    are the test's verbatim so the gate describes the kernel the device runs.
+    The compile's stderr comes back alongside, for the same no-`error:`-line
+    reason as every other arm.
+    """
+    z, h, n_ctx, d_head = 1, 1, 1024, 64
+    q = torch.rand(z, h, n_ctx, d_head)
+    k = torch.rand(z, h, n_ctx, d_head)
+    v = torch.rand(z, h, n_ctx, d_head)
+    out = torch.zeros_like(q)
+    fa_opts = dict(
+        enableVectorization=True, enableSplitReduceGeneric=True,
+        enableHVXInlining=True, enableSCFLoopUnroll=True,
+        enableMultiThreading=True, enableHexKL=False,
+        enableVTCMTiling=False, enableConvertToHexagonmem=True,
+        enableHexagonmemCopyToDMA=False,
+        N_CTX=n_ctx, BLOCK_M=n_ctx, BLOCK_DMODEL=d_head, BLOCK_N=64,
+        STAGE=1, stride_0=h * n_ctx * d_head, stride_1=n_ctx * d_head,
+        stride_2=d_head, stride_3=1,
+    )
+    with tempfile.TemporaryDirectory(prefix="hmx-readout-gate-fa-") as tmp:
+        previous_cache = os.environ.get("TRITON_CACHE_DIR")
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(tmp, "cache")
+        captured = os.dup(2)
+        path = os.path.join(tmp, "stderr")
+        sink = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.dup2(sink, 2)
+            kernel_obj = _FA.attention_fwd_kernel.warmup(
+                0, q, k, v, 0.5, out, h, grid=(1,), target_artifact="o",
+                **{**fa_opts, **options},
+            )
+        finally:
+            os.dup2(captured, 2)
+            os.close(sink)
+            os.close(captured)
+            if previous_cache is None:
+                os.environ.pop("TRITON_CACHE_DIR", None)
+            else:
+                os.environ["TRITON_CACHE_DIR"] = previous_cache
+        stderr = Path(path).read_text(errors="replace")
+    return bytes(kernel_obj.asm["o"]), stderr
+
 
 # `shutil.which` is resolved once: every arm below needs it, and a gate that skips
 # itself three times over is not a gate.
@@ -694,18 +853,24 @@ class TheGateIsNotVacuous(unittest.TestCase):
     Two independent ways the pass can be inert, both of which produce a perfectly
     good-looking object with none of the feature in it:
 
-      * the option off (the default), and
-      * the option ON at pipeline-depth 0, where there is no m-tile loop for the
-        rewrite to attach to so the pass declines and the object is byte-identical
-        to the option-off build.
+      * the option explicitly off, and
+      * the option ON at pipeline-depth 0 on a shape the read-out channel
+        declines (GRID_SMALL, 2 m-tiles), where the split has no loop it
+        matches so the object is code-identical to the option-off build.
 
     The second is the trap: it is a build with `enableHmxVectorReadout=True`, so a
     gate that only checked "the option was on and an object came out" would pass.
     """
 
     def test_option_off_object_has_none_of_the_feature(self):
+        # The option is EXPLICITLY off. It was the default once, and the arm
+        # relied on that; the default flipped to on (2026-10-04), and this arm
+        # silently became "the default build" -- which carries the feature --
+        # until the explicit False was added. A negative arm that follows a
+        # default is not a negative arm.
         for name, kernel, grid, constexpr in SHAPES:
-            symbols = _nm(_compile_obj(kernel, grid, constexpr)[0])
+            symbols = _nm(_compile_obj(kernel, grid, constexpr,
+                                       enableHmxVectorReadout=False)[0])
             missing = _split_is_in_object(symbols)
             self.assertNotEqual(
                 [], missing,
@@ -714,16 +879,27 @@ class TheGateIsNotVacuous(unittest.TestCase):
             )
 
     def test_depth_zero_is_a_silent_noop_and_the_gate_rejects_it(self):
-        # The trap. At pipeline-depth 0 there is no m-tile loop for the read-out
-        # pass to attach to, so with the option ON the pass declines, the kernel
-        # runs the original serial read-out, and the build looks entirely healthy:
-        # no error, an object, a correct answer.
+        # The trap, re-scoped to the shapes where it still is one. At
+        # pipeline-depth 0 (`auto`) the read-out channel opens only for a
+        # matmul with at least `stagedReadoutMTiles` m-tiles (2 x batch = 8),
+        # so the two big shapes stage and the split attaches; GRID_SMALL (2
+        # m-tiles) stays on the unstaged serial form, the split declines, the
+        # kernel runs the original serial read-out, and the build looks
+        # entirely healthy: no error, an object, a correct answer.
+        #
+        # (When this arm was written, depth 0 declined all three shapes; the
+        # channel wiring has since made depth 0 a real request for the shapes
+        # the channel covers, so the arm now names the shape it depends on
+        # rather than all of them.)
         for name, kernel, grid, constexpr in SHAPES:
+            if name != "grid-tiled-small":
+                continue
             symbol = kernel.fn.__name__ if hasattr(kernel, "fn") else "matmul_kernel"
             on_zero, _ = _compile_obj(kernel, grid, constexpr,
                                       enableHmxPipelineDepth=0, **READOUT_ON)
             off_zero, _ = _compile_obj(kernel, grid, constexpr,
-                                       enableHmxPipelineDepth=0)
+                                       enableHmxPipelineDepth=0,
+                                       enableHmxVectorReadout=False)
 
             # "No-op" is asserted as identical kernel CODE, not as identical bytes.
             # Byte equality is not available here: the object embeds runtime bitcode
@@ -787,6 +963,57 @@ class TheManifestDoesNotDoubleCount(unittest.TestCase):
                 f"[{name}] the split must not INCREASE the read-out site count "
                 f"({off} -> {on}); a rise is a bridge op attributed to two records",
             )
+
+
+class TheMultiMatmulReach(unittest.TestCase):
+    """One group per matmul -- present where it pays, declined where it cannot.
+
+    Both assertions are object-level (see the module comment for why IR-level
+    checks once passed on a build whose feature never ran), and the two are a
+    pair: the presence arm proves the multi-matmul grouping works at all, the
+    flash-attention arm proves the decline it takes instead is the one the
+    measurements ordered -- not the feature silently absent. Either arm alone
+    could pass on the other's failure.
+    """
+
+    def test_a_top_level_two_matmul_function_carries_both_readouts(self):
+        obj, stderr = _two_matmul_compile_obj()
+        errs = [l for l in stderr.splitlines() if "error" in l.lower()]
+        self.assertEqual([], errs, "the two-matmul compile must be clean")
+        symbols = _nm(obj)
+        missing = []
+        for name in TWO_MM_DEFINED_REQUIRED:
+            if symbols.get(name) not in ("T", "t"):
+                missing.append(f"{name} is not defined (got {symbols.get(name)!r})")
+        for name in REFERENCED_REQUIRED:
+            if name not in symbols:
+                missing.append(f"{name} is absent entirely")
+        self.assertEqual(
+            [], missing,
+            "a top-level function holding two matmuls must carry one read-out "
+            "each; a missing symbol is the multi-matmul grouping silently "
+            "absent, not a slower kernel",
+        )
+
+    def test_flash_attention_is_declined_and_that_is_the_measured_answer(self):
+        # See the comment at `_import_fa_kernel` for the full chain. The short
+        # form: flash attention's matmuls sit inside the attention loop, the
+        # staged ring's fixed cost is per tile-loop execution and measurably
+        # loses to the unstaged serial loop there, and the unstaged form has
+        # no engine work overlapping the read-out -- so the correct object has
+        # no read-out symbols at all, with the option on and the compile clean.
+        obj, stderr = _fa_compile_obj()
+        errs = [l for l in stderr.splitlines() if "error" in l.lower()]
+        self.assertEqual([], errs, "the FA compile must be clean")
+        symbols = _nm(obj)
+        present = [name for name in FA_ABSENT_REQUIRED if name in symbols]
+        self.assertEqual(
+            [], present,
+            "flash attention must take the unstaged serial form and be "
+            "declined by the read-out split; read-out symbols here would mean "
+            "the staging channel opened for a loop-nested matmul again (the "
+            "measured +5%)",
+        )
 
 
 if __name__ == "__main__":

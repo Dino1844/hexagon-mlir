@@ -386,9 +386,12 @@ def test_hmx_parser_sees_every_option():
     opts = hmx_options()
     fields = {field for _p, field, _f, _d in opts}
     assert len(opts) >= 8, f"only found {len(opts)} Hmx options across {len(fields)} fields"
-    # Seven are filled by the pipeline, two are CLI-only. If this number moves,
+    # Eight are filled by the pipeline, two are CLI-only. If this number moves,
     # one of the two states changed and the classification below needs a human.
-    assert len(fields) == 9, f"unexpected Hmx option field set: {sorted(fields)}"
+    # (It moved 9 -> 10 on 2026-10-04: `stagedReadoutMTiles` joined as a
+    # pipeline-filled option -- the read-out channel of `auto` staging, wired
+    # from enableHmxVectorReadout in LinalgToLLVMPass.cpp.)
+    assert len(fields) == 10, f"unexpected Hmx option field set: {sorted(fields)}"
     assert {p for p, _f, _fl, _d in opts} == {
         "MatmulToHmx", "HmxPartition", "WeightResident", "HmxVectorReadout",
     }, "the pass-block regex picked up a different set of passes"

@@ -62,11 +62,46 @@ static bool isInnermostLoop(scf::ForOp forOp) {
   return !hasNestedLoop;
 }
 
+/// Returns `true` if the loop's body holds any HMX dialect op.
+///
+/// The unroller exists for vectorized streaming loops ("innermost loop after
+/// vectorization" -- the comment at the pipeline site that adds this pass). An
+/// HMX loop is not that: it is engine-scheduled structure that later passes
+/// pattern-match by shape -- hmx-partition stages it, hmx-vector-readout
+/// batches its accumulator read-out onto a second thread -- and unrolling
+/// changes the very shape those passes match. Measured on flash attention
+/// (two matmuls, this build, 2026-10-04): with the read-out loop unrolled to
+/// step 2 the body held two `hmx.unpack_acc` per iteration and the read-out
+/// split declined the whole function -- silently, with the option on. HMX
+/// loops are therefore not this pass's to restructure.
+///
+/// The namespace is compared as a string so this generic pass does not grow a
+/// dependency on the HMX dialect's headers; the name is frozen by the dialect
+/// definition (HmxDialect.td, `name = "hmx"`).
+static bool bodyHoldsHmxOp(scf::ForOp forOp) {
+  bool holds = false;
+  forOp.getBody()->walk([&](Operation *op) {
+    Dialect *dialect = op->getDialect();
+    if (dialect && dialect->getNamespace() == "hmx") {
+      holds = true;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return holds;
+}
+
 /// Helper function to decide whether a loop should be unrolled.
 /// Checks loop bounds and unroll factor relations to make sure
 /// unroll does not cause skipped or extra iterations.
 static bool shouldUnrollLoop(scf::ForOp forOp, int64_t unrollFactor) {
   DBG("Analyzing loop: " << forOp.getLoc());
+
+  // HMX engine loops are not this pass's to restructure (see bodyHoldsHmxOp).
+  if (bodyHoldsHmxOp(forOp)) {
+    DBG("Loop body holds HMX ops, skipping unroll");
+    return false;
+  }
 
   // Extract constants. Skip if bounds or step not constant.
   auto lowerBoundOpt = getConstantIntValue(forOp.getLowerBound());

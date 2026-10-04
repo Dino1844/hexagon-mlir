@@ -497,6 +497,14 @@ static std::optional<ReadoutMatch> matchReadout(scf::ForOp loop,
 static func::FuncOp declareRuntime(ModuleOp module, StringRef name,
                                    ArrayRef<Type> params,
                                    ArrayRef<Type> results = {}) {
+  // Sibling function passes run CONCURRENTLY (the pass manager is
+  // multithreaded), and two invocations racing check-then-insert here produce
+  // two declarations of the same symbol -- a verifier error, not a warning.
+  // The shared module-state mutex is the established serializer for exactly
+  // this class of module mutation (WeightResidentPass's manifest setter,
+  // MatmulToHmx's records); nothing that holds it calls back into this pass,
+  // so the lock cannot nest.
+  std::lock_guard<std::mutex> guard(hmxModuleStateMutex());
   if (auto existing = module.lookupSymbol<func::FuncOp>(name))
     return existing;
   OpBuilder builder(module.getContext());
@@ -556,15 +564,24 @@ static func::FuncOp getOrCreateReadout(ModuleOp module, MemRefType arType,
   OpBuilder builder(module.getContext());
   builder.setInsertionPointToEnd(module.getBody());
 
+  // The name is picked by probe-then-create, so two concurrent sibling
+  // invocations could pick the same free name and both create it: the probe
+  // and the create are one critical section on the shared module-state mutex
+  // (see declareRuntime). The body is built on the new function afterwards,
+  // outside the lock, because nothing else can name it yet.
   std::string name = kReadoutFnPrefix.str();
-  for (unsigned n = 1; module.lookupSymbol(name); ++n)
-    name = (Twine(kReadoutFnPrefix) + "_" + Twine(n)).str();
+  func::FuncOp fn;
+  {
+    std::lock_guard<std::mutex> guard(hmxModuleStateMutex());
+    for (unsigned n = 1; module.lookupSymbol(name); ++n)
+      name = (Twine(kReadoutFnPrefix) + "_" + Twine(n)).str();
 
-  auto fn = func::FuncOp::create(
-      builder, builder.getUnknownLoc(), name,
-      builder.getFunctionType({arType, dstType, builder.getIndexType(),
-                               builder.getIndexType()},
-                              {}));
+    fn = func::FuncOp::create(
+        builder, builder.getUnknownLoc(), name,
+        builder.getFunctionType({arType, dstType, builder.getIndexType(),
+                                 builder.getIndexType()},
+                                {}));
+  }
   fn.setPrivate();
   // Marks this as the executor's work function. Nothing calls it HERE -- the
   // `configure` handoff that would is emitted by HmxToLLVMPass, which runs after
@@ -686,6 +703,35 @@ static void emitDrain(OpBuilder &builder, Location loc, ModuleOp module) {
                        ValueRange{});
 }
 
+/// Emit one matmul group's `configure` call with a placeholder function
+/// pointer.
+///
+/// The real address cannot be spelled here: `llvm.mlir.addressof` rejects a
+/// `func.func` symbol, and this pass runs before convert-func-to-llvm. So the
+/// placeholder travels to the lowering (HmxToLLVMPass, wireConfigureCalls),
+/// which pairs the engine's configure calls with the handoff records emitted
+/// beside them and writes each entry point's address in. A placeholder of 0 is
+/// safe even if the lowering never runs: the runtime's null-function check
+/// returns -1 and the publish check traps -- a loud refusal, not a silent
+/// wrong answer.
+///
+/// Placement is before the GROUP's first tile loop, not the function's entry
+/// block: for every group but the first, this call is also the correctness
+/// barrier. The runtime drains the ring before swapping the function pointer
+/// (HmxVectorExecutor.cpp configure), so the previous group's in-flight
+/// batches finish under their own read-out before this group's batches can
+/// run at all. `configure` is idempotent, and one call per group is one call
+/// per work function -- never per iteration.
+static void emitConfigurePlaceholder(OpBuilder &builder, Location loc,
+                                     ModuleOp module) {
+  Type i32 = builder.getI32Type();
+  func::CallOp::create(
+      builder, loc,
+      module.lookupSymbol<func::FuncOp>(kHmxExecConfigureFn),
+      ValueRange{arith::ConstantIntOp::create(builder, loc, 0, 32),
+                 arith::ConstantIntOp::create(builder, loc, 1, 32)});
+}
+
 /// Record which kernel's publishes belong to which outlined read-out, and the
 /// two memref types the lowering needs to call it.
 ///
@@ -696,6 +742,11 @@ static void emitDrain(OpBuilder &builder, Location loc, ModuleOp module) {
 static void recordHandoff(ModuleOp module, func::FuncOp engine,
                           func::FuncOp work, MemRefType arType,
                           MemRefType dstType) {
+  // The handoff array is a read-modify-write of a module attribute, and
+  // sibling function passes run concurrently: an unlocked append loses one
+  // side's record. Same mutex, same reason, as every other module-state
+  // mutation in this pass.
+  std::lock_guard<std::mutex> guard(hmxModuleStateMutex());
   OpBuilder builder(module.getContext());
   auto existing = module->getAttrOfType<ArrayAttr>(kHmxReadoutHandoffsAttr);
   SmallVector<Attribute> records;
@@ -744,6 +795,14 @@ private:
   void rewrite(func::FuncOp function, int64_t group) {
     if (function.isDeclaration())
       return;
+    // This pass's own outlined read-outs are functions in the same module, and
+    // a nested `func.func` pipeline re-runs the pass on everything the module
+    // holds -- including them. Their AR is an argument rather than an
+    // allocation, so matchReadout declines them anyway; the guard says so
+    // without paying the walk, and keeps a future matchReadout change from
+    // ever re-processing the pass's own output.
+    if (function->hasAttr(kHmxReadoutOutlinedAttr))
+      return;
     ModuleOp module = function->getParentOfType<ModuleOp>();
     DominanceInfo dominance(function);
 
@@ -758,105 +817,162 @@ private:
     if (matches.empty())
       return;
 
-    // All the blocks of one matmul share the AR array and the destination, and
-    // one descriptor per function is the design ("no descriptor array is
-    // needed"). A function whose blocks disagree is declined as a whole rather
-    // than given a second descriptor this pass does not model.
-    for (const ReadoutMatch &match : matches)
-      if (match.ar != matches.front().ar || match.dst != matches.front().dst)
-        return;
-
-    // ONE decision id for the whole function, and a decline rather than a guess.
+    // One matmul's blocks share the AR array and the destination, and one
+    // descriptor per matmul is the design ("no descriptor array is
+    // needed"). A multi-matmul function -- flash attention's Q@K and P@V --
+    // therefore holds one GROUP per AR array, and the groups are taken in
+    // sequence: each gets its own descriptor, outlined read-out, handoff
+    // record and `configure` call, and the runtime's drain-before-swap
+    // (HmxVectorExecutor.cpp configure) is what makes the sequence sound.
     //
-    // The outlined read-out is a single function, so it can carry a single
-    // `hmx.decision_id`, and `recordHandoff` records a single (engine, work) pair
-    // -- the manifest key is (function, id), so a function whose read-outs name
-    // two different records could not be attributed even with the attribute
-    // present. This is the same "decline, never repair" rule the rest of the pass
-    // follows: a shape this pass does not fully understand comes out
-    // byte-identical.
+    // `function.walk` visits in program order, so the matches are numbered in
+    // the order their loops execute and the groups form in first-occurrence
+    // order of their AR array.
+    SmallVector<SmallVector<unsigned>> groups;
+    DenseMap<Value, unsigned> groupOfAr;
+    for (unsigned i = 0; i < matches.size(); ++i) {
+      auto [it, inserted] = groupOfAr.try_emplace(matches[i].ar, groups.size());
+      if (inserted)
+        groups.emplace_back();
+      groups[it->second].push_back(i);
+    }
+
+    // The groups must run SEQUENTIALLY: every loop of an earlier group before
+    // every loop of a later one. A group whose `configure` fires while an
+    // earlier group still has publishes behind it would hand those publishes
+    // to the wrong read-out -- the plausible-looking wrong answer this pass
+    // exists to never ship. Matches are numbered in walk order, so the test is
+    // that each group's indices form one contiguous run: a gap inside a group
+    // is an interleave.
+    {
+      unsigned expected = 0;
+      for (const auto &groupMatches : groups) {
+        for (unsigned k = 0; k < groupMatches.size(); ++k, ++expected)
+          if (groupMatches[k] != expected) {
+            function.emitRemark()
+                << "hmx-vector-readout declined: matmul groups interleave (AR"
+                   " arrays alternate inside the function); a configure"
+                   " between another group's publishes would swap the"
+                   " executor's read-out mid-group";
+            return;
+          }
+      }
+    }
+
+    // No group's loop may contain another group's loop either: a nested
+    // group's `configure` fires per outer iteration, between the outer
+    // group's publishes. Contiguity does not catch this -- `function.walk`
+    // visits in POST-order, so the inner loop's match is numbered BEFORE the
+    // outer one's and the runs still look contiguous -- so the ancestor
+    // relation is checked on its own, in both directions.
+    for (unsigned g = 0; g < groups.size(); ++g)
+      for (unsigned h = g + 1; h < groups.size(); ++h)
+        for (unsigned i : groups[g])
+          for (unsigned j : groups[h])
+            if (matches[i].loop->isAncestor(matches[j].loop) ||
+                matches[j].loop->isAncestor(matches[i].loop)) {
+              function.emitRemark()
+                  << "hmx-vector-readout declined: one matmul group's tile"
+                     " loop contains another's; the inner configure would"
+                     " fire between the outer group's publishes";
+              return;
+            }
+
+    // Within ONE matmul, every block still has to agree on the destination
+    // and the decision id -- the same "decline, never repair" rule as before,
+    // now per group instead of per function. A block that disagrees is a
+    // malformed single matmul, and the function is declined whole rather than
+    // given a second descriptor for one matmul.
     //
     // Absent is not disagreement. Standalone invocations on IR that never went
     // through `matmul-to-hmx` carry no id at all, and that has always worked, so
     // "none of them has one" leaves every one unset.
-    Attribute decisionId = matches.front().unpack->getAttr(kHmxDecisionIdAttr);
-    for (const ReadoutMatch &match : matches)
-      if (match.unpack->getAttr(kHmxDecisionIdAttr) != decisionId)
-        return;
+    for (const auto &groupMatches : groups) {
+      Value dst = matches[groupMatches.front()].dst;
+      Attribute decisionId =
+          matches[groupMatches.front()].unpack->getAttr(kHmxDecisionIdAttr);
+      for (unsigned i : groupMatches) {
+        if (matches[i].dst != dst) {
+          function.emitRemark()
+              << "hmx-vector-readout declined: one matmul's blocks name"
+                 " different destinations; the pass does not model a second"
+                 " descriptor for one matmul";
+          return;
+        }
+        if (matches[i].unpack->getAttr(kHmxDecisionIdAttr) != decisionId) {
+          function.emitRemark()
+              << "hmx-vector-readout declined: one matmul's read-outs name"
+                 " different manifest decision ids, so the outlined read-out"
+                 " could not be attributed";
+          return;
+        }
+      }
+    }
 
     OpBuilder builder(function.getContext());
 
-    // `configure` names the work the vector thread runs, once per function,
-    // before the first handoff.
+    // `configure` names the work the vector thread runs, once per GROUP,
+    // before its first tile loop -- see emitConfigurePlaceholder for why the
+    // address is a placeholder here and for why the position, not just the
+    // call, is load-bearing.
     //
-    // NOT EMITTED HERE, and the reason is structural rather than a shortcut. The
-    // call needs the outlined function's ADDRESS, and a function's address is not
-    // expressible before `convert-func-to-llvm`: `llvm.mlir.addressof` rejects a
-    // `func.func` symbol (verified against this build -- it accepts only
-    // `llvm.func`, `llvm.mlir.global`, `llvm.mlir.alias` and `llvm.mlir.ifunc`),
-    // and the `func` dialect has no operation that yields a symbol address.
-    // Fabricating a placeholder address would hand the executor a garbage
-    // pointer and the vector thread would call it, which is precisely the
-    // plausible-looking wrong failure this pass must not ship.
-    //
-    // HmxToLLVMPass runs after the func-to-llvm conversion and already owns the
-    // engine-leaf declarations (`getVoidLeaf`, HmxToLLVMPass.cpp:58-63), so it is
-    // where the `llvm.mlir.addressof` and the `configure` call now live. What it
-    // needs from here is the pairing and the two memref types, which is what
-    // recordHandoff below publishes: `convert-func-to-llvm` expands a memref
-    // argument into (allocated, aligned, offset, sizes, strides), so by then the
-    // outlined signature no longer says which words are which buffer.
-    //
-    // The declarations are still made here, so the symbols the linker must
-    // resolve are recorded and the lit tests pin the exact ABI the executor sees.
+    // The declarations are made here, so the symbols the linker must resolve
+    // are recorded and the lit tests pin the exact ABI the executor sees.
     // `configure` is declared with the ABI's i32 result, which is what lets the
     // lowering re-declare it through `lookupOrCreateFn` (that helper rejects a
-    // redefinition of a different type). The function pointer travels as a
-    // 32-bit address, not as `!llvm.ptr`: that is how every other address crosses
-    // into the runtime on this target (`asAddress`, HmxToLLVMPass.cpp:689-694),
-    // and it keeps this pass free of the LLVM dialect, which it cannot otherwise
-    // use at this pipeline point.
+    // redefinition of a different type).
     declareRuntime(module, kHmxExecConfigureFn,
                    {builder.getI32Type(), builder.getI32Type()},
                    {builder.getI32Type()});
     declareRuntime(module, kHmxExecShutdownFn, {});
 
-    // One descriptor for the whole function, placed before the first tile loop so
-    // it dominates every publish.
-    builder.setInsertionPoint(matches.front().loop);
-    Descriptor desc =
-        buildDescriptor(builder, matches.front().loop.getLoc(), module,
-                        matches.front().ar, matches.front().dst,
-                        matches.front().dstType.getDimSize(0),
-                        matches.front().count);
+    // One descriptor per group, placed before its first tile loop so it
+    // dominates every publish of that group, with the group's configure
+    // placeholder, outlined read-out and handoff record beside it. Records are
+    // appended in group order, which is the order the lowering pairs with the
+    // engine's configure calls.
+    SmallVector<Descriptor> descriptors;
+    for (const auto &groupMatches : groups) {
+      ReadoutMatch &first = matches[groupMatches.front()];
 
-    func::FuncOp work = getOrCreateReadout(module, matches.front().arType,
-                                           matches.front().dstType,
-                                           matches.front().count,
-                                           matches.front().col, decisionId);
-    recordHandoff(module, function, work, matches.front().arType,
-                  matches.front().dstType);
+      builder.setInsertionPoint(first.loop);
+      Descriptor desc = buildDescriptor(
+          builder, first.loop.getLoc(), module, first.ar, first.dst,
+          first.dstType.getDimSize(0), first.count);
+      emitConfigurePlaceholder(builder, first.loop.getLoc(), module);
+
+      Attribute decisionId = first.unpack->getAttr(kHmxDecisionIdAttr);
+      func::FuncOp work = getOrCreateReadout(module, first.arType,
+                                             first.dstType, first.count,
+                                             first.col, decisionId);
+      recordHandoff(module, function, work, first.arType, first.dstType);
+      descriptors.push_back(desc);
+    }
 
     // Deferred drain: drop the exit drain so the tail batch is waited for by
     // the NEXT call's configure() barrier instead (the executor drains before
     // swapping the function pointer, HmxVectorExecutor.cpp configure), and by
     // the wrapper after the last call. A decline, never a repair: it applies
-    // only when this function holds exactly ONE readout loop, because the
+    // only when the whole function holds exactly ONE readout loop, because the
     // per-loop drain is also the only thing standing between one loop's
     // batches and the NEXT loop's publishes -- the ring is 15 deep and a full
     // ring drops batches, which checkPublishReturns turns into a trap. A
-    // multi-loop function therefore keeps every drain and says so, rather
-    // than silently shipping a deferral it cannot honour.
-    const bool deferDrain = this->deferDrain && matches.size() == 1;
-    if (this->deferDrain && matches.size() != 1)
+    // multi-loop or multi-group function therefore keeps every drain and says
+    // so, rather than silently shipping a deferral it cannot honour.
+    const bool deferDrain =
+        this->deferDrain && groups.size() == 1 && groups.front().size() == 1;
+    if (this->deferDrain && !deferDrain)
       function.emitRemark()
           << "hmx-vector-readout defer-drain declined: function holds "
-          << matches.size() << " readout loops sharing one ring; keeping the "
-             "per-loop drain (a removed barrier would let the second loop's "
-             "publishes overflow the ring and drop batches)";
+          << matches.size() << " readout loops in " << groups.size()
+          << " matmul group(s) sharing one ring; keeping the per-loop drain"
+             " (a removed barrier would let a later loop's publishes overflow"
+             " the ring and drop batches)";
 
-    for (ReadoutMatch &match : matches)
-      rewriteLoop(builder, match, desc, group, module, deferDrain);
+    for (unsigned g = 0; g < groups.size(); ++g)
+      for (unsigned i : groups[g])
+        rewriteLoop(builder, matches[i], descriptors[g], group, module,
+                    deferDrain);
   }
 
   /// Replace one tile loop's read-out with a batched publish, and its tail with
