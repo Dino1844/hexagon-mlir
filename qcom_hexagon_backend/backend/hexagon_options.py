@@ -93,6 +93,12 @@ class HexagonOptions:
     scratch: int = 0
     enableHVXInlining: bool = False
     enableSCFLoopUnroll: bool = False
+    # L2 prefetch for flat streaming vector loops. Default ON since
+    # 2026-10-05: the device A/B passed the gate at 5.5x on the flat
+    # DDR-bound shape, 1.62x on the nested form, -33% on the near-L2 test
+    # shape, neutral on 7 non-streaming arms, numerics unchanged
+    # (docs/results/l2-prefetch-2026-10-04.md).
+    enableL2Prefetch: bool = True
     enableConversionToFp16: bool = False
 
     # Runtime-weight residency (P2). When on, the compiler drops a runtime

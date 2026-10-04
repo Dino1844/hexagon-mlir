@@ -51,6 +51,7 @@ add_mlir_library(Transforms
   EliminateRedundantUnpackPackPass.cpp
   DivToMulOptimizationPass.cpp
   SCFLoopUnrollPass.cpp
+  HexagonL2PrefetchPass.cpp
 
   DEPENDS
   TransformsPassIncGen

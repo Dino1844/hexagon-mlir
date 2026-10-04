@@ -140,6 +140,13 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("enableHVXInlining").compare(TRUE);
   options.enableSCFLoopUnroll =
       !arch_kwargs.at("enableSCFLoopUnroll").compare(TRUE);
+  // Tolerant read: several probe scripts build a partial options map
+  // (exp/hmx/gap_table/op_side/gap_survey.py's BASE is one), and a new gate
+  // must not turn their missing key into a throw. Absent = the declared
+  // default (off).
+  auto l2Prefetch = arch_kwargs.find("enableL2Prefetch");
+  options.enableL2Prefetch =
+      l2Prefetch != arch_kwargs.end() && !l2Prefetch->second.compare(TRUE);
   options.enableConversionToFp16 =
       !arch_kwargs.at("enableConversionToFp16").compare(TRUE);
   // Tolerant read: several probe scripts build a partial options map, and a new

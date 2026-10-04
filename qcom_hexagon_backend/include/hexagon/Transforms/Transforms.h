@@ -135,6 +135,8 @@ std::unique_ptr<OperationPass<func::FuncOp>> createDivToMulOptimizationPass();
 std::unique_ptr<OperationPass<func::FuncOp>> createSCFLoopUnrollPass(
     const SCFLoopUnrollOptions &options = SCFLoopUnrollOptions());
 
+std::unique_ptr<Pass> createHexagonL2PrefetchPass();
+
 } // namespace hexagon
 } // namespace mlir
 

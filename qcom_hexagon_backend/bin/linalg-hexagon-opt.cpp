@@ -151,6 +151,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerOptimizeExtfTruncfOpPass();
   mlir::hexagon::registerDivToMulOptimizationPass();
   mlir::hexagon::registerSCFLoopUnrollPass();
+  mlir::hexagon::registerHexagonL2PrefetchPass();
 
   // Register all external models.
   mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);

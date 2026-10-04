@@ -500,6 +500,13 @@ public:
 
       pm.addNestedPass<func::FuncOp>(createConvertZeroSizeMemrefPass());
       pm.addPass(createConvertBufferizationToMemRefPass());
+      // The streaming slice loops are in their final form here (subview of
+      // the induction variable + vector.transfer_read), and the async
+      // formation below clones whole loop bodies, so the fetch calls ride
+      // along into every chunk with the chunk's own bounds.
+      if (enableL2Prefetch) {
+        pm.addNestedPass<func::FuncOp>(createHexagonL2PrefetchPass());
+      }
       // A compile-time constant weight arrives here as a `memref.get_global`,
       // which the engine cannot read; give it a resident VTCM buffer before the
       // tile level asks for one (see WeightResidentPass). With

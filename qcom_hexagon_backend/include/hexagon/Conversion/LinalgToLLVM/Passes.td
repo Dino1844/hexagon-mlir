@@ -157,6 +157,13 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
     Option<"enableSCFLoopUnroll", "enable-scf-loop-unroll", "bool",
           /*default=*/"false",
           "Enable SCF loop unrolling optimization">,
+    Option<"enableL2Prefetch", "enable-l2-prefetch", "bool",
+          /*default=*/"true",
+          "Insert l2fetch (L2 prefetch engine) into flat streaming vector "
+          "loops: the single-core L2-miss path moves ~11 GB/s while the "
+          "prefetch engine side-steps it (3.9x measured on the gap-table "
+          "ceiling working set). Off by default until the device A/B "
+          "approves flipping it">,
     Option<"forceHVXCroutonization", "force-hvx-croutonization", "bool",
           /*default=*/"false",
           "Force HVX croutonization pass">,

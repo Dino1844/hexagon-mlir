@@ -659,4 +659,19 @@ def SCFLoopUnroll : Pass<"scf-loop-unroll", "func::FuncOp"> {
   let constructor = "hexagon::createSCFLoopUnrollPass()";
 }
 
+def HexagonL2Prefetch : Pass<"hexagon-l2-prefetch", "func::FuncOp"> {
+  let summary = "Prefetch streaming vector loops into L2 with l2fetch";
+  let description = [{
+    Inserts `l2fetch` (the L2 prefetch engine, 2D block form) into the
+    flat streaming vector loops the vectorizer emits for elementwise
+    kernels. The single-core L2-miss path moves ~11 GB/s while the
+    prefetch engine side-steps it entirely (measured 3.9x on the
+    gap-table ceiling working set, exp/hmx/streaming_bw_probe); the
+    distance and block constants are calibration results documented in
+    the pass source. Loops that near-miss the streaming shape are
+    declined with a remark.
+  }];
+  let constructor = "hexagon::createHexagonL2PrefetchPass()";
+}
+
 #endif
