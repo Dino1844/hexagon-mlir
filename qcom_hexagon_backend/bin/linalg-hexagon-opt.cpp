@@ -23,7 +23,6 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "hexagon/Conversion/AffineToLLVM/Passes.h"
 #include "hexagon/Conversion/DMAToLLVM/Passes.h"
 #include "hexagon/Conversion/HexKLToLLVM/Passes.h"
 #include "hexagon/Conversion/HmxToLLVM/Passes.h"
@@ -64,12 +63,6 @@ int main(int argc, char **argv) {
   registry.insert<mlir::hvx::HvxDialect>();
 
   mlir::hexagonmem::registerConvertHexagonMemToLLVMInterface(registry);
-
-  mlir::hexagon::registerAffineToLLVMPass();
-  mlir::hexagon::registerAffineTilingPass();
-  mlir::hexagon::registerAffinePipelineFusionPass();
-  mlir::hexagon::registerAffineVectorizePass();
-  mlir::hexagon::registerAffineTileMemoryPass();
 
   mlir::hexagon::registerHexagonAddFastMathPass();
   mlir::hexagon::registerHexagonFusionPass();

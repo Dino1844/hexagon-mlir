@@ -28,7 +28,6 @@ add_triton_plugin(TritonHexagon
     ${conversion_libs}
     ${extension_libs}
     TritonLinalgLLVM
-    AffineToLLVM
     LinalgToLLVM
     DMAToLLVM
     HexKLToLLVM
