@@ -162,8 +162,11 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "Insert l2fetch (L2 prefetch engine) into flat streaming vector "
           "loops: the single-core L2-miss path moves ~11 GB/s while the "
           "prefetch engine side-steps it (3.9x measured on the gap-table "
-          "ceiling working set). Off by default until the device A/B "
-          "approves flipping it">,
+          "ceiling working set). Default ON since 2026-10-05: the device A/B "
+          "passed and this .td was flipped together with "
+          "backend/hexagon_options.py (see "
+          "docs/results/l2-prefetch-2026-10-04.md). The OFF arm must now be "
+          "requested explicitly with enable-l2-prefetch=false">,
     Option<"forceHVXCroutonization", "force-hvx-croutonization", "bool",
           /*default=*/"false",
           "Force HVX croutonization pass">,
@@ -182,7 +185,7 @@ def LinalgToLLVM : Pass<"linalg-to-llvm", "mlir::ModuleOp"> {
           "HMX tile-level staging ring depth (hmx-partition): 0 = auto, "
           "1 = force the serial ring, 2 = request double buffering, 3 = skip "
           "staging (emit the unstaged serial tile loop).">,
-    Option<"hmxCroutonsPerMma", "hmx-crontons-per-mma", "int64_t",
+    Option<"hmxCroutonsPerMma", "hmx-croutons-per-mma", "int64_t",
           /*default=*/"0",
           "K croutons walked by one hmx.mma (hmx-partition's croutons-per-mma): "
           "0 = the hardware maximum (32), 1 = one mma per crouton, 32 = the "

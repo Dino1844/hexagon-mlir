@@ -12,10 +12,16 @@
 // both arms observe insertion vs non-insertion directly. The rewrite semantics
 // themselves are pinned by maxnum-legalize.mlir (unit, -hvx-maxnum-legalize).
 //
-// One RUN line carries both arms on purpose: the workspace's manual lit runner
-// executes only the first RUN line of a file.
+// Two RUN lines, one per arm, like every other pipeline test in this tree: each
+// RUN line is an independent lit test (test/lit.cfg.py:24 uses
+// lit.formats.ShTest), so a failure names the arm that broke. An earlier version
+// folded both arms into one `... && ...` line on the stated grounds that "the
+// workspace's manual lit runner executes only the first RUN line of a file".
+// That is false: tools/hexmlir/run_lit_manual.sh collects and runs every RUN
+// line (its `collect_runs` + `for runline in` loop).
 //
-// RUN: linalg-hexagon-opt %s -linalg-to-llvm 2>&1 | FileCheck %s --check-prefix=OFF && linalg-hexagon-opt %s -linalg-to-llvm="enable-maxnum-legalize=true" 2>&1 | FileCheck %s --check-prefix=ON
+// RUN: linalg-hexagon-opt %s -linalg-to-llvm 2>&1 | FileCheck %s --check-prefix=OFF
+// RUN: linalg-hexagon-opt %s -linalg-to-llvm="enable-maxnum-legalize=true" 2>&1 | FileCheck %s --check-prefix=ON
 //
 // OFF (default): the pass must not run at all.
 // OFF-NOT: hvx-maxnum-legalize

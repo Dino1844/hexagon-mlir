@@ -4,6 +4,10 @@
 // It verifies if the operation is expanding into it's mathematical expression
 // consisting of simple operations
 
+// A trailing CHECK-NOT only guards the text *after* the preceding match, so the
+// single directive used to be satisfiable by a math.tanh emitted *before* the
+// exp. Bracketing the positive check closes both ends.
+// CHECK-NOT: math.tanh
 // CHECK: {{.*}}  = math.exp %{{.*}} : vector<32xf32>
 // CHECK-NOT: math.tanh
 

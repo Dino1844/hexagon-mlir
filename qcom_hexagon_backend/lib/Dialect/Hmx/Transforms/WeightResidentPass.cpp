@@ -198,57 +198,11 @@ static std::optional<int64_t> checkedByteSize(MemRefType type) {
   return bytes;
 }
 
-static int64_t residentAlignment(hexagonmem::AllocOp alloc) {
-  if (auto attr = alloc->getAttrOfType<IntegerAttr>("alignment"))
-    return attr.getInt();
-  return 128;
-}
-
-static bool isResidentAliasLike(Operation *op) {
-  return isa<memref::AssumeAlignmentOp, memref::CastOp, memref::SubViewOp,
-             memref::ReinterpretCastOp, memref::MemorySpaceCastOp,
-             memref::TransposeOp, memref::ViewOp, memref::ExpandShapeOp,
-             memref::CollapseShapeOp, memref::ReshapeOp>(op);
-}
-
-/// Validate a transient pack array before its bridge is removed.  A direct
-/// dealloc is unambiguous; a dealloc through a view/cast is not evidence that
-/// the principal array can be dropped safely.
-static LogicalResult validateResidentDealloc(Value value, Operation *anchor,
-                                             unsigned &directCount,
-                                             bool &aliasDealloc) {
-  SmallVector<Value> worklist{value};
-  SmallPtrSet<Value, 16> visited;
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    for (OpOperand &use : current.getUses()) {
-      Operation *owner = use.getOwner();
-      if (isa<CallOpInterface, func::ReturnOp, cf::BranchOp, cf::CondBranchOp,
-              cf::SwitchOp, scf::YieldOp,
-              memref::ExtractAlignedPointerAsIndexOp>(owner))
-        return anchor->emitError(
-            "resident weight bridge value escapes through a call/control-flow/"
-            "pointer operation");
-      if (isa<memref::DeallocOp, hexagonmem::DeallocOp>(owner)) {
-        if (current == value)
-          ++directCount;
-        else
-          aliasDealloc = true;
-        continue;
-      }
-      if (isResidentAliasLike(owner))
-        for (Value result : owner->getResults())
-          worklist.push_back(result);
-    }
-  }
-  if (aliasDealloc)
-    return anchor->emitError("resident weight bridge has a deallocation "
-                             "through a memref alias/view");
-  return success();
-}
-
+/// The weight record's own fields: the identity key, the runtime key
+/// kind, the source descriptors, and the content/address-reuse claims
+/// that depend on the source.  The shared field skeleton (and the
+/// buffer-safety checks this pass audits with) lives in
+/// `HmxResidentContract.h`; only what is unique to a weight stays here.
 static DictionaryAttr
 makeWeightProvenance(MLIRContext *context, StringRef principal,
                      StringRef function, StringRef site, int64_t slot,
@@ -257,62 +211,21 @@ makeWeightProvenance(MLIRContext *context, StringRef principal,
                      StringRef contentStatus, StringRef contentIdentity,
                      DictionaryAttr sourceView = {}) {
   NamedAttrList fields;
-  fields.append("schema", StringAttr::get(context, kHmxResidentKeySchema));
-  fields.append("key_namespace",
-                StringAttr::get(context, kHmxResidentKeyNamespace));
-  fields.append("kind", StringAttr::get(context, "weight"));
+  appendResidentProvenanceCore(fields, context, "weight",
+                               "weight-resident", principal, function, site,
+                               slot, bytes, alignment, contentStatus);
   fields.append("identity_key",
                 IntegerAttr::get(IntegerType::get(context, 64), identityKey));
   fields.append("runtime_key_kind", StringAttr::get(context, runtimeKeyKind));
-  fields.append("bytes",
-                IntegerAttr::get(IntegerType::get(context, 64), bytes));
-  fields.append("alignment",
-                IntegerAttr::get(IntegerType::get(context, 64), alignment));
-  fields.append("module", StringAttr::get(context, principal));
-  fields.append("principal_status",
-                StringAttr::get(context, principal == "<anonymous-principal>"
-                                             ? kHmxResidentNotProven
-                                             : "module-symbol"));
-  fields.append("function", StringAttr::get(context, function));
-  fields.append("function_id", IntegerAttr::get(IntegerType::get(context, 64),
-                                                residentFunctionIdentity(
-                                                    principal, function)));
-  fields.append("role", StringAttr::get(context, "weight-resident"));
-  fields.append("site", StringAttr::get(context, site));
-  fields.append("site_id", IntegerAttr::get(
-                               IntegerType::get(context, 64),
-                               residentSiteIdentity(principal, function, site,
-                                                    "weight-resident", slot)));
-  fields.append("slot", IntegerAttr::get(IntegerType::get(context, 64), slot));
   fields.append("source", StringAttr::get(context, source));
   if (sourceView)
     fields.append("source_view", sourceView);
-  fields.append("scope", StringAttr::get(context, kHmxResidentScope));
-  fields.append("launch_status",
-                StringAttr::get(context, kHmxResidentNotProven));
-  fields.append("content_status", StringAttr::get(context, contentStatus));
   fields.append("content_identity", StringAttr::get(context, contentIdentity));
   fields.append("address_reuse_status",
                 StringAttr::get(context, runtimeKeyKind == "argument-address"
                                              ? kHmxResidentNotProven
                                              : "immutable-source"));
-  fields.append("reuse_status", StringAttr::get(context, "process-resident"));
-  fields.append("descriptor_status", StringAttr::get(context, "checked"));
   return DictionaryAttr::get(context, fields);
-}
-
-static LogicalResult setOrValidateWeightProvenance(Operation *operation,
-                                                   DictionaryAttr expected) {
-  auto existing =
-      operation->getAttrOfType<DictionaryAttr>(kHmxResidentProvenanceAttr);
-  if (!existing) {
-    operation->setAttr(kHmxResidentProvenanceAttr, expected);
-    return success();
-  }
-  if (existing != expected)
-    return operation->emitError(
-        "resident weight provenance changed across repeated lowering");
-  return success();
 }
 
 /// Validate the exact source type of a compile-time weight.  The resident
@@ -1124,8 +1037,10 @@ validateStrictWeightPack(WeightPack &pack, MemRefType crouton,
           "strict resident weight bridge has multiple source views");
   unsigned directDeallocs = 0;
   bool aliasDealloc = false;
-  if (failed(validateResidentDealloc(pack.array.getResult(), anchor,
-                                     directDeallocs, aliasDealloc)))
+  if (failed(validateResidentDeallocs(
+          pack.array.getResult(), anchor, directDeallocs, aliasDealloc,
+          ResidentDeallocForm::MemrefAndHexagonmem,
+          "resident weight bridge")))
     return failure();
   if (directDeallocs != 1)
     return anchor->emitError(
@@ -1191,8 +1106,12 @@ validateExistingWeightResident(Operation *operation,
 
   unsigned directDeallocs = 0;
   bool aliasDealloc = false;
-  if (failed(validateResidentDealloc(alloc.getResult(), operation,
-                                     directDeallocs, aliasDealloc)) ||
+  // The allocation here is already a `hexagonmem.alloc`; an earlier
+  // lowering may have left its release in either op form.
+  if (failed(validateResidentDeallocs(
+          alloc.getResult(), operation, directDeallocs, aliasDealloc,
+          ResidentDeallocForm::MemrefAndHexagonmem,
+          "resident weight bridge")) ||
       directDeallocs != 0)
     return anchor->emitError(
         "strict resident weight has an alias or direct deallocation");
@@ -1787,8 +1706,9 @@ struct WeightResidentPass
                   /*slot=*/0, bytes, /*alignment=*/128, identityKey,
                   "global-address", "global:" + source.getSymName().str(),
                   kHmxResidentImmutableGlobal, "compile-time-symbol");
-              if (failed(setOrValidateWeightProvenance(alloc.getOperation(),
-                                                       expected)))
+              if (failed(setOrValidateResidentProvenance(alloc.getOperation(),
+                                                         expected,
+                                                         "resident weight")))
                 return signalPassFailure();
             }
             resident = alloc.getResult();
@@ -1925,9 +1845,10 @@ struct WeightResidentPass
         if (strictResidentContract) {
           unsigned directDeallocs = 0;
           bool aliasDealloc = false;
-          if (failed(validateResidentDealloc(pack->array.getResult(),
-                                             op.getOperation(), directDeallocs,
-                                             aliasDealloc)))
+          if (failed(validateResidentDeallocs(
+                  pack->array.getResult(), op.getOperation(), directDeallocs,
+                  aliasDealloc, ResidentDeallocForm::MemrefAndHexagonmem,
+                  "resident weight bridge")))
             return signalPassFailure();
           if (directDeallocs != 1) {
             op.emitError("strict resident weight bridge must have one direct "
@@ -2045,8 +1966,9 @@ struct WeightResidentPass
                 "entry-argument-slot:" + std::to_string(slot),
                 kHmxResidentNotProven, "not-carried-to-device",
                 strictSourceView);
-            if (failed(setOrValidateWeightProvenance(alloc.getOperation(),
-                                                     expected)))
+            if (failed(setOrValidateResidentProvenance(alloc.getOperation(),
+                                                       expected,
+                                                       "resident weight")))
               return signalPassFailure();
             if (failed(validateExistingWeightResident(alloc.getOperation())))
               return signalPassFailure();

@@ -41,16 +41,16 @@ func.func @tileWithXYfullyInVTCM(
 // CHECK: memref.copy %{{.*}}, %[[ALLOC1]] : memref<128x256xf32> to memref<128x256xf32, 1>
 // CHECK: %[[ALLOC2:.+]] = memref.alloc() {alignment = 64 : i64} : memref<128xf32, 1>
 // CHECK: memref.copy %{{.*}}, %[[ALLOC2]] : memref<128xf32> to memref<128xf32, 1>
+// The out is read-modify-write (the body adds into %z): its per-tile staging
+// stays. W's map is the identity -- every element is read exactly once -- so
+// W is not staged: the loop body reads the DDR subview directly.
 // CHECK: %[[ALLOC3:.+]] = memref.alloc() {alignment = 64 : i64} : memref<7716x128x256xf32, 1>
-// CHECK-NEXT: %[[ALLOC4:.+]] = memref.alloc() {alignment = 64 : i64} : memref<7716x128x256xf32, 1>
 // CHECK: scf.for %[[I:.+]] = %c0 to %c123456 step %c7716 {
 // CHECK-DAG: %[[VW:.+]] = memref.subview %[[W]][%[[I]], 0, 0] [7716, 128, 256] [1, 1, 1] : memref<123456x128x256xf32> to memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>>
-// CHECK-DAG: memref.copy %[[VW]], %[[ALLOC3]] : memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>> to memref<7716x128x256xf32, 1>
 // CHECK-DAG: %[[VZ:.+]] = memref.subview %[[Z]][%[[I]], 0, 0] [7716, 128, 256] [1, 1, 1] : memref<123456x128x256xf32> to memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>>
-// CHECK-DAG: memref.copy %[[VZ]], %[[ALLOC4]] : memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>> to memref<7716x128x256xf32, 1>
-// CHECK:     linalg.generic {{.*}} ins(%{{.*}}, %{{.*}} : memref<7716x128x256xf32, 1>, memref<128x256xf32, 1>, memref<128xf32, 1>) outs(%{{.*}} : memref<7716x128x256xf32, 1>)
-// CHECK:     memref.copy %[[ALLOC4]], %[[VZ]] : memref<7716x128x256xf32, 1> to memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>>
+// CHECK-DAG: memref.copy %[[VZ]], %[[ALLOC3]] : memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>> to memref<7716x128x256xf32, 1>
+// CHECK:     linalg.generic {{.*}} ins(%[[VW]], %[[ALLOC1]], %[[ALLOC2]] : memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>>, memref<128x256xf32, 1>, memref<128xf32, 1>) outs(%[[ALLOC3]] : memref<7716x128x256xf32, 1>)
+// CHECK:     memref.copy %[[ALLOC3]], %[[VZ]] : memref<7716x128x256xf32, 1> to memref<7716x128x256xf32, strided<[32768, 256, 1], offset: ?>>
 // CHECK: memref.dealloc %{{.*}} : memref<128x256xf32, 1>
 // CHECK: memref.dealloc %{{.*}} : memref<128xf32, 1>
-// CHECK: memref.dealloc %{{.*}} : memref<7716x128x256xf32, 1>
 // CHECK: memref.dealloc %{{.*}} : memref<7716x128x256xf32, 1>

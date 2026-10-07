@@ -12,8 +12,21 @@
 // the partition pass's conversion state, activation-staging ring slots,
 // statuses and the crouton-row scratch). The runtime's allocator does a
 // best-fit scan, a split/coalesce and the buffer-manager bookkeeping for each,
-// and the cost is size-independent -- measured at ~6.3 us per alloc/free pair,
-// so on a small shape (S3) it is more than half the launch.
+// at 1.12 / 1.51 / 1.69 us per alloc/free pair (S1/S2/S3: A/B delta pcycles
+// divided by the static pair counts, docs/hmx/m3.2-device-result-2026-09-29.md
+// §4). On S3 that is a few us against a launch of the same order, so the tax is
+// what dominates a small shape.
+//
+// Two corrections (2026-10-07), both from that same §4:
+//   - "~6.3 us per pair" and "size-independent" were WRONG. The real value is
+//     1.1-1.7 us, i.e. 4-6x lower, and the three points scatter by 1.5x, so
+//     "size-independent" has no evidence behind it -- three points cannot
+//     decide it (the pair counts came from a 09-28 build). Treat the
+//     size-independence claim as untested, not as fact.
+//   - the number was also high enough to matter: at 6.3 us/pair this pass
+//     would look like a large win on any small shape. At the measured value
+//     its effect is smaller, and it must be re-measured on the current build
+//     before being quoted as a size.
 //
 // A workspace has no compile-time image: the kernel refills it on every launch.
 // So all it needs is a stable buffer, which is exactly the residency mechanism
@@ -75,8 +88,8 @@
 #include "llvm/Support/Debug.h"
 #include <cstdint>
 #include <limits>
-#include <map>
 #include <mutex>
+#include <set>
 #include <string>
 
 #define DEBUG_TYPE "hmx-workspace-resident"
@@ -99,9 +112,12 @@ constexpr StringLiteral kResidentAttr = kHmxWorkspaceResidentAttr;
 constexpr const char *kResidentKeyAttr = "key";
 constexpr const char *kResidentBytesAttr = "bytes";
 
-/// A strict diagnostic site is deliberately separate from the production key.
-/// The latter remains the compatibility ABI; this record is the evidence that
-/// the key is derived from a stable principal/function/source-location tuple.
+/// A strict diagnostic site identity is deliberately separate from the
+/// production key: it never becomes the runtime key (that stays the
+/// compatibility ABI for marked and unmarked modules alike).  It drives
+/// collision detection (at collection time) and is published via the
+/// provenance record's site_id/function_id, proving the site is a stable
+/// principal/function/source-location tuple rather than an allocation order.
 struct WorkspaceResidentSite {
   memref::AllocOp alloc;
   int64_t bytes = 0;
@@ -109,120 +125,35 @@ struct WorkspaceResidentSite {
   std::string principal;
   std::string function;
   std::string site;
-  uint64_t key = 0;
 };
 
-static int64_t workspaceAlignment(memref::AllocOp alloc) {
-  // ConvertToHexagonmem gives an omitted memref alignment the same 128-byte
-  // default as hexagonmem.alloc.  Spell that default out here so the recorded
-  // descriptor is the descriptor the runtime receives, not an assumption about
-  // an unrelated MLIR default.
-  if (auto attr = alloc->getAttrOfType<IntegerAttr>("alignment"))
-    return attr.getInt();
-  return 128;
-}
-
-static bool isAliasLike(Operation *op) {
-  return isa<memref::AssumeAlignmentOp, memref::CastOp, memref::SubViewOp,
-             memref::ReinterpretCastOp, memref::MemorySpaceCastOp,
-             memref::TransposeOp, memref::ViewOp, memref::ExpandShapeOp,
-             memref::CollapseShapeOp, memref::ReshapeOp>(op);
-}
-
-/// Check the deallocation shape before erasing anything.  A direct dealloc is
-/// the only form this pass may remove.  A view/cast dealloc is ambiguous: the
-/// runtime resident table is keyed by the principal allocation, not by an
-/// arbitrary alias descriptor.
-static LogicalResult validateWorkspaceDeallocs(Value value, Operation *anchor,
-                                               unsigned &directCount,
-                                               bool &aliasDealloc) {
-  SmallVector<Value> worklist{value};
-  SmallPtrSet<Value, 16> visited;
-  while (!worklist.empty()) {
-    Value current = worklist.pop_back_val();
-    if (!visited.insert(current).second)
-      continue;
-    for (OpOperand &use : current.getUses()) {
-      Operation *owner = use.getOwner();
-      if (isa<CallOpInterface, func::ReturnOp, cf::BranchOp, cf::CondBranchOp,
-              cf::SwitchOp, scf::YieldOp,
-              memref::ExtractAlignedPointerAsIndexOp>(owner))
-        return anchor->emitError(
-            "resident workspace value escapes through a call/control-flow/"
-            "pointer operation");
-      if (isa<memref::DeallocOp>(owner)) {
-        if (current == value)
-          ++directCount;
-        else
-          aliasDealloc = true;
-        continue;
-      }
-      if (isAliasLike(owner)) {
-        for (Value result : owner->getResults())
-          worklist.push_back(result);
-      }
-    }
-  }
-  if (aliasDealloc)
-    return anchor->emitError(
-        "resident workspace has a deallocation through a memref alias/view");
-  return success();
-}
-
+/// The workspace record's own field: the runtime key (the production
+/// compatibility key; see the key-selection comment in `runOnOperation`).
+/// The shared field skeleton (and the buffer-safety checks this pass audits
+/// with) lives in `HmxResidentContract.h`; only what is unique to a workspace
+/// stays here.
 static DictionaryAttr
 makeWorkspaceProvenance(MLIRContext *context, StringRef principal,
                         StringRef function, StringRef site, int64_t slot,
                         int64_t bytes, int64_t alignment, uint64_t key) {
   NamedAttrList fields;
-  fields.append("schema", StringAttr::get(context, kHmxResidentKeySchema));
-  fields.append("key_namespace",
-                StringAttr::get(context, kHmxResidentKeyNamespace));
-  fields.append("kind", StringAttr::get(context, "workspace"));
+  // Workspace bytes are deliberately not a content identity: every
+  // launch refills the buffer.  This is an explicit statement, not an
+  // implicit hash.
+  appendResidentProvenanceCore(fields, context, "workspace",
+                               "workspace-resident", principal, function, site,
+                               slot, bytes, alignment, "per-launch-refill");
   fields.append("key", IntegerAttr::get(IntegerType::get(context, 64), key));
-  fields.append("bytes",
-                IntegerAttr::get(IntegerType::get(context, 64), bytes));
-  fields.append("alignment",
-                IntegerAttr::get(IntegerType::get(context, 64), alignment));
-  fields.append("module", StringAttr::get(context, principal));
-  fields.append("principal_status",
-                StringAttr::get(context, principal == "<anonymous-principal>"
-                                             ? kHmxResidentNotProven
-                                             : "module-symbol"));
-  fields.append("function", StringAttr::get(context, function));
-  fields.append("function_id", IntegerAttr::get(IntegerType::get(context, 64),
-                                                residentFunctionIdentity(
-                                                    principal, function)));
-  fields.append("role", StringAttr::get(context, "workspace-resident"));
-  fields.append("site", StringAttr::get(context, site));
-  fields.append("site_id", IntegerAttr::get(IntegerType::get(context, 64),
-                                            residentSiteIdentity(
-                                                principal, function, site,
-                                                "workspace-resident", slot)));
-  fields.append("slot", IntegerAttr::get(IntegerType::get(context, 64), slot));
-  fields.append("scope", StringAttr::get(context, kHmxResidentScope));
-  fields.append("launch_status",
-                StringAttr::get(context, kHmxResidentNotProven));
-  // Workspace bytes are deliberately not a content identity: every launch
-  // refills the buffer.  This is an explicit statement, not an implicit hash.
-  fields.append("content_status",
-                StringAttr::get(context, "per-launch-refill"));
-  fields.append("reuse_status", StringAttr::get(context, "process-resident"));
-  fields.append("descriptor_status", StringAttr::get(context, "checked"));
   return DictionaryAttr::get(context, fields);
 }
 
+/// Idempotence check shared with the weight pass (see
+/// `HmxResidentContract.h`); this local entry point keeps the pass's own
+/// subject wording in its diagnostic.
 static LogicalResult setOrValidateWorkspaceProvenance(Operation *operation,
                                                       DictionaryAttr expected) {
-  auto existing =
-      operation->getAttrOfType<DictionaryAttr>(kHmxResidentProvenanceAttr);
-  if (!existing) {
-    operation->setAttr(kHmxResidentProvenanceAttr, expected);
-    return success();
-  }
-  if (existing != expected)
-    return operation->emitError(
-        "resident workspace provenance changed across repeated lowering");
-  return success();
+  return setOrValidateResidentProvenance(operation, expected,
+                                         "resident workspace");
 }
 
 struct HmxWorkspaceResidentPass
@@ -271,7 +202,9 @@ struct HmxWorkspaceResidentPass
     // In diagnostic mode this is a validation pass as well as a producer: do
     // all checks before mutating IR, so a collision cannot leave half a
     // resident contract behind.
-    std::map<uint64_t, std::string> keyOwners;
+    // Strict keys only need to be distinct, so the collision check keeps
+    // a key set and no owner identity.
+    std::set<uint64_t> keyOwners;
     LogicalResult collectionResult = success();
     const std::string principal = residentPrincipalName(module);
     const std::string function = func.getSymName().str();
@@ -320,7 +253,7 @@ struct HmxWorkspaceResidentPass
           collectionResult = failure();
           return;
         }
-        int64_t alignment = workspaceAlignment(alloc);
+        int64_t alignment = residentAlignment(alloc);
         if (!isSupportedResidentAlignment(alignment)) {
           alloc.emitError("resident workspace has an unsupported alignment");
           collectionResult = failure();
@@ -361,19 +294,18 @@ struct HmxWorkspaceResidentPass
           collectionResult = failure();
           return;
         }
-        uint64_t key = stableWorkspaceResidentKey(principal, function, *site,
-                                                  /*slot=*/0);
-        std::string identity =
-            principal + "\\x1f" + function + "\\x1f" + *site + "\\x1f0";
-        auto [keyIt, keyInserted] = keyOwners.emplace(key, identity);
-        if (!keyInserted) {
+        // Collision detection on the site identity, not on the runtime key:
+        // two allocations claiming the same source site would make the
+        // provenance evidence ambiguous.
+        uint64_t siteKey = stableWorkspaceResidentKey(principal, function,
+                                                      *site, /*slot=*/0);
+        if (!keyOwners.insert(siteKey).second) {
           func.emitError("resident workspace key collision for stable site");
           collectionResult = failure();
           return;
         }
-        (void)keyIt;
-        strictSites.push_back(
-            {alloc, bytes, alignment, principal, function, *site, key});
+        strictSites.push_back({alloc, bytes, alignment, principal, function,
+                               *site});
       }
       workspaces.push_back(alloc);
     });
@@ -383,9 +315,12 @@ struct HmxWorkspaceResidentPass
       for (WorkspaceResidentSite &site : strictSites) {
         unsigned directDeallocs = 0;
         bool aliasDealloc = false;
-        if (failed(validateWorkspaceDeallocs(site.alloc.getResult(),
-                                             func.getOperation(),
-                                             directDeallocs, aliasDealloc)))
+        // This pass runs before `convert-to-hexagonmem`, so its releases are
+        // still memref-typed; see `ResidentDeallocForm`.
+        if (failed(validateResidentDeallocs(
+                site.alloc.getResult(), func.getOperation(), directDeallocs,
+                aliasDealloc, ResidentDeallocForm::MemrefOnly,
+                "resident workspace")))
           return signalPassFailure();
         if (directDeallocs > 1) {
           func.emitError(
@@ -407,9 +342,11 @@ struct HmxWorkspaceResidentPass
 
     // Key by the function symbol and the buffer's order within it, never by an
     // address: the key has to be the same on every launch of the same kernel.
-    // This is the compatibility key.  Strict diagnostics publish the stronger
-    // principal/function/site identity above, but do not silently change the
-    // production ABI selection for an unmarked module.
+    // This is the compatibility key, for marked and unmarked modules alike:
+    // strict diagnostics never swap it for the site identity, because a
+    // diagnostic that changed the key distribution would measure a different
+    // kernel than production.  The stronger principal/function/site identity
+    // is published in the provenance record (site_id/function_id) instead.
     uint64_t hash = llvm::hash_value(func.getSymName());
 
     MLIRContext *context = func.getContext();
@@ -430,7 +367,6 @@ struct HmxWorkspaceResidentPass
           candidate.emitError("resident workspace lost its validated site");
           return signalPassFailure();
         }
-        key = strictIt->key;
         strictExpected = makeWorkspaceProvenance(
             context, strictIt->principal, strictIt->function, strictIt->site,
             /*slot=*/0, strictIt->bytes, strictIt->alignment, key);

@@ -186,10 +186,16 @@ class HexagonOptions:
     # Per-launch VTCM workspace residency (hmx-workspace-resident). When on, the
     # crouton arrays, conversion state, staging ring/scratch and statuses of an
     # HMX kernel are allocated once and reused by every launch instead of being
-    # allocated/freed per launch (~6.3 us per alloc/free pair, size-independent:
-    # on S3 128x128x128 that is more than half the launch, 14 -> 6 us; on S1
-    # 1024x512x64 it is another -17% on top of the readout split; gap-table
-    # 2026-10-04, iters=1000). On by default: the resident entry is keyed by
+    # allocated/freed per launch. That costs 1.12 / 1.51 / 1.69 us per
+    # alloc/free pair on S1/S2/S3 (A/B delta pcycles over the static pair
+    # counts; docs/hmx/m3.2-device-result-2026-09-29.md §4). On S3 128x128x128
+    # that is a few us against a launch of the same order, so it dominates a
+    # small shape; on S1 1024x512x64 it is a few more us on top of the readout
+    # split.
+    # (2026-10-07: this comment said "~6.3 us per pair, size-independent". Both
+    # were wrong -- 6.3 overstates by 4-6x, and the three measured points
+    # scatter by 1.5x so "size-independent" has no evidence behind it. Same §4.)
+    # On by default: the resident entry is keyed by
     # the caller's flat program id (VtcmPool::Resident's slot), so concurrent
     # instances of a grid>1 launch get separate buffers instead of a shared
     # clobbered one, and the same pid across launches reuses the same buffer.

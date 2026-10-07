@@ -13,6 +13,17 @@
 // and reject an unprovable identity, but must not silently turn a host-side
 // prepack hash into a device-side content identity.
 //
+// Besides the identity vocabulary, this header is the one home of the
+// buffer-safety checks the *weight* and *workspace* residency passes share:
+// the alias-op list, the allocation-alignment read, the dealloc/escape walk
+// and the provenance record skeleton.  The two passes drive one runtime
+// residency mechanism, so the predicates that mechanism rests on must not
+// drift between them; their genuine differences (which dealloc op forms
+// count as owner-visible releases, which fields each record adds) are
+// explicit parameters here, never unions.  `HmxVtcmAccountingPass` keeps
+// its own, strictly narrower escape analysis and is deliberately not a
+// consumer of these helpers.
+//
 // A principal is one immutable object in one process.  The process scope is
 // supplied by the launcher/runtime contract; an anonymous MLIR module is
 // therefore represented as "<anonymous-principal>" and is not evidence that
@@ -23,14 +34,27 @@
 #ifndef HEXAGON_DIALECT_HMX_TRANSFORMS_HMXRESIDENTCONTRACT_H
 #define HEXAGON_DIALECT_HMX_TRANSFORMS_HMXRESIDENTCONTRACT_H
 
+#include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxVtcmAccounting.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/IR/Types.h"
+#include "mlir/Interfaces/CallInterfaces.h"
+#include "mlir/Support/LogicalResult.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/Twine.h"
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -618,6 +642,175 @@ inline uint64_t stableWorkspaceResidentKey(StringRef principal,
   uint64_t hash = residentSiteIdentity(principal, function, site,
                                        "workspace-resident", slot);
   return kHmxWorkspaceResidentKeyTag | (hash & ~kHmxWorkspaceResidentKeyTag);
+}
+
+/// The alias ops a resident candidate's value may flow through while still
+/// naming the same underlying storage: layout-only views and casts.  The
+/// weight and the workspace residency passes walk the same list on purpose:
+/// both ask the same question -- "is this use a new name for the principal
+/// allocation, or a new object?" -- about the same runtime residency
+/// mechanism, and a list that drifted between the two would let a use be a
+/// tracked alias on one path and an invisible one on the other.
+///
+/// `HmxVtcmAccountingPass` is deliberately not a consumer: its escape
+/// analysis is strictly narrower (it rejects every dealloc, every
+/// region-bearing transfer and every raw-pointer extraction outright), and
+/// sharing this list would silently loosen it.
+inline bool isResidentAliasLike(Operation *op) {
+  return isa<memref::AssumeAlignmentOp, memref::CastOp, memref::SubViewOp,
+             memref::ReinterpretCastOp, memref::MemorySpaceCastOp,
+             memref::TransposeOp, memref::ViewOp, memref::ExpandShapeOp,
+             memref::CollapseShapeOp, memref::ReshapeOp>(op);
+}
+
+/// The alignment a resident allocation's descriptor records.  Both producer
+/// forms (`memref.alloc` before conversion, `hexagonmem.alloc` after) carry
+/// an optional `alignment` attribute, and `ConvertToHexagonmem` gives an
+/// omitted memref alignment the same 128-byte default as `hexagonmem.alloc`,
+/// so the default is spelled out here: the recorded descriptor is the
+/// descriptor the runtime receives, not an assumption about an unrelated
+/// MLIR default.
+inline int64_t residentAlignment(Operation *alloc) {
+  if (auto attr = alloc->getAttrOfType<IntegerAttr>("alignment"))
+    return attr.getInt();
+  return 128;
+}
+
+/// Which deallocation op forms the shared dealloc walk reports as
+/// owner-visible releases.  The two residency passes genuinely differ here,
+/// and the difference is an explicit parameter rather than a union: the
+/// workspace pass runs before `convert-to-hexagonmem`, so every release it
+/// audits is still a `memref.dealloc`, while the weight path also validates
+/// records left by an earlier lowering, where the allocation and its release
+/// have already taken the `hexagonmem` form.  A union would silently widen
+/// the workspace side: a hand-written `hexagonmem.dealloc` would start
+/// counting as a direct release instead of an unrecognized use.
+enum class ResidentDeallocForm {
+  MemrefOnly,
+  MemrefAndHexagonmem,
+};
+
+/// Audit every release of a resident candidate's value before anything is
+/// erased.  A direct dealloc of the principal value is the one form the
+/// residency passes may transfer or drop; a dealloc reached through an alias
+/// is ambiguous, because the runtime resident table is keyed by the principal
+/// allocation and not by an arbitrary alias descriptor; and an escape through
+/// a call, control flow or a raw pointer extraction is a use no residency
+/// pass can reason about.  `subject` names the resident in the diagnostics
+/// ("resident workspace", "resident weight bridge") so the shared walk keeps
+/// each pass's wording.
+inline LogicalResult
+validateResidentDeallocs(Value value, Operation *anchor, unsigned &directCount,
+                         bool &aliasDealloc, ResidentDeallocForm deallocForm,
+                         StringRef subject) {
+  SmallVector<Value> worklist{value};
+  SmallPtrSet<Value, 16> visited;
+  while (!worklist.empty()) {
+    Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    for (OpOperand &use : current.getUses()) {
+      Operation *owner = use.getOwner();
+      if (isa<CallOpInterface, func::ReturnOp, cf::BranchOp, cf::CondBranchOp,
+              cf::SwitchOp, scf::YieldOp,
+              memref::ExtractAlignedPointerAsIndexOp>(owner))
+        return anchor->emitError(
+            subject +
+            " value escapes through a call/control-flow/pointer operation");
+      if (isa<memref::DeallocOp>(owner) ||
+          (deallocForm == ResidentDeallocForm::MemrefAndHexagonmem &&
+           isa<hexagonmem::DeallocOp>(owner))) {
+        if (current == value)
+          ++directCount;
+        else
+          aliasDealloc = true;
+        continue;
+      }
+      if (isResidentAliasLike(owner)) {
+        for (Value result : owner->getResults())
+          worklist.push_back(result);
+      }
+    }
+  }
+  if (aliasDealloc)
+    return anchor->emitError(
+        subject + " has a deallocation through a memref alias/view");
+  return success();
+}
+
+/// Append the fields every resident provenance record shares.  The two
+/// producers build one diagnostic vocabulary over one residency mechanism,
+/// so the shared skeleton lives with it; each pass's own fields (the
+/// workspace key, the weight identity/runtime-key/source descriptors) are
+/// appended by the passes themselves and stay with them.
+///
+/// `kind` and `role` carry the vocabulary difference between the two
+/// records ("workspace"/"workspace-resident" versus
+/// "weight"/"weight-resident"); `role` also feeds `site_id`, so the two
+/// cannot drift apart at a call site.  `contentStatus` is a parameter
+/// because the two passes make different claims about content: a workspace
+/// is refilled every launch, while a weight's content status depends on its
+/// source.
+///
+/// `DictionaryAttr` canonicalizes its entries by sorting them, so the append
+/// order here reaches neither the printed record nor the rerun comparison.
+inline void appendResidentProvenanceCore(NamedAttrList &fields,
+                                         MLIRContext *context, StringRef kind,
+                                         StringRef role, StringRef principal,
+                                         StringRef function, StringRef site,
+                                         int64_t slot, int64_t bytes,
+                                         int64_t alignment,
+                                         StringRef contentStatus) {
+  fields.append("schema", StringAttr::get(context, kHmxResidentKeySchema));
+  fields.append("key_namespace",
+                StringAttr::get(context, kHmxResidentKeyNamespace));
+  fields.append("kind", StringAttr::get(context, kind));
+  fields.append("bytes",
+                IntegerAttr::get(IntegerType::get(context, 64), bytes));
+  fields.append("alignment",
+                IntegerAttr::get(IntegerType::get(context, 64), alignment));
+  fields.append("module", StringAttr::get(context, principal));
+  fields.append("principal_status",
+                StringAttr::get(context, principal == "<anonymous-principal>"
+                                             ? kHmxResidentNotProven
+                                             : "module-symbol"));
+  fields.append("function", StringAttr::get(context, function));
+  fields.append("function_id",
+                IntegerAttr::get(IntegerType::get(context, 64),
+                                 residentFunctionIdentity(principal,
+                                                          function)));
+  fields.append("role", StringAttr::get(context, role));
+  fields.append("site", StringAttr::get(context, site));
+  fields.append("site_id",
+                IntegerAttr::get(IntegerType::get(context, 64),
+                                 residentSiteIdentity(principal, function, site,
+                                                      role, slot)));
+  fields.append("slot", IntegerAttr::get(IntegerType::get(context, 64), slot));
+  fields.append("scope", StringAttr::get(context, kHmxResidentScope));
+  fields.append("launch_status",
+                StringAttr::get(context, kHmxResidentNotProven));
+  fields.append("content_status", StringAttr::get(context, contentStatus));
+  fields.append("reuse_status", StringAttr::get(context, "process-resident"));
+  fields.append("descriptor_status", StringAttr::get(context, "checked"));
+}
+
+/// Publish or re-check a provenance record.  A repeated lowering must produce
+/// the same evidence it published the first time; a changed record is a
+/// changed identity claim, not a refresh.  `subject` names the resident in
+/// the diagnostic so the shared check keeps each pass's wording.
+inline LogicalResult setOrValidateResidentProvenance(Operation *operation,
+                                                     DictionaryAttr expected,
+                                                     StringRef subject) {
+  auto existing =
+      operation->getAttrOfType<DictionaryAttr>(kHmxResidentProvenanceAttr);
+  if (!existing) {
+    operation->setAttr(kHmxResidentProvenanceAttr, expected);
+    return success();
+  }
+  if (existing != expected)
+    return operation->emitError(subject +
+                                " provenance changed across repeated lowering");
+  return success();
 }
 
 } // namespace hmx

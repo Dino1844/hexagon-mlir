@@ -7,8 +7,10 @@
 //
 //===----------------------------------------------------------------------===//
 // Reordering two otherwise independent allocations must not change either
-// site's resident key.  This is a source-level check of the identity contract;
-// it does not claim that a real launch's grid scope has been proven.
+// site's identity (site_id).  The runtime key stays the production
+// compatibility key and may track allocation order.  This is a source-level
+// check of the identity contract; it does not claim that a real launch's grid
+// scope has been proven.
 //
 // RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(func.func(hmx-workspace-resident))' | python3 "$(dirname %s)/resident-provenance-order.py"
 // RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(func.func(hmx-workspace-resident))' | linalg-hexagon-opt -split-input-file -pass-pipeline='builtin.module(func.func(hmx-workspace-resident))' | python3 "$(dirname %s)/resident-provenance-order.py"

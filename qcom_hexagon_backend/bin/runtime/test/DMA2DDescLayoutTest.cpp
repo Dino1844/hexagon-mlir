@@ -2,12 +2,23 @@
 // DMA2DDescLayoutTest.cpp - Host test for the v75+ 24-bit 2D descriptor.
 //
 // Device independent: it includes only UserDMADescriptors.h (no asm, no HMX)
-// and builds descriptors with the same setters UserDMA::copy2D uses. The
-// expected words are the `new24` oracle from exp/hmx/dma2d_probe/wrapper_dma2d.cpp
-// (build_desc_new), which was confirmed on v79 (logs/dma2d_probe/REPORT.txt).
+// and builds descriptors with the same setters UserDMA::copy2D uses.
 //
-// This file is NOT part of the device gtest suite (test/CMakeLists.txt) and
-// must not be added there. Build and run it on the host:
+// Provenance of the expected words (corrected 2026-10-05). This header used to
+// cite `exp/hmx/dma2d_probe/wrapper_dma2d.cpp` (build_desc_new) as the oracle
+// and `logs/dma2d_probe/REPORT.txt` as the v79 confirmation. Neither path
+// exists in the workspace, so the claim was unverifiable -- and per AGENTS.md
+// §7.9 a claim pointing at a missing artefact reads as verified when it is not.
+// The words below are instead cross-checked against the artefact that *is* the
+// source of truth, UserDMA/UserDMADescriptors.h, by
+// test/test_userdma_2d_geometry_contract.py.
+//
+// NOT part of any automatic gate. It is a standalone host main(), absent from
+// test/CMakeLists.txt on purpose (it trips undefined symbols in
+// run_main_on_hexagon), and nothing in the tree runs it. The reject contract
+// that matters most -- dma2DGeometryFits must run before the masking setters --
+// *is* covered automatically by that contract test. These end-to-end descriptor
+// words are not, so run them by hand after touching the descriptor layout:
 //
 //   clang++ -std=c++17 -Wall -Wextra \
 //       qcom_hexagon_backend/bin/runtime/test/DMA2DDescLayoutTest.cpp \

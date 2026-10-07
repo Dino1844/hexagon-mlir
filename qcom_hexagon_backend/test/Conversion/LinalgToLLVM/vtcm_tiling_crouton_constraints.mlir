@@ -58,15 +58,15 @@ module {
   }
 }
 
-// Non-streaming => staged through VTCM: both inputs and the accumulator get
-// space-1 allocs (", 1>") copied in, the generic runs on those, and the result
-// is copied back out. The 8 x 8 x 32 crouton tail stays untiled.
+// Non-streaming, but the input maps are the identity over the whole
+// iteration space: every element is read exactly once, so the inputs are NOT
+// staged -- the generic consumes their DDR subviews directly. Only the
+// read-modify-write accumulator is staged through VTCM (space-1 alloc copied
+// in and back out per tile). The 8 x 8 x 32 crouton tail stays untiled.
 // CHECK-LABEL:   func.func @crouton_constraints_i8_reduction(
 // CHECK-SAME:    %[[X:.+]]: memref<4x3x2x1024x8x8x32xi8>, %[[Y:.+]]: memref<4x3x2x1024x8x8x32xi8>, %[[Z:.+]]: memref<4x3x2x8x8x32xi8>
 
 // CHECK:           %[[ALLOC_DDR:.*]] = memref.alloc() {alignment = 64 : i64} : memref<4x3x2x8x8x32xi8>
-// CHECK:           %[[ALLOC_IN1:.*]] = memref.alloc() {alignment = 64 : i64} : memref<4x1x1x64x8x8x32xi8, 1>
-// CHECK:           %[[ALLOC_IN2:.*]] = memref.alloc() {alignment = 64 : i64} : memref<4x1x1x64x8x8x32xi8, 1>
 // CHECK:           %[[ALLOC_OUT:.*]] = memref.alloc() {alignment = 64 : i64} : memref<4x1x1x8x8x32xi8, 1>
 
 // CHECK:           scf.for %[[I:.*]] = %c0 to %c3 step %c1 {
@@ -75,18 +75,14 @@ module {
 
 // CHECK:                 %[[IN1_SUBVIEW:.*]] = memref.subview %[[X]][0, %[[I]], %[[J]], %[[K]], 0, 0, 0] [4, 1, 1, 64, 8, 8, 32] [1, 1, 1, 1, 1, 1, 1]
 // CHECK-SAME:            : memref<4x3x2x1024x8x8x32xi8> to memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>>
-// CHECK:                 memref.copy %[[IN1_SUBVIEW]], %[[ALLOC_IN1]] : memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>> to memref<4x1x1x64x8x8x32xi8, 1>
 // CHECK:                 %[[IN2_SUBVIEW:.*]] = memref.subview %[[Y]][0, %[[I]], %[[J]], %[[K]], 0, 0, 0] [4, 1, 1, 64, 8, 8, 32] [1, 1, 1, 1, 1, 1, 1]
 // CHECK-SAME:            : memref<4x3x2x1024x8x8x32xi8> to memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>>
-// CHECK:                 memref.copy %[[IN2_SUBVIEW]], %[[ALLOC_IN2]] : memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>> to memref<4x1x1x64x8x8x32xi8, 1>
 // CHECK:                 %[[OUT_SUBVIEW:.*]] = memref.subview %[[ALLOC_DDR]][0, %[[I]], %[[J]], 0, 0, 0] [4, 1, 1, 8, 8, 32] [1, 1, 1, 1, 1, 1]
 // CHECK-SAME:            : memref<4x3x2x8x8x32xi8> to memref<4x1x1x8x8x32xi8, strided<[12288, 4096, 2048, 256, 32, 1], offset: ?>>
 // CHECK:                 memref.copy %[[OUT_SUBVIEW]], %[[ALLOC_OUT]] : memref<4x1x1x8x8x32xi8, strided<[12288, 4096, 2048, 256, 32, 1], offset: ?>> to memref<4x1x1x8x8x32xi8, 1>
-// CHECK:                 linalg.generic {{.*}} ins(%[[ALLOC_IN1]], %[[ALLOC_IN2]] : memref<4x1x1x64x8x8x32xi8, 1>, memref<4x1x1x64x8x8x32xi8, 1>) outs(%[[ALLOC_OUT]] : memref<4x1x1x8x8x32xi8, 1>) {
+// CHECK:                 linalg.generic {{.*}} ins(%[[IN1_SUBVIEW]], %[[IN2_SUBVIEW]] : memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>>, memref<4x1x1x64x8x8x32xi8, strided<[12582912, 4194304, 2097152, 2048, 256, 32, 1], offset: ?>>) outs(%[[ALLOC_OUT]] : memref<4x1x1x8x8x32xi8, 1>) {
 // CHECK:                 memref.copy %[[ALLOC_OUT]], %[[OUT_SUBVIEW]] : memref<4x1x1x8x8x32xi8, 1> to memref<4x1x1x8x8x32xi8, strided<[12288, 4096, 2048, 256, 32, 1], offset: ?>>
 
 // CHECK:           memref.copy %[[ALLOC_DDR]], %[[Z]] : memref<4x3x2x8x8x32xi8> to memref<4x3x2x8x8x32xi8>
 // CHECK:           memref.dealloc %[[ALLOC_DDR]] : memref<4x3x2x8x8x32xi8>
-// CHECK:           memref.dealloc %[[ALLOC_IN1]] : memref<4x1x1x64x8x8x32xi8, 1>
-// CHECK:           memref.dealloc %[[ALLOC_IN2]] : memref<4x1x1x64x8x8x32xi8, 1>
 // CHECK:           memref.dealloc %[[ALLOC_OUT]] : memref<4x1x1x8x8x32xi8, 1>

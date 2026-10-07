@@ -167,11 +167,120 @@ GenericOp getGenericWithNewOperands(IRRewriter &rewriter, GenericOp op,
   return newOp;
 }
 
+/// Accumulate the linear coefficients of `e` w.r.t. the iteration dims into
+/// `coeffs` (indexed by dim position), scaled by `scale`. Returns false when
+/// the expression is not a linear function of the dims (a product of two
+/// dims, div/mod, a symbol): injectivity is then not provable here.
+static bool collectLinearCoeffs(AffineExpr e, int64_t scale,
+                                SmallVectorImpl<int64_t> &coeffs) {
+  if (auto dim = dyn_cast<AffineDimExpr>(e)) {
+    coeffs[dim.getPosition()] += scale;
+    return true;
+  }
+  if (isa<AffineConstantExpr>(e))
+    return true;
+  if (auto bin = dyn_cast<AffineBinaryOpExpr>(e)) {
+    switch (bin.getKind()) {
+    case AffineExprKind::Add:
+      return collectLinearCoeffs(bin.getLHS(), scale, coeffs) &&
+             collectLinearCoeffs(bin.getRHS(), scale, coeffs);
+    case AffineExprKind::Mul:
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getRHS()))
+        return collectLinearCoeffs(bin.getLHS(), scale * c.getValue(), coeffs);
+      if (auto c = dyn_cast<AffineConstantExpr>(bin.getLHS()))
+        return collectLinearCoeffs(bin.getRHS(), scale * c.getValue(), coeffs);
+      return false;
+    default:
+      return false; // Mod/FloorDiv/CeilDiv: not linear.
+    }
+  }
+  return false; // SymbolId or anything else.
+}
+
+/// Rank of a small integer matrix via fraction-free Gaussian elimination.
+/// The matrices here are (num loops x operand rank); both are tiny and their
+/// entries are unit-scale, so int64 cannot overflow in practice.
+static unsigned rankOf(SmallVector<SmallVector<int64_t>> m) {
+  const unsigned rows = m.size();
+  const unsigned cols = rows ? m[0].size() : 0;
+  unsigned rank = 0;
+  for (unsigned col = 0; col != cols && rank != rows; ++col) {
+    unsigned pivot = rank;
+    while (pivot != rows && m[pivot][col] == 0)
+      ++pivot;
+    if (pivot == rows)
+      continue;
+    std::swap(m[rank], m[pivot]);
+    for (unsigned r = rank + 1; r != rows; ++r) {
+      if (m[r][col] == 0)
+        continue;
+      int64_t a = m[rank][col], b = m[r][col];
+      for (unsigned c = 0; c != cols; ++c)
+        m[r][c] = m[r][c] * a - m[rank][c] * b;
+    }
+    ++rank;
+  }
+  return rank;
+}
+
+/// Is `map` injective over its whole domain, hence over any iteration box?
+/// True when the map's linear part has full column rank: distinct iteration
+/// points then address distinct tensor elements, i.e. every element of the
+/// operand is read at most once. This is a sufficient, shape-free condition;
+/// a map that is injective only on a restricted box (a unit-trip-count
+/// dimension collapsed by the map) conservatively returns false.
+static bool isSingleReadIndexingMap(AffineMap map) {
+  const unsigned numDims = map.getNumDims();
+  if (numDims == 0)
+    return true;
+  if (map.getNumResults() < numDims)
+    return false; // iteration dims collapse: not injective.
+  SmallVector<SmallVector<int64_t>> lin(
+      numDims, SmallVector<int64_t>(map.getNumResults(), 0));
+  for (auto [j, res] : llvm::enumerate(map.getResults())) {
+    SmallVector<int64_t> col(numDims, 0);
+    if (!collectLinearCoeffs(res, 1, col))
+      return false;
+    for (unsigned i = 0; i != numDims; ++i)
+      lin[i][j] = col[i];
+  }
+  return rankOf(std::move(lin)) == numDims;
+}
+
+/// Per-operand staging decision for a generic. Staging a tensor through VTCM
+/// only pays off when the data is *reused* (or bulk-prefetched), so:
+///  - an input whose indexing map is injective over the iteration space is
+///    read at most once and stays in DDR;
+///  - an out whose region never reads the init block arg is write-only: its
+///    old value cannot survive into the result, so the destination is written
+///    directly -- no init copy, no VTCM slot, no copy-back;
+///  - everything else (broadcast or complex maps, read-modify-write outs)
+///    keeps the staged behavior.
+/// The decision is orthogonal to the tiling: whether a tile covers a whole
+/// operand (the `prefetch` set) only picks whole-tensor vs per-tile staging
+/// for the operands that are staged at all.
+static void computeOperandStaging(linalg::GenericOp op,
+                                  SmallVector<bool> &stage) {
+  stage.assign(op.getNumOperands(), true);
+  for (OpOperand &opOperand : op->getOpOperands()) {
+    unsigned idx = opOperand.getOperandNumber();
+    if (op.isDpsInit(&opOperand)) {
+      if (op.getMatchingBlockArgument(&opOperand).use_empty())
+        stage[idx] = false;
+    } else {
+      if (isSingleReadIndexingMap(op.getMatchingIndexingMap(&opOperand)))
+        stage[idx] = false;
+    }
+  }
+}
+
 /// Return a linalg generic where `prefetch` tensors are VTCM copies
-/// of data on DDR. Other operands are as in original.
+/// of data on DDR. Other operands are as in original. Operands that are not
+/// staged (`stage` false) keep their original (DDR) buffer.
 GenericOp replaceGenericWithPrefetchedOperands(IRRewriter &rewriter,
                                                GenericOp op,
-                                               SmallVector<bool> prefetch) {
+                                               SmallVector<bool> prefetch,
+                                               SmallVector<bool> stage) {
   SmallVector<Value> newIns;
   SmallVector<Value> newOuts;
 
@@ -180,7 +289,7 @@ GenericOp replaceGenericWithPrefetchedOperands(IRRewriter &rewriter,
     Value globalTensor = op->getOperand(idx);
     Value newTensor = globalTensor;
 
-    if (prefetch[idx])
+    if (prefetch[idx] && stage[idx])
       newTensor = copyToVTCM(rewriter, globalTensor, op.getLoc());
     op.isDpsInit(&opOperand) ? newOuts.push_back(newTensor)
                              : newIns.push_back(newTensor);
@@ -191,17 +300,19 @@ GenericOp replaceGenericWithPrefetchedOperands(IRRewriter &rewriter,
 }
 
 /// Replace tiled generic that operates on slices from DDR,
-/// to a new generic that operates on copies on VTCM.
+/// to a new generic that operates on copies on VTCM. Slices of operands that
+/// are not staged keep operating on the DDR slices directly.
 LogicalResult replaceTiledGenericWithVTCMSlices(IRRewriter &rewriter,
                                                 GenericOp top,
-                                                SmallVector<bool> prefetch) {
+                                                SmallVector<bool> prefetch,
+                                                SmallVector<bool> stage) {
   SmallVector<Value> newIns, newOuts;
   for (OpOperand &opOperand : top->getOpOperands()) {
     auto idx = opOperand.getOperandNumber();
     Value globalTensor = top->getOperand(idx);
     Value newTensor = globalTensor;
 
-    if (!prefetch[idx]) {
+    if (!prefetch[idx] && stage[idx]) {
       if (!globalTensor.template getDefiningOp<tensor::ExtractSliceOp>())
         return failure();
       newTensor = copyToVTCM(rewriter, globalTensor, top.getLoc());
@@ -216,11 +327,14 @@ LogicalResult replaceTiledGenericWithVTCMSlices(IRRewriter &rewriter,
 
 /// Copying the results corresponding to the operands to be "prefetched" for a
 /// linalg op to DDR and replacing the uses to the copied tensor on DDR.
+/// Results that were never staged were computed directly on their DDR
+/// destination and need no copy-back.
 void copyResultsToDDR(IRRewriter &rewriter, GenericOp op,
-                      SmallVector<bool> prefetch) {
+                      SmallVector<bool> prefetch,
+                      SmallVector<bool> stage) {
   for (int idx = 0; idx < op.getNumDpsInits(); ++idx) {
     auto operandIdx = op.getNumDpsInputs() + idx;
-    if (prefetch[operandIdx]) {
+    if (prefetch[operandIdx] && stage[operandIdx]) {
       Value resultTensor = op.getResult(idx);
       // A crouton result read by `hmx.matmul` must keep its VTCM buffer: the
       // engine reads a crouton, and the DDR copy would hand `hmx.mma` a space-0
@@ -277,6 +391,13 @@ void VTCMTilingPass::runOnOperation() {
     // it through VTCM costs an extra round trip plus allocation churn in the
     // runtime pool. Measured on device: 34x on a plain 131072-element add
     // (4320 -> 128 us) and 6.9x on silu (773 -> 112 us).
+    //
+    // The same reuse principle also applies per operand (see
+    // computeOperandStaging): single-read inputs (injective indexing maps)
+    // and write-only outs (regions that never read the init block arg) stay
+    // on their DDR buffers; only reused inputs and read-modify-write outs pay
+    // for a VTCM round trip. The streaming skip below stays whole: it is the
+    // all-operands-at-once special case and also covers the outs.
     const bool streaming =
         llvm::all_of(op.getIteratorTypesArray(), [](utils::IteratorType t) {
           return t == utils::IteratorType::parallel;
@@ -296,6 +417,8 @@ void VTCMTilingPass::runOnOperation() {
       return WalkResult::advance();
 
     IRRewriter rewriter(op.getContext());
+    SmallVector<bool> stage;
+    computeOperandStaging(op, stage);
     SmallVector<bool> prefetch(op.getNumOperands(), false);
     FailureOr<linalg::LinalgTilingOptions> vtcmTilingOptions =
         getVTCMTilingOptions(op, userProvidedTileSizes, prefetch, vtcmBudget);
@@ -306,8 +429,8 @@ void VTCMTilingPass::runOnOperation() {
     // into VTCM (prefetch 'set') are copied to VTCM before tiling, then copy
     // the corresponding results back to DDR.
     linalg::GenericOp prefetchOp =
-        replaceGenericWithPrefetchedOperands(rewriter, op, prefetch);
-    copyResultsToDDR(rewriter, prefetchOp, prefetch);
+        replaceGenericWithPrefetchedOperands(rewriter, op, prefetch, stage);
+    copyResultsToDDR(rewriter, prefetchOp, prefetch, stage);
 
     rewriter.setInsertionPointAfter(prefetchOp);
     FailureOr<linalg::TiledLinalgOp> tiledOp =
@@ -319,7 +442,8 @@ void VTCMTilingPass::runOnOperation() {
     annotateTiledLoop(prefetchOp, *tiledOp);
 
     auto top = llvm::dyn_cast<GenericOp>(tiledOp->op.getOperation());
-    if (failed(replaceTiledGenericWithVTCMSlices(rewriter, top, prefetch)))
+    if (failed(replaceTiledGenericWithVTCMSlices(rewriter, top, prefetch,
+                                                 stage)))
       return WalkResult::advance();
 
     rewriter.replaceOp(prefetchOp, tiledOp->tensorResults);

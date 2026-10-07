@@ -64,10 +64,12 @@ func.func @rowmax_f32(%S: tensor<128x64xf32>, %m: tensor<128xf32>) -> tensor<128
   return %out : tensor<128xf32>
 }
 
-// PROVISIONAL -- the CHECK block below has not been run yet (the pass did not
-// exist when it was written). Expect to adjust the flag spellings on the first
-// real run; the structure (five vror, no extract, one group write) is the part
-// that must not move.
+// These CHECK blocks were written before the pass existed and carried a
+// PROVISIONAL note saying they had never been run. That note is stale and was
+// removed on 2026-10-05: the file's single RUN uses -split-input-file, so
+// FileCheck matches against the concatenated stdout of all 16 chunks, every
+// CHECK-LABEL below resolves, and the flag spellings (notably the `fastmath<nnan>`
+// on arith.maxnumf and the vror immediates) are verified on every run.
 //
 // CHECK-LABEL: func.func @rowmax_f32
 // CHECK-NOT: vector.reduction
@@ -147,7 +149,7 @@ func.func @rowmax_f16(%S: tensor<128x128xf16>, %m: tensor<128xf16>) -> tensor<12
   return %out : tensor<128xf16>
 }
 
-// PROVISIONAL -- see the f32 block above.
+// Flag spellings verified -- see the note above the f32 block.
 //
 // CHECK-LABEL: func.func @rowmax_f16
 // CHECK-NOT: vector.reduction

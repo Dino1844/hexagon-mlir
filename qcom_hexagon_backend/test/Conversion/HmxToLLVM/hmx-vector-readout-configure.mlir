@@ -33,14 +33,28 @@
 //           trap. Checked per call site: there are two publishes, and a single
 //           check would leave the in-loop drops unreported.
 //
-// And the arm that matters most for every existing measurement: OFF is
-// byte-identical to a run with no option at all.
+// The OFF arm is what every measurement taken before 2026-10-04 actually ran:
+// the pass absent from the pipeline, so no publish code is emitted at all.
+//
+// There is deliberately no byte-equality gate here, and an earlier version of
+// this file had one (`diff %t.off %t.off` -- the file compared with itself).
+// Its comment claimed "OFF is byte-identical to a run with no option at all",
+// but this file drives hand-written mini-pipelines, where "no option at all"
+// is not expressible: the pass is simply absent from the pipeline string, so
+// the claim reduces to the degenerate one. A gate that claims to verify
+// something it does not is worse than no gate. The two things the claim was
+// really about are pinned elsewhere:
+//
+//   - the option default is `true`, and .td <-> Python default agreement is
+//     gated by test/test_option_surface_agreement.py (LinalgToLLVM/Passes.td:
+//     191 is the enable-hmx-vector-readout definition).
+//   - pipeline insertion is gated on that option at
+//     LinalgToLLVMPass.cpp:584.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(hmx-vector-readout{hmx-readout-batch=4}),convert-scf-to-cf,convert-func-to-llvm,hmx-to-llvm)' > %t.on
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(convert-scf-to-cf,convert-func-to-llvm,hmx-to-llvm)' > %t.off
 // RUN: FileCheck %s --check-prefix=ON < %t.on
 // RUN: FileCheck %s --check-prefix=OFF < %t.off
-// RUN: diff %t.off %t.off
 //
 // `convert-scf-to-cf` is in the pipeline because the publish check is a branch,
 // and an `scf.if` body cannot hold one. That is not this test's requirement: it

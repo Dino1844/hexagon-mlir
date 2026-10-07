@@ -9,9 +9,15 @@
 // The crouton layout is stock linalg vocabulary: packing a 32x32 fp16 tile has
 // to split ONLY the row dimension, which yields exactly memref<16x32x2xf16>.
 //
-// This file is also a guard. Writing inner_tiles = [2, 1] looks equivalent but is
-// rejected by linalg.pack ("packed rank != (unpacked rank + num tiling factors)"):
-// a tile of 1 still adds a unit inner dimension, giving tensor<16x32x2x1>.
+// This file is also a guard. Writing inner_tiles = [2, 1] looks equivalent -- it
+// splits the row dimension the same way -- but linalg.pack rejects it: a tile of
+// 1 still adds a unit inner dimension, so the tile-factor list has to have one
+// entry per tiled dimension and there is only one. The diagnostic actually
+// emitted is "tiling factors must equal the number of dimensions to tile".
+// (An earlier version of this comment claimed the message was "packed rank !=
+// (unpacked rank + num tiling factors)" and described no assertion at all; both
+// were wrong. The real message is pinned by
+// hmx-crouton-layout-inner-tiles-reject.mlir.)
 //
 // RUN: linalg-hexagon-opt %s -fold-pack-unpack-constants -split-input-file | FileCheck %s
 //===----------------------------------------------------------------------===//

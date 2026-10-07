@@ -1186,6 +1186,17 @@ Value toI32(ConversionPatternRewriter &rewriter, Location loc, Value v) {
   return LLVM::TruncOp::create(rewriter, loc, rewriter.getI32Type(), v);
 }
 
+/// An i32 constant materialised at `loc`. The eight pack/unpack converters
+/// each declared this as a local lambda capturing their local `i32Ty`; one
+/// named helper replaces the eight copies. `rewriter.getI32Type()` is the
+/// same interned type those lambdas captured, so every call site emits the
+/// IR it did before.
+Value dimCst(ConversionPatternRewriter &rewriter, Location loc, int64_t v) {
+  return LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
+                                  rewriter.getI32IntegerAttr(v))
+      .getResult();
+}
+
 /// A buffer argument is an address: the integer image of the memref's aligned
 /// pointer *plus the descriptor's offset*. The offset is not optional: a pack
 /// source is often a view into the middle of a buffer (the K block of an
@@ -1746,6 +1757,89 @@ struct LowerAccClear : public ConvertOpToLLVMPattern<AccClearOp> {
   }
 };
 
+/// The runtime leaf family a pack source's element type selects: every form
+/// of the call -- the single block, the ranged `_bulk` form, the bounds-safe
+/// `tail` form, and (weight only) the `_T` transposed-source twins -- exists
+/// once per admitted source dtype. One struct is one family; the functions
+/// below are the dtype -> family tables.
+struct PackActLeafFamily {
+  std::string single, bulk, tail;
+};
+
+/// `hmx.pack_act`'s dtype -> leaf-family table, and the only place its
+/// lowering answers "which leaf family does this source dtype read through".
+/// f16 packs directly; an f32 source is quantised to the engine's fp16 inside
+/// the pack (HMXAPI.h), which is why f32 is a twin leaf family rather than a
+/// narrowing op ahead of the pack.
+///
+/// A source element type outside the admitted set -- {f16, f32} today;
+/// `dtype::isAdmittedFloat` (HmxDType.h) is the predicate and the ODS source
+/// constraint (HmxOps.td) is its other spelling -- is a *compile error*,
+/// never a silent f16 fallback. Why loud and not a fallback: the f16 leaf
+/// takes any buffer address and walks it as f16, so an f32- or bf16-typed
+/// source handed to it is read as f16 -- wrong values, right exit code, no
+/// diagnostic anywhere. That is the same structural trap as the stride-family
+/// bugs (pack `src_stride` / unpack `dst_stride`: the leaf takes the number
+/// and walks), and it fails closed the same way: degrade to unknown, not to
+/// wrong.
+///
+/// Extending the admitted set (bf16, fp8, ...) means extending the three
+/// spellings together -- HmxDType.h, HmxOps.td and this table. The Python
+/// contract test_hmx_dtype_admitted_set_contract.py compares the three
+/// mechanically, so none of the three can drift alone; the 2026-10-07 review
+/// found the pre-refactor ternaries scattered over four sites with nothing
+/// binding them.
+static FailureOr<PackActLeafFamily> packActLeafFamily(Operation *op,
+                                                      Type srcElem) {
+  if (srcElem.isF16())
+    return PackActLeafFamily{getPackActF16FnName(), getPackActF16BulkFnName(),
+                             getPackActTailF16FnName()};
+  if (dtype::isF32(srcElem))
+    return PackActLeafFamily{getPackActF32FnName(), getPackActF32BulkFnName(),
+                             getPackActTailF32FnName()};
+  return op->emitError()
+         << "hmx.pack_act source element type " << srcElem
+         << " is outside the engine's admitted source set {f16, f32} "
+            "(dtype::isAdmittedFloat): the pack leaves exist only for those, "
+            "and reading the source as f16 would silently pack wrong values. "
+            "Extend dtype::isAdmittedFloat (HmxDType.h), the HmxOps.td source "
+            "constraint and packActLeafFamily together -- "
+            "test_hmx_dtype_admitted_set_contract.py pins the three together";
+}
+
+/// The `hmx.pack_weight` family: the same forms as `PackActLeafFamily` plus
+/// the `_T` twins for a `src_transposed` source (the [N, K] transpose input;
+/// see the op and HMXAPI.h).
+struct PackWeightLeafFamily {
+  std::string single, singleT, bulk, bulkT, tail, tailT;
+};
+
+/// `hmx.pack_weight`'s dtype -> leaf-family table: the same admitted set and
+/// the same loud-failure contract as `packActLeafFamily`, its own leaf names
+/// (the engine indexes the weight array along different dims, so the two ops
+/// cannot share a family).
+static FailureOr<PackWeightLeafFamily> packWeightLeafFamily(Operation *op,
+                                                            Type srcElem) {
+  if (srcElem.isF16())
+    return PackWeightLeafFamily{
+        getPackWeightF16FnName(), getPackWeightF16TFnName(),
+        getPackWeightF16BulkFnName(), getPackWeightF16TBulkFnName(),
+        getPackWeightTailF16FnName(), getPackWeightTailF16TFnName()};
+  if (dtype::isF32(srcElem))
+    return PackWeightLeafFamily{
+        getPackWeightF32FnName(), getPackWeightF32TFnName(),
+        getPackWeightF32BulkFnName(), getPackWeightF32TBulkFnName(),
+        getPackWeightTailF32FnName(), getPackWeightTailF32TFnName()};
+  return op->emitError()
+         << "hmx.pack_weight source element type " << srcElem
+         << " is outside the engine's admitted source set {f16, f32} "
+            "(dtype::isAdmittedFloat): the pack leaves exist only for those, "
+            "and reading the source as f16 would silently pack wrong values. "
+            "Extend dtype::isAdmittedFloat (HmxDType.h), the HmxOps.td source "
+            "constraint and packWeightLeafFamily together -- "
+            "test_hmx_dtype_admitted_set_contract.py pins the three together";
+}
+
 /// `hmx.pack_act` -> `hmx_pack_act_f16(...)` for an f16 source and
 /// `hmx_pack_act_f32(...)` for an f32 one (which quantises to the engine's fp16
 /// inside the pack), each in the single-block form or the ranged `_bulk` form
@@ -1782,10 +1876,11 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                                         "crouton destination",
                                         /*rowMajor=*/false)))
         return failure();
-      bool srcIsF32 = dtype::isF32(srcType.getElementType());
-      auto fn = getVoidLeaf(module,
-                            srcIsF32 ? getPackActTailF32FnName()
-                                     : getPackActTailF16FnName(),
+      FailureOr<PackActLeafFamily> family =
+          packActLeafFamily(op.getOperation(), srcType.getElementType());
+      if (failed(family))
+        return failure();
+      auto fn = getVoidLeaf(module, (*family).tail,
                             SmallVector<Type>(9, i32Ty), rewriter);
       if (failed(fn))
         return failure();
@@ -1794,13 +1889,8 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                               dstType.getElementTypeBitWidth() / 8);
       Value src = asAddress(rewriter, loc, adaptor.getSrc(),
                             srcType.getElementTypeBitWidth() / 8);
-      auto dimCst = [&](int64_t v) {
-        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                        rewriter.getI32IntegerAttr(v))
-            .getResult();
-      };
-      Value rows = dimCst(srcType.getDimSize(0));
-      Value cols = dimCst(srcType.getDimSize(1));
+      Value rows = dimCst(rewriter, loc, srcType.getDimSize(0));
+      Value cols = dimCst(rewriter, loc, srcType.getDimSize(1));
       Value srcStride;
       if (failed(rowStride(rewriter, loc, srcType, cols, op,
                                     srcStride)))
@@ -1812,8 +1902,8 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                               srcStride,
                               toI32(rewriter, loc, adaptor.getRow()),
                               toI32(rewriter, loc, adaptor.getCol()),
-                              dimCst(validRows.getInt()),
-                              dimCst(validCols.getInt())};
+                              dimCst(rewriter, loc, validRows.getInt()),
+                              dimCst(rewriter, loc, validCols.getInt())};
       replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
       return success();
     }
@@ -1821,15 +1911,15 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
     SmallVector<Type> argTys(7, i32Ty);
     if (bulk)
       argTys.push_back(i32Ty);
-    // The source's element type picks the leaf: an f32 source is quantised to
-    // the engine's fp16 inside the pack, so it has its own entry rather than a
-    // narrowing op of its own ahead of the pack.
-    bool srcIsF32 = dtype::isF32(srcType.getElementType());
-    auto fn = getVoidLeaf(
-        module,
-        srcIsF32 ? (bulk ? getPackActF32BulkFnName() : getPackActF32FnName())
-                 : (bulk ? getPackActF16BulkFnName() : getPackActF16FnName()),
-        argTys, rewriter);
+    // The source's element type picks the leaf family (packActLeafFamily): an
+    // f32 source is quantised to the engine's fp16 inside the pack, so it has
+    // its own entry rather than a narrowing op of its own ahead of the pack.
+    FailureOr<PackActLeafFamily> family =
+        packActLeafFamily(op.getOperation(), srcType.getElementType());
+    if (failed(family))
+      return failure();
+    auto fn = getVoidLeaf(module, bulk ? (*family).bulk : (*family).single,
+                          argTys, rewriter);
     if (failed(fn))
       return failure();
 
@@ -1838,13 +1928,8 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                     adaptor.getCol(), dstType.getElementTypeBitWidth() / 8);
     Value src = asAddress(rewriter, loc, adaptor.getSrc(),
                           srcType.getElementTypeBitWidth() / 8);
-    auto dimCst = [&](int64_t v) {
-      return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                      rewriter.getI32IntegerAttr(v))
-          .getResult();
-    };
-    Value rows = dimCst(srcType.getDimSize(0));
-    Value cols = dimCst(srcType.getDimSize(1));
+    Value rows = dimCst(rewriter, loc, srcType.getDimSize(0));
+    Value cols = dimCst(rewriter, loc, srcType.getDimSize(1));
     Value srcStride;
     if (failed(rowStride(rewriter, loc, srcType, cols, op, srcStride)))
       return failure();
@@ -1857,7 +1942,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                             toI32(rewriter, loc, adaptor.getRow()),
                             toI32(rewriter, loc, adaptor.getCol())};
     if (bulk)
-      args.push_back(dimCst(count));
+      args.push_back(dimCst(rewriter, loc, count));
     replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
     return success();
   }
@@ -1902,14 +1987,13 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                                         "crouton destination",
                                         /*rowMajor=*/false)))
         return failure();
-      bool srcIsF32 = dtype::isF32(srcType.getElementType());
       bool srcTransposed = op.getSrcTransposed().value_or(false);
+      FailureOr<PackWeightLeafFamily> family =
+          packWeightLeafFamily(op.getOperation(), srcType.getElementType());
+      if (failed(family))
+        return failure();
       auto fn = getVoidLeaf(
-          module,
-          srcIsF32 ? (srcTransposed ? getPackWeightTailF32TFnName()
-                                    : getPackWeightTailF32FnName())
-                   : (srcTransposed ? getPackWeightTailF16TFnName()
-                                    : getPackWeightTailF16FnName()),
+          module, srcTransposed ? (*family).tailT : (*family).tail,
           SmallVector<Type>(9, i32Ty), rewriter);
       if (failed(fn))
         return failure();
@@ -1918,17 +2002,12 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                               dstType.getElementTypeBitWidth() / 8);
       Value src = asAddress(rewriter, loc, adaptor.getSrc(),
                             srcType.getElementTypeBitWidth() / 8);
-      auto dimCst = [&](int64_t v) {
-        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                        rewriter.getI32IntegerAttr(v))
-            .getResult();
-      };
       // A transposed source is the [N, K] transpose input itself, so the
       // extents swap: K is dim 1 -- the contiguous, crouton-pair axis -- and N
       // dim 0. The stride fallback width stays dim 1 either way (N row-major,
       // K transposed).
-      Value k = dimCst(srcType.getDimSize(srcTransposed ? 1 : 0));
-      Value n = dimCst(srcType.getDimSize(srcTransposed ? 0 : 1));
+      Value k = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 1 : 0));
+      Value n = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 0 : 1));
       Value srcStride;
       if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
                            srcStride)))
@@ -1940,8 +2019,8 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                               srcStride,
                               toI32(rewriter, loc, adaptor.getKTile()),
                               toI32(rewriter, loc, adaptor.getNTile()),
-                              dimCst(validRows.getInt()),
-                              dimCst(validCols.getInt())};
+                              dimCst(rewriter, loc, validRows.getInt()),
+                              dimCst(rewriter, loc, validCols.getInt())};
       replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
       return success();
     }
@@ -1949,19 +2028,15 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     SmallVector<Type> argTys(7, i32Ty);
     if (bulk)
       argTys.push_back(i32Ty);
-    bool srcIsF32 = dtype::isF32(srcType.getElementType());
     bool srcTransposed = op.getSrcTransposed().value_or(false);
+    FailureOr<PackWeightLeafFamily> family =
+        packWeightLeafFamily(op.getOperation(), srcType.getElementType());
+    if (failed(family))
+      return failure();
     auto fn = getVoidLeaf(
         module,
-        srcIsF32
-            ? (bulk ? (srcTransposed ? getPackWeightF32TBulkFnName()
-                                     : getPackWeightF32BulkFnName())
-                    : (srcTransposed ? getPackWeightF32TFnName()
-                                     : getPackWeightF32FnName()))
-            : (bulk ? (srcTransposed ? getPackWeightF16TBulkFnName()
-                                     : getPackWeightF16BulkFnName())
-                    : (srcTransposed ? getPackWeightF16TFnName()
-                                     : getPackWeightF16FnName())),
+        bulk ? (srcTransposed ? (*family).bulkT : (*family).bulk)
+             : (srcTransposed ? (*family).singleT : (*family).single),
         argTys, rewriter);
     if (failed(fn))
       return failure();
@@ -1973,14 +2048,9 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                             dstType.getElementTypeBitWidth() / 8);
     Value src = asAddress(rewriter, loc, adaptor.getSrc(),
                           srcType.getElementTypeBitWidth() / 8);
-    auto dimCst = [&](int64_t v) {
-      return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                      rewriter.getI32IntegerAttr(v))
-          .getResult();
-    };
     // Same transposed-extent swap as the tail branch above.
-    Value k = dimCst(srcType.getDimSize(srcTransposed ? 1 : 0));
-    Value n = dimCst(srcType.getDimSize(srcTransposed ? 0 : 1));
+    Value k = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 1 : 0));
+    Value n = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 0 : 1));
     Value srcStride;
     if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
                          srcStride)))
@@ -1994,7 +2064,7 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                             toI32(rewriter, loc, adaptor.getKTile()),
                             toI32(rewriter, loc, adaptor.getNTile())};
     if (bulk)
-      args.push_back(dimCst(count));
+      args.push_back(dimCst(rewriter, loc, count));
     replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
     return success();
   }
@@ -2058,11 +2128,6 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                             SmallVector<Type>(9, i32Ty), rewriter);
       if (failed(fn))
         return failure();
-      auto dimCst = [&](int64_t v) {
-        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                        rewriter.getI32IntegerAttr(v))
-            .getResult();
-      };
       Value dst = asAddress(rewriter, loc, adaptor.getDst(),
                             dstType.getElementTypeBitWidth() / 8);
       if (nTile) {
@@ -2073,15 +2138,15 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
           return failure();
         dst = *shifted;
       }
-      Value sourceCol = nTile ? dimCst(*nTile) : dimCst(0);
+      Value sourceCol = nTile ? dimCst(rewriter, loc, *nTile) : dimCst(rewriter, loc, 0);
       Value src = croutonAddr(rewriter, loc, adaptor.getSrc(), srcType,
                               adaptor.getRow(), sourceCol,
                               srcType.getElementTypeBitWidth() / 8);
-      Value rows = dimCst(dstType.getDimSize(0));
-      Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
+      Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
+      Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
       Value dstStride;
       if (failed(rowStride(rewriter, loc, dstType,
-                           nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                           nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                            dstStride)))
         return failure();
       SmallVector<Value> args{dst,
@@ -2091,8 +2156,8 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                               dstStride,
                               toI32(rewriter, loc, adaptor.getRow()),
                               toI32(rewriter, loc, adaptor.getCol()),
-                              dimCst(validRows.getInt()),
-                              dimCst(validCols.getInt())};
+                              dimCst(rewriter, loc, validRows.getInt()),
+                              dimCst(rewriter, loc, validCols.getInt())};
       replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
       return success();
     }
@@ -2119,11 +2184,6 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
     if (failed(maybeColumns))
       return failure();
     int64_t localColCount = *maybeColumns;
-    auto dimCst = [&](int64_t v) {
-      return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                      rewriter.getI32IntegerAttr(v))
-          .getResult();
-    };
     Value dst = asAddress(rewriter, loc, adaptor.getDst(),
                           dstType.getElementTypeBitWidth() / 8);
     if (nTile) {
@@ -2136,15 +2196,15 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
     }
     // The leaf unpacks a whole row-pair and walks the crouton row itself, so
     // the address it takes is the selected N tile's first crouton.
-    Value sourceCol = nTile ? dimCst(*nTile) : dimCst(0);
+    Value sourceCol = nTile ? dimCst(rewriter, loc, *nTile) : dimCst(rewriter, loc, 0);
     Value src =
         croutonAddr(rewriter, loc, adaptor.getSrc(), srcType, adaptor.getRow(),
                     sourceCol, srcType.getElementTypeBitWidth() / 8);
-    Value rows = dimCst(dstType.getDimSize(0));
-    Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
+    Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
+    Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
     Value dstStride;
     if (failed(rowStride(rewriter, loc, dstType,
-                         nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                         nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                          dstStride)))
       return failure();
 
@@ -2152,7 +2212,7 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                             rows,      cols,
                             dstStride, toI32(rewriter, loc, adaptor.getRow())};
     if (bulk)
-      args.push_back(dimCst(count));
+      args.push_back(dimCst(rewriter, loc, count));
     else
       args.push_back(toI32(rewriter, loc, adaptor.getCol()));
     replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
@@ -2230,11 +2290,6 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                             SmallVector<Type>(12, i32Ty), rewriter);
       if (failed(fn))
         return failure();
-      auto dimCst = [&](int64_t v) {
-        return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                        rewriter.getI32IntegerAttr(v))
-            .getResult();
-      };
       Value dst = asAddress(rewriter, loc, adaptor.getDst(),
                             dstType.getElementTypeBitWidth() / 8);
       if (nTile) {
@@ -2263,25 +2318,25 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
         if (failed(verifyStaticTailLayout(op.getOperation(), resType,
                                           "residual", /*rowMajor=*/true)))
           return failure();
-        hasRes = dimCst(1);
-        Value resWidth = dimCst(resType.getDimSize(1));
+        hasRes = dimCst(rewriter, loc, 1);
+        Value resWidth = dimCst(rewriter, loc, resType.getDimSize(1));
         if (failed(rowStride(rewriter, loc, resType, resWidth, op,
                               resStride)))
           return failure();
       } else {
-        res = dimCst(0);
-        hasRes = dimCst(0);
-        resStride = dimCst(0);
+        res = dimCst(rewriter, loc, 0);
+        hasRes = dimCst(rewriter, loc, 0);
+        resStride = dimCst(rewriter, loc, 0);
       }
-      Value sourceCol = nTile ? dimCst(*nTile) : dimCst(0);
+      Value sourceCol = nTile ? dimCst(rewriter, loc, *nTile) : dimCst(rewriter, loc, 0);
       Value src = croutonAddr(rewriter, loc, adaptor.getSrc(), srcType,
                               adaptor.getRow(), sourceCol,
                               srcType.getElementTypeBitWidth() / 8);
-      Value rows = dimCst(dstType.getDimSize(0));
-      Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
+      Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
+      Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
       Value dstStride;
       if (failed(rowStride(rewriter, loc, dstType,
-                           nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                           nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                            dstStride)))
         return failure();
       SmallVector<Value> args{dst,
@@ -2294,8 +2349,8 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                               resStride,
                               toI32(rewriter, loc, adaptor.getRow()),
                               toI32(rewriter, loc, adaptor.getCol()),
-                              dimCst(validRows.getInt()),
-                              dimCst(validCols.getInt())};
+                              dimCst(rewriter, loc, validRows.getInt()),
+                              dimCst(rewriter, loc, validCols.getInt())};
       replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);
       return success();
     }
@@ -2320,11 +2375,6 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
     if (failed(maybeColumns))
       return failure();
     int64_t localColCount = *maybeColumns;
-    auto dimCst = [&](int64_t v) {
-      return LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                      rewriter.getI32IntegerAttr(v))
-          .getResult();
-    };
     Value dst = asAddress(rewriter, loc, adaptor.getDst(),
                           dstType.getElementTypeBitWidth() / 8);
     if (nTile) {
@@ -2350,31 +2400,31 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
           return failure();
         res = *shiftedResidual;
       }
-      hasRes = dimCst(1);
+      hasRes = dimCst(rewriter, loc, 1);
       // The residual is a row-major block like the destination; its row stride
       // is stride(rank-2), not the width. A strided residual (an N-tile view)
       // read with the width would walk the wrong rows, exactly like the pack
       // `src_stride` / unpack `dst_stride` cases. Dense falls back to the
       // width.
-      Value resWidth = dimCst(resType.getDimSize(1));
+      Value resWidth = dimCst(rewriter, loc, resType.getDimSize(1));
       if (failed(rowStride(rewriter, loc, resType, resWidth, op, resStride)))
         return failure();
     } else {
-      res = dimCst(0);
-      hasRes = dimCst(0);
-      resStride = dimCst(0);
+      res = dimCst(rewriter, loc, 0);
+      hasRes = dimCst(rewriter, loc, 0);
+      resStride = dimCst(rewriter, loc, 0);
     }
     // Like the fp16 unpack, the leaf walks the crouton row itself, so the
     // address it takes is the selected N tile's first crouton.
-    Value sourceCol = nTile ? dimCst(*nTile) : dimCst(0);
+    Value sourceCol = nTile ? dimCst(rewriter, loc, *nTile) : dimCst(rewriter, loc, 0);
     Value src =
         croutonAddr(rewriter, loc, adaptor.getSrc(), srcType, adaptor.getRow(),
                     sourceCol, srcType.getElementTypeBitWidth() / 8);
-    Value rows = dimCst(dstType.getDimSize(0));
-    Value cols = dimCst(nTile ? localColCount : dstType.getDimSize(1));
+    Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
+    Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
     Value dstStride;
     if (failed(rowStride(rewriter, loc, dstType,
-                         nTile ? dimCst(dstType.getDimSize(1)) : cols, op,
+                         nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                          dstStride)))
       return failure();
 
@@ -2383,7 +2433,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
         src,       rows,      cols,
         dstStride, resStride, toI32(rewriter, loc, adaptor.getRow())};
     if (bulk)
-      args.push_back(dimCst(count));
+      args.push_back(dimCst(rewriter, loc, count));
     else
       args.push_back(toI32(rewriter, loc, adaptor.getCol()));
     replaceWithLeafCall(rewriter, loc, op, adaptor.getDst(), *fn, args);

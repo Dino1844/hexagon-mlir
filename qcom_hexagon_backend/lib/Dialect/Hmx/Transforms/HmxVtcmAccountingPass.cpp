@@ -176,8 +176,6 @@ constexpr StringLiteral kIdentityReasonZeroHash =
     "static identity hash produced zero";
 constexpr StringLiteral kIdentityReasonUnknownRole =
     "allocation role is not reviewed for identity";
-constexpr StringLiteral kIdentityReasonResidentSeparate =
-    "resident provenance is a separate runtime contract";
 constexpr StringLiteral kIdentityReasonResidentProvenanceMissing =
     "resident provenance is missing or malformed";
 constexpr StringLiteral kIdentityReasonResidentSource =

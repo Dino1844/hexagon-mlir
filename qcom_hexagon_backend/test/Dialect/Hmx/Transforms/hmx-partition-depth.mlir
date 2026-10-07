@@ -47,9 +47,7 @@
 // the selected depth and canonical reason describe the downgrade.
 // budget_depth is 1 here, not 2: it records what the VTCM budget allowed,
 // which is the one number that was previously unobservable and is what
-// separates "clamped by the budget" from "chose depth 1 anyway". Kept as plain
-// comments on purpose: a DOWNGRADE-prefixed line is a FileCheck assertion that
-// the text appears in the tool's output, and prose never does.
+// separates "clamped by the budget" from "chose depth 1 anyway".
 // DOWNGRADE: hmx.kernel_manifest = {
 // DOWNGRADE: pipeline = {budget_depth = 1 : i64, depth = 1 : i64, reason = "vtcm-budget", requested = 2 : i64, selected = "staged"}
 

@@ -244,22 +244,18 @@ class PrepackBehaviourTest(unittest.TestCase):
         self._accepts(layout=None)
 
     def test_anti_vacuity_floor(self):
-        # In the spirit of the depfile contract's `assert checked >= 2`: prove
-        # the probes above really reach a validator, so "no failures" elsewhere
-        # cannot mean "no calls". Every assertion above is driven through this.
+        # The three rejection probes that used to live here -- unknown field,
+        # wrong dtype, wrong crouton rank -- were removed on 2026-10-05. They
+        # were the only tautological test in this file: the loop incremented
+        # `reached` unconditionally after `assertRaisesRegex` returned, and the
+        # loop ran a fixed three times, so `assertEqual(reached, 3)` could not
+        # fail. It read as a floor on "no failures means no calls" while
+        # depending on nothing. The same three rejections are already asserted,
+        # by pattern, in the tests above; keeping a second copy of them bought
+        # no coverage. What remains is the part that was real: the frozen ranks
+        # and tile edge are the ones the producer emits, not numbers chosen
+        # independently here.
         utils = _utils()
-        reached = 0
-        for entry, pattern in (
-            (_conforming_entry(extra=1), "unknown field"),
-            (_conforming_entry(dtype="bf16"), "must be 'f16' or 'f32'"),
-            (_conforming_entry(crouton=[1]), "crouton"),
-        ):
-            with self.assertRaisesRegex(ValueError, pattern):
-                utils.validate_weight_prepack(_prepack(entry))
-            reached += 1
-        self.assertEqual(reached, 3, "a rejection probe never reached the validator")
-        # And the frozen ranks are the ones the producer emits, not numbers
-        # chosen independently here.
         self.assertEqual(utils.HMX_TILE_EDGE, 32)
         self.assertEqual(CROUTON_RANK, 5)
         self.assertEqual(LOGICAL_RANK, 2)

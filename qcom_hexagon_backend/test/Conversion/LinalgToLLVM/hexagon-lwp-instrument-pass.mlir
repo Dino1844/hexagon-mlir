@@ -1,5 +1,4 @@
 // RUN: linalg-hexagon-opt %s -linalg-to-llvm="enable-lwp=true" | FileCheck %s
-// -check-prefixes=CHECK
 
 module {
   func.func @minimal_loop() -> f32 {

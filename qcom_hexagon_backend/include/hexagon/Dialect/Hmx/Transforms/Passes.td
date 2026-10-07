@@ -386,6 +386,14 @@ def HmxWorkspaceResident : InterfacePass<"hmx-workspace-resident",
     best-fit scan plus bookkeeping for each, measured at ~6.3 us per alloc/free
     pair, so on a small shape the sequence costs more than the compute.
 
+    (2026-10-07 correction: the "~6.3 us per pair" above and the
+    "size-independent" qualifier are BOTH wrong and must not be quoted. The
+    measured cost is 1.12 / 1.51 / 1.69 us per pair on S1/S2/S3, i.e. 4-6x
+    lower, and the three points scatter by 1.5x, so size-independence has no
+    evidence behind it -- three points cannot decide it, and the pair counts
+    came from a 09-28 build. Source:
+    docs/hmx/m3.2-device-result-2026-09-29.md §4.)
+
     A workspace has no compile-time contents -- the kernel refills it every
     launch -- so all it needs is a stable buffer. This pass tags each static
     VTCM `memref.alloc` with `hmx.workspace_resident` and drops its

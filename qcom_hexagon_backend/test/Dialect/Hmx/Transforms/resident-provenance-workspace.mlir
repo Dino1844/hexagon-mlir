@@ -7,8 +7,9 @@
 //
 //===----------------------------------------------------------------------===//
 // The accounting + static-identity markers enable the strict, process-principal
-// workspace contract.  They change only diagnostic evidence: the unmarked
-// production key remains the compatibility key.  A strict key is derived from
+// workspace contract.  They change only diagnostic evidence: the runtime key
+// stays the production compatibility key for marked and unmarked modules
+// alike.  The strict site identity (provenance site_id) is derived from
 // principal/function/source-location, never from allocation order.
 //
 // RUN: linalg-hexagon-opt %s -split-input-file -verify-diagnostics -pass-pipeline='builtin.module(func.func(hmx-workspace-resident))' | FileCheck %s

@@ -1,5 +1,11 @@
 
-// REQUIRES: do-not-run-because-flaky-test-that-needs-being-investigated
+// The REQUIRES that stood here ("do-not-run-because-flaky-test-that-needs-being
+// -investigated") was removed on 2026-10-05. A stale no-run marker is not a
+// safety mechanism: it silently removes the file from every lit count while
+// looking like coverage. The flakiness claim was re-tested rather than assumed
+// -- six consecutive runs of this file with the marker deleted are green, so the
+// claim did not reproduce and the marker had no witness. If this file starts
+// failing intermittently, fix the flake; do not re-add the marker.
 
 // RUN: linalg-hexagon-opt -split-input-file %s -linalg-to-llvm | FileCheck %s
 

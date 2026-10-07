@@ -217,11 +217,6 @@ struct HmxTarget {
             shape};
   }
 
-  bool supportsContraction(int64_t m, int64_t n, int64_t k, Type lhsElem,
-                           Type rhsElem, Type outElem) const {
-    return queryContraction(m, n, k, lhsElem, rhsElem, outElem).supported();
-  }
-
   /// How the crouton bridge pays for its residency: the M extent it walks in
   /// one block, and the crouton bytes that one block holds. A contraction too
   /// large to hold whole is walked in M blocks instead of being refused (see
@@ -255,7 +250,7 @@ struct HmxTarget {
     return (rows * k + k * n + rows * n) * croutonElemBytes;
   }
 
-  /// The engine's second question, next to `supportsF16Contraction`: legality
+  /// The engine's second question, next to `queryContraction`: legality
   /// says the engine *can* take this contraction, this says how the crouton
   /// bridge fits what is left of the pool. One hard gate, in the terse shape of
   /// upstream's K threshold (`supportMMA`: `if (k < 256 / bitWidth)`).
