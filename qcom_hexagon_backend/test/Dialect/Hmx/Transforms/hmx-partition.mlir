@@ -255,29 +255,45 @@ func.func @pipeline_carried(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>) {
 
 // `auto` does not stage a shallow-K shape: Kt=4 is below the `kStageMinKTiles`
 // floor (32), where the transfer is too small to hide the DMA engine's fixed
-// cost behind the tile's compute. So the plain tile loop is emitted unchanged:
-// the activation bridge and its whole crouton array are kept and the mmas read
-// that array, exactly as for a shape the pipeline never applied to. There is no
-// scratch and no staging ring, hence no `hmx.stage`/`hmx.await` anywhere. The
-// shape here is Mt=2, Kt=4 (K=128): a `memref<64x128xf16>` source and a
-// `2x4x16x32x2` activation crouton array.
+// cost behind the tile's compute. So the serial tile loop runs -- and the
+// serial path folds the whole-array activation bridge into it: one pack per
+// m-tile, from a per-tile view of the row-major source into a one-row crouton
+// scratch, the mmas reading the scratch at crouton row 0, and the whole
+// activation array retired with the bridge. No `hmx.stage`/`hmx.await`, no
+// ring, no pipeliner -- the folded serial source loop. (S2.5, 2026-10-08:
+// this used to keep the bridge in front of the loop and read the whole array,
+// which left the kernel `role-split-nopack`; the fold gives the serial form
+// the same per-tile producer stream the staged form has.) The shape here is
+// Mt=2, Kt=4 (K=128): a `memref<64x128xf16>` source and a `2x4x16x32x2`
+// activation crouton array.
 // CHECK-LABEL: func.func @pipeline_shallow_kt
 // CHECK: hmx.bias_init
-// The activation array survives: the bridge fills it and the mmas read it.
-// CHECK: %[[ACT:.*]] = memref.alloc() : memref<2x4x16x32x2xf16, 1>
-// CHECK: scf.for {{.*}} {
-// CHECK: hmx.pack_act ins(%arg0, {{.*}} : memref<64x128xf16>) outs(%[[ACT]] :
-// The weight is the whole 2x4 crouton array, not a resident ring.
+// The whole activation array is gone: the tile loop fills a one-row scratch
+// instead, and no pack writes a 2x4 destination (the weight array below is
+// the only 2x4 crouton alloc, and the pack_act reads the source view, not
+// the source itself).
 // CHECK: %[[W:.*]] = memref.alloc() : memref<2x4x16x32x2xf16, 1>
 // CHECK: %[[ACC:.*]] = memref.alloc() : memref<2x2x16x32x2xf16, 1>
-// The plain (m, n) tile nest reads the activation array directly.
+// One crouton-row scratch: Kt croutons in one row.
+// CHECK: %[[SCRATCH:.*]] = memref.alloc() : memref<1x4x16x32x2xf16, 1>
+// The folded serial source loop: pack(m) at the top of the m iteration -- a
+// subview of the source at element row m*32, then the ranged pack -- with the
+// engine ops one loop deeper.
 // CHECK: scf.for %[[M:.*]] = {{.*}} to
+// CHECK: %[[ROW:.*]] = arith.muli %[[M]], {{.*}} : index
+// CHECK: %[[TILE:.*]] = memref.subview %arg0[%[[ROW]], 0] [32, 128] [1, 1] : memref<64x128xf16> to memref<32x128xf16, strided<[128, 1], offset: ?>>
+// CHECK: hmx.pack_act ins(%[[TILE]], {{.*}}, {{.*}} : memref<32x128xf16, strided<[128, 1], offset: ?>>) outs(%[[SCRATCH]] : memref<1x4x16x32x2xf16, 1>) {count = 4 : i64}
+// The engine nest: the mma reads the scratch at crouton row 0, one mma with
+// the whole K as its repeat count (Kt=4 <= the batch), and `acc_read` still
+// writes output tile row m.
 // CHECK: scf.for %[[N:.*]] = {{.*}} to
 // CHECK: hmx.acc_clear
 // CHECK-NOT: scf.for
 // CHECK: %[[K:.*]] = arith.constant 0 : index
-// CHECK-NEXT: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 4 : i32}
+// CHECK-NEXT: hmx.mma %[[SCRATCH]], %[[W]], {{.*}}, %[[N]], %[[K]] {n_croutons = 4 : i32}
 // CHECK: hmx.acc_read {{.*}}, %[[ACC]], %[[M]], %[[N]] {bias_set = 0 : i32}
+// The scratch is released after the loop; nothing else survives.
+// CHECK: memref.dealloc %[[SCRATCH]]
 // CHECK-NOT: hmx.stage
 // CHECK-NOT: hmx.await
 // CHECK-NOT: hmx.matmul

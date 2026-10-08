@@ -32,14 +32,18 @@
 // alignment.
 // CHECK-DAG: %[[STATE_ALIGN:.*]] = llvm.mlir.constant(256 : i32) : i32
 // One resident call per remaining per-launch VTCM workspace: the conversion
-// state, the activation and the output crouton array. The weight is not one of
-// them anymore. The trailing argument is the flat program id; this IR has no
-// program-info pack, so it is the constant 0.
+// state and the output crouton array ahead of the weight's own residency
+// entry, then the folded serial path's one-row activation scratch at the
+// matmul's position (S2.5: the whole activation array is retired with the
+// bridge, and the scratch is allocated where the tile loop sits -- after the
+// weight residency). The weight itself is not one of them anymore. The
+// trailing argument is the flat program id; this IR has no program-info pack,
+// so it is the constant 0.
 // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp({{.*}}, {{.*}}, %[[STATE_ALIGN]], {{.*}})
-// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // The weight comes from the host pre-pack instead.
 // CHECK: llvm.call @hexagon_runtime_weight_resident_v2_dsp
+// CHECK: llvm.call @hexagon_runtime_workspace_resident_v2_dsp
 // No per-launch allocation or deallocation survives for any of them.
 // CHECK-NOT: hexagon_runtime_alloc_1d_dsp
 // CHECK-NOT: hexagon_runtime_free_1d_dsp

@@ -88,26 +88,34 @@
 // DEPTH2: hmx.mma %[[SCRATCH]], {{.*}}, {{.*}}, {{.*}}, {{.*}} {n_croutons = 32 : i32}
 // DEPTH2-NOT: hmx.matmul
 
-// Forced serial (pipeline-depth=3): no staging rewrite at all. The activation
-// bridge and its whole crouton array survive (the mmas read that array), so
-// there is no crouton-row scratch and no ring -- and, by the implicit checks on
-// the RUN line, no hmx.stage/hmx.await anywhere in the module. What is left is
-// the plain (m, n) tile nest.
+// Forced serial (pipeline-depth=3): no staging rewrite at all -- no ring, no
+// pipeliner -- and, by the implicit checks on the RUN line, no
+// hmx.stage/hmx.await anywhere in the module. The serial path still folds the
+// whole-array activation bridge into the m-tile loop (S2.5): one pack per tile
+// from a per-tile view of the source into a one-row scratch, the array retired
+// with the bridge. What distinguishes this arm from depth 1 is the DMA ring
+// itself: depth 1 is the same per-tile pack fed from an awaited VTCM slot,
+// while depth 3 packs straight from the source view.
 // DEPTH3-LABEL: func.func @depth
 // DEPTH3: hmx.bias_init
-// The activation array is kept: it is what the bridge fills and the mmas read.
-// DEPTH3: %[[ACT:.*]] = memref.alloc() : memref<4x32x16x32x2xf16, 1>
-// DEPTH3: scf.for {{.*}} {
-// DEPTH3: hmx.pack_act ins(%{{.*}} : memref<128x1024xf16>) outs(%[[ACT]] : memref<4x32x16x32x2xf16, 1>) {hmx.decision_id = 0 : i64}
+// The whole activation array is gone: a one-row scratch replaces it.
+// DEPTH3-NOT: memref<4x32x16x32x2xf16, 1>
 // DEPTH3: %[[W:.*]] = memref.alloc() : memref<2x32x16x32x2xf16, 1>
 // DEPTH3: %[[ACC:.*]] = memref.alloc() : memref<4x2x16x32x2xf16, 1>
+// DEPTH3: %[[SCRATCH:.*]] = memref.alloc() : memref<1x32x16x32x2xf16, 1>
+// The folded serial source loop: pack(m) at the iteration top, from the
+// source view at row m*32, then the engine nest reading the scratch.
 // DEPTH3: scf.for %[[M:.*]] = {{.*}} to {{.*}} step
+// DEPTH3: %[[ROW:.*]] = arith.muli %[[M]], {{.*}} : index
+// DEPTH3: %[[TILE:.*]] = memref.subview %arg0[%[[ROW]], 0] [32, 1024] [1, 1] : memref<128x1024xf16> to memref<32x1024xf16, strided<[1024, 1], offset: ?>>
+// DEPTH3: hmx.pack_act ins(%[[TILE]], {{.*}}, {{.*}} : memref<32x1024xf16, strided<[1024, 1], offset: ?>>) outs(%[[SCRATCH]] : memref<1x32x16x32x2xf16, 1>) {count = 32 : i64, hmx.decision_id = 0 : i64}
 // DEPTH3: scf.for %[[N:.*]] = {{.*}} to {{.*}} step
 // DEPTH3: hmx.acc_clear
 // DEPTH3-NOT: scf.for
 // DEPTH3: %[[K:.*]] = arith.constant 0 : index
-// DEPTH3-NEXT: hmx.mma %[[ACT]], %[[W]], %[[M]], %[[N]], %[[K]] {n_croutons = 32 : i32}
+// DEPTH3-NEXT: hmx.mma %[[SCRATCH]], %[[W]], {{.*}}, %[[N]], %[[K]] {n_croutons = 32 : i32}
 // DEPTH3: hmx.acc_read %{{.*}}, %[[ACC]], %[[M]], %[[N]] {bias_set = 0 : i32}
+// DEPTH3: memref.dealloc %[[SCRATCH]]
 // DEPTH3-NOT: hmx.matmul
 
 module attributes {hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{dtypes = {crouton = "f16", lhs = "f16", out = "f16", rhs = "f16"}, execution = {block_m = 128 : i64, blocking = "whole", bridge_counts = {count_semantics = "ir_sites", pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, unpack_sites = 1 : i64}}, full = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, function = "depth", id = 0 : i64, layout = "row-major-inner-contiguous", logical = {k = {kind = "static", value = 1024 : i64}, m = {kind = "static", value = 128 : i64}, n = {kind = "static", value = 64 : i64}}, padded = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, plan = "full-hmx", reason = "selected-aligned", shape_state = "static", tail = {k = 0 : i64, m = 0 : i64, n = 0 : i64}, vtcm_accounting = "bridge-only", vtcm_before_bytes = 0 : i64, vtcm_bridge_peak_bytes = 409600 : i64, vtcm_budget_bytes = 8388608 : i64, weight_binding = {kind = "argument-slot", policy_ref = {function = "depth", slot = 1 : i64}}, workspace_class = "runtime-internal"}], pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, schema = "hex.hmx.kernel_manifest/v2", unpack_sites = 1 : i64, weight_policies = []}} {

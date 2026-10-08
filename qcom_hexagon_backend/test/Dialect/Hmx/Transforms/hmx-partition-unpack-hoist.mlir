@@ -37,9 +37,11 @@
 // row is unpacked twice.
 //
 // Depth 1 is the unpipelined source loop, so one unpack per iteration covers all
-// Mt rows directly. Depth 3 skips staging entirely and keeps the separate loop:
-// that arm reproduces the pre-pipeline codegen and is the A/B baseline, so its
-// shape is left exactly as it was (see DEPTH3 below).
+// Mt rows directly. Depth 3 skips staging entirely, and the serial path folds
+// the whole-array bridge into the m-tile loop (S2.5): the arm still keeps its
+// separate read-out loop -- the hoist follows the *staging decision*, and the
+// fold moves no read-out -- but the pack now rides the tile loop like every
+// staged arm's (see DEPTH3 below).
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(hmx-partition{pipeline-depth=1}))' | FileCheck %s --check-prefix=DEPTH1
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(hmx-partition{pipeline-depth=2}))' | FileCheck %s --check-prefix=DEPTH2
@@ -116,23 +118,26 @@
 // DEPTH2-NOT: hmx.matmul
 
 // `auto` on @hoist declines staging -- Kt = 1 is below the auto K floor -- so
-// the plain tile loop runs and the separate read-out loop stays exactly where it
-// was. `auto` on @deep_k (Kt = 32, at the floor) does stage, and the read-out is
-// hoisted exactly as at an explicit depth 2. The hoist therefore follows the
-// *staging decision*, not the requested depth: these two functions differ only
-// in K, and neither arm disturbs the other. Both manifest fields are checked up
-// front because the manifest is one module-level attribute printed before
-// either function body, so a check placed after a LABEL could not see them.
+// the serial tile loop runs, the whole-array bridge folds into it (S2.5), and
+// the separate read-out loop stays exactly where it was: the hoist follows the
+// *staging decision*, and the fold moves no read-out. `auto` on @deep_k (Kt =
+// 32, at the floor) does stage, and the read-out is hoisted exactly as at an
+// explicit depth 2. The hoist therefore follows the *staging decision*, not
+// the requested depth: these two functions differ only in K, and neither arm
+// disturbs the other. Both manifest fields are checked up front because the
+// manifest is one module-level attribute printed before either function body,
+// so a check placed after a LABEL could not see them.
 // AUTO: pipeline = {{.*}}reason = "shallow-k", requested = 0 : i64, selected = "serial"
 // AUTO: pipeline = {{.*}}depth = 2 : i64, requested = 0 : i64, selected = "staged"
 // AUTO-LABEL: func.func @hoist
-// The activation bridge survives, exactly as in the pre-pipeline codegen.
+// The folded serial source loop: the pack rides the m-tile iteration -- from a
+// per-tile view of the source into a one-row scratch, no stage and no await.
+// AUTO: memref.subview
 // AUTO: hmx.pack_act
 // AUTO-NOT: hmx.stage
-// The tile loop is the plain m/n nest reading the whole packed activation array
-// (%alloc_0, the array `pack_act` filled above -- not a crouton-row scratch, which
-// only the staged path allocates), and the read-out loop follows it unchanged.
-// AUTO: hmx.mma %alloc_0,
+// The mma reads the one-row scratch (crouton row 0), not a whole activation
+// array, and the read-out loop follows the tile loop unchanged.
+// AUTO: hmx.mma {{.*}} {n_croutons = 2 : i32} : memref<1x2x16x32x2xf16, 1>, memref<2x2x16x32x2xf16, 1>
 // AUTO: scf.for {{.*}} {
 // AUTO: hmx.unpack_acc
 // @deep_k stages, so it carries one unpack in the pipelined kernel and one in
@@ -143,9 +148,11 @@
 // AUTO: hmx.unpack_acc
 // AUTO-NOT: hmx.matmul
 
-// `pipeline-depth=3` skips staging entirely: this is the A/B baseline arm that
-// reproduces the pre-pipeline codegen, and the separate read-out loop stays.
-// AUTO is not reused here so the two arms cannot be confused for each other.
+// `pipeline-depth=3` skips staging entirely: the serial path's folded source
+// loop runs (the pack in the m-tile iteration, the engine nest one loop
+// deeper), and the separate read-out loop stays -- the hoist never runs on an
+// unstaged shape. AUTO is not reused here so the two arms cannot be confused
+// for each other.
 // DEPTH3-LABEL: func.func @hoist
 // DEPTH3-NOT: hmx.stage
 // DEPTH3: scf.for {{.*}} {

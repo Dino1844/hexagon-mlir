@@ -64,7 +64,11 @@
 // One attributed 64x64x64 matmul.  The weight is a runtime argument, so the
 // weight-resident pass turns it into a resident VTCM buffer and the kernel drops
 // its per-launch pack; the census sees that buffer as a resident site and the
-// bias state, activation bridge and accumulator as transient ones.
+// bias state, the folded serial path's one-row activation scratch and the
+// accumulator as transient ones (S2.5: the whole 2x2 activation array, 8192
+// bytes, is retired by the serial pack fold and the 4096-byte scratch takes
+// its place, so every transient figure below is 4096 less than the whole-array
+// form).
 //
 // The workspace-resident option is spelled out as false because this fixture's
 // arithmetic is the MIXED one -- a resident weight against three transient
@@ -102,8 +106,9 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // source, so they stay empty rather than borrowing the requested figure.
 // CHECK-DAG: allocator_aligned = {basis = "allocator-model", modeled_aligned_peak_bytes, resident_aligned_bytes, status = "not-proven", transient_aligned_peak_bytes, unit = "bytes"}
 // CHECK-DAG: observed_high_water = {basis = "runtime-observation", scope = "process-high-water", source, status = "not-proven", unit = "bytes", value_bytes}
-// CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes = 24832 : i64, resident_requested_bytes = 8192 : i64, status = "complete", transient_requested_peak_bytes = 16640 : i64, unit = "bytes"}
+// CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes = 20736 : i64, resident_requested_bytes = 8192 : i64, status = "complete", transient_requested_peak_bytes = 12544 : i64, unit = "bytes"}
 // CHECK-DAG: scope = {function = "one_matmul", grid = {policy = "single-instance", required_product = 1 : i64}, invocations = 1 : i64, resident = "process-floor"}
+// CHECK-DAG: shape
 
 // The census, straight from the real analysis: four sites, the resident weight
 // split out from the transient sum, and no unmodelled allocation.  Its
@@ -115,17 +120,18 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // CHECK-DAG: external_vtcm = "none"
 // CHECK-DAG: kind = "allocation-site-census"
 // CHECK-DAG: peak_status = "not-proven"
-// CHECK-DAG: raw_site_sum_bytes = 24832 : i64
+// CHECK-DAG: raw_site_sum_bytes = 20736 : i64
 // CHECK-DAG: resident_site_sum_bytes = 8192 : i64
 // CHECK-DAG: status = "complete"
-// CHECK-DAG: transient_bytes = 16640 : i64
+// CHECK-DAG: transient_bytes = 12544 : i64
 // CHECK-DAG: unknown_allocations = 0 : i64
 // CHECK-DAG: weight_resident_bytes = 8192 : i64
 // CHECK-DAG: workspace_resident_bytes = 0 : i64
 
 // The liveness sidecar.  The three transient sites are the bias state, the
-// activation bridge and the accumulator (256 + 8192 + 8192), and all three are
-// live at the peak, so `transient_requested_peak_bytes` reaches the census sum.
+// folded serial path's one-row activation scratch and the accumulator
+// (256 + 4096 + 8192), and all three are live at the peak, so
+// `transient_requested_peak_bytes` reaches the census sum.
 // `modeled_requested_peak_bytes` adds the resident weight, which is never
 // released inside the function: four sites, three release events.
 // CHECK: hmx.kernel_vtcm_live_range = {
@@ -133,11 +139,11 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // CHECK-DAG: allocator_peak_status = "not-proven"
 // CHECK-DAG: fragmentation_status = "not-proven"
 // CHECK-DAG: functions = [{aligned_charge_basis = "runtime-size-quantum-no-header-no-address-padding", allocation_site_coverage = "complete", allocation_sites = 4 : i64, constant_bounded_extent_sites = 0 : i64, deallocation_sites = 3 : i64
-// CHECK-DAG: modeled_requested_peak_bytes = 24832 : i64
+// CHECK-DAG: modeled_requested_peak_bytes = 20736 : i64
 // CHECK-DAG: peak_site_count = 3 : i64
 // CHECK-DAG: peak_status = "structured-upper-bound"
 // CHECK-DAG: status = "complete", symbol = "one_matmul"
-// CHECK-DAG: transient_requested_peak_bytes = 16640 : i64
+// CHECK-DAG: transient_requested_peak_bytes = 12544 : i64
 // CHECK-DAG: weight_resident_requested_bytes = 8192 : i64
 // CHECK-DAG: workspace_resident_requested_bytes = 0 : i64}]
 // CHECK-DAG: grid_status = "not-proven"
@@ -181,16 +187,23 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes, resident_requested_bytes, status = "not-proven", transient_requested_peak_bytes, unit = "bytes"}
 
 // The sidecars, meanwhile, do carry the real figures for the whole function:
-// six sites -- the shared bias state, three crouton arrays, two resident
-// weights -- of which four are transient and peak at 24832 bytes, and the
-// resident floor brings the model bound to 41216.  The census sum and the
-// liveness peak are independent derivations that agree here; the *record* is
-// the only surface that must not spread one function's number over its two
-// records.
+// six sites -- the shared bias state, three crouton arrays (the first
+// matmul's folded one-row scratch, the first matmul's accumulator -- which is
+// the second matmul's chained activation, so it never folds -- and the second
+// matmul's accumulator), two resident weights. The first matmul's bridge
+// folds (S2.5), so its activation is the 4096-byte scratch, retired with the
+// first tile loop; the second matmul's activation is the first's read-out
+// array and has no bridge to fold. Four sites are transient: the census sums
+// them to 20736 bytes, while the liveness peak sees the scratch die before
+// the second accumulator appears and peaks at 16640 -- the two derivations
+// agreed on the whole-array form (both 24832) and now honestly disagree,
+// because the fold made the first activation short-lived. The resident floor
+// brings the model bound to 33024. The *record* is still the only surface
+// that must not spread one function's number over its two records.
 // CHECK: hmx.kernel_vtcm_accounting = {
 // CHECK-DAG: allocation_sites = 6 : i64
 // CHECK-DAG: status = "complete"
-// CHECK-DAG: transient_bytes = 24832 : i64
+// CHECK-DAG: transient_bytes = 20736 : i64
 // CHECK-DAG: weight_resident_bytes = 16384 : i64
 // CHECK: hmx.kernel_vtcm_live_range = {
 // CHECK-DAG: allocation_site_coverage = "complete"
@@ -199,10 +212,10 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // still refuses an allocator claim.
 // CHECK-DAG: functions = [{aligned_charge_basis = "runtime-size-quantum-no-header-no-address-padding", allocation_site_coverage = "complete", allocation_sites = 6 : i64
 // CHECK-DAG: deallocation_sites = 4 : i64
-// CHECK-DAG: modeled_requested_peak_bytes = 41216 : i64
-// CHECK-DAG: peak_site_count = 4 : i64
+// CHECK-DAG: modeled_requested_peak_bytes = 33024 : i64
+// CHECK-DAG: peak_site_count = 3 : i64
 // CHECK-DAG: status = "complete", symbol = "two_matmuls"
-// CHECK-DAG: transient_requested_peak_bytes = 24832 : i64
+// CHECK-DAG: transient_requested_peak_bytes = 16640 : i64
 // CHECK-DAG: weight_resident_requested_bytes = 16384 : i64
 // CHECK-DAG: workspace_resident_requested_bytes = 0 : i64}]
 // CHECK-DAG: status = "complete"
@@ -261,24 +274,26 @@ module attributes {hmx.diagnostic_vtcm_accounting,
 // CHECK-DAG: weight_policies = [{consumers = [0], function = "one_matmul_f32", policy = "resident-prepack", reason = "eligible-quantized-f32", slot = 1 : i64}]
 // CHECK-DAG: schema = "hex.hmx.kernel_manifest/v2"
 
-// The record takes the sidecar's numbers, exactly as the f16 case does.
+// The record takes the sidecar's numbers, exactly as the f16 case does (the
+// folded-serial figures: the whole activation array is retired by the serial
+// pack fold, so the transient side is 4096 less than the whole-array form).
 // CHECK: "hmx.kernel_record/v3" = {admission = "not-authorized", record_mode = "record-only", records = [{fallback = {on_malformed_record = "reject-v3-record"}, function = "one_matmul_f32", id = 0 : i64, plan = "full-hmx"
-// CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes = 24832 : i64, resident_requested_bytes = 8192 : i64, status = "complete", transient_requested_peak_bytes = 16640 : i64, unit = "bytes"}
+// CHECK-DAG: requested = {basis = "compile-time-requested", modeled_requested_peak_bytes = 20736 : i64, resident_requested_bytes = 8192 : i64, status = "complete", transient_requested_peak_bytes = 12544 : i64, unit = "bytes"}
 
 // The census admits the f32 resident source and closes every transient site.
 // CHECK: hmx.kernel_vtcm_accounting = {
 // CHECK-DAG: allocation_sites = 4 : i64
-// CHECK-DAG: raw_site_sum_bytes = 24832 : i64
+// CHECK-DAG: raw_site_sum_bytes = 20736 : i64
 // CHECK-DAG: resident_site_sum_bytes = 8192 : i64
 // CHECK-DAG: status = "complete"
-// CHECK-DAG: transient_bytes = 16640 : i64
+// CHECK-DAG: transient_bytes = 12544 : i64
 // CHECK-DAG: unknown_allocations = 0 : i64
 // CHECK-DAG: weight_resident_bytes = 8192 : i64
 
 // And so does the liveness sidecar.
 // CHECK: hmx.kernel_vtcm_live_range = {
 // CHECK-DAG: allocation_site_coverage = "complete"
-// CHECK-DAG: modeled_requested_peak_bytes = 24832 : i64
+// CHECK-DAG: modeled_requested_peak_bytes = 20736 : i64
 // CHECK-DAG: status = "complete", symbol = "one_matmul_f32"
-// CHECK-DAG: transient_requested_peak_bytes = 16640 : i64
+// CHECK-DAG: transient_requested_peak_bytes = 12544 : i64
 // CHECK-DAG: weight_resident_requested_bytes = 8192 : i64

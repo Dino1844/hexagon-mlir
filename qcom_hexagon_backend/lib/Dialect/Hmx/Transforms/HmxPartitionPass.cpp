@@ -60,6 +60,17 @@
 // the scratch occupy VTCM on top of the weight and the accumulator. A staged
 // loop therefore never carries a full second copy of the activation.
 //
+// The unstaged serial path folds its whole-array bridge into the m-tile loop
+// the same way when the bridge is the canonical pack shape
+// (`tryFoldSerialActivationBridge`): one pack per m-tile from a per-tile view
+// of the bridge's source into the same one-row scratch, the mmas reading the
+// scratch, and the array retired with the bridge. No ring and no pipeliner --
+// the serial source loop is the staged form's compute half with the DMA
+// stage/await replaced by the source view. A serial shape the fold declines
+// (an outer loop re-executes the matmul, the bridge is not canonical, the
+// array has another reader) keeps the plain tile loop and the whole array,
+// exactly as before the fold existed.
+//
 // The last tiles are the pipeliner's peeled epilogue, which only awaits and
 // computes -- it stages nothing. That is what keeps every `hmx.stage` row in
 // range without a guard or a token sentinel: the kernel stops one iteration
@@ -747,15 +758,18 @@ static void emitMmaKLoop(IRRewriter &rewriter, Location loc, Value act,
 
 /// The serial tile loop: bias clear, the (m, n) tiles, one K loop of mmas and a
 /// fused read-out per tile. This is the form whenever the pipeline does not
-/// apply, including the `pipeline-depth=3` arm.
+/// apply, including the `pipeline-depth=3` arm -- and, when the activation
+/// behind the matmul is the canonical whole-array pack bridge and the fold
+/// applies (`tryFoldSerialActivationBridge`), it is the inner half of the
+/// folded form instead: the pack has already moved into the m-tile loop and
+/// this emitter is not reached.
 ///
 /// It touches only the matmul's own operands: `act`, `wt` and the output are
 /// consumed where they are, so a bridge that fills `act` (and the array itself)
-/// survives untouched. That is what makes the serial arm work for a bridge
-/// shape
-/// -- the pack loop stays and the mma reads the whole array, with nothing
-/// staged. There is no structural assumption here beyond the tile shapes the
-/// caller already resolved.
+/// survives untouched. That is what makes the declined serial arm work for a
+/// bridge shape -- the pack loop stays and the mma reads the whole array, with
+/// nothing staged. There is no structural assumption here beyond the tile
+/// shapes the caller already resolved.
 static void emitSerialTileLoop(IRRewriter &rewriter, Location opLoc, Value bias,
                                MatmulOp op, TileShape shape, int64_t batch) {
   Value act = op.getLhs();
@@ -1750,33 +1764,34 @@ static LogicalResult emitDiagnosticOutputBridge(
   return success();
 }
 
-/// The compute half of one tile: pack the awaited slot's 32 x K rows into the
+/// The compute half of one tile: pack this tile's 32 x K source rows into the
 /// one crouton-row scratch, then one (acc_clear, K mmas, acc_read) per N tile.
-/// This is the compute part of the source loop's body; the pipeliner clones it
-/// into the kernel and the peeled epilogue, both of which consume the awaited
-/// slot the same way. The caller has already emitted the await and placed the
-/// insertion point where the tile's work belongs.
+/// This is the compute part of both source loops' bodies: the staged loop,
+/// where the pipeliner clones it into the kernel and the peeled epilogue (the
+/// caller has already emitted the await and passes the awaited slot as
+/// `packSrc`), and the folded unstaged serial loop, where `packSrc` is the
+/// per-tile view of the bridge's row-major source.
 ///
-/// The scratch is always crouton row 0: the slot holds exactly the 32 source
-/// rows of tile `m`, and the pack and its mma are in the same iteration, so the
-/// crouton row index the engine reads is 0 regardless of which output tile this
-/// iteration computes. The output tile row `m` is still what `acc_read` writes.
-/// Rewriting the whole scratch every iteration costs nothing extra -- the pack
-/// has to write every crouton of the tile anyway, and no other iteration's data
-/// is live in it -- and it is what lets one buffer (not the whole array) hold
-/// the activation.
+/// The scratch is always crouton row 0: `packSrc` holds exactly the 32 source
+/// rows of tile `m` (a slot the DMA filled, or a view at that row), and the
+/// pack and its mma are in the same iteration, so the crouton row index the
+/// engine reads is 0 regardless of which output tile this iteration computes.
+/// The output tile row `m` is still what `acc_read` writes. Rewriting the whole
+/// scratch every iteration costs nothing extra -- the pack has to write every
+/// crouton of the tile anyway, and no other iteration's data is live in it --
+/// and it is what lets one buffer (not the whole array) hold the activation.
 static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
                             Value scratch, Value wt, Value ar, Value m,
-                            Value stagedSlot, Value c0, Value c1, int64_t Kt,
+                            Value packSrc, Value c0, Value c1, int64_t Kt,
                             int64_t batch, Value cNt,
                             std::optional<int64_t> decisionId) {
   // The pack's destination is the scratch itself: its crouton grid is one row
   // tall, so the destination crouton is (0, k) while the source block is
-  // (row 0, column k) of the staged slot. The scratch's contiguous axis is K,
+  // (row 0, column k) of `packSrc`. The scratch's contiguous axis is K,
   // so one ranged pack covers the whole K run -- the same shape the row-major
   // bridge uses (`packCroutonsWithLeaves`).
   auto scratchType = cast<MemRefType>(scratch.getType());
-  emitPackAct(rewriter, loc, scratch, stagedSlot, c0, c0, decisionId,
+  emitPackAct(rewriter, loc, scratch, packSrc, c0, c0, decisionId,
               rewriter.getI64IntegerAttr(scratchType.getDimSize(1)));
 
   auto nLoop = scf::ForOp::create(rewriter, loc, c0, cNt, c1, ValueRange{});
@@ -1787,6 +1802,244 @@ static void emitTileCompute(IRRewriter &rewriter, Location loc, Value bias,
   AccReadOp::create(rewriter, loc, bias, ar, m, nLoop.getInductionVar(),
                     rewriter.getI32IntegerAttr(0));
   rewriter.setInsertionPointAfter(nLoop);
+}
+
+/// Try to fold the whole-array activation pack bridge in front of an unstaged
+/// serial matmul into the m-tile loop itself: one pack per m-tile, reading a
+/// per-tile view of the bridge's row-major SOURCE into a one-row crouton
+/// scratch, the mmas reading that scratch, and the whole-array bridge -- its
+/// pack loop, its packs, the array allocation and its deallocations -- retired
+/// the way the staged path retires it.
+///
+/// WHY. The unstaged serial tile loop is emitted with the bridge in front of
+/// it: the packs fill the whole activation array before the first mma, so
+/// producer layout work and engine work never share an iteration, and
+/// thread-role-partition's verdict for the kernel is `role-split-nopack` --
+/// there is no per-tile producer stream to hand to a second thread. Folding
+/// the pack into the m-tile loop is what gives the serial form that stream:
+/// the pack sits directly in the m-loop with the engine ops one loop deeper
+/// in the n-loop it drives, the same iteration shape every staged arm's
+/// compute half already has, minus the DMA stage/await. No ring, no
+/// pipeliner, no hand-written peel: the serial source loop IS the folded
+/// form.
+///
+/// WHAT MAKES IT SOUND. The pack's contract maps crouton (row, col) of `dst`
+/// to block (row, col) of `src` with one coordinate pair, so a one-row
+/// scratch must be packed from a source that holds exactly one tile's rows.
+/// The per-tile view (a `memref.subview` at element row m * 32) is that
+/// source: pure descriptor arithmetic, no data movement, and the strided
+/// source the pack leaf already supports. The ranged pack with count = Kt is
+/// the same leaf call the bridge itself makes, so the pack volume is
+/// unchanged -- the bridge's Mt row-packs become the loop's Mt row-packs --
+/// and the scratch is one crouton row where the array was Mt of them.
+///
+/// WHEN IT DECLINES. The fold re-executes the pack with the tile loop, so a
+/// matmul an outer loop re-executes (flash attention's per-chunk Q@K and P@V,
+/// an m-blocked contraction's per-block matmuls) must keep its bridge: a
+/// hoisted bridge amortizes its packs across the outer iterations, and
+/// folding it would re-pay them per iteration. That is the same condition the
+/// staged read-out channel uses (`readoutChannelFor`). The bridge must also
+/// be the canonical single-source, packs-plus-arith shape `findPackBridge`
+/// accepts, with no reader of the array besides this matmul, the bridge's own
+/// packs and the deallocations, and a source that describes this matmul's
+/// crouton grid. A shape that declines keeps today's serial form exactly, and
+/// every decline that had a bridge behind it names its reason in a remark --
+/// only the no-bridge-at-all form stays silent, because there is nothing
+/// being declined there (a chained read-out, a bare allocation: normal
+/// serial shapes, not refused ones).
+static LogicalResult tryFoldSerialActivationBridge(
+    IRRewriter &rewriter, Location opLoc, Value bias, MatmulOp op,
+    const TileShape &shape, int64_t batch, func::FuncOp func,
+    int64_t vtcmBudget, bool &folded) {
+  folded = false;
+  Value act = op.getLhs();
+
+  auto anyActPackWrites = [&](Value array) {
+    for (OpOperand &use : array.getUses())
+      if (isa<PackActOp>(use.getOwner()))
+        return true;
+    return false;
+  };
+  auto bridge = findPackBridge(act, /*isWeight=*/false);
+  if (!bridge) {
+    if (anyActPackWrites(act))
+      op.emitRemark("HMX serial pack fold not applied: the activation "
+                    "bridge is not the canonical single-source pack loop, so "
+                    "the whole-array pack stays in front of the tile loop");
+    return success();
+  }
+
+  // The array is retired with the bridge, so the only readers allowed are the
+  // bridge's own packs, this matmul, and its deallocations -- the same
+  // ownership the staged rewrite demands.
+  for (OpOperand &u : act.getUses()) {
+    Operation *owner = u.getOwner();
+    if (owner == op.getOperation() ||
+        (isa<PackActOp>(owner) && cast<PackActOp>(owner).getDst() == act) ||
+        isa<memref::DeallocOp, scf::YieldOp>(owner))
+      continue;
+    op.emitRemark("HMX serial pack fold not applied: the activation array "
+                  "has a reader the fold does not own");
+    return success();
+  }
+  // A carried bridge writes its region argument; the init buffer underneath
+  // must not have a second user either, or erasing the bridge would orphan a
+  // reader of a buffer that no longer exists.
+  if (bridge->buffer != act) {
+    for (OpOperand &u : bridge->buffer.getUses()) {
+      Operation *owner = u.getOwner();
+      if (owner == bridge->loop.getOperation() ||
+          isa<memref::DeallocOp>(owner))
+        continue;
+      op.emitRemark("HMX serial pack fold not applied: the bridge's "
+                    "activation buffer has an external user");
+      return success();
+    }
+  }
+
+  // The source must be the static rank-2 row-major matrix the bridge's own
+  // packs address, sized to this matmul's crouton grid, and the weight must
+  // carry the same K run the scratch will hold.
+  auto srcType = dyn_cast<MemRefType>(bridge->source.getType());
+  auto wtType = dyn_cast<MemRefType>(op.getRhs().getType());
+  if (!srcType || srcType.getRank() != 2 || !srcType.hasStaticShape() ||
+      !dtype::isAdmittedFloat(srcType.getElementType()) || !wtType ||
+      srcType.getDimSize(0) != shape.m * layout::kTileEdge ||
+      srcType.getDimSize(1) != shape.k * layout::kTileEdge ||
+      weightKTiles(wtType) != shape.k) {
+    op.emitRemark("HMX serial pack fold not applied: the activation "
+                  "bridge's source does not describe this matmul's crouton "
+                  "grid");
+    return success();
+  }
+
+  // Tail valid extents select the bounds-safe per-block leaf; the folded
+  // ranged pack does not model them, so a bridge that carries them keeps its
+  // whole-array form.
+  for (Operation *packOp : bridge->ops) {
+    auto pack = cast<PackActOp>(packOp);
+    if (pack.getValidRows() || pack.getValidCols()) {
+      op.emitRemark("HMX serial pack fold not applied: the bridge packs "
+                    "carry tail valid extents the folded ranged pack does "
+                    "not model");
+      return success();
+    }
+  }
+
+  // The fold re-executes the pack with the tile loop, so a matmul an outer
+  // loop re-executes keeps its (possibly hoisted, amortized) bridge.
+  for (Operation *ancestor = op->getParentOp(); ancestor != nullptr;
+       ancestor = ancestor->getParentOp())
+    if (isa<scf::ForOp, scf::ForallOp>(ancestor)) {
+      op.emitRemark("HMX serial pack fold not applied: an outer loop "
+                    "re-executes this matmul, so the whole-array bridge "
+                    "amortizes its packs across iterations and folding would "
+                    "re-pay them per iteration");
+      return success();
+    }
+
+  // The array must be a plain allocation this pass can retire alongside the
+  // bridge; anything else (an argument, a view) is not the fold's to free.
+  auto arrayAlloc = bridge->buffer.getDefiningOp<memref::AllocOp>();
+  if (!arrayAlloc) {
+    op.emitRemark("HMX serial pack fold not applied: the activation array "
+                  "is not a memref allocation the fold can retire");
+    return success();
+  }
+
+  // Budget, staged-path style: the whole array comes back with the bridge,
+  // and the scratch is one crouton row -- Kt of the array's Mt rows -- so a
+  // bridge that fit always leaves room for the fold. Computing it rather than
+  // assuming it keeps that a fact about this IR: the scratch is charged
+  // against the same room the staged path would compute.
+  auto actType = cast<MemRefType>(act.getType());
+  int64_t actBytes = actType.getNumElements() * 2;
+  int64_t scratchBytes = shape.k * layout::kCroutonBytes;
+  int64_t room = vtcmBudget - vtcmBytesCommitted(func) + actBytes;
+  if (scratchBytes > room) {
+    op.emitRemark("HMX serial pack fold not applied: the crouton-row "
+                  "scratch needs ")
+           << scratchBytes << " bytes of VTCM, only " << room << " are free";
+    return success();
+  }
+
+  std::optional<int64_t> decisionId;
+  if (failed(readDecisionId(op.getOperation(), decisionId)))
+    return failure();
+
+  // The folded serial source loop: pack(m) at the top of the m-tile
+  // iteration, the engine ops in the n-loop it drives. The scratch is one
+  // crouton row, re-filled (not re-allocated) every tile; the per-tile view
+  // replaces the DMA slot the staged form packs from.
+  OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(op);
+  int64_t K = shape.k * layout::kTileEdge;
+  auto scratchType = MemRefType::get(
+      {1, shape.k, layout::kCroutonPair, layout::kCroutonCol,
+       layout::kCroutonHalf},
+      dtype::croutonElementType(rewriter.getContext()), AffineMap{},
+      hexagon::VTCM_ADDRESS_SPACE);
+  Value scratch =
+      memref::AllocOp::create(rewriter, opLoc, scratchType, ValueRange{});
+  auto c0 = arith::ConstantIndexOp::create(rewriter, opLoc, 0);
+  auto c1 = arith::ConstantIndexOp::create(rewriter, opLoc, 1);
+  auto cTileEdge =
+      arith::ConstantIndexOp::create(rewriter, opLoc, layout::kTileEdge);
+  auto cNt = arith::ConstantIndexOp::create(rewriter, opLoc, shape.n);
+  auto cMt = arith::ConstantIndexOp::create(rewriter, opLoc, shape.m);
+
+  auto mLoop = scf::ForOp::create(rewriter, opLoc, c0, cMt, c1, ValueRange{});
+  rewriter.setInsertionPointToStart(mLoop.getBody());
+  Value m = mLoop.getInductionVar();
+  Value row = arith::MulIOp::create(rewriter, opLoc, m, cTileEdge);
+  SmallVector<OpFoldResult> tileOffsets{row, rewriter.getIndexAttr(0)};
+  SmallVector<OpFoldResult> tileSizes{rewriter.getIndexAttr(layout::kTileEdge),
+                                      rewriter.getIndexAttr(K)};
+  SmallVector<OpFoldResult> tileStrides{rewriter.getIndexAttr(1),
+                                        rewriter.getIndexAttr(1)};
+  Value tile = memref::SubViewOp::create(rewriter, opLoc, bridge->source,
+                                         tileOffsets, tileSizes, tileStrides);
+  emitTileCompute(rewriter, opLoc, bias, scratch, op.getRhs(), op.getOuts(),
+                  m, tile, c0, c1, shape.k, batch, cNt, decisionId);
+  rewriter.setInsertionPointAfter(mLoop);
+  memref::DeallocOp::create(rewriter, opLoc, scratch);
+
+  // Retire the bridge, staged-path style. The packs' DPS results redirect to
+  // the buffers they wrote (the carried loop's yield folds to its own iter
+  // arg), then the matmul and the array's deallocations go, then the bridge
+  // loop or the packs, and finally the array allocation underneath -- each
+  // erased only once nothing uses it.
+  for (Operation *packOp : bridge->ops)
+    if (packOp->getNumResults() != 0)
+      packOp->getResult(0)
+          .replaceAllUsesWith(cast<PackActOp>(packOp).getDst());
+
+  SmallVector<memref::DeallocOp> actDeallocs;
+  for (Operation *user : act.getUsers())
+    if (auto d = dyn_cast<memref::DeallocOp>(user))
+      actDeallocs.push_back(d);
+
+  rewriter.eraseOp(op);
+  for (memref::DeallocOp d : actDeallocs)
+    rewriter.eraseOp(d);
+  if (bridge->loop) {
+    rewriter.eraseOp(bridge->loop);
+  } else {
+    for (Operation *packOp : bridge->ops)
+      rewriter.eraseOp(packOp);
+  }
+
+  SmallVector<memref::DeallocOp> bufferDeallocs;
+  for (Operation *user : bridge->buffer.getUsers())
+    if (auto d = dyn_cast<memref::DeallocOp>(user))
+      bufferDeallocs.push_back(d);
+  for (memref::DeallocOp d : bufferDeallocs)
+    rewriter.eraseOp(d);
+  if (arrayAlloc->use_empty())
+    rewriter.eraseOp(arrayAlloc);
+
+  folded = true;
+  return success();
 }
 
 /// The staged tile loop. Returns false (and leaves the IR alone) when the
@@ -2445,8 +2698,22 @@ struct HmxPartitionPass
         if (staged)
           continue;
       }
-      emitSerialTileLoop(rewriter, opLoc, bias, op, *shape, batch);
-      rewriter.eraseOp(op);
+      // The serial tile loop. First try to fold the whole-array activation
+      // bridge into the m-tile loop (per-tile pack from the bridge's source,
+      // one crouton-row scratch, the bridge retired): that is the serial
+      // source-ring form, and it is what gives the unstaged shape a per-tile
+      // producer stream. A matmul the fold declines -- no canonical bridge, a
+      // reader it does not own, an outer loop re-executing the matmul -- keeps
+      // today's plain tile loop, reading the whole array where it is.
+      bool folded = false;
+      if (failed(tryFoldSerialActivationBridge(rewriter, opLoc, bias, op,
+                                               *shape, batch, func, vtcmBudget,
+                                               folded)))
+        return signalPassFailure();
+      if (!folded) {
+        emitSerialTileLoop(rewriter, opLoc, bias, op, *shape, batch);
+        rewriter.eraseOp(op);
+      }
     }
 
     // The conversion-state block is kernel-level setup: it is filled once at
