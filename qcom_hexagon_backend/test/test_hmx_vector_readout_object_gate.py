@@ -121,12 +121,15 @@ DEPTH_2 = dict(
 READOUT_ON = dict(enableHmxVectorReadout=True)
 
 # The role channel's runtime demand, for the dual-role shapes: the producer
-# submits and drains through the role executor, so THOSE are the undefined
-# references its object places on the runtime archive (see
+# submits, drains and -- since the read-out coexistence (2026-10-09, the
+# merged R2+R3 unit) -- WAITS per publish boundary through the role
+# executor's granular barrier, so those are the undefined references its
+# object places on the runtime archive (see
 # test_the_runtime_entry_points_are_referenced for the composition rule).
 ROLE_REFERENCED_REQUIRED = (
     "hexagon_runtime_hmx_role_submit",
     "hexagon_runtime_hmx_role_drain",
+    "hexagon_runtime_hmx_role_wait_retired",
 )
 
 
@@ -792,32 +795,34 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
     def test_the_outlined_readout_is_in_the_object(self):
         # The assertion whose absence is why seven sweeps read "no speedup".
         #
-        # ONE shape now takes the other split instead, by design: these
-        # compiles run with enableThreadRolePartition=True (DEPTH_2, the
-        # measurement options), and on grid-tiled-small -- the only shape
-        # whose depth-2 request caps to the serial source ring (Mt=2 is at
-        # the pipeliner's tile-count cap) -- the thread-role split FIRES.
-        # A dual-role kernel moves its read-out past the exit drain (the
-        # consumer owns the AR rows until they retire, and the frozen
-        # executor ABI offers no per-tile retire visibility), which removes
-        # the in-loop read-out this pass attaches to -- so the read-out
-        # split declines there and the ROLE channel is the split that must
-        # be in the object instead. Asserting that substitution rather than
-        # exempting the shape silently: a dual-role object with NEITHER
-        # split's symbols is still a failure.
+        # The two splits now COMPOSE on one kernel (2026-10-09, the merged
+        # R2+R3 unit): these compiles run with enableThreadRolePartition=True
+        # (DEPTH_2, the measurement options), and the read-out split runs
+        # BEFORE the role split in the pipeline -- it attaches while its
+        # completion proof (an in-body `acc_read`) is still in the tile
+        # loop, and the role split then moves that `acc_read` onto the bound
+        # thread and re-establishes the proof per group with a
+        # `wait_retired` barrier ahead of each publish (the safety argument
+        # is ThreadRolePartition.cpp's emission comment). So a dual-role
+        # object must carry BOTH splits' symbols: the read-out entry point
+        # alongside the role channel is the composed form, not a
+        # contradiction. (Before the coexistence, the role split moved the
+        # read-out past its exit drain and the read-out split declined --
+        # that substitution is what this arm used to assert.)
         for name, (_obj, _stderr, symbols) in self.compiled.items():
+            missing = _split_is_in_object(symbols)
             if _role_split_is_in_object(symbols):
-                missing = _split_is_in_object(symbols)
-                self.assertNotEqual(
+                self.assertEqual(
                     [], missing,
                     f"[{name}] the thread-role split is in the object, so the "
-                    "read-out split must have declined (its attach point moved "
-                    "past the exit drain) -- a read-out entry point alongside "
-                    "the role channel would mean both splits fired on one "
-                    "kernel, which the composition rule forbids",
+                    "read-out coexistence must have fired too (the read-out "
+                    "split runs BEFORE the role split and publishes behind a "
+                    "wait_retired barrier) -- a dual-role object without the "
+                    "read-out channel is the pre-coexistence form, where the "
+                    "role split moved the read-out past its exit drain and "
+                    "the read-out split declined",
                 )
                 continue
-            missing = _split_is_in_object(symbols)
             self.assertEqual([], missing, f"[{name}] " + "; ".join(missing))
 
     def test_the_runtime_entry_points_are_referenced(self):
@@ -825,10 +830,12 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
         # definitions above because the two mean different things: `T` is code
         # this kernel carries, `U` is a demand it places on the runtime archive.
         #
-        # The dual-role substitution of test_the_outlined_readout_is_in_the_object
-        # applies here too: where the role split fired, the demanded runtime is
-        # the ROLE executor's submit/drain, not the vector executor's
-        # configure/publish/drain.
+        # The dual-role composition (2026-10-09): where the role split fired,
+        # the demanded runtime is BOTH executors' -- the role executor's
+        # submit/drain/wait_retired AND the vector executor's
+        # configure/publish/drain, because the read-out split fired too (it
+        # runs before the role split) and the role split only re-establishes
+        # its completion proof per group instead of moving it out of the loop.
         for name, (_obj, _stderr, symbols) in self.compiled.items():
             if _role_split_is_in_object(symbols):
                 for required in ROLE_REFERENCED_REQUIRED:
@@ -838,7 +845,6 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
                         f"resolved at device link (the dual-role kernel's "
                         f"runtime demand), got {symbols.get(required)!r}",
                     )
-                continue
             for required in REFERENCED_REQUIRED:
                 self.assertEqual(
                     "U", symbols.get(required),

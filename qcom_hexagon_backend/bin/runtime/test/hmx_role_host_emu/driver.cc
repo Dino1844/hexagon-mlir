@@ -26,6 +26,7 @@
  *   > submit <n> <slot> <rowStart> <rowCount> <eventLo> <eventHi> ...x n
  *                                   -> SUBMIT <accepted>
  *   > drain                         -> DRAIN ok
+ *   > wait <target>                 -> WAIT ok           (granular barrier)
  *   > join                          -> JOIN ok
  *   > poke <slot> <value>           -> POKE ok | POKE VIOLATION
  *   > poke-force <slot> <value>     -> POKE-FORCE ok     (negative-control bypass)
@@ -57,6 +58,7 @@
  * is proven non-vacuous.
  */
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -282,6 +284,23 @@ void clearInflight() {
   gShadow.expected.clear();
 }
 
+// The slots of the first `target` accepted groups, in submission (and hence
+// retirement) order. The ring retires FIFO, so the front of the order vector
+// is exactly the group the retire counter just passed -- this is the driver's
+// model of what wait_retired's target means for slot ownership.
+std::vector<uint32_t> gSubmitOrder;
+
+void retireThrough(uint32_t target) {
+  std::lock_guard<std::mutex> lk(gShadow.mu);
+  size_t done = std::min<size_t>(gSubmitOrder.size(), target);
+  for (size_t i = 0; i < done; ++i) {
+    gShadow.inflight.erase(gSubmitOrder[i]);
+    gShadow.expected.erase(gSubmitOrder[i]);
+  }
+  gSubmitOrder.erase(gSubmitOrder.begin(),
+                     gSubmitOrder.begin() + static_cast<long>(done));
+}
+
 } // namespace
 
 int main() {
@@ -329,16 +348,35 @@ int main() {
       }
       const uint32_t accepted =
           hexagon_runtime_hmx_role_submit(groups, static_cast<uint32_t>(n));
-      for (uint32_t i = 0; i < accepted; ++i)
+      for (uint32_t i = 0; i < accepted; ++i) {
         markInflight(groups[i]);
+        // Ownership order tracking for `wait`: the ring retires FIFO, so the
+        // accepted prefix of this submit continues the retirement order.
+        if (groups[i].slot < kShadowSlots)
+          gSubmitOrder.push_back(groups[i].slot);
+      }
       reply = "SUBMIT " + std::to_string(accepted);
     } else if (std::strncmp(p, "drain", 5) == 0) {
       hexagon_runtime_hmx_role_drain();
       clearInflight();
+      gSubmitOrder.clear();
       reply = "DRAIN ok";
+    } else if (std::strncmp(p, "wait ", 5) == 0) {
+      p += 5;
+      const uint64_t target = nextUint(p, "target");
+      if (target > 0xFFFFFFFFull)
+        protoError("wait target out of range");
+      // Sample the ownership effect BEFORE the wait: the wait's own semantics
+      // (retire counter >= target) are what make retireThrough's model true,
+      // and the order here is the same order the runtime establishes.
+      hexagon_runtime_hmx_role_wait_retired(
+          static_cast<uint32_t>(target));
+      retireThrough(static_cast<uint32_t>(target));
+      reply = "WAIT ok";
     } else if (std::strncmp(p, "join", 4) == 0) {
       hexagon_runtime_hmx_role_join();
       clearInflight();
+      gSubmitOrder.clear();
       reply = "JOIN ok";
     } else if (std::strncmp(p, "poke-force ", 11) == 0) {
       p += 11;

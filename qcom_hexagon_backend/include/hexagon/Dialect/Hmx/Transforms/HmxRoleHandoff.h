@@ -50,12 +50,19 @@ namespace mlir {
 namespace hmx {
 
 /// Runtime entry points of the role executor, spelled once for the producer
-/// pass's declarations (the lowering calls two of them and checks nothing:
+/// pass's declarations (the lowering calls three of them and checks nothing:
 /// the short return is HANDLED in IR, not trapped -- see the emission).
 inline constexpr StringLiteral kHmxRoleSubmitFn =
     "hexagon_runtime_hmx_role_submit";
 inline constexpr StringLiteral kHmxRoleDrainFn =
     "hexagon_runtime_hmx_role_drain";
+/// The granular barrier (the ABI entry's own comment in HmxRoleExecutor.h is
+/// the contract): wait until the retire counter reaches the target. Spelled
+/// here for the same reason submit/drain are -- the pass declares it, the
+/// runtime defines it, and a one-sided rename must be an unresolved link
+/// rather than a silently missing wait.
+inline constexpr StringLiteral kHmxRoleWaitRetiredFn =
+    "hexagon_runtime_hmx_role_wait_retired";
 
 /// The region's thread role, as an attribute on the function that runs it
 /// (ROADMAP1001 section 3.2: the carrier is an attribute, not a new op; the

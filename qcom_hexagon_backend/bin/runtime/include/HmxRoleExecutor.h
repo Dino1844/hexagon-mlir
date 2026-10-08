@@ -18,13 +18,17 @@
 // configure/publish/drain/shutdown): that file is the vector-side precedent
 // and this one follows it rather than inventing a second style.
 //
-// THE FOUR INTERFACES
+// THE FIVE INTERFACES
 // -------------------
 //   bind(fn, depth)   declare which section the bound thread runs, and how
 //                     deep the ring is. Idempotent; a rebind waits for all
 //                     in-flight work first (drain-before-swap, below).
 //   submit(groups,n)  hand n tile-group descriptors to the bound thread.
 //                     Never blocks; returns how many were accepted.
+//   wait_retired(t)   block until the retire counter reaches t: the sections
+//                     of the first t groups have all RETURNED. The granular
+//                     form of drain (see the entry's own comment for the
+//                     read-out coexistence it exists for).
 //   drain()           block until every accepted group has been executed.
 //   join()            release the bound thread. Session teardown only.
 //
@@ -162,6 +166,59 @@ uint32_t hexagon_runtime_hmx_role_submit(const HmxTileGroupDesc *groups,
 /// before returning, because the destinations the sections write are the
 /// caller's memory.
 void hexagon_runtime_hmx_role_drain(void);
+
+/// Wait until the retire counter has reached `target`: every group the ring
+/// retired before the target-th retire has had its section RETURN, so the
+/// destinations those sections wrote (the caller's memory) are visible to the
+/// caller on return. `target <= retired` returns immediately.
+///
+/// THE GRANULAR-BARRIER ENTRY (added 2026-10-09, R2; the review that proposed
+/// it is docs/architecture/
+/// hmx-coscheduling-architecture-review-2026-10-09.md section 4f). drain is
+/// the ALL-groups barrier and the only one the first form needed: it runs once
+/// at kernel exit, where "everything" is the only granularity that exists.
+/// The read-out coexistence needs a finer one -- the producer publishes tile
+/// i's read-out to the vector executor INSIDE the tile loop, and that publish
+/// may only happen once tile i's engine section has returned. `tail` already
+/// advances per group (HmxSpscRing.h, retire), and the producer already
+/// acquire-loads it (publish's full check), so the fact this entry exposes is
+/// not new state -- only a read of it, with a wait.
+///
+/// The safety argument this entry carries, stated once because it replaces an
+/// older one: the first form moved every in-loop read-out past the exit drain
+/// because "after drain, every section has returned" was the only proof the
+/// `ar` rows were complete. This entry upgrades that proof to "after the
+/// retire of group i, group i's section has returned" -- semantically the same
+/// statement (retire happens only after the section returns,
+/// HmxSpscRing.h's ownership model) at per-group granularity, which is exactly
+/// the upgrade "same semantics, finer grain" the review asked for. The
+/// producer-side order the compiler emits is submit(i) ... wait_retired(i+1)
+/// ... publish(i): the wait is the proof, the publish is what it unblocks.
+///
+/// PARK POLICY: identical to drain -- a bounded spin (kPollCount), then
+/// qurt_futex_wait on the ring's `tail` word with a re-check before the park
+/// (the lost-wakeup window drain's comment documents). The consumer's retire
+/// wakes a parked waiter (it futex-wakes `tail` once per group). No unbounded
+/// spin exists on any path -- including an UNSATISFIABLE one: a target beyond
+/// the published head can never be retired (the caller is the producer, so
+/// nothing new is published while it waits), and waiting for it forever is the
+/// 13-minute-DSP-hang failure mode this file's design constraint 3 exists to
+/// prevent. Such a target is a caller bug; this entry names it in the log and
+/// RETURNS instead of parking, so the failure is loud and recoverable rather
+/// than silent and fatal. A target of 0 returns immediately (nothing has ever
+/// been published that 0 would wait for).
+///
+/// ADDITIVE, AND THE ABI VERSION STAYS 1 -- DELIBERATELY. The macro above
+/// exists so "a kernel built against an older header fails loudly at bind
+/// instead of calling an entry whose descriptor it mis-fills". This entry
+/// mis-fills nothing: it takes one uint32 whose meaning is self-contained, it
+/// is a NEW symbol no kernel built against an older header references, and a
+/// kernel that does reference it pulls the same archive member that defines
+/// submit/drain (all three live in HmxRoleExecutor.cpp), so no kernel can call
+/// it against a runtime that lacks it. A version bump here would fail old
+/// kernels at bind for no defect they can exhibit -- the opposite of the
+/// macro's purpose.
+void hexagon_runtime_hmx_role_wait_retired(uint32_t target);
 
 /// Release the bound thread. Session teardown only -- NEVER per launch: the
 /// thread is the process's HMX-role thread, and paying its ~18 us creation

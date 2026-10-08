@@ -28,6 +28,7 @@
 
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxIndexFold.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
@@ -65,211 +66,11 @@ namespace {
 /// function whose body silently describes the wrong layout.
 constexpr StringLiteral kReadoutFnPrefix = "__hmx_readout";
 
-/// NOT-A-DECISION this is a safety bound, not a tuned limit: it exists so folding
-/// cannot hang, not because 16 is the right depth for any shape.
-///
-/// Depth cap for the recursive index folding below. The chains this pass walks are
-/// two or three ops deep in production -- the peeled row alone is
-/// `addi %c0, (muli %c1, (maxsi %c0, (subi (divsi (...), %c1), %c1)))`, six ops --
-/// so 16 is an order of magnitude of headroom over the longest real chain. Folding
-/// only ever follows `arith` ops and is side-effect free, so a chain deeper than the
-/// cap simply declines rather than folding something wrong.
-constexpr unsigned kFoldDepth = 16;
-
-/// Fold an `i1`. Needed because the peeled row in the verified post-partition IR
-/// is gated on a comparison:
-///
-///     %12 = arith.cmpi slt, %c1, %c0      // false
-///     %13 = arith.select %12, %c1, %c-1    // -1
-///     ... %19 = maxsi %c0, %18            // 31
-///     %21 = addi %c0, (muli %c1, %19)      // 31 == Mt - 1
-///
-/// Without this the pass declines every depth-2 kernel, i.e. exactly the shape
-/// the batching exists for.
-// Forward declaration: foldBool reads the i1 that gates the peeled row, and
-// foldIndex below reads the i1's operands, so the two are mutually recursive.
-static std::optional<int64_t> foldIndex(Value value, unsigned depth = 0);
-
-static std::optional<bool> foldBool(Value value, unsigned depth = 0) {
-  if (depth > kFoldDepth)
-    return std::nullopt;
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return std::nullopt;
-  if (def->hasTrait<OpTrait::ConstantLike>()) {
-    if (auto attr = dyn_cast_or_null<IntegerAttr>(def->getAttr("value")))
-      if (value.getType().isInteger(1))
-        return attr.getValue().getZExtValue() != 0;
-    return std::nullopt;
-  }
-  auto cmp = dyn_cast<arith::CmpIOp>(def);
-  if (!cmp)
-    return std::nullopt;
-  // Both sides must be index values; this pass never compares two wide integers,
-  // and assuming it did would fold a comparison it has not actually evaluated.
-  std::optional<int64_t> lhs = foldIndex(cmp.getLhs(), depth + 1);
-  std::optional<int64_t> rhs = foldIndex(cmp.getRhs(), depth + 1);
-  if (!lhs || !rhs)
-    return std::nullopt;
-
-  switch (cmp.getPredicate()) {
-  case arith::CmpIPredicate::eq:
-    return *lhs == *rhs;
-  case arith::CmpIPredicate::ne:
-    return *lhs != *rhs;
-  case arith::CmpIPredicate::slt:
-    return *lhs < *rhs;
-  case arith::CmpIPredicate::sle:
-    return *lhs <= *rhs;
-  case arith::CmpIPredicate::sgt:
-    return *lhs > *rhs;
-  case arith::CmpIPredicate::sge:
-    return *lhs >= *rhs;
-  case arith::CmpIPredicate::ult:
-    return static_cast<uint64_t>(*lhs) < static_cast<uint64_t>(*rhs);
-  case arith::CmpIPredicate::ule:
-    return static_cast<uint64_t>(*lhs) <= static_cast<uint64_t>(*rhs);
-  case arith::CmpIPredicate::ugt:
-    return static_cast<uint64_t>(*lhs) > static_cast<uint64_t>(*rhs);
-  case arith::CmpIPredicate::uge:
-    return static_cast<uint64_t>(*lhs) >= static_cast<uint64_t>(*rhs);
-  }
-  return std::nullopt;
-}
-
-/// Constant-fold an index through the `arith` integer ops the partition pass
-/// actually emits.
-///
-/// `constantIndexValue` in HmxPartitionPass.cpp:871 accepts only a bare
-/// `arith.constant`, which is not enough here. Two chains matter:
-///
-///   * the loop bound, which is `subi %c32, (muli %c1, %c1)`; and
-///   * the peeled row, which in the verified post-partition IR
-///     (pp-1024x512x64.mlir:79-81) is
-///         `%19 = maxsi 0, (subi (divsi (...), 1), 1)`
-///         `%20 = muli %c1, %19`
-///         `%21 = addi %c0, %20`
-///     so without max/div the pass would decline every depth-2 kernel, which is
-///     the only shape the batching exists for.
-///
-/// Everything here is pure integer arithmetic on values the pass has already
-/// proven constant, so folding cannot change meaning -- it only recovers a
-/// number that was there all along. Overflow and division by zero decline rather
-/// than wrap.
-static std::optional<int64_t> foldIndex(Value value, unsigned depth) {
-  if (depth > kFoldDepth)
-    return std::nullopt;
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return std::nullopt;
-  if (def->hasTrait<OpTrait::ConstantLike>()) {
-    if (auto attr = dyn_cast_or_null<IntegerAttr>(def->getAttr("value")))
-      if (value.getType().isIndex())
-        return attr.getValue().getSExtValue();
-  }
-
-  auto operands = [&](Operation *op, std::optional<int64_t> &lhs,
-                     std::optional<int64_t> &rhs) {
-    lhs = foldIndex(op->getOperand(0), depth + 1);
-    rhs = foldIndex(op->getOperand(1), depth + 1);
-    return lhs && rhs;
-  };
-  int64_t result = 0;
-
-  if (isa<arith::AddIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs) || __builtin_add_overflow(*lhs, *rhs, &result))
-      return std::nullopt;
-    return result;
-  }
-  if (isa<arith::SubIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs) || __builtin_sub_overflow(*lhs, *rhs, &result))
-      return std::nullopt;
-    return result;
-  }
-  if (isa<arith::MulIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs) || __builtin_mul_overflow(*lhs, *rhs, &result))
-      return std::nullopt;
-    return result;
-  }
-  if (isa<arith::MaxSIOp, arith::MaxUIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs))
-      return std::nullopt;
-    return std::max(*lhs, *rhs);
-  }
-  if (isa<arith::MinSIOp, arith::MinUIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs))
-      return std::nullopt;
-    return std::min(*lhs, *rhs);
-  }
-  // Truncating division: these tile bounds are non-negative, so trunc and
-  // floor agree and there is no remainder case to get wrong. A zero divisor is
-  // a decline, not a wrap -- folding it to 0 would be a wrong row index.
-  if (isa<arith::DivSIOp, arith::DivUIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs) || *rhs == 0)
-      return std::nullopt;
-    return *lhs / *rhs;
-  }
-  if (isa<arith::RemSIOp, arith::RemUIOp>(def)) {
-    std::optional<int64_t> lhs, rhs;
-    if (!operands(def, lhs, rhs) || *rhs == 0)
-      return std::nullopt;
-    return *lhs % *rhs;
-  }
-  // `arith.select` on a foldable condition is the arm it picks. The condition is
-  // an `i1`, so it goes through foldBool rather than foldIndex.
-  if (auto select = dyn_cast<arith::SelectOp>(def)) {
-    std::optional<bool> condition = foldBool(select.getCondition(), depth + 1);
-    if (!condition)
-      return std::nullopt;
-    return *condition ? foldIndex(select.getTrueValue(), depth + 1)
-                      : foldIndex(select.getFalseValue(), depth + 1);
-  }
-  return std::nullopt;
-}
-
-/// Prove `value == iv + offset` for a compile-time `offset`, walking `addi` and
-/// `muli` over `arith` ops.
-///
-/// This is what turns the post-partition `addi %arg9, (muli 1, 0)` into "the row
-/// IS the induction variable" instead of "the row is some expression this pass
-/// would have to reason about". Only `iv + 0` is accepted by the caller; the
-/// general form is here so that a near miss declines with a number attached.
-static std::optional<int64_t> inductionOffset(Value value, Value iv,
-                                              unsigned depth = 0) {
-  if (value == iv)
-    return 0;
-  if (depth > kFoldDepth)
-    return std::nullopt;
-  Operation *def = value.getDefiningOp();
-  if (!def)
-    return std::nullopt;
-
-  if (auto add = dyn_cast<arith::AddIOp>(def)) {
-    if (std::optional<int64_t> base = inductionOffset(add.getLhs(), iv, depth + 1))
-      if (std::optional<int64_t> delta = foldIndex(add.getRhs(), depth + 1))
-        return *base + *delta;
-    if (std::optional<int64_t> base = inductionOffset(add.getRhs(), iv, depth + 1))
-      if (std::optional<int64_t> delta = foldIndex(add.getLhs(), depth + 1))
-        return *base + *delta;
-    return std::nullopt;
-  }
-  if (auto mul = dyn_cast<arith::MulIOp>(def)) {
-    if (std::optional<int64_t> base = inductionOffset(mul.getLhs(), iv, depth + 1))
-      if (std::optional<int64_t> factor = foldIndex(mul.getRhs(), depth + 1))
-        return *base * *factor;
-    if (std::optional<int64_t> base = inductionOffset(mul.getRhs(), iv, depth + 1))
-      if (std::optional<int64_t> factor = foldIndex(mul.getLhs(), depth + 1))
-        return *base * *factor;
-    return std::nullopt;
-  }
-  return std::nullopt;
-}
+/// The index folding this pass needs -- loop bounds, the pipeliner's shifted
+/// row chains, the peeled epilogue row -- lives in the shared HmxIndexFold.h,
+/// together with the reasons it must not be duplicated: the same chains are
+/// folded by ThreadRolePartition, and two folders that disagree about a chain
+/// would be a silent coverage bug, not a style difference.
 
 /// Erase `value`'s defining op once nothing uses it, walking back through the
 /// chain so the tile loop does not keep the `addi`/`muli` only the read-out
@@ -278,7 +79,7 @@ static std::optional<int64_t> inductionOffset(Value value, Value iv,
 /// software-pipelined loop keeps exactly the cross-stage (token, slot) pair the
 /// pipeliner gave it, and no loop-carried state is invented.
 static void eraseDeadDefiners(Value value, unsigned depth = 0) {
-  if (depth > kFoldDepth)
+  if (depth > kHmxFoldDepth)
     return;
   Operation *def = value.getDefiningOp();
   // `isOpTriviallyDead`, NOT `wouldOpBeTriviallyDead`: the latter asks "would

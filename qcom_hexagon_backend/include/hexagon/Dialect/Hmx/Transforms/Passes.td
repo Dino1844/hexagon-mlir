@@ -144,6 +144,20 @@ def ThreadRolePartition : InterfacePass<"thread-role-partition",
     loop and, at depth 2, what puts the pack inside it. Running after it is what
     lets the pass observe that difference instead of re-deriving it.
 
+    It also runs AFTER hmx-vector-readout, and that order is load-bearing in
+    the other direction (2026-10-09, the merged R2+R3 unit): the read-out
+    split attaches while its completion proof (an in-body `acc_read`) is
+    still in the tile loop and replaces the read-out with publishes; this
+    pass then moves that `acc_read` onto the bound thread and re-establishes
+    the proof per group with a `wait_retired` barrier ahead of each publish
+    (the frozen executor's granular retire visibility). With the order
+    reversed, this pass would first orphan the read-outs past its exit drain
+    and the read-out split would find nothing to attach to. The split itself
+    handles BOTH source forms -- the serial ring and the pipelined depth-2
+    ring (whose peeled epilogue is outlined into the same engine section as
+    the steady loop, the peeled tile riding the tail descriptor) -- and
+    declines loudly on anything else.
+
     The manifest topology field is module-level, so it describes the kernel the
     backend emits -- one per module in this pipeline.
   }];

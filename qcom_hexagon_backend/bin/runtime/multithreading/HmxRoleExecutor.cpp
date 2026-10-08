@@ -2,7 +2,7 @@
 //
 // The design, the measurements every decision rests on, and the hazard that
 // makes the executor lazy are all in include/HmxRoleExecutor.h. This file is
-// only the implementation of the four entries that header declares; the ABI
+// only the implementation of the five entries that header declares; the ABI
 // header is the contract and is not edited here. The ring protocol itself
 // lives in include/HmxSpscRing.h and is not restated below.
 //
@@ -170,6 +170,76 @@ void drainLocked(RoleExecutor &e) {
     const uint32_t seen =
         e.ring.tail.load(std::memory_order_acquire);
     if (e.ring.drainedTo(target)) {
+      break;
+    }
+    qurt_futex_wait(&e.ring.tail, static_cast<int>(seen));
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// The granular barrier (wait_retired; HmxRoleExecutor.h's entry comment is
+// the contract this implements)
+//===----------------------------------------------------------------------===//
+
+/// Half-window "at or past" on the ring's monotone 32-bit counters.
+///
+/// `tail` and any caller-supplied target are both monotone counters that wrap
+/// at 2^32 (HmxSpscRing.h, decision 2), so a plain `>=` on the wrapped values
+/// is wrong across the wrap and an exact equality wedges when the consumer
+/// steps past the target between two observations -- the exact bug that made
+/// the ring monotone in the first place. The unsigned difference
+/// `word - target` is small (< 2^31) exactly when `word` is at or past
+/// `target` within a half window, and the ring's own invariants bound every
+/// REAL distance below 2^31: occupancy never exceeds `capacity` < 2^31 (the
+/// full check), and a sane target satisfies target <= head. Distances of 2^31
+/// or more can therefore only come from a target the producer never published,
+/// which the unreachable check below catches and names rather than parking on.
+static inline bool counterReached(uint32_t word, uint32_t target) {
+  return (word - target) < 0x80000000u;
+}
+
+/// Block until the retire counter reaches `target` (see the ABI header for the
+/// read-out coexistence this serves and the proof it carries).
+///
+/// Same park policy as drainLocked: bounded spin, re-check before the park,
+/// futex on the ring's `tail` word (the consumer wakes it once per retire).
+/// The one way it DIFFERS from drain is the unreachable-target path: drain's
+/// target is sampled from `head` itself so it is satisfiable by construction,
+/// while this target is a caller-supplied group count -- and waiting forever
+/// on a count the ring can never reach is the unbounded wait this file's
+/// constraint 3 forbids. The check is sound because the caller IS the producer
+/// (single producer, HmxRoleExecutor.h): it publishes nothing while it waits,
+/// so `head` is stable for the whole call and a target beyond it now is beyond
+/// it forever.
+static void waitRetiredLocked(RoleExecutor &e, uint32_t target) {
+  // Nothing has ever been published that retire-count 0 would wait for; also
+  // sidesteps the wrap edge where a large retired `tail` compares ambiguously
+  // against a zero target.
+  if (target == 0u)
+    return;
+  if (counterReached(e.ring.tail.load(std::memory_order_acquire), target))
+    return; // already satisfied: no spin, no park, no wakeup owed
+  if (!counterReached(e.ring.head.load(std::memory_order_acquire), target)) {
+    // Beyond the published head: the ring can never retire it. A caller bug
+    // (the producer mis-derived its group count); name it and return rather
+    // than parking forever -- the loud-and-recoverable side of the choice,
+    // same direction as submit's short return, opposite of a DSP hang.
+    FARF(ERROR, "hmx-role: wait_retired target %u is beyond the published "
+                "head %u; it can never retire -- returning without waiting "
+                "(caller bug)",
+         target, e.ring.head.load(std::memory_order_relaxed));
+    return;
+  }
+
+  unsigned spins = kPollCount;
+  while (!counterReached(e.ring.tail.load(std::memory_order_acquire), target)) {
+    if (spins != 0u) {
+      --spins;
+      continue;
+    }
+    const uint32_t seen =
+        e.ring.tail.load(std::memory_order_acquire);
+    if (counterReached(seen, target)) {
       break;
     }
     qurt_futex_wait(&e.ring.tail, static_cast<int>(seen));
@@ -467,6 +537,11 @@ hexagon_runtime_hmx_role_submit(const HmxTileGroupDesc *groups, uint32_t count) 
 
 __attribute__((visibility("default"))) void hexagon_runtime_hmx_role_drain(void) {
   drainLocked(gRoleExecutor);
+}
+
+__attribute__((visibility("default"))) void
+hexagon_runtime_hmx_role_wait_retired(uint32_t target) {
+  waitRetiredLocked(gRoleExecutor, target);
 }
 
 __attribute__((visibility("default"))) void hexagon_runtime_hmx_role_join(void) {

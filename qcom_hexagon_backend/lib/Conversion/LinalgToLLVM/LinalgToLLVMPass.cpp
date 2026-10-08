@@ -548,44 +548,40 @@ public:
       // runs, so disabling the split restores the transfer-only floor.
       hmxPartitionOpts.stagedReadoutMTiles =
           enableHmxVectorReadout ? 2 * hmxReadoutBatch : 0;
-      // The thread-role split's first form transforms the SERIAL source
-      // ring (ROADMAP1001 section 5, S3 row: "首形态从简"), so while the
-      // split gate is on, `auto` staging resolves to the serial ring
-      // instead of the SCF-pipelined double ring: the pipelined depth-2
-      // form peels an epilogue whose engine work the first form has no
-      // story for, and thread-role-partition declines it with a remark.
-      // Declining the PIPELINER here -- rather than letting the split
-      // decline the pipelined shape -- is the honest order: the cross-
-      // thread overlap IS the mechanism for this arm, and S3's measurement
-      // owns the verdict on whether it beats the single-thread pipeline
-      // (the task records this as "首次发射可以 decline pipelining").
-      // Only `auto` is overridden: an explicit pipeline-depth request
-      // stands (and an explicit 2 then declines the split, loudly, in
-      // thread-role-partition).
-      if (enableThreadRolePartition && enableHmxPipelineDepth <= 0)
-        hmxPartitionOpts.pipelineDepth = 1;
+      // NOTE: the thread-role split no longer forces `auto` staging to the
+      // serial ring. It did while the split's matcher only understood the
+      // serial source loop (the pipelined depth-2 form peeled an epilogue
+      // the matcher declined); the matcher now outlines the peeled epilogue
+      // into the same engine section as the steady loop, so `auto` keeps its
+      // own decision and the dual-role A/B runs on the same depth the
+      // single-thread pipeline would choose.
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createHmxPartitionPass(hmxPartitionOpts));
-        // Thread-role classification runs AFTER hmx-partition, and that order is
-        // load-bearing in the other direction from the obvious guess. Before
-        // hmx-partition every HMX kernel looks the same: one `hmx.matmul` sitting
-        // between two independent pack loops, so "is there a pack to stream" has
-        // the same answer for all of them and the verdict carries no information.
-        // hmx-partition is what creates the tile loop and, at pipeline-depth 2,
-        // moves the pack inside it -- which is exactly the difference the measured
-        // depth-1-vs-depth-2 A/B turns on (14-35%). Running here is what lets the
-        // pass see that difference instead of predicting it.
-        if (enableThreadRolePartition)
-          pm.addNestedPass<func::FuncOp>(
-              mlir::hmx::createThreadRolePartition());
-
-        // Hand the accumulator read-out to a second thread. It runs HERE, after
-        // hmx-partition, because hmx-partition is what creates the m-tile loop
-        // and hoists the read-out into it (see HmxPartitionPass.cpp:990-1083) --
-        // before that, the read-out is a separate loop after the matmul and the
-        // batching has nothing to attach to. It must run before the residency and
-        // convert-to-hexagonmem rewrites below, which are about VTCM placement
-        // and have nothing to say about which thread runs the vector work.
+        // Hand the accumulator read-out to a second thread. It runs BEFORE
+        // thread-role-partition, and that order is load-bearing in BOTH
+        // directions:
+        //
+        // * It runs after hmx-partition, because hmx-partition is what
+        //   creates the m-tile loop and hoists the read-out into it (see
+        //   HmxPartitionPass.cpp:990-1083) -- before that, the read-out is a
+        //   separate loop after the matmul and the batching has nothing to
+        //   attach to. It must run before the residency and
+        //   convert-to-hexagonmem rewrites below, which are about VTCM
+        //   placement and have nothing to say about which thread runs the
+        //   vector work.
+        //
+        // * It runs before THREAD-ROLE-PARTITION because the two splits
+        //   compose in that order and not the other way: the read-out split
+        //   matches while its completion proof (an in-body `acc_read`) is
+        //   still in the tile loop, replaces the read-out with publishes at
+        //   that position, and THEN the role split moves the `acc_read` onto
+        //   the bound thread and re-establishes the proof per group with a
+        //   `wait_retired` barrier ahead of each publish (the safety
+        //   argument is ThreadRolePartition.cpp's emission comment). With
+        //   the order reversed, the role split would first orphan the
+        //   read-outs past its exit drain and the read-out split would find
+        //   nothing to attach to -- the exact "readout gives way" regression
+        //   the R2 mechanism exists to remove.
         //
         // On by default since the gap-table measurement (2026-10-04): OFF->G4
         // is -24% on S1 (iters=1000) and every non-matching structure declines
@@ -604,6 +600,20 @@ public:
           pm.addNestedPass<func::FuncOp>(
               mlir::hmx::createHmxVectorReadoutPass(readoutOpts));
         }
+
+        // Thread-role classification runs AFTER hmx-partition and the
+        // read-out split, and both orders are load-bearing. Before
+        // hmx-partition every HMX kernel looks the same: one `hmx.matmul`
+        // sitting between two independent pack loops, so "is there a pack to
+        // stream" has the same answer for all of them and the verdict carries
+        // no information. hmx-partition is what creates the tile loop and, at
+        // pipeline-depth 2, moves the pack inside it -- which is exactly the
+        // difference the measured depth-1-vs-depth-2 A/B turns on (14-35%).
+        // Running here is what lets the pass see that difference instead of
+        // predicting it. After the read-out split, for the reason above.
+        if (enableThreadRolePartition)
+          pm.addNestedPass<func::FuncOp>(
+              mlir::hmx::createThreadRolePartition());
 
       // Per-launch VTCM workspace becomes a resident buffer. On by default:
       // the runtime keys workspace residency by the calling thread's ordinal

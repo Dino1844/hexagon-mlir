@@ -50,6 +50,11 @@ What it locks
   ensureCalls stay 1 across grow and shrink rebinds, which is the property
   the lifetime lock depends on (a restarted thread would have to re-ensure
   and block on its own predecessor's held lock).
+* The granular barrier (wait_retired): a waited target's section effects are
+  visible WITHOUT a drain (retire implies complete), a satisfied target
+  returns without parking, and a target beyond the published head returns
+  with an ERROR instead of parking forever (no unbounded wait, the same
+  design constraint drain's bounded spin serves).
 * The lock migration's first half: the ensure entry is called exactly once,
   on the thread that was created, before any section ran (sequence numbers).
 * Ownership transfer: a producer write to an in-flight slot is refused; a
@@ -640,6 +645,111 @@ class ExecutorLifecycleTests(unittest.TestCase):
         finally:
             s.close()
 
+    def test_wait_retired_blocks_until_retire_advances(self):
+        """THE GRANULAR BARRIER'S CORE SEMANTIC: return from wait(k) means the
+        first k groups' sections have RETURNED -- their side effects are
+        visible WITHOUT a drain. That visibility is the whole reason the
+        read-out coexistence can publish inside the tile loop (the entry's
+        ABI-header comment), so it is checked directly at the data level: the
+        shadow slots of the waited groups carry the sections' marker writes,
+        while nothing was drained."""
+        s = self.session()
+        try:
+            self.assertEqual(s.cmd("fn slow"), "FN slow")
+            self.assertEqual(s.cmd("bind 3"), "BIND 0")
+            for slot, _, _, _ in [(0, 0, 1, 1), (1, 1, 1, 2), (2, 2, 1, 3)]:
+                self.assertEqual(s.cmd(f"poke {slot} {40 + slot}"), "POKE ok")
+            self.assertEqual(
+                s.cmd(submit_args([(0, 0, 1, 1), (1, 1, 1, 2), (2, 2, 1, 3)])),
+                "SUBMIT 3")
+            # Two slow sections (20 ms each) are in flight when this returns:
+            # the wait parks on the tail word and the consumer's second retire
+            # wakes it. The reply itself proves liveness (a wedged wait would
+            # hit the 90 s watchdog and name this command).
+            self.assertEqual(s.cmd("wait 2"), "WAIT ok")
+            # Group 2 is still the consumer's: the producer's poke is refused.
+            self.assertEqual(s.cmd("poke 2 99"), "POKE VIOLATION")
+            # The waited groups' marker writes are visible without a drain --
+            # retire happened after the sections returned, so their effects
+            # landed. This is "retire implies complete", the safety argument
+            # the entry exists to carry. Group 2 is NOT asserted: it is
+            # running, not blocked, and whether its 20 ms section finished
+            # before this fnlog is a race the wait never promised to settle.
+            log = parse_fnlog(s.cmd("fnlog"))
+            self.assertGreaterEqual(len(log), 2)
+            self.assertEqual([e["slot"] for e in log[:2]], [0, 1])
+            for entry in log[:2]:
+                self.assertEqual(
+                    int(s.cmd(f"shadow {entry['slot']}").split()[2]),
+                    entry["wrote"])
+            self.assertEqual(s.cmd("drain"), "DRAIN ok")
+            # After the drain the third group's slot is the producer's again.
+            self.assertEqual(s.cmd("poke 2 98"), "POKE ok")
+            self.assertEqual(s.cmd("join"), "JOIN ok")
+        finally:
+            s.close()
+
+    def test_wait_retired_satisfied_target_returns_immediately(self):
+        """A target at or below the retired count returns without parking and
+        without waiting on anything -- the producer's in-loop wait for a tile
+        the consumer already retired must not cost a park (that is the fast
+        path every steady-state iteration takes when the engine thread runs
+        ahead)."""
+        s = self.session()
+        try:
+            self.assertEqual(s.cmd("fn probe"), "FN probe")
+            self.assertEqual(s.cmd("bind 2"), "BIND 0")
+            self.assertEqual(s.cmd(submit_args([(5, 0, 1, 7), (6, 1, 1, 8)])),
+                             "SUBMIT 2")
+            self.assertEqual(s.cmd("drain"), "DRAIN ok")
+            before = parse_kv(s.cmd("probe"))
+            waits_before = int(before["futexWaits"])
+            # Both satisfied targets, plus the 0 special case.
+            self.assertEqual(s.cmd("wait 0"), "WAIT ok")
+            self.assertEqual(s.cmd("wait 1"), "WAIT ok")
+            self.assertEqual(s.cmd("wait 2"), "WAIT ok")
+            # Only the consumer's idle parks may have happened in between; a
+            # satisfied target must not add one. (The consumer parks on seqn,
+            # so let it go idle first and compare against a fresh baseline to
+            # keep this deterministic.)
+            time.sleep(0.2)
+            baseline = parse_kv(s.cmd("probe"))
+            self.assertEqual(s.cmd("wait 2"), "WAIT ok")
+            after = parse_kv(s.cmd("probe"))
+            self.assertEqual(int(after["futexWaits"]),
+                             int(baseline["futexWaits"]),
+                             "a satisfied wait_retired parked: the immediate "
+                             "return path did not execute")
+            self.assertGreaterEqual(int(baseline["futexWaits"]), waits_before)
+            self.assertEqual(s.cmd("join"), "JOIN ok")
+        finally:
+            s.close()
+
+    def test_wait_retired_beyond_head_returns_loudly(self):
+        """A target beyond the published head can never retire (the caller is
+        the producer; nothing new is published while it waits). Parking on it
+        forever is the unbounded-wait failure mode this file's production
+        constraint 3 exists to prevent, so the entry must name it and RETURN.
+        The stderr assertion is the 'loud' half; the reply is the
+        'recoverable' half."""
+        s = self.session()
+        try:
+            self.assertEqual(s.cmd("fn probe"), "FN probe")
+            self.assertEqual(s.cmd("bind 2"), "BIND 0")
+            # Nothing submitted: head = 0, so 5 is unreachable.
+            self.assertEqual(s.cmd("wait 5"), "WAIT ok")
+            # A partial overshoot is still an overshoot: submit 2, drain, then
+            # ask for 3.
+            self.assertEqual(s.cmd(submit_args([(0, 0, 1, 1), (1, 1, 1, 2)])),
+                             "SUBMIT 2")
+            self.assertEqual(s.cmd("drain"), "DRAIN ok")
+            self.assertEqual(s.cmd("wait 3"), "WAIT ok")
+            err = s.close()
+        finally:
+            s.kill()
+        self.assertIn("beyond the published head", err)
+        self.assertEqual(err.count("beyond the published head"), 2)
+
     def test_wraparound_torture(self):
         s = self.session()
         try:
@@ -843,11 +953,12 @@ class SourceContractTests(unittest.TestCase):
     pattern as test_hmx_leaf_abi_contract.py: parse the header, assert the
     shape, so a change is a loud failure rather than silent adaptation)."""
 
-    def test_abi_header_declares_the_four_entries(self):
+    def test_abi_header_declares_the_five_entries(self):
         text = ROLE_EXECUTOR_H.read_text(encoding="utf-8")
         for entry in ("hexagon_runtime_hmx_role_bind",
                       "hexagon_runtime_hmx_role_submit",
                       "hexagon_runtime_hmx_role_drain",
+                      "hexagon_runtime_hmx_role_wait_retired",
                       "hexagon_runtime_hmx_role_join"):
             self.assertIn(entry, text, f"{entry} missing from the ABI header")
         self.assertIn("#define HEXMLIR_HMX_ROLE_EXECUTOR_ABI 1", text)
@@ -860,6 +971,12 @@ class SourceContractTests(unittest.TestCase):
             text,
             r"int32_t hexagon_runtime_hmx_role_bind\(HmxSectionFn fn, "
             r"uint32_t depth\)")
+        # The wait entry takes its target the same way: a parameter, never a
+        # default -- a defaulted target would hide a compiler-side derivation
+        # bug the way a defaulted depth would.
+        self.assertRegex(
+            text,
+            r"void hexagon_runtime_hmx_role_wait_retired\(uint32_t target\)")
 
     def test_descriptor_shape_is_locked(self):
         text = SPSC_RING_H.read_text(encoding="utf-8")

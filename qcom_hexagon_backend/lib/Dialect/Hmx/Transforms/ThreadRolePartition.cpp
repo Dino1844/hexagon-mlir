@@ -25,6 +25,7 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxIndexFold.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxRoleHandoff.h"
@@ -339,6 +340,41 @@ StringRef decideTopology(const KernelVerdict &v) {
 constexpr int64_t kRoleSubmitBatch = 4;
 
 /// One candidate m-tile loop, with everything the split needs from it.
+///
+/// THE TWO FORMS (R3, 2026-10-09). The serial source ring (the folded serial
+/// loop, or the staged loop at depth 1) is the form the first split handled:
+///
+///     for m in 0..Mt:                       no iter_args
+///       [stage(m), await(m)]                staged arm only
+///       pack_act(m) -> scratch              the producer work
+///       for n...: acc_clear/mma/acc_read    the engine half, ONE nest
+///       [unpack_acc(m)]                     the in-loop read-out, if any
+///
+/// The pipelined depth-2 form (what `scf::pipelineForLoop` turns that into)
+/// adds a prologue, a peeled epilogue, and a (token, slot) iter-arg pair the
+/// steady loop carries:
+///
+///     <parity select>, stage(0)                        prologue: issue tile 0
+///     for m in 0..Mt-1 iter_args(token, slot):         upper is Mt-1
+///       <parity select for m+1>, stage(m+1)            issue NEXT tile
+///       await(token, slot)                             await THIS tile
+///       pack_act(m) -> scratch
+///       for n...: acc_clear/mma/acc_read(m)            steady engine nest
+///       [unpack_acc(m) | publish-if]                   read-out
+///       yield(next token, next slot)
+///     <folded Mt-1 row>
+///     await(last token, last slot)                     epilogue: tile Mt-1
+///     pack_act(Mt-1) -> scratch
+///     for n...: acc_clear/mma/acc_read(Mt-1)           peeled engine nest
+///     [unpack_acc(Mt-1) | tail publish]
+///
+/// Both engine nests outline into the SAME work function: the steady nest is
+/// the clone source (its row becomes the work function's per-tile row), the
+/// peeled nest is verified structurally equivalent and simply dropped -- the
+/// peeled tile is the LAST DESCRIPTOR (rowStart = Mt-1), and the section's
+/// (rows, wt, bias, ar, m0, count) signature already covers it. That is the
+/// "peel 尾的 tile 就是最后几个 descriptor" property the merged R2+R3 plan
+/// rests on.
 struct RoleSplitMatch {
   scf::ForOp mLoop;
   PackActOp pack;         ///< the producer work, directly in the m-loop body
@@ -348,14 +384,266 @@ struct RoleSplitMatch {
   Value wt;               ///< shared buffers the engine half closes over
   Value bias;
   Value ar;
-  SmallVector<Operation *> unpacks; ///< in-loop read-outs to move past the drain
+  Value rowValue;         ///< the steady nest's row expression (iv + 0)
+  SmallVector<Operation *> unpacks; ///< in-loop read-outs (readout-OFF form)
   SmallVector<Operation *> biasInits; ///< function-level engine preamble to move
   int64_t mt = 0;         ///< tile count: the ring depth and the scratch rows
+  int64_t upper = 0;      ///< folded loop upper: Mt (serial), Mt-1 (pipelined)
+
+  // ---- the read-out coexistence state (R2; see collectReadoutState) ----
+  /// The read-out split (hmx-vector-readout) runs BEFORE this pass in the
+  /// production pipeline, so the in-loop read-outs arrive as publishes to the
+  /// vector executor rather than as `hmx.unpack_acc` ops. The two forms are
+  /// mutually exclusive and shape everything the emission does with the
+  /// read-out: publishes stay in the loop behind a retire wait; unpacks move
+  /// past the exit drain (the first form's behavior).
+  SmallVector<scf::IfOp> publishIfs;   ///< in-loop publish boundaries
+  SmallVector<func::CallOp> tailPublishes; ///< post-loop publish(es)
+  bool readoutOn = false;
+
+  // ---- the pipelined (depth-2) form ----
+  bool pipelined = false;
+  AwaitOp epilogueAwait;   ///< the peeled epilogue's await (producer side)
+  PackActOp epiloguePack;  ///< the peeled epilogue's pack
+  scf::ForOp epilogueNest; ///< the peeled epilogue's engine nest
+  Operation *epilogueUnpack = nullptr; ///< its read-out (readout-OFF form)
 };
 
 /// Is `op` one of the m-loop body's direct children?
 static bool directlyIn(Operation *op, scf::ForOp loop) {
   return op->getParentOp() == loop.getOperation();
+}
+
+/// Does this loop directly hold engine work anywhere beneath it?
+static bool holdsEngineWork(scf::ForOp loop) {
+  bool holds = false;
+  loop->walk([&](Operation *o) { holds |= mustRunOnEngineThread(o); });
+  return holds;
+}
+
+/// The two read-out ops' shared accessors, spelled once each so the f32
+/// residual form's extra operand cannot shift an index under a caller. Both
+/// ops expose the same four facts (AR source, destination, row, column); the
+/// accessors keep that spelled as facts rather than as operand positions.
+static Value unpackSrc(Operation *op) {
+  if (auto u = dyn_cast<UnpackAccOp>(op))
+    return u.getSrc();
+  return cast<UnpackAccF32Op>(op).getSrc();
+}
+static Value unpackDst(Operation *op) {
+  if (auto u = dyn_cast<UnpackAccOp>(op))
+    return u.getDst();
+  return cast<UnpackAccF32Op>(op).getDst();
+}
+static Value unpackRow(Operation *op) {
+  if (auto u = dyn_cast<UnpackAccOp>(op))
+    return u.getRow();
+  return cast<UnpackAccF32Op>(op).getRow();
+}
+static Value unpackCol(Operation *op) {
+  if (auto u = dyn_cast<UnpackAccOp>(op))
+    return u.getCol();
+  return cast<UnpackAccF32Op>(op).getCol();
+}
+
+/// Structural equivalence of the steady engine nest and the peeled epilogue's
+/// engine nest, modulo the row value.
+///
+/// The pipeliner produces the epilogue by CLONING the source loop body, so the
+/// two nests are the same computation on different row expressions by
+/// construction -- but "by construction" is exactly what this pass does not
+/// trust: a future pipeliner change would leave the two silently different,
+/// and the emission below clones only the STEADY nest and covers the peeled
+/// tile with a descriptor. That coverage argument is only sound if the two
+/// nests really are the same work, so the check is structural and complete
+/// rather than spot: same op sequence, same attributes, and every operand
+/// either the same SSA value (the shared buffers), the row pair
+/// (`rowA`/`rowB`), a constant of the same folded value, or a block argument
+/// of the correspondingly-positioned region (the nests' own inner induction
+/// variables).
+///
+/// A constant can be spelled by different SSA ops and still be the same
+/// number (the pipeliner re-materialises constants per clone), which is why
+/// the constant case folds rather than compares. Everything else is SSA
+/// identity: the shared buffers (`scratch`, `wt`, `bias`, `ar`) and the loop
+/// bounds are defined outside both nests and are the same values in both, and
+/// any operand that is neither is a shape this check does not understand, so
+/// it declines.
+static bool nestEquivalent(Operation *a, Operation *b, Value rowA, Value rowB,
+                           DenseMap<Value, Value> &argMap) {
+  if (a->getName() != b->getName())
+    return false;
+  if (a->getNumOperands() != b->getNumOperands() ||
+      a->getNumResults() != b->getNumResults() ||
+      a->getNumRegions() != b->getNumRegions())
+    return false;
+  if (a->getAttrs() != b->getAttrs())
+    return false;
+  for (auto [oa, ob] : llvm::zip(a->getOperands(), b->getOperands())) {
+    if (oa == rowA && ob == rowB)
+      continue;
+    if (oa == ob)
+      continue; // the same SSA value: a shared buffer, a shared constant
+    // Constants re-materialised per clone: same folded number, different op.
+    std::optional<int64_t> fa = foldIndex(oa);
+    std::optional<int64_t> fb = foldIndex(ob);
+    if (fa && fb && *fa == *fb)
+      continue;
+    // Block arguments of correspondingly-positioned regions: the nests' own
+    // inner-loop induction variables (and any iter_args).
+    auto it = argMap.find(oa);
+    if (it != argMap.end() && it->second == ob)
+      continue;
+    return false;
+  }
+  for (auto [ra, rb] : llvm::zip(a->getRegions(), b->getRegions())) {
+    if (ra.getBlocks().size() != rb.getBlocks().size())
+      return false;
+    for (auto [ba, bb] : llvm::zip(ra.getBlocks(), rb.getBlocks())) {
+      if (ba.getArguments().size() != bb.getArguments().size())
+        return false;
+      for (auto [va, vb] : llvm::zip(ba.getArguments(), bb.getArguments()))
+        argMap[va] = vb;
+      if (ba.getOperations().size() != bb.getOperations().size())
+        return false;
+      for (auto [oa, ob] : llvm::zip(ba.getOperations(), bb.getOperations()))
+        if (!nestEquivalent(&oa, &ob, rowA, rowB, argMap))
+          return false;
+    }
+  }
+  return true;
+}
+
+/// The read-out coexistence state of a matched tile loop (R2).
+///
+/// The production pipeline runs `hmx-vector-readout` BEFORE this pass, so by
+/// the time the split looks at the loop, the read-out is either
+///   * MOVED ONTO the vector executor: the in-loop `hmx.unpack_acc` ops are
+///     gone and their positions hold boundary-guarded `exec_publish` calls,
+///     with a tail publish after the loop; or
+///   * STILL INLINE (`hmx.unpack_acc` ops in the body): the read-out split is
+///     off, or it declined this shape for its own reasons.
+/// The two are mutually exclusive; a loop holding both is a form this pass
+/// did not make and declines.
+///
+/// WHY DETECTION IS EMISSION-SAFE (the part that makes the coexistence sound)
+/// ---------------------------------------------------------------------
+/// With publishes present, the in-loop read-out reads `ar` rows that the
+/// BOUND THREAD writes, not this loop's body -- the read-out split matched
+/// when its own proof (an in-body `acc_read`) was still there, and this pass
+/// is about to move that `acc_read` onto T_HMX. The order the two passes
+/// established is what carries the proof across that move: the publish sits
+/// at the position of the read-out it replaced, which is AFTER the engine
+/// nest, and the split re-emits the submit and a `wait_retired` barrier at
+/// the nest's own position -- BEFORE the publish, in the same iteration. So
+/// the composed order is submit(i) ... wait_retired(i+1) ... publish(i), and
+/// "publish only after the engine section retired" is re-established at a
+/// finer grain than the exit drain the first form used. The emission's
+/// comment carries the full argument.
+static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
+  // In-loop: publish-if blocks and/or unpacks, as DIRECT children of the body.
+  for (Operation &op : m.mLoop.getBody()->without_terminator()) {
+    if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+      bool publish = false;
+      ifOp->walk([&](Operation *o) {
+        if (auto call = dyn_cast<func::CallOp>(o))
+          publish |= call.getCallee() == kHmxExecPublishFn;
+      });
+      if (publish)
+        m.publishIfs.push_back(ifOp);
+      continue;
+    }
+    if (isa<UnpackAccOp, UnpackAccF32Op>(op))
+      m.unpacks.push_back(&op);
+  }
+  if (!m.publishIfs.empty() && !m.unpacks.empty()) {
+    fn.emitRemark("thread-role split not applied: the tile loop holds both a "
+                  "vector-executor publish and an inline read-out; the two "
+                  "read-out forms are mutually exclusive and this shape is "
+                  "neither");
+    return failure();
+  }
+
+  // Post-loop: the tail publish (a plain call after the loop -- the read-out
+  // split anchors it at the peeled row's read-out or right after the loop).
+  // Collected by walking the function and excluding the loop's own subtree:
+  // every publish this pass did not find in the body IS a tail publish, and
+  // there is at most one of those per read-out loop (the read-out split's
+  // rewriteLoop emits exactly one).
+  fn.walk([&](func::CallOp call) {
+    if (call.getCallee() == kHmxExecPublishFn && !m.mLoop->isAncestor(call))
+      m.tailPublishes.push_back(call);
+  });
+
+  m.readoutOn = !m.publishIfs.empty() || !m.tailPublishes.empty();
+  if (m.readoutOn &&
+      (!m.unpacks.empty() ||
+       (m.pipelined && m.epilogueUnpack != nullptr))) {
+    fn.emitRemark("thread-role split not applied: the kernel holds a "
+                  "vector-executor publish and an inline read-out at once; "
+                  "the two read-out forms are mutually exclusive");
+    return failure();
+  }
+
+  // THE COVERAGE GATE (a deadlock-prevention check, not a preference): the
+  // wait this pass emits before a publish targets the tiles the publish
+  // names, and it can only be satisfied if those tiles were SUBMITTED -- the
+  // submit fires every kRoleSubmitBatch tiles, the publish every G tiles, and
+  // a publish boundary that is not also a submit boundary would wait for
+  // tiles the ring has not been handed. G is read off the publish-if's own
+  // boundary condition (`(m+1) % G == 0`, the read-out split's emission), and
+  // the requirement is kRoleSubmitBatch divides G: every multiple of G is
+  // then a multiple of the submit batch, so the covering submit fired earlier
+  // in the same iteration. A finer read-out batch declines the split, loudly,
+  // and the kernel keeps the single-thread pipeline with its read-out intact.
+  if (!m.publishIfs.empty()) {
+    Value iv = m.mLoop.getInductionVar();
+    for (scf::IfOp ifOp : m.publishIfs) {
+      auto cmp = ifOp.getCondition().getDefiningOp<arith::CmpIOp>();
+      if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::eq) {
+        fn.emitRemark("thread-role split not applied: a publish boundary "
+                      "condition is not the equality the read-out split "
+                      "emits");
+        return failure();
+      }
+      Value rem = nullptr, zero = nullptr;
+      if (dyn_cast_or_null<arith::RemSIOp>(cmp.getLhs().getDefiningOp())) {
+        rem = cmp.getLhs();
+        zero = cmp.getRhs();
+      } else if (dyn_cast_or_null<arith::RemSIOp>(cmp.getRhs().getDefiningOp())) {
+        rem = cmp.getRhs();
+        zero = cmp.getLhs();
+      } else {
+        fn.emitRemark("thread-role split not applied: a publish boundary "
+                      "condition has no remainder term (the read-out "
+                      "split's `(m+1) %% G` form)");
+        return failure();
+      }
+      auto remsi = cast<arith::RemSIOp>(rem.getDefiningOp());
+      auto addi = dyn_cast_or_null<arith::AddIOp>(remsi.getLhs().getDefiningOp());
+      std::optional<int64_t> group = foldIndex(remsi.getRhs());
+      std::optional<int64_t> one = addi ? foldIndex(addi.getRhs()) : std::nullopt;
+      std::optional<int64_t> zeroV = foldIndex(zero);
+      if (!addi || addi.getLhs() != iv || !group || !one || !zeroV ||
+          *one != 1 || *zeroV != 0) {
+        fn.emitRemark("thread-role split not applied: a publish boundary "
+                      "condition is not the `(m+1) %% G == 0` form the "
+                      "read-out split emits");
+        return failure();
+      }
+      if (*group % kRoleSubmitBatch != 0) {
+        fn.emitRemark()
+            << "thread-role split not applied: the read-out publishes every "
+            << *group << " tiles but the role submit batches every "
+            << kRoleSubmitBatch
+            << "; a publish boundary the submit does not cover would wait "
+               "for tiles the ring never received (deadlock). The kernel "
+               "keeps the single-thread pipeline with its read-out intact";
+        return failure();
+      }
+    }
+  }
+  return success();
 }
 
 /// The one m-tile loop this pass knows how to split, or nothing.
@@ -403,18 +691,6 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
   RoleSplitMatch m;
   m.mLoop = candidates.front();
 
-  // Static 0..Mt trip: the descriptor math (rowStart = m, slot = m) and the
-  // ring depth (= Mt) are derived from the induction variable counting
-  // tiles from zero.
-  auto lb = m.mLoop.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
-  auto ub = m.mLoop.getUpperBound().getDefiningOp<arith::ConstantIndexOp>();
-  auto step = m.mLoop.getStep().getDefiningOp<arith::ConstantIndexOp>();
-  if (!lb || !ub || !step || lb.value() != 0 || step.value() != 1) {
-    fn.emitRemark("thread-role split not applied: the tile loop is not the "
-                  "static 0..Mt form the emitters produce");
-    return std::nullopt;
-  }
-  m.mt = ub.value();
 
   // One pack, one engine n-loop, directly in the body.
   for (Operation &op : m.mLoop.getBody()->without_terminator()) {
@@ -438,14 +714,40 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
         m.nLoop = inner;
       }
     }
-    if (isa<UnpackAccOp, UnpackAccF32Op>(op))
-      m.unpacks.push_back(&op);
+    // The read-outs are collected by `collectReadoutState` below -- the one
+    // collector, so the same op can never enter `m.unpacks` twice (a doubled
+    // entry would dangle after the first erase).
   }
   if (!m.pack || !m.nLoop) {
     fn.emitRemark("thread-role split not applied: the tile loop body is not "
                   "the pack-plus-engine-loop form");
     return std::nullopt;
   }
+
+  // Static 0..upper step-1 trip, with the upper FOLDED rather than read off
+  // a bare constant: the pipelined steady loop's upper is `subi Mt, 1` (the
+  // pipeliner's arithmetic), the serial loop's is the constant Mt itself.
+  // The descriptor math (rowStart = m, slot = m) and the ring depth (= Mt)
+  // are derived from the induction variable counting tiles from zero.
+  auto lb = m.mLoop.getLowerBound().getDefiningOp<arith::ConstantIndexOp>();
+  auto step = m.mLoop.getStep().getDefiningOp<arith::ConstantIndexOp>();
+  if (!lb || !step || lb.value() != 0 || step.value() != 1) {
+    fn.emitRemark("thread-role split not applied: the tile loop is not the "
+                  "static 0..upper step-1 form the emitters produce");
+    return std::nullopt;
+  }
+  std::optional<int64_t> upper = foldIndex(m.mLoop.getUpperBound());
+  if (!upper || *upper < 1) {
+    fn.emitRemark("thread-role split not applied: the tile loop's upper "
+                  "bound does not fold to a constant");
+    return std::nullopt;
+  }
+  m.upper = *upper;
+
+  // THE FORM DISCRIMINATOR: the pipeliner's steady loop carries its (token,
+  // slot) pair as iter_args; the serial source loop carries nothing. One bit,
+  // and it is structural -- not a guess about which emitter ran.
+  m.pipelined = m.mLoop.getNumRegionIterArgs() != 0;
 
   // The single-row scratch: the pack writes crouton row 0 of it, which is
   // the single-thread assumption this split removes. A pack addressing any
@@ -469,19 +771,6 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
       !scratchType.getLayout().isIdentity()) {
     fn.emitRemark("thread-role split not applied: the scratch is not the "
                   "static identity-layout one-row crouton array");
-    return std::nullopt;
-  }
-
-  // The scratch's users must be exactly the pack, the engine loop and its
-  // deallocation: a fourth reader observes the row this split hands to the
-  // consumer, and this pass does not claim to reason about it.
-  for (OpOperand &use : m.scratch.getUses()) {
-    Operation *owner = use.getOwner();
-    if (owner == m.pack || owner == m.nLoop ||
-        m.nLoop->isAncestor(owner) || isa<memref::DeallocOp>(owner))
-      continue;
-    fn.emitRemark("thread-role split not applied: the scratch has a reader "
-                  "besides the pack, the engine loop and its deallocation");
     return std::nullopt;
   }
 
@@ -514,6 +803,49 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
   m.wt = wt;
   m.bias = bias;
   m.ar = ar;
+
+  // The steady nest's ROW: every acc_read in the nest names the same row
+  // expression, and that expression is the induction (serial) or the
+  // pipeliner's `iv + 0` shift of it (pipelined). The work function's clone
+  // maps THIS value -- not the induction -- to its per-tile row, which is
+  // why the offset must be exactly zero: any other row arithmetic is a
+  // shape whose per-tile meaning this pass cannot restate.
+  Value row;
+  m.nLoop->walk([&](Operation *o) {
+    if (auto read = dyn_cast<AccReadOp>(o)) {
+      if (row && row != read.getM())
+        disagree = true;
+      row = read.getM();
+    }
+  });
+  if (disagree || !row ||
+      inductionOffset(row, m.mLoop.getInductionVar()).value_or(1) != 0) {
+    fn.emitRemark("thread-role split not applied: the engine loop's "
+                  "acc_reads do not name the tile loop's own row");
+    return std::nullopt;
+  }
+  m.rowValue = row;
+
+  // The tile count: the AR array's own row dimension (the acc_reads write
+  // exactly those rows), cross-checked against the loop upper -- Mt for the
+  // serial source loop, Mt-1 for the pipelined steady loop (the pipeliner
+  // peels the last tile into the epilogue checked below). A disagreement is
+  // a form the emitters do not produce.
+  auto arType = dyn_cast<MemRefType>(m.ar.getType());
+  if (!arType || !arType.hasStaticShape() || arType.getRank() < 1) {
+    fn.emitRemark("thread-role split not applied: the accumulator array is "
+                  "not a static crouton array");
+    return std::nullopt;
+  }
+  m.mt = arType.getDimSize(0);
+  if (m.mt < 1 || m.upper != (m.pipelined ? m.mt - 1 : m.mt)) {
+    fn.emitRemark("thread-role split not applied: the tile loop's upper "
+                  "bound does not match the accumulator's row count (the "
+                  "form the emitters produce is Mt, or Mt-1 with a peeled "
+                  "epilogue)");
+    return std::nullopt;
+  }
+
   // The shared buffers must be defined outside the m-loop: they become the
   // work function's parameters, so a value local to one iteration cannot
   // stand in for them.
@@ -526,21 +858,140 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
     }
   }
 
-  // No engine work outside the matched loop EXCEPT the one form the emitters
-  // actually produce: `hmx.bias_init`, which runs once at function entry.
-  // bias_init IS engine work (it loads the conversion state the acc_reads
-  // use, one of the five engine leaves), so on the split it must move into
-  // the section with the rest -- the producer thread must never issue an
-  // engine instruction, or its per-kernel ensure blocks forever on the
-  // bound thread's lifetime lock. Re-initialising the state per section
-  // call is redundant but correct (same block, same register set) and costs
-  // one 256-byte load against a tile of engine work. The depth-2 pipelined
-  // form peels an epilogue holding a second engine run and a second matmul
-  // holds another whole loop; neither is a bias_init, so both still decline
-  // here.
+  // ---- the pipelined form's prologue and peeled epilogue ----------------
+  //
+  // Everything here is OUTSIDE the steady loop and unique per function: the
+  // prologue is the one StageOp before the loop (it issues tile 0 through
+  // the parity slot select), the epilogue is the await + pack + engine nest
+  // (+ read-out) for the peeled last tile. The prologue stays producer-side
+  // untouched (the DMA is engine-independent); the epilogue's pack moves to
+  // the rotating rows like the steady pack, and its engine nest is verified
+  // equivalent to the steady nest and covered by the tail descriptor.
+  AwaitOp epilogueAwait;
+  PackActOp epiloguePack;
+  scf::ForOp epilogueNest;
+  StageOp prologueStage;
+  size_t stagesOutside = 0, awaitsOutside = 0, packsOutside = 0,
+         nestsOutside = 0;
+  fn.walk([&](Operation *op) {
+    if (m.mLoop->isAncestor(op))
+      return;
+    if (auto stage = dyn_cast<StageOp>(op)) {
+      ++stagesOutside;
+      prologueStage = stage;
+    }
+    if (auto await = dyn_cast<AwaitOp>(op)) {
+      ++awaitsOutside;
+      epilogueAwait = await;
+    }
+    if (auto pack = dyn_cast<PackActOp>(op)) {
+      ++packsOutside;
+      epiloguePack = pack;
+    }
+    if (auto loop = dyn_cast<scf::ForOp>(op)) {
+      // Directly in the function body: the pipeliner emits the peeled
+      // epilogue's nest as a sibling of the steady loop, and a nest nested
+      // deeper (inside some other region) is not that.
+      if (loop != m.mLoop && loop->getParentOp() == fn &&
+          holdsEngineWork(loop)) {
+        ++nestsOutside;
+        epilogueNest = loop;
+      }
+    }
+    if (isa<UnpackAccOp, UnpackAccF32Op>(op))
+      m.epilogueUnpack = op;
+  });
+  if (m.pipelined) {
+    if (stagesOutside != 1 || awaitsOutside != 1 || packsOutside != 1 ||
+        nestsOutside != 1 || !prologueStage || !epilogueAwait ||
+        !epiloguePack || !epilogueNest) {
+      fn.emitRemark("thread-role split not applied: the pipelined form's "
+                    "prologue/epilogue is not the one-issue, one-await, "
+                    "one-pack, one-engine-nest shape the pipeliner emits");
+      return std::nullopt;
+    }
+    // The prologue issues tile 0: its source row folds to 0 (the pipeliner
+    // spells it `muli 0, 32`).
+    if (foldIndex(prologueStage->getOperand(1)).value_or(1) != 0) {
+      fn.emitRemark("thread-role split not applied: the pipelined prologue "
+                    "does not issue tile 0");
+      return std::nullopt;
+    }
+    // The epilogue's pack writes the SAME one-row scratch (its row operand
+    // is 0 for the same reason the steady pack's is).
+    if (epiloguePack.getDst() != m.scratch) {
+      fn.emitRemark("thread-role split not applied: the peeled epilogue's "
+                    "pack does not write the tile loop's scratch");
+      return std::nullopt;
+    }
+    auto epRow = epiloguePack.getRow().getDefiningOp<arith::ConstantIndexOp>();
+    if (!epRow || epRow.value() != 0) {
+      fn.emitRemark("thread-role split not applied: the peeled epilogue's "
+                    "pack does not address crouton row 0 of the scratch");
+      return std::nullopt;
+    }
+    // The epilogue's nest: same shared buffers, and its row is the folded
+    // LAST tile (the pipeliner's peeled-row chain).
+    Value epRowValue;
+    bool epDisagree = false;
+    epilogueNest->walk([&](Operation *o) {
+      if (auto mma = dyn_cast<MmaOp>(o)) {
+        if (mma.getWt() != m.wt)
+          epDisagree = true;
+      }
+      if (auto read = dyn_cast<AccReadOp>(o)) {
+        if (read.getBias() != m.bias || read.getDst() != m.ar)
+          epDisagree = true;
+        if (epRowValue && epRowValue != read.getM())
+          epDisagree = true;
+        epRowValue = read.getM();
+      }
+    });
+    if (epDisagree || !epRowValue ||
+        foldIndex(epRowValue).value_or(-1) != m.mt - 1) {
+      fn.emitRemark("thread-role split not applied: the peeled epilogue's "
+                    "engine nest does not read the shared buffers at the "
+                    "last tile's row");
+      return std::nullopt;
+    }
+    // The two nests are the SAME work on different rows -- the coverage
+    // argument for covering the peeled tile with a descriptor rests on it,
+    // so it is verified structurally, not assumed from the pipeliner.
+    DenseMap<Value, Value> argMap;
+    if (!nestEquivalent(m.nLoop.getOperation(), epilogueNest.getOperation(),
+                        m.rowValue, epRowValue, argMap)) {
+      fn.emitRemark("thread-role split not applied: the peeled epilogue's "
+                    "engine nest is not the steady nest on the last tile's "
+                    "row, so one outlined section cannot cover both");
+      return std::nullopt;
+    }
+    m.epilogueAwait = epilogueAwait;
+    m.epiloguePack = epiloguePack;
+    m.epilogueNest = epilogueNest;
+  } else {
+    // The serial source loop has no prologue and no epilogue; anything of
+    // these kinds outside it is a second matmul's work or a form this pass
+    // does not know, and the engine-outside check below declines it.
+    (void)stagesOutside;
+    (void)awaitsOutside;
+    (void)packsOutside;
+    (void)nestsOutside;
+    m.epilogueUnpack = nullptr;
+  }
+
+  // No engine work outside the matched loop EXCEPT the forms the emitters
+  // actually produce: `hmx.bias_init`, which runs once at function entry
+  // (it moves into the section with the rest -- the producer thread must
+  // never issue an engine instruction, or its per-kernel ensure blocks
+  // forever on the bound thread's lifetime lock), and -- in the pipelined
+  // form -- the peeled epilogue's engine nest, which the emission outlines
+  // with the steady nest into the same section.
   bool engineOutside = false;
   fn.walk([&](Operation *op) {
     if (!mustRunOnEngineThread(op) || m.mLoop->isAncestor(op))
+      return;
+    if (m.pipelined && m.epilogueNest &&
+        m.epilogueNest->isAncestor(op))
       return;
     if (auto init = dyn_cast<BiasInitOp>(op)) {
       m.biasInits.push_back(op);
@@ -550,9 +1001,9 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
   });
   if (engineOutside) {
     fn.emitRemark("thread-role split not applied: engine work outside the "
-                  "matched tile loop (the pipelined depth-2 form, or a "
-                  "second matmul); the first form transforms exactly one "
-                  "serial source ring");
+                  "matched tile loop and its peeled epilogue (a second "
+                  "matmul); the split transforms exactly one source ring "
+                  "per kernel");
     return std::nullopt;
   }
   for (Operation *init : m.biasInits) {
@@ -563,28 +1014,97 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
     }
   }
 
-  // The read-outs to move: their non-induction operands must be defined
-  // outside the m-loop, or the post-drain position cannot see them.
-  for (Operation *unpack : m.unpacks) {
-    for (Value operand : unpack->getOperands()) {
-      if (operand == m.mLoop.getInductionVar())
-        continue;
-      Operation *def = operand.getDefiningOp();
-      if (def && m.mLoop->isAncestor(def)) {
+  // The scratch's users must be exactly the packs, the engine nests and its
+  // deallocation: a further reader observes rows this split hands to the
+  // consumer, and this pass does not claim to reason about it.
+  for (OpOperand &use : m.scratch.getUses()) {
+    Operation *owner = use.getOwner();
+    if (owner == m.pack || owner == m.nLoop ||
+        m.nLoop->isAncestor(owner) || isa<memref::DeallocOp>(owner))
+      continue;
+    if (m.pipelined &&
+        (owner == m.epiloguePack || m.epilogueNest->isAncestor(owner)))
+      continue;
+    fn.emitRemark("thread-role split not applied: the scratch has a reader "
+                  "besides the packs, the engine nests and its deallocation");
+    return std::nullopt;
+  }
+
+  // The read-out coexistence state: publishes (the read-out split ran) or
+  // inline unpacks (it did not). Collected and validated by
+  // `collectReadoutState`, whose comment is the soundness argument.
+  if (failed(collectReadoutState(fn, m))) {
+    return std::nullopt;
+  }
+
+  // The inline read-outs to move past the exit drain (readout-OFF form):
+  // each one's ROW must be the loop's own row arithmetic (the move rewrites
+  // it to the read-out loop's induction), and every other operand must be
+  // defined outside the m-loop or the post-drain position cannot see it.
+  if (!m.readoutOn) {
+    for (Operation *unpack : m.unpacks) {
+      Value rowOperand = unpackRow(unpack);
+      if (inductionOffset(rowOperand, m.mLoop.getInductionVar()).value_or(1) != 0) {
         fn.emitRemark("thread-role split not applied: an in-loop read-out "
-                      "depends on a value computed inside the tile loop, so "
-                      "it cannot move past the exit drain");
+                      "does not read the tile loop's own row, so it cannot "
+                      "move past the exit drain");
         return std::nullopt;
+      }
+      for (Value operand : unpack->getOperands()) {
+        if (operand == rowOperand)
+          continue;
+        Operation *def = operand.getDefiningOp();
+        if (def && m.mLoop->isAncestor(def)) {
+          fn.emitRemark("thread-role split not applied: an in-loop read-out "
+                        "depends on a value computed inside the tile loop, "
+                        "so it cannot move past the exit drain");
+          return std::nullopt;
+        }
+      }
+    }
+    // The pipelined form's PEELED read-out (readout-OFF): it must be the
+    // steady body's read-out on the last tile's row -- same destination,
+    // same count, same crouton column, same attributes -- because the
+    // emission drops it and the moved read-out loop's last iteration covers
+    // that row instead. Anything else is a shape whose coverage this pass
+    // cannot restate.
+    if (m.pipelined) {
+      if (m.unpacks.empty() != (m.epilogueUnpack == nullptr)) {
+        fn.emitRemark("thread-role split not applied: the pipelined form "
+                      "has a read-out in the loop or in the epilogue but "
+                      "not both; the coverage argument needs the pair");
+        return std::nullopt;
+      }
+      if (m.epilogueUnpack) {
+        if (foldIndex(unpackRow(m.epilogueUnpack)).value_or(-1) != m.mt - 1) {
+          fn.emitRemark("thread-role split not applied: the peeled "
+                        "epilogue's read-out does not read the last tile's "
+                        "row");
+          return std::nullopt;
+        }
+        Operation *steady = m.unpacks.front();
+        if (steady->getName() != m.epilogueUnpack->getName() ||
+            steady->getAttrs() != m.epilogueUnpack->getAttrs() ||
+            unpackSrc(steady) != unpackSrc(m.epilogueUnpack) ||
+            unpackDst(steady) != unpackDst(m.epilogueUnpack) ||
+            unpackCol(steady) != unpackCol(m.epilogueUnpack) ||
+            unpackRow(steady) == unpackRow(m.epilogueUnpack)) {
+          fn.emitRemark("thread-role split not applied: the peeled "
+                        "epilogue's read-out is not the steady read-out on "
+                        "the last row (same destination and column, only "
+                        "the row differs), so dropping it would lose or "
+                        "duplicate a row");
+          return std::nullopt;
+        }
       }
     }
   }
 
   // Every value the engine loop uses from outside must be one this pass
-  // knows how to rebuild or hand over: the scratch, the induction, the
-  // shared buffers, or a constant (re-created in the work function).
-  /// Collected and validated by `collectEngineOutsideUses` during the
-  /// emission; the check lives there so the walk and the use of the walk
-  /// cannot drift apart.
+  // knows how to rebuild or hand over: the scratch, the row, the shared
+  // buffers, or a constant (re-created in the work function).
+  /// Collected and validated during the emission; the check lives there so
+  /// the walk and the use of the walk cannot drift apart.
   return m;
 }
 
@@ -790,9 +1310,11 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   }
 
   // ---- validate the engine loop's outside uses before touching anything ----
-  // Each must be the scratch, the induction, a shared buffer, or a constant
-  // this pass can re-create; anything else is a form the matcher over-
-  // claimed and the emission refuses loudly.
+  // Each must be the scratch, the row (the tile-index fact the matcher
+  // verified -- the induction itself in the serial form, the pipeliner's
+  // `iv + 0` shift of it in the pipelined form), a shared buffer, or a
+  // constant this pass can re-create; anything else is a form the matcher
+  // over-claimed and the emission refuses loudly.
   SmallVector<Value> outsideUses;
   for (Operation &op : m.nLoop.getBody()->getOperations()) {
     op.walk([&](Operation *o) {
@@ -812,13 +1334,13 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   }
   for (Value value : outsideUses) {
     if (value == m.scratch || value == m.wt || value == m.bias ||
-        value == m.ar || value == m.mLoop.getInductionVar())
+        value == m.ar || value == m.rowValue)
       continue;
     if (isa_and_nonnull<arith::ConstantOp>(value.getDefiningOp()))
       continue;
     return fn.emitError()
            << "thread-role split: the engine loop uses a value that is "
-              "neither the scratch, a shared buffer, the tile index nor a "
+              "neither the scratch, a shared buffer, the row nor a "
               "constant; the matcher over-claimed this shape";
   }
 
@@ -908,13 +1430,18 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   map.map(m.wt, wtParam);
   map.map(m.bias, biasParam);
   map.map(m.ar, arParam);
-  map.map(m.mLoop.getInductionVar(), mVal);
+  // THE ROW, not the induction: in the serial form the row IS the induction
+  // (same SSA value), and in the pipelined form the pipeliner spells the row
+  // as `addi iv, (muli 1, 0)` -- a distinct SSA value the induction never
+  // appears as inside the nest. Mapping the row covers both, and the
+  // outside-uses validation above already refused any other induction use.
+  map.map(m.rowValue, mVal);
   map.map(nLb, nLbNew);
   map.map(nUb, nUbNew);
   map.map(nStep, nStepNew);
   for (Value value : outsideUses) {
     if (value == m.scratch || value == m.wt || value == m.bias ||
-        value == m.ar || value == m.mLoop.getInductionVar() ||
+        value == m.ar || value == m.rowValue ||
         value == nLb || value == nUb || value == nStep)
       continue;
     // A constant: re-create it in the work function so the clone does not
@@ -943,6 +1470,13 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   func::FuncOp submitFn =
       declareRoleRuntime(module, kHmxRoleSubmitFn, {i32, i32}, {i32});
   func::FuncOp drainFn = declareRoleRuntime(module, kHmxRoleDrainFn, {});
+  // The granular barrier (HmxRoleExecutor.h's wait_retired entry; the ABI
+  // header's comment is the contract). Declared unconditionally so the
+  // spelling exists in exactly one place for every arm of this pass, the
+  // same rule as submit/drain; only the read-out coexistence path below
+  // emits a call to it.
+  func::FuncOp waitFn =
+      declareRoleRuntime(module, kHmxRoleWaitRetiredFn, {i32});
 
   // The rotating rows replace the one-row scratch, at the scratch's own
   // position; the submit buffer is a stack object for the whole loop
@@ -1069,19 +1603,138 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   emitRoleSubmit(sb, loc, submitFn, drainFn, descBuf, cBatch,
                  arith::ConstantIntOp::create(sb, loc, kRoleSubmitBatch, 32));
 
+  // ---- the pipelined form's peeled epilogue ------------------------------
+  // The epilogue's pack moves to row Mt-1 of the rotating rows exactly the
+  // way the steady pack moved to row m (through a one-row VIEW: the same
+  // source-meaning argument as the steady pack's comment above), and the
+  // peeled tile's descriptor is filled at the pack's position so the tail
+  // batch below carries it. The epilogue's await stays producer-side (the
+  // DMA is engine-independent), and its engine nest is NOT re-emitted here:
+  // the matcher verified it is the steady nest on the last row, so the tail
+  // descriptor's rowStart = Mt-1 runs it through the same outlined section.
+  //
+  // The builder anchors at the epilogue's ENGINE NEST, not at the pack it
+  // replaces: the anchor op must outlive the emission (the pack is erased
+  // mid-block and the steady emission anchors at its nest for exactly this
+  // reason).
+  if (m.pipelined) {
+    b.setInsertionPoint(m.epilogueNest);
+    Value cLast = arith::ConstantIndexOp::create(b, loc, m.mt - 1);
+    SmallVector<OpFoldResult> epOffs{cLast, b.getIndexAttr(0),
+                                     b.getIndexAttr(0), b.getIndexAttr(0),
+                                     b.getIndexAttr(0)};
+    Value epView = memref::SubViewOp::create(b, loc, rows, epOffs, rowSizes,
+                                              rowStrides);
+    PackActOp epPack = PackActOp::create(
+        b, loc, TypeRange{epView.getType()}, epView, m.epiloguePack.getSrc(),
+        m.epiloguePack.getRow(), m.epiloguePack.getCol(),
+        m.epiloguePack.getCountAttr(), m.epiloguePack.getValidRowsAttr(),
+        m.epiloguePack.getValidColsAttr());
+    for (const auto &named : m.epiloguePack->getAttrs())
+      if (named.getName() != "count" && named.getName() != "valid_rows" &&
+          named.getName() != "valid_cols")
+        epPack->setAttr(named.getName(), named.getValue());
+    m.epiloguePack.erase();
+
+    // The peeled tile's descriptor: slot (Mt-1) mod batch -- the tail batch
+    // occupies slots 0..tailCount-1 (tailStart is a multiple of the batch),
+    // and Mt-1 is its last entry. The constants are created AT this
+    // position: the steady body's `cWords` lives inside the m-loop's region
+    // and a use of it out here is the non-dominating operand the verifier
+    // rejects.
+    Value epMod = arith::ConstantIndexOp::create(
+        b, loc, (m.mt - 1) % kRoleSubmitBatch);
+    Value epWords = arith::ConstantIndexOp::create(b, loc, kHmxRoleDescWords);
+    Value epBase = arith::MulIOp::create(b, loc, epMod, epWords);
+    storeRoleDescWord(b, loc, descBuf, epBase, kHmxRoleDescSlot,
+                      arith::ConstantIntOp::create(b, loc, m.mt - 1, 32));
+    storeRoleDescWord(b, loc, descBuf, epBase, kHmxRoleDescRowStart,
+                      arith::ConstantIntOp::create(b, loc, m.mt - 1, 32));
+    storeRoleDescWord(
+        b, loc, descBuf, epBase, kHmxRoleDescRowCount,
+        arith::ConstantIntOp::create(b, loc, 1, 32));
+    storeRoleDescWord(
+        b, loc, descBuf, epBase, kHmxRoleDescPad,
+        arith::ConstantIntOp::create(b, loc, 0, 32));
+    storeRoleDescWord(
+        b, loc, descBuf, epBase, kHmxRoleDescEventLo,
+        arith::ConstantIntOp::create(b, loc, 0, 32));
+    storeRoleDescWord(
+        b, loc, descBuf, epBase, kHmxRoleDescEventHi,
+        arith::ConstantIntOp::create(b, loc, 0, 32));
+  }
+
+  // ---- the read-out coexistence barriers (R2; the mechanism this half
+  // exists for) -------------------------------------------------------------
+  //
+  // THE SAFETY ARGUMENT, UPGRADED (and this comment is where it lives): the
+  // first form moved every in-loop read-out past the exit drain because
+  // "after drain, every section has returned" was the only producer-side
+  // proof that an `ar` row was complete. The read-out split (which ran
+  // BEFORE this pass) already put the read-out back inside the loop as a
+  // publish to the vector executor; what its match-time proof (an in-body
+  // `acc_read`) cannot survive is THIS pass moving that `acc_read` onto
+  // T_HMX. The wait re-establishes the proof at a finer grain: retire
+  // happens only after the bound section RETURNS (HmxSpscRing.h's ownership
+  // model), so `wait_retired(m+1)` in iteration m means tiles 0..m's engine
+  // work has landed -- semantically the same statement as the drain's, one
+  // tile instead of all of them. The emitted order per iteration is
+  // submit(batch) ... wait_retired(m+1) ... publish(group), and the same
+  // for the tail after the loop; the vector thread's unpack of group k
+  // therefore overlaps group k+1's engine work, which is exactly the
+  // llama.cpp `pop C_{i-1}` shape the co-scheduling review identified as
+  // the missing mechanism (docs/architecture/
+  // hmx-coscheduling-architecture-review-2026-10-09.md section 4f).
+  //
+  // The wait goes in the PUBLISH's own boundary block, not the submit's:
+  // the publish is what needs the proof, and a read-out batch wider than
+  // the submit batch (the coverage gate in collectReadoutState guarantees
+  // the submit batch divides it) then keeps its producer running free
+  // between the submit boundaries instead of stalling at each one.
+  if (m.readoutOn) {
+    // In-loop: at the top of each publish boundary block, before everything
+    // in it. The target is m+1: the tiles the boundary's publish names end
+    // at m, and retire-count m+1 covers exactly those.
+    for (scf::IfOp publishIf : m.publishIfs) {
+      OpBuilder pb(b.getContext());
+      pb.setInsertionPointToStart(&publishIf.getThenRegion().front());
+      Value waited = arith::AddIOp::create(pb, loc, mInd, cOne);
+      Value target = arith::IndexCastOp::create(pb, loc, i32, waited);
+      func::CallOp::create(pb, loc, waitFn, ValueRange{target});
+    }
+    // After the loop: the tail publish names the tail rows, whose end is
+    // the tile count -- the wait lands immediately before it (and after
+    // the tail submit below, which is the order that makes it satisfiable).
+    for (func::CallOp publish : m.tailPublishes) {
+      b.setInsertionPoint(publish);
+      Value target = arith::ConstantIntOp::create(b, loc, m.mt, 32);
+      func::CallOp::create(b, loc, waitFn, ValueRange{target});
+    }
+  }
+
   // ---- after the loop: the tail batch, the barrier, the read-outs ------
-  // The in-loop read-outs are MOVED, not dropped: each is cloned into a
-  // fresh loop after the exit drain (the only producer-side point where
-  // every tile's engine work is provably done -- the consumer owns `ar`
-  // rows until then), and the originals are erased only once every clone
-  // is in place. The constants below are created AT this position: reusing
-  // the boundary math's constants would cross the m-loop's region boundary
-  // (they were created inside it), and a use of them out here is exactly
-  // the non-dominating operand the verifier rejects.
-  b.setInsertionPointAfter(m.mLoop);
+  // The emission position differs by form, and the difference is
+  // load-bearing: the pipelined form's tail batch carries the peeled
+  // epilogue's tile, so it is emitted at the epilogue's engine nest (the
+  // position the nest is about to leave) -- after the epilogue pack and
+  // its descriptor fill, before the read-out split's tail publish. The
+  // serial form has no epilogue, and the position is right after the loop.
+  if (m.pipelined)
+    b.setInsertionPoint(m.epilogueNest);
+  else
+    b.setInsertionPointAfter(m.mLoop);
+  // The constants below are created AT this position: reusing the boundary
+  // math's constants would cross the m-loop's region boundary (they were
+  // created inside it), and a use of them out here is exactly the
+  // non-dominating operand the verifier rejects.
   Value cZero2 = arith::ConstantIndexOp::create(b, loc, 0);
   Value cOne2 = arith::ConstantIndexOp::create(b, loc, 1);
-  int64_t fullBatches = m.mt / kRoleSubmitBatch;
+  // The tail batch is the tiles the loop's own batch boundaries did not
+  // reach: floor(upper / batch) * batch .. Mt-1. The SERIAL loop's upper is
+  // Mt (every tile passes through the loop); the PIPELINED loop's upper is
+  // Mt-1 (the pipeliner peeled the last tile into the epilogue), so the
+  // tail here also carries the peeled tile.
+  int64_t fullBatches = m.upper / kRoleSubmitBatch;
   int64_t tailCount = m.mt - fullBatches * kRoleSubmitBatch;
   if (tailCount > 0) {
     Value cTail = arith::ConstantIndexOp::create(b, loc, tailCount);
@@ -1089,8 +1742,21 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
                    arith::ConstantIntOp::create(b, loc, tailCount, 32));
   }
   // The exit drain: the kernel does not return until every group's engine
-  // work has landed in `ar`, because `ar` is the caller's memory.
+  // work has landed in `ar`, because `ar` is the caller's memory. After the
+  // read-out coexistence's tail wait it is trivially satisfied; it is
+  // emitted anyway because the ABI's contract is positional (before the
+  // kernel returns), not incidental.
   func::CallOp::create(b, loc, drainFn, ValueRange{});
+  // The inline read-outs are MOVED, not dropped: each is cloned into a
+  // fresh loop after the exit drain (the only producer-side point where
+  // every tile's engine work is provably done -- the consumer owns `ar`
+  // rows until then), and the originals are erased only once every clone
+  // is in place. The clone maps the read-out's ROW -- the same tile-index
+  // fact the work function's clone maps, for the same reason -- to the
+  // read-out loop's induction, so one clone per read-out covers every row.
+  // The pipelined form's PEELED read-out is not cloned: the matcher
+  // verified it is the steady read-out on the last row, so the loop's last
+  // iteration covers that row and the original is simply erased below.
   if (!m.unpacks.empty()) {
     Value cMt = arith::ConstantIndexOp::create(b, loc, m.mt);
     scf::ForOp readoutLoop =
@@ -1099,24 +1765,30 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
     rb.setInsertionPoint(readoutLoop.getBody()->getTerminator());
     for (Operation *unpack : m.unpacks) {
       IRMapping remap;
-      remap.map(mInd, readoutLoop.getInductionVar());
+      remap.map(unpackRow(unpack), readoutLoop.getInductionVar());
       rb.clone(*unpack, remap);
     }
   }
 
-  // The engine loop and the in-loop read-outs leave the producer body only
-  // now, after everything that cloned from them is in place: the former
-  // lives in the work function, the latter past the exit drain. The bias
-  // inits left with the work function too -- erased last because the work
-  // function cloned them.
+  // The engine loops and the read-outs leave the producer body only now,
+  // after everything that cloned from them is in place: the steady nest
+  // lives in the work function, the peeled nest was verified equivalent and
+  // is covered by the tail descriptor, the inline read-outs live past the
+  // exit drain. The bias inits left with the work function too -- erased
+  // last because the work function cloned them.
   m.nLoop.erase();
+  if (m.pipelined)
+    m.epilogueNest.erase();
   for (Operation *unpack : m.unpacks)
     unpack->erase();
+  if (m.pipelined && m.epilogueUnpack)
+    m.epilogueUnpack->erase();
   for (Operation *init : m.biasInits)
     init->erase();
-  // Now nothing references the one-row scratch: the pack was re-created on
-  // the rows, the engine loop lives in the work function, the dealloc was
-  // replaced above.
+
+  // Now nothing references the one-row scratch: the packs were re-created
+  // on the rows, the engine loops live in the work function, the dealloc
+  // was replaced above.
   m.scratchAlloc.erase();
 
   recordRoleHandoff(module, fn, work, m.mt, rowsType,
@@ -1253,7 +1925,9 @@ struct ThreadRolePartitionPass
       if (std::optional<RoleSplitMatch> m = matchSplitLoop(fn)) {
         if (failed(emitRoleSplit(fn, *m)))
           return signalPassFailure();
+      } else {
       }
+    } else {
     }
 
     if (failed(setHmxManifestTopology(module, topology, verdict.regions)))
