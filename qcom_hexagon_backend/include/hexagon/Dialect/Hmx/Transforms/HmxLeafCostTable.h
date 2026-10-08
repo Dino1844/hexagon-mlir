@@ -18,6 +18,12 @@
 // manifest `modeled_ii` diagnostic (see THE MANIFEST SPEC below), both of
 // which are post-unfreeze work.
 //
+// W1 CLOSE-OUT (2026-10-09): the DERIVED section below modeled_ii carries
+// the co-scheduling review's S1 default-face chain decomposition and the
+// World A/B bounds -- the R1 window's reading frame. Those rows are
+// inferences composed from the measured cells above, never measured slots;
+// their structures are deliberately separate (see that section's header).
+//
 // === THE FOUR CONTRACT NOTES (read before using any number here) ===
 //
 // 1. UPPER-BOUND ACCOUNTING. Every modeled total below is a SUM OF
@@ -127,6 +133,8 @@ enum class Src {
   T1Pending,     // reserved: the 2026-10-08 campaign's LWP partition rerun
   T1Replica0810, // in-kernel LWP regions, 10-02-config replica arm (readout/WSR/L2 off)
   T1Default0810, // in-kernel LWP regions, default-face backfill (readout ON)
+  ArchReview1009, // DERIVED rows only, never a measured slot: the review's
+                  // S1 chain decomposition + World A/B bounds (2026-10-09)
 };
 
 struct SourceRef {
@@ -217,6 +225,17 @@ constexpr SourceRef kSources[] = {
      "the readout-outlined consumer, so the fused producer region carries "
      "the GROUP handoff func.call and holds no unpack work) / libhmxapi "
      "f42384f2"},
+    {Src::ArchReview1009,
+     "docs/architecture/hmx-coscheduling-architecture-review-2026-10-09.md "
+     "§2.2 (S1 main-chain decomposition) + §2.3 (World A/B bounds), "
+     "2026-10-09: DERIVED, cross-config, never a measured slot -- the "
+     "review maps the replica arm's per-leaf LWP regions (docs/results/"
+     "t1-lwp-partition-2026-10-08.md §2b/§7c, build libtriton 78865e23 / "
+     "libhmxapi f42384f2) onto the default face (§7a, build libtriton "
+     "fa79e610 / libhmxapi f42384f2, 82,425 pcyc/iter); us figures use "
+     "the default-face run's OWN implied clock 2.147 GHz; the 38 us "
+     "baseline is the measured default-face S1 (§7a, N=1000/20000 ladder "
+     "38/37)"},
 };
 
 //===----------------------------------------------------------------------===//
@@ -844,6 +863,127 @@ inline ModeledII modeledII(Grid g, const FamilyPrices &fp) {
   return {pack, engine, unpack, pack + engine + unpack,
           "upper-bound-leaf-sum"};
 }
+
+//===----------------------------------------------------------------------===//
+// DERIVED entries -- the R1 window's reading frame (W1 close-out,
+// 2026-10-09). NOT measured slots: every row below is an INFERENCE the
+// co-scheduling architecture review composed FROM measured cells, carried
+// in its own structures so a derived row can never be mistakable for a
+// kLeafPrices / kArmAnchors measurement. Nothing computes with these yet;
+// their one consumer is the R1 window (review §5) -- the experiment that
+// decides which world S1 lives in. Until it runs, every number here is a
+// conditional bound, not a prediction.
+//
+// Contract note 1 is unchanged and still governs: nothing below is an
+// arm-total subtraction, and the subtraction the note forbids stays
+// forbidden. These rows are mechanism bounds under a physics question the
+// existing data cannot answer (see kWorldBounds).
+//
+// mechanism: the two sub-sections below -- the replica-to-default mapping
+//   of the chain decomposition, and the engine-wait vs issue-saturated
+//   question the R1 window adjudicates.
+// measurement: none of these numbers is one. The inputs are the
+//   T1Replica0810 / T1Default0810 cells above and the review's arithmetic
+//   over them; Src::ArchReview1009 carries the full evidence chain.
+// shape set: S1 1024x512x64 WR=1 default face ONLY -- the one shape the
+//   review decomposed; no other family has a derived row.
+// workload representativeness: the review's own caveat -- World A/B is
+//   UNDECIDED, so both bounds below are conditional, not predicted.
+//===----------------------------------------------------------------------===//
+
+// --- The S1 default-face main-chain decomposition (review §2.2) ---
+//
+// The default face's S1 producer is ONE fused LWP region plus a small
+// independent engine residual and a function-level residual (76.41% +
+// 2.06% + 21.54% of 82,425 pcyc/iter, T1 §7a, build fa79e610) -- no clean
+// per-leaf region exists on that face. The review mapped the REPLICA
+// arm's per-leaf regions onto it instead: the leaf set is a shape
+// property (form-independent), but the mapping is CROSS-CONFIG, hence the
+// inferred caliber on every row. "glue" is the fused region's remainder
+// once pack_act and engine are placed (stage/await + the readout GROUP
+// handoff + loop glue); "residual" is the function-level share (entry and
+// exit, everything outside the pipeline regions); "unpack_concurrent" is
+// the vector thread's side and is NOT part of the main-chain sum.
+//
+// The review's closure check: fused_total + residual = 29.3 + 8.3 = 37.6
+// us ~= the measured 38 us default face (fa79e610, N=1000/20000 ladder
+// 38/37); the gap is the independent engine residual region (~1.7k pcyc,
+// 2.06%), which the five main-chain rows deliberately leave outside the
+// fused total. Every us figure below uses the default-face run's OWN
+// implied clock (2.147 GHz) -- never kSteadyGhz, never an A/B instrument
+// (contract note 2).
+struct ChainRow {
+  const char *component; // "pack_act" | "engine" | "glue" | "fused_total"
+                         // | "residual" | "unpack_concurrent"
+  int64_t pcyc;
+  double us;             // at the default-face run's own 2.147 GHz
+  const char *caliber;   // "derived-inferred" -- never a measured slot
+  Src src;               // the derivation's provenance (the review)
+};
+
+constexpr ChainRow kS1DefaultChain[] = {
+    {"pack_act", 7312, 3.4, "derived-inferred", Src::ArchReview1009},
+    {"engine", 45116, 21.0, "derived-inferred", Src::ArchReview1009},
+    {"glue", 10532, 4.9, "derived-inferred", Src::ArchReview1009},
+    {"fused_total", 62960, 29.3, "derived-inferred", Src::ArchReview1009},
+    {"residual", 17756, 8.3, "derived-inferred", Src::ArchReview1009},
+    // concurrent vector-thread side (replica-arm caliber), NOT a
+    // main-chain row: the third input of the World B three-thread bound.
+    {"unpack_concurrent", 44675, 20.8, "derived-inferred",
+     Src::ArchReview1009},
+};
+
+// --- The two-world bounds (review §2.3) -- the undecided question ---
+//
+// The ~21 us engine share of the S1 main chain is one of two PHYSICS, and
+// the existing data cannot tell them apart: the v81 PRM does not say
+// whether issue continues while the engine is busy (review §2.4), so both
+// worlds are consistent with every measurement so far.
+//
+//   World A (engine-wait): acc_read stalls the CPU while the engine
+//     computes; the window holds ~21 us of CPU idle, more than the 8.3 us
+//     of pack+DMA+glue. A SINGLE-THREADED rearrangement (T11-style pack
+//     hoisting / ping-pong scratch) reaches the bound -- no thread
+//     topology. Bound ~= engine + residual ~= 29.3 us, -22% vs 38.
+//   World B (issue-saturated): 22 pcyc/leaf ~= the pure issue stake; the
+//     CPU never idles, there is no window to fill. Only moving the engine
+//     issue stream to T_HMX cuts the main chain: the 3-thread bound ~=
+//     max(engine 21.0, unpack 20.8, main chain 16.6) ~= 21-26 us,
+//     -30~-45% vs 38.
+//
+// Evidence leans both ways (toward A: S2's readout on/off arms measured
+// equal, A=C=32.0 us -- unpack issue once hid inside an engine busy
+// window; toward B: 22 pcyc/leaf sits near the pure-issue estimate, and
+// S1 carries ~2x the engine leaves per unit of engine work that S2 does
+// -- the issue-dense vs engine-waiting shape split, review §2.2). WHICH
+// WORLD S1 LIVES IN IS UNDECIDED; the R1 window (review §5: the
+// T11-on-S1 rearrangement + the S1 four-arm) is the adjudicator. These
+// two rows are its reading frame, not predictions.
+struct WorldBoundRow {
+  const char *world;   // "A" (engine-wait) | "B" (issue-saturated)
+  double baselineUs;   // the measured default-face S1 anchor (T1 §7a: 38)
+  double boundUsLo;    // the bound's range in us (lo == hi: a point bound)
+  double boundUsHi;
+  const char *carrier; // the mechanism that reaches the bound
+  const char *caliber; // names the undecided question and the adjudicator
+  Src src;
+};
+
+constexpr WorldBoundRow kWorldBounds[] = {
+    {"A", 38.0, 29.3, 29.3,
+     "single-threaded rearrangement (T11-style pack hoisting / ping-pong "
+     "scratch) hides pack+DMA+glue inside the engine window -- no thread "
+     "topology",
+     "derived-inferred-world-undecided: adjudicator = the R1 window "
+     "(review §5; rearrangement gain >= ~4 us -> World A)",
+     Src::ArchReview1009},
+    {"B", 38.0, 21.0, 26.0,
+     "thread topology only: the engine issue stream moves to T_HMX; "
+     "3-thread bound = max(engine, unpack, main chain)",
+     "derived-inferred-world-undecided: adjudicator = the R1 window "
+     "(review §5; rearrangement gain ~= 0, < 1 us -> World B)",
+     Src::ArchReview1009},
+};
 
 //===----------------------------------------------------------------------===//
 // THE MANIFEST `modeled_ii` SPEC -- NOT IMPLEMENTED (contract wall)

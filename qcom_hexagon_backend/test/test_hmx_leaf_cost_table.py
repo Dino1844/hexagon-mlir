@@ -42,6 +42,17 @@ THE TWO STYLES, FOLLOWING THE HOUSE CONTRACT-TEST PATTERN
     line mirror of the inline functions -- the header is the single source
     of the numbers) and asserts the flips.
 
+  * DerivedEntryContractTests (the W1 close-out, 2026-10-09) pins the
+    DERIVED rows the co-scheduling review added (docs/architecture/
+    hmx-coscheduling-architecture-review-2026-10-09.md §2.2/§2.3): the S1
+    default-face chain decomposition and the World A/B bounds. Pinned:
+    existence, the "derived-inferred" caliber, the undecided/R1-adjudicator
+    labels, the evidence chain in the citation, structural separation from
+    the measured tables, and the ties that keep the derived arithmetic
+    glued to the measured cells it was composed from. NOT pinned: the
+    values -- their home is the citation, and a re-derivation updates the
+    entries and these ties together, loudly.
+
 WHAT IS DELIBERATELY NOT HERE
 -----------------------------
   * No binding-level exercise of the C++ query functions: this session is
@@ -104,6 +115,14 @@ _FAMILY_ENTRY = re.compile(
 )
 _SCALAR = re.compile(
     r"constexpr\s+(?:double|int64_t)\s+(\w+)\s*=\s*(-?[\d.]+);"
+)
+
+_CHAIN_ROW = re.compile(
+    r'\{"(\w+)",\s*(\d+),\s*(-?[\d.]+),\s*"([-\w]+)",\s*Src::(\w+)\},'
+)
+_WORLD_ROW = re.compile(
+    rf'\{{"([AB])",\s*(-?[\d.]+),\s*(-?[\d.]+),\s*(-?[\d.]+),\s*({_STRINGS}),'
+    rf'\s*({_STRINGS}),\s*Src::(\w+)\}},'
 )
 
 
@@ -199,6 +218,37 @@ def scalars():
     return {m.group(1): float(m.group(2)) for m in _SCALAR.finditer(TEXT)}
 
 
+def chain_rows():
+    """[{component, pcyc, us, caliber, src}] -- kS1DefaultChain (DERIVED)."""
+    return [
+        dict(
+            component=m.group(1),
+            pcyc=int(m.group(2)),
+            us=float(m.group(3)),
+            caliber=m.group(4),
+            src=m.group(5),
+        )
+        for m in _CHAIN_ROW.finditer(TEXT)
+    ]
+
+
+def world_rows():
+    """[{world, baseline, lo, hi, carrier, caliber, src}] -- kWorldBounds
+    (DERIVED)."""
+    return [
+        dict(
+            world=m.group(1),
+            baseline=float(m.group(2)),
+            lo=float(m.group(3)),
+            hi=float(m.group(4)),
+            carrier=_join_strings(m.group(5)),
+            caliber=_join_strings(m.group(6)),
+            src=m.group(7),
+        )
+        for m in _WORLD_ROW.finditer(TEXT)
+    ]
+
+
 SOURCES = sources()
 LEAF_PRICES = leaf_prices()
 NO_DATA = no_data()
@@ -207,6 +257,8 @@ PROTOCOL = protocol_facts()
 FLIP_ANCHORS = flip_anchors()
 FAMILIES = family_prices()
 SCALARS = scalars()
+CHAIN_ROWS = chain_rows()
+WORLD_ROWS = world_rows()
 
 # ---------------------------------------------------------------------------
 # The frozen literals -- the measured endpoints, copied from the named logs.
@@ -862,6 +914,231 @@ class FlipReproductionTests(unittest.TestCase):
         self.assertEqual(engine_calls(g), 2048)
         self.assertEqual(engine_calls(Grid(256, 64, 2048)), 80)
         self.assertEqual(engine_calls(Grid(128, 128, 128)), 64)
+
+
+# ---------------------------------------------------------------------------
+# Style 3: the derived-entry contract tests (the W1 close-out, 2026-10-09).
+# ---------------------------------------------------------------------------
+
+
+class DerivedEntryContractTests(unittest.TestCase):
+    """The review's DERIVED rows: the S1 default-face chain decomposition
+    and the World A/B bounds (review §2.2/§2.3).
+
+    These are DERIVED rows, not measured slots. What is pinned here: their
+    EXISTENCE, their CERTAINTY LABELS ("derived-inferred"; the worlds
+    additionally "undecided" + the R1 adjudicator), their CITATION (the
+    review + T1 + both arms' build fingerprints), their STRUCTURAL
+    SEPARATION from the measured tables, and the TIES that keep the
+    derived arithmetic glued to the measured cells it was composed from.
+    What is deliberately NOT pinned: the values as eternally correct --
+    their home is the citation, and a re-derivation updates the entries
+    and these ties together, loudly.
+    """
+
+    def test_the_derived_tables_parse(self):
+        # The discovery check comes first (the same discipline as above):
+        # if either regex stopped matching, every other assertion in this
+        # class goes green while checking nothing.
+        self.assertEqual(
+            [r["component"] for r in CHAIN_ROWS],
+            [
+                "pack_act",
+                "engine",
+                "glue",
+                "fused_total",
+                "residual",
+                "unpack_concurrent",
+            ],
+            "kS1DefaultChain did not parse (or a row changed)",
+        )
+        self.assertEqual(
+            [w["world"] for w in WORLD_ROWS],
+            ["A", "B"],
+            "kWorldBounds did not parse (or a world changed)",
+        )
+
+    def test_every_derived_row_is_labeled_inferred_and_cites_the_review(self):
+        for r in CHAIN_ROWS + WORLD_ROWS:
+            name = r.get("component", r.get("world"))
+            self.assertIn(
+                "derived-inferred",
+                r["caliber"],
+                f"{name}: a derived row lost its inferred caliber",
+            )
+            self.assertEqual(
+                r["src"],
+                "ArchReview1009",
+                f"{name}: a derived row cites something other than the review",
+            )
+        # the world bounds additionally name the undecided question and
+        # the R1 adjudicator -- the honesty label the close-out requires
+        for w in WORLD_ROWS:
+            self.assertIn("undecided", w["caliber"], f"World {w['world']}")
+            self.assertIn("R1", w["caliber"], f"World {w['world']}")
+
+    def test_the_review_citation_carries_the_full_evidence_chain(self):
+        # 出处纪律: the review doc + the T1 doc + BOTH arms' build
+        # fingerprints + the default-face run's own clock + the DERIVED
+        # caliber -- every needle a reader needs to re-derive the rows.
+        cite = SOURCES["ArchReview1009"]
+        for needle in (
+            "hmx-coscheduling-architecture-review-2026-10-09.md",
+            "t1-lwp-partition-2026-10-08.md",
+            "78865e23",  # the replica arm's libtriton fingerprint
+            "fa79e610",  # the default-face libtriton fingerprint
+            "f42384f2",  # libhmxapi, unchanged across both arms
+            "2.147 GHz",  # the default-face run's own implied clock
+            "DERIVED",
+        ):
+            self.assertIn(needle, cite, f"the review citation lost {needle}")
+
+    def test_no_derived_row_is_disguised_as_a_measured_slot(self):
+        # Structural separation, stated directly: the measured tables must
+        # not grow a review-cited row. (The frozen-set tests above pin
+        # their exact membership; this is the rule itself, so a future
+        # entry added to a measured table fails here first.)
+        for e in LEAF_PRICES:
+            self.assertNotEqual(
+                e["src"],
+                "ArchReview1009",
+                f"{e['leaf']}/{e['family']}/{e['cond']}: a measured price "
+                "cell cites the review -- derived rows live in their own "
+                "arrays",
+            )
+        for a in ARM_ANCHORS + FLIP_ANCHORS:
+            self.assertNotEqual(a["src"], "ArchReview1009")
+        for fp in FAMILIES.values():
+            self.assertNotEqual(fp["src"], "ArchReview1009")
+        # ...and the derived section declares what it is
+        self.assertIn("NOT measured slots", TEXT)
+
+    def test_the_chain_rows_restate_the_replica_cells_exactly(self):
+        # pack_act / engine / unpack_concurrent are the T1Replica0810
+        # region medians restated in the review's decomposition. The tie
+        # fails loudly if those cells are ever re-measured: re-derive the
+        # decomposition, never let it drift.
+        by_component = {r["component"]: r for r in CHAIN_ROWS}
+        for leaf, comp in (
+            ("PackActF16", "pack_act"),
+            ("MmaF16", "engine"),
+            ("UnpackAccF16", "unpack_concurrent"),
+        ):
+            cell = next(
+                e
+                for e in LEAF_PRICES
+                if e["family"] == "S1"
+                and e["leaf"] == leaf
+                and e["cond"] == "InKernelWR1"
+                and e["src"] == "T1Replica0810"
+            )
+            self.assertEqual(
+                by_component[comp]["pcyc"],
+                cell["region_pcyc"],
+                f"{comp}: drifted from the replica cell it restates",
+            )
+
+    def test_the_decomposition_sums_and_converts_close(self):
+        # Internal closure, on the parsed values (never frozen literals):
+        # the three main-chain components sum to the fused total, and every
+        # us figure is its pcyc at the citation's own clock.
+        rows = {r["component"]: r for r in CHAIN_ROWS}
+        self.assertEqual(
+            rows["pack_act"]["pcyc"]
+            + rows["engine"]["pcyc"]
+            + rows["glue"]["pcyc"],
+            rows["fused_total"]["pcyc"],
+            "the main-chain components no longer sum to the fused total",
+        )
+        clock_ghz = float(
+            re.search(r"([\d.]+) GHz", SOURCES["ArchReview1009"]).group(1)
+        )
+        for r in CHAIN_ROWS:
+            self.assertAlmostEqual(
+                r["us"],
+                r["pcyc"] / (clock_ghz * 1000.0),
+                delta=0.15,
+                msg=f"{r['component']}: us is not its pcyc at the cited clock",
+            )
+
+    def test_the_reviews_closure_check_still_holds(self):
+        # The review's own sanity check: fused_total + residual ~= the
+        # measured default-face 38 us (T1 §7a, N=1000/20000 ladder 38/37;
+        # the ~0.4 us gap is the independent engine residual region the
+        # five-row table leaves outside the fused total). The 38 us
+        # baseline is a MEASURED anchor the world rows carry -- frozen-
+        # literal style: a new baseline is a re-derivation and must update
+        # this pin consciously.
+        rows = {r["component"]: r for r in CHAIN_ROWS}
+        fused_plus_residual = (
+            rows["fused_total"]["us"] + rows["residual"]["us"]
+        )
+        for w in WORLD_ROWS:
+            self.assertEqual(
+                w["baseline"],
+                38.0,
+                "the world rows' baseline left the measured 38 us anchor",
+            )
+            self.assertLess(
+                fused_plus_residual,
+                w["baseline"] + 1.0,
+                "fused+residual overshot the measured default face",
+            )
+            self.assertGreater(
+                fused_plus_residual,
+                w["baseline"] - 2.0,
+                "fused+residual collapsed away from the measured face",
+            )
+
+    def test_world_a_ties_to_its_mechanism(self):
+        # World A's bound = engine + residual (pack+DMA+glue hidden inside
+        # the engine window), and the premise -- the window is big enough
+        # -- must still hold on the parsed rows.
+        rows = {r["component"]: r for r in CHAIN_ROWS}
+        a = next(w for w in WORLD_ROWS if w["world"] == "A")
+        self.assertAlmostEqual(
+            (a["lo"] + a["hi"]) / 2.0,
+            rows["engine"]["us"] + rows["residual"]["us"],
+            delta=0.3,
+            msg="World A's bound drifted from engine + residual",
+        )
+        self.assertLess(
+            rows["pack_act"]["us"] + rows["glue"]["us"],
+            rows["engine"]["us"],
+            "World A's premise broke: pack+glue no longer fit inside the "
+            "engine window -- re-derive, do not reuse",
+        )
+        self.assertLess(a["hi"], a["baseline"])
+
+    def test_world_b_ties_to_its_mechanism(self):
+        # World B's lower bound = max(engine, concurrent unpack, the main
+        # chain); the upper bound is the review's -30% endpoint of the
+        # baseline. Both must sit below the baseline -- the whole point of
+        # the topology.
+        rows = {r["component"]: r for r in CHAIN_ROWS}
+        b = next(w for w in WORLD_ROWS if w["world"] == "B")
+        main_chain = (
+            rows["pack_act"]["us"]
+            + rows["glue"]["us"]
+            + rows["residual"]["us"]
+        )
+        three_thread_max = max(
+            rows["engine"]["us"], rows["unpack_concurrent"]["us"], main_chain
+        )
+        self.assertAlmostEqual(
+            b["lo"],
+            three_thread_max,
+            delta=0.5,
+            msg="World B's lower bound drifted from the three-thread max",
+        )
+        self.assertAlmostEqual(
+            b["hi"],
+            b["baseline"] * 0.70,
+            delta=1.0,
+            msg="World B's upper bound drifted from the -30% endpoint",
+        )
+        self.assertGreater(b["hi"], b["lo"])
+        self.assertLess(b["hi"], b["baseline"])
 
 
 if __name__ == "__main__":
