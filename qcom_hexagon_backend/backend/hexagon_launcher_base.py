@@ -91,7 +91,7 @@ uint64_t avg_time_us = 0, avg_pcycles = 0;
 // none of the role executor ABI, so the archive member defining this entry
 // is not linked into its .so and the reference resolves to null -- the
 // guarded call is skipped and the legacy path is byte-for-byte today's. A
-// dual-role kernel references hexagon_runtime_hmx_role_{submit,drain}
+// dual-role kernel references hexagon_runtime_hmx_role_{{submit,drain}}
 // strongly, so the member (and this entry with it) is present by
 // construction.
 //
