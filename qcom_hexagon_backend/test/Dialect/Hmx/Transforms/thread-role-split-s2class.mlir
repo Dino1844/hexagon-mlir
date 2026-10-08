@@ -84,11 +84,20 @@
 
 // The producer loop keeps the staged arm's DMA (stage/await stay
 // producer-side: the transfer is engine-independent) and the pack, now into
-// ROW m of the rotating rows -- the pack's row operand is the tile index.
+// ROW m of the rotating rows -- reached through a one-row VIEW at row m,
+// NOT through the row operand: the pack's (row, col) name the SOURCE block
+// and the DESTINATION crouton with the same values (HmxOps.td), and the
+// source is always staging tile (0, 0). Moving the operand to m would read
+// staging rows [m*32, +32) -- out of range for every tile past the first,
+// zero-padded by the leaf -- instead of tile m's data; the device caught
+// exactly that (tile 0 correct, tiles 1..7 exactly zero,
+// logs/s3-rootcause-2026-10-08). croutonAddr addresses the sliced view at
+// its real position, so crouton (0, 0) of the view is row m of the array.
 // SPLIT: scf.for %[[M:.*]] = {{.*}} to {{.*}} step {{.*}} {
 // SPLIT: hmx.stage
 // SPLIT: hmx.await
-// SPLIT: hmx.pack_act ins({{.*}}, %[[M]], {{.*}} : memref<32x2048xf16, 1>) outs(%[[ROWS]] : memref<8x64x16x32x2xf16, 1>)
+// SPLIT: %[[ROWVIEW:.*]] = memref.subview %[[ROWS]][%[[M]], 0, 0, 0, 0] [1, 64, 16, 32, 2] [1, 1, 1, 1, 1] : memref<8x64x16x32x2xf16, 1> to memref<1x64x16x32x2xf16, strided<[65536, 1024, 64, 2, 1], offset: ?>, 1>
+// SPLIT: hmx.pack_act ins({{.*}}, %c0{{(_[0-9]+)?}}, %c0{{(_[0-9]+)?}} : memref<32x2048xf16, 1>) outs(%[[ROWVIEW]] : memref<1x64x16x32x2xf16, strided<[65536, 1024, 64, 2, 1], offset: ?>, 1>)
 
 // The engine nest is GONE from the producer -- no acc_clear, mma or acc_read
 // between the pack and the submit. What replaces it is the descriptor fill
@@ -102,6 +111,10 @@
 // problem (a dropped group is an unwritten output -- a wrong answer, not a
 // slow one), so the return is compared, and a short return drains (the one
 // barrier the frozen executor offers) and resubmits the tail by address.
+// The predicate is pinned on purpose: the first emission tested EQ, which
+// drained after every FULLY accepted batch (serializing the pipeline) and
+// ignored real short returns.
+// SPLIT: %{{.*}} = arith.cmpi ne, %{{.*}}, %{{.*}} : i32
 // SPLIT: call @hexagon_runtime_hmx_role_drain() : () -> ()
 // SPLIT: memref.subview %[[DESC]][{{.*}}] [{{.*}}] [{{.*}}] : memref<24xi32> to memref<?xi32
 // SPLIT: func.call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32

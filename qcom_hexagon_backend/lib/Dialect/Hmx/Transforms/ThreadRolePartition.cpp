@@ -278,13 +278,16 @@ StringRef decideTopology(const KernelVerdict &v) {
 // The first form removes the assumption structurally rather than policing
 // it: the scratch becomes the full [Mt, Kt] crouton array -- the same shape
 // the whole-array activation bridge used before hmx-partition retired it --
-// and every tile packs into and computes from its OWN row (hmx.pack_act and
-// hmx.mma address the whole array by row index natively, so no subviews are
-// needed anywhere). The ring depth is then the tile count itself, derived
-// from the tile-ring geometry exactly as HmxSpscRing.h demands ("the
-// compiler side derives it from the tile-ring geometry of the kernel"): a
-// ring Mt deep never fills (at most Mt descriptors exist), so the producer
-// never waits, never reuses a row, and the only barrier is the exit drain.
+// and every tile packs into and computes from its OWN row (hmx.mma addresses
+// the whole array by row index natively; hmx.pack_act does NOT -- its row
+// operand names the SOURCE block as well, so the pack reaches its row
+// through a one-row view of the array instead. See the emission note at the
+// pack: moving the row operand would move the source with it). The ring
+// depth is then the tile count itself, derived from the tile-ring geometry
+// exactly as HmxSpscRing.h demands ("the compiler side derives it from the
+// tile-ring geometry of the kernel"): a ring Mt deep never fills (at most
+// Mt descriptors exist), so the producer never waits, never reuses a row,
+// and the only barrier is the exit drain.
 //
 // THE VTCM QUESTION (ROADMAP1001 section 5.1.7, verified here)
 // -----------------------------------------------------------
@@ -683,9 +686,14 @@ static void emitRoleSubmit(OpBuilder &b, Location loc, func::FuncOp submitFn,
   Value accepted =
       func::CallOp::create(b, loc, submitFn, ValueRange{addr, countI32})
           .getResult(0);
-  Value allTaken = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::eq,
-                                         accepted, countI32);
-  scf::IfOp recovery = scf::IfOp::create(b, loc, allTaken,
+  // NE, not EQ: the recovery is for the SHORT return (groups the ring did
+  // not take). The first emission tested EQ, so the common all-accepted path
+  // drained after every batch -- serializing the pipeline the split exists
+  // to overlap -- while a real short return (unreachable with a ring Mt deep)
+  // would have dropped its tail silently. Found in the S3 root-cause hunt.
+  Value shortReturn = arith::CmpIOp::create(b, loc, arith::CmpIPredicate::ne,
+                                            accepted, countI32);
+  scf::IfOp recovery = scf::IfOp::create(b, loc, shortReturn,
                                          /*withElseRegion=*/false);
   OpBuilder inner(b.getContext());
   inner.setInsertionPoint(recovery.getThenRegion().front().getTerminator());
@@ -977,14 +985,43 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   // In the loop body: the pack moves to row m of the rows array, the
   // descriptor is filled at slot m mod batch, and every batch-th iteration
   // submits.
-  // The pack moves to row m of the rows array (the decision id and any
-  // other attrs travel with it; the three address attrs are re-supplied).
+  //
+  // THE PACK'S ROW IS A VIEW, NOT A ROW OPERAND. The pack's (row, col)
+  // operands name the source block's position AND the destination crouton's
+  // position with the same values (HmxOps.td: "Packs the 32x32 fp16 block
+  // at (row, col) of the row-major src into crouton (row, col) of the ...
+  // dst"), and every emitter before this pass kept the two equal by
+  // construction -- the staged ring packs staging tile (0, 0) into crouton
+  // (0, 0) of a one-row scratch. Redirecting the destination to row m by
+  // moving the ROW OPERAND would move the SOURCE with it: the leaf reads
+  // source rows [row*32, +32) (HMXLayout.c hmx__pack_32x32 pads
+  // out-of-range source rows with zero), and the staging tile holds exactly
+  // one tile's 32 rows, so every tile past the first would read out of
+  // range and pack zeros. Measured on the device: the first dual-role
+  // launch returned tile 0 correct and tiles 1..7 exactly zero
+  // (logs/s3-rootcause-2026-10-08). The one-row view of `rows` at row m
+  // keeps the operands at their source meaning -- crouton (0, 0) of the
+  // m-th row view IS row m of the rows array (croutonAddr addresses a
+  // sliced array at its real position, HmxToLLVMPass.cpp) -- while the
+  // source stays staging tile (0, 0).
   b.setInsertionPoint(m.nLoop);
   Value mInd = m.mLoop.getInductionVar();
+  SmallVector<OpFoldResult> rowOffs{mInd, b.getIndexAttr(0), b.getIndexAttr(0),
+                                    b.getIndexAttr(0), b.getIndexAttr(0)};
+  SmallVector<OpFoldResult> rowSizes{
+      b.getIndexAttr(1), b.getIndexAttr(scratchType.getDimSize(1)),
+      b.getIndexAttr(scratchType.getDimSize(2)),
+      b.getIndexAttr(scratchType.getDimSize(3)),
+      b.getIndexAttr(scratchType.getDimSize(4))};
+  SmallVector<OpFoldResult> rowStrides{b.getIndexAttr(1), b.getIndexAttr(1),
+                                       b.getIndexAttr(1), b.getIndexAttr(1),
+                                       b.getIndexAttr(1)};
+  Value rowView = memref::SubViewOp::create(b, loc, rows, rowOffs, rowSizes,
+                                            rowStrides);
   PackActOp pack = PackActOp::create(
-      b, loc, TypeRange{rowsType}, rows, m.pack.getSrc(), mInd,
-      m.pack.getCol(), m.pack.getCountAttr(), m.pack.getValidRowsAttr(),
-      m.pack.getValidColsAttr());
+      b, loc, TypeRange{rowView.getType()}, rowView, m.pack.getSrc(),
+      m.pack.getRow(), m.pack.getCol(), m.pack.getCountAttr(),
+      m.pack.getValidRowsAttr(), m.pack.getValidColsAttr());
   for (const auto &named : m.pack->getAttrs())
     if (named.getName() != "count" && named.getName() != "valid_rows" &&
         named.getName() != "valid_cols")
