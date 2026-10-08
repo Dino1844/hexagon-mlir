@@ -86,11 +86,22 @@ include_directories(
 # than from this file, so that source marks its four extern "C" entries with
 # __attribute__((visibility("default"))) -- the same mechanism AsyncRuntime.h:33
 # and HexagonCustomDefs.cpp:93 use. Nothing else in this library needs it.
+#
+# HmxRoleExecutor.cpp is the S2 runtime floor for thread-role execution
+# (roadmap/ROADMAP1001.md §4.1-§4.3): the bound-thread role executor
+# (bind/submit/drain/join, ABI in include/HmxRoleExecutor.h) plus the
+# process-singleton T_HMX qurt thread that takes the HMX lock once at start
+# and holds it for its lifetime. The ring protocol is include/HmxSpscRing.h.
+# Lazy by construction: nothing in this runtime or in any existing kernel
+# references its entries, and an archive member is pulled into a .so only
+# when something references it -- the S3 dispatch channel is the intended
+# first caller, and until it exists this object changes no shipped behavior.
 set(SOURCES
     AsyncRuntime.cpp
     HexagonThreadPool.cpp
     HexagonCustomDefs.cpp
     HmxVectorExecutor.cpp
+    HmxRoleExecutor.cpp
     StringMap.cpp
     MemAlloc.cpp
 )
