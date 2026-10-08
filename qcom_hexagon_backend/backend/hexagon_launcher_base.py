@@ -80,6 +80,37 @@ struct FuncResult
         self.func_call_and_benchmarking = """
 uint64_t avg_time_us = 0, avg_pcycles = 0;
 
+// Thread-role channel probe (S3): decide, before anything runs, whether this
+// kernel is dual-role -- its HMX section outlined for the bound thread of
+// HmxRoleExecutor.h -- and bind it if so. The channel is per-kernel SYMBOLS
+// (bin/runtime/include/HmxRoleChannel.h): the compiler exports
+// <func_name>__hmx_section + <func_name>__hmx_role_depth for a dual-role
+// kernel and nothing for a legacy one, and the probe inside the runtime
+// dlsym's them. The declaration below is WEAK for the same reason the
+// read-out hooks further down are: a legacy kernel's LLVM object references
+// none of the role executor ABI, so the archive member defining this entry
+// is not linked into its .so and the reference resolves to null -- the
+// guarded call is skipped and the legacy path is byte-for-byte today's. A
+// dual-role kernel references hexagon_runtime_hmx_role_{submit,drain}
+// strongly, so the member (and this entry with it) is present by
+// construction.
+//
+// RTLD_SELF: search the calling module itself -- the wrapper, the channel
+// entry and the section symbols all live in this .so. Negative return: a
+// half-emitted channel or a refused bind; the kernel must NOT run (an
+// unbound dual-role kernel submits into an executor that drops every group
+// -- a wrong answer, not a slow one), so the launch fails loudly here.
+// Return -1, not 0: the host treats a nonzero exit as a failed launch.
+if (hexagon_runtime_hmx_role_channel_launch != nullptr) {{
+  int32_t hmx_role_rc =
+      hexagon_runtime_hmx_role_channel_launch(RTLD_SELF, "{func_name}");
+  if (hmx_role_rc < 0) {{
+    FARF(ERROR, "hmx-role channel refused kernel '{func_name}' (rc=%d)",
+         (int)hmx_role_rc);
+    return -1;
+  }}
+}}
+
 // One discarded call before the timed loop. Adopted 2026-10-02.
 //
 // Measured on the phone (1024x512x64 f16, per-iteration pcycle trace): the first
@@ -205,6 +236,17 @@ extern "C" void hexagon_runtime_hmx_exec_drain(void)
 // kernels reference hexagon_runtime_hmx_exec_* strongly from their LLVM
 // object, so the archive member defining this symbol is already in their .so.
 extern "C" void hexagon_runtime_hmx_exec_dump(const char *path)
+    __attribute__((weak));
+// Thread-role channel probe (S3, bin/runtime/include/HmxRoleChannel.h): the
+// launch-side half of the dual-role dispatch. Weak for the same reason as
+// the three declarations above: only a dual-role kernel's .so contains the
+// archive member that defines it (the kernel's strong submit/drain
+// references pull it in), so legacy kernels resolve it to null and the
+// guarded call in the benchmarking block is skipped. dlfcn.h is included
+// for RTLD_SELF, the handle that names this .so to the probe.
+#include <dlfcn.h>
+extern "C" int32_t hexagon_runtime_hmx_role_channel_launch(void *handle,
+                                                           const char *entry)
     __attribute__((weak));
 """
 

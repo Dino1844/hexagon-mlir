@@ -548,6 +548,22 @@ public:
       // runs, so disabling the split restores the transfer-only floor.
       hmxPartitionOpts.stagedReadoutMTiles =
           enableHmxVectorReadout ? 2 * hmxReadoutBatch : 0;
+      // The thread-role split's first form transforms the SERIAL source
+      // ring (ROADMAP1001 section 5, S3 row: "首形态从简"), so while the
+      // split gate is on, `auto` staging resolves to the serial ring
+      // instead of the SCF-pipelined double ring: the pipelined depth-2
+      // form peels an epilogue whose engine work the first form has no
+      // story for, and thread-role-partition declines it with a remark.
+      // Declining the PIPELINER here -- rather than letting the split
+      // decline the pipelined shape -- is the honest order: the cross-
+      // thread overlap IS the mechanism for this arm, and S3's measurement
+      // owns the verdict on whether it beats the single-thread pipeline
+      // (the task records this as "首次发射可以 decline pipelining").
+      // Only `auto` is overridden: an explicit pipeline-depth request
+      // stands (and an explicit 2 then declines the split, loudly, in
+      // thread-role-partition).
+      if (enableThreadRolePartition && enableHmxPipelineDepth <= 0)
+        hmxPartitionOpts.pipelineDepth = 1;
       pm.addNestedPass<func::FuncOp>(
           mlir::hmx::createHmxPartitionPass(hmxPartitionOpts));
         // Thread-role classification runs AFTER hmx-partition, and that order is

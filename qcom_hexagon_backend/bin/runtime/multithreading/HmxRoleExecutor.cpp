@@ -43,6 +43,19 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
+
+// The dispatch channel's shared suffix header (ROADMAP1001 section 4.6). The
+// compiler emission includes the same file, so the symbol spellings agree by
+// construction. Plain C on purpose -- see its file header.
+#include "HmxRoleChannel.h"
+
+// dlsym for the channel probe. On the device this is the DSP libc's dlfcn
+// (target/hexagon/include/dlfcn.h in the SDK tools); on the host contract
+// test it is glibc's. The entry never spells a handle constant itself -- the
+// caller passes RTLD_SELF on the device, a dlopen handle on the host -- so
+// the two platforms' different RTLD_* values never meet this file.
+#include <dlfcn.h>
 
 // HAP_farf.h uses `, ##__VA_ARGS__`, which -pedantic rejects and this target
 // compiles with -Werror (clang). Scoped to the include, same as
@@ -490,6 +503,117 @@ __attribute__((visibility("default"))) void hexagon_runtime_hmx_role_join(void) 
   e.ring.reset();
   e.started.store(false, std::memory_order_release);
   e.stop.store(false, std::memory_order_release);
+}
+
+//===----------------------------------------------------------------------===//
+// The host->device dispatch channel (HmxRoleChannel.h, ROADMAP1001 4.6)
+//===----------------------------------------------------------------------===//
+//
+// WHY THIS ENTRY LIVES IN THIS ARCHIVE MEMBER AND NOT ITS OWN FILE
+// ---------------------------------------------------------------
+// The launch side (the generated wrapper main) references this entry WEAKLY,
+// exactly the way it references hexagon_runtime_hmx_exec_drain and
+// hexagon_runtime_hmx_exec_dump (hexagon_launcher_base.py's headers block):
+// a weak reference resolves to null when the definition is absent, which is
+// what keeps a legacy kernel's wrapper a no-op without any launch ABI
+// change. But a weak reference PULLS NOTHING from an archive: the member is
+// only linked when some strong reference demands it. The strong references
+// that exist are the compiler-emitted submit/drain calls of a dual-role
+// kernel's body -- and they resolve against THIS member
+// (hexagon_runtime_hmx_role_submit / _drain above). So this member, and only
+// this member, is present in exactly those .so's that are dual-role, which
+// is precisely the set for which the probe must exist. A separate channel
+// translation unit would stay in the archive for every dual-role .so and
+// the wrapper's weak reference would be null -- the probe would never run.
+//
+// THE PROBE
+// ---------
+// dlsym for `<entry>__hmx_section` (the section entry point) and
+// `<entry>__hmx_role_depth` (the companion uint32_t depth object); both
+// names are built from the suffixes in HmxRoleChannel.h, which the compiler
+// emission includes too. Neither found: legacy, return 0, touch nothing.
+// Exactly one found: a half-emitted channel -- refuse (the caller must not
+// run the kernel; see the header's return-code block for why a refused
+// launch is better than a bound-less dual-role kernel). Both found: bind.
+//
+// [未验证] WHETHER dlsym(RTLD_SELF, ...) SEARCHES THE CALLING .so ON THE
+// DEVICE. The DSP libc's dlfcn.h documents RTLD_SELF as "search the caller
+// itself", and this entry, the wrapper that calls it, and the section
+// symbols all live in the same .so by the archive-pull argument above, so
+// the handle names the right module. The host contract test proves the
+// probe's logic against real dlopen/dlsym on stub modules; the device-side
+// confirmation (and, if RTLD_SELF's scope differs there, the one-line handle
+// change in the wrapper) belongs to the S3 device window, which is where
+// this channel gets its first real launch.
+__attribute__((visibility("default"))) int32_t
+hexagon_runtime_hmx_role_channel_launch(void *handle, const char *kernel_entry) {
+  if (kernel_entry == nullptr || handle == nullptr) {
+    // A null handle is refused alongside a null name: passing 0 to dlsym is
+    // RTLD_DEFAULT on some platforms (a global-scope search), which would
+    // make the probe's answer depend on what else is loaded rather than on
+    // the module being launched. The launch side always has a handle.
+    FARF(ERROR, "hmx-role: channel probe needs a dlsym handle and a kernel "
+                "entry name");
+    return HMX_ROLE_CHANNEL_ERR_ARG;
+  }
+
+  // One buffer, reused: the two names share the prefix and neither outlives
+  // its dlsym call. Long enough for a kernel entry name plus the suffix with
+  // room to spare; a name that does not fit is refused rather than
+  // truncated, because a truncated name probes a symbol nobody emitted.
+  char name[256];
+  const size_t entryLen = std::strlen(kernel_entry);
+
+  auto buildName = [&](const char *suffix) -> bool {
+    const size_t suffixLen = std::strlen(suffix);
+    if (entryLen + suffixLen + 1 > sizeof(name)) {
+      FARF(ERROR, "hmx-role: kernel entry name '%s' plus the channel suffix "
+                  "does not fit the probe buffer",
+           kernel_entry);
+      return false;
+    }
+    std::memcpy(name, kernel_entry, entryLen);
+    std::memcpy(name + entryLen, suffix, suffixLen + 1);
+    return true;
+  };
+
+  if (!buildName(HMX_ROLE_SECTION_SUFFIX))
+    return HMX_ROLE_CHANNEL_ERR_NAME;
+  // POSIX requires dlsym's void* to convert to a function pointer; both the
+  // DSP libc and the host libcs used here honor it.
+  void *section = dlsym(handle, name);
+
+  if (!buildName(HMX_ROLE_DEPTH_SUFFIX))
+    return HMX_ROLE_CHANNEL_ERR_NAME;
+  void *depthSym = dlsym(handle, name);
+
+  if (section == nullptr && depthSym == nullptr)
+    return HMX_ROLE_CHANNEL_LEGACY; // today's path: nothing bound, nothing touched
+
+  if (section == nullptr || depthSym == nullptr) {
+    // Half a channel: the compiler emits the section and the depth as one
+    // unit (HmxToLLVMPass), so one without the other is a broken build, not
+    // a legacy kernel. Binding anyway would need a guessed depth; treating
+    // it as legacy would run a dual-role kernel unbound, whose submits drop
+    // every group. Both are wrong answers, so the launch is refused.
+    FARF(ERROR, "hmx-role: half-emitted channel for kernel '%s': section=%d "
+                "depth=%d; refusing to run the kernel",
+         kernel_entry, section != nullptr, depthSym != nullptr);
+    return HMX_ROLE_CHANNEL_ERR_HALF;
+  }
+
+  const uint32_t depth = *static_cast<const uint32_t *>(depthSym);
+  const int32_t rc = hexagon_runtime_hmx_role_bind(
+      reinterpret_cast<HmxSectionFn>(section), depth);
+  if (rc != HEXMLIR_HMX_ROLE_OK) {
+    // bind already logged its own reason for create failures; the depth
+    // refusals (null section cannot happen here, depth 0 can) are named
+    // here so the log and the return agree.
+    FARF(ERROR, "hmx-role: bind refused kernel '%s' (rc=%d, depth=%u)",
+         kernel_entry, rc, depth);
+    return HMX_ROLE_CHANNEL_ERR_BIND;
+  }
+  return HMX_ROLE_CHANNEL_BOUND;
 }
 
 } // extern "C"

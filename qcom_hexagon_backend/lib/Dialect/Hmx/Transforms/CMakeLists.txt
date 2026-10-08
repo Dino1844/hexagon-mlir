@@ -24,6 +24,7 @@ add_mlir_dialect_library(HmxTransforms
   MLIRDestinationStyleOpInterface
   MLIRFuncDialect
   MLIRIR
+  MLIRLLVMDialect
   MLIRLinalgDialect
   MLIRMemRefDialect
   MLIRPass

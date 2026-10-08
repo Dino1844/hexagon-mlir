@@ -120,6 +120,29 @@ DEPTH_2 = dict(
 )
 READOUT_ON = dict(enableHmxVectorReadout=True)
 
+# The role channel's runtime demand, for the dual-role shapes: the producer
+# submits and drains through the role executor, so THOSE are the undefined
+# references its object places on the runtime archive (see
+# test_the_runtime_entry_points_are_referenced for the composition rule).
+ROLE_REFERENCED_REQUIRED = (
+    "hexagon_runtime_hmx_role_submit",
+    "hexagon_runtime_hmx_role_drain",
+)
+
+
+def _role_split_is_in_object(symbols):
+    """Whether the object carries the thread-role split instead of the
+    read-out split.
+
+    The role channel's exported entry point is named
+    `<kernel>__hmx_section` (HmxRoleChannel.h's suffix), so a definition
+    with that suffix is the positive signal; the submit reference is the
+    demand. Both are required so a kernel that exported the entry point but
+    never submitted (a half-split) does not read as dual-role.
+    """
+    entry = [s for s in symbols if s.endswith("__hmx_section")]
+    return bool(entry) and symbols.get("hexagon_runtime_hmx_role_submit") == "U"
+
 
 @triton.jit
 def matmul_kernel(A, B, C, N_ROWS: tl.constexpr, N_COLUMNS: tl.constexpr,
@@ -768,7 +791,32 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
 
     def test_the_outlined_readout_is_in_the_object(self):
         # The assertion whose absence is why seven sweeps read "no speedup".
+        #
+        # ONE shape now takes the other split instead, by design: these
+        # compiles run with enableThreadRolePartition=True (DEPTH_2, the
+        # measurement options), and on grid-tiled-small -- the only shape
+        # whose depth-2 request caps to the serial source ring (Mt=2 is at
+        # the pipeliner's tile-count cap) -- the thread-role split FIRES.
+        # A dual-role kernel moves its read-out past the exit drain (the
+        # consumer owns the AR rows until they retire, and the frozen
+        # executor ABI offers no per-tile retire visibility), which removes
+        # the in-loop read-out this pass attaches to -- so the read-out
+        # split declines there and the ROLE channel is the split that must
+        # be in the object instead. Asserting that substitution rather than
+        # exempting the shape silently: a dual-role object with NEITHER
+        # split's symbols is still a failure.
         for name, (_obj, _stderr, symbols) in self.compiled.items():
+            if _role_split_is_in_object(symbols):
+                missing = _split_is_in_object(symbols)
+                self.assertNotEqual(
+                    [], missing,
+                    f"[{name}] the thread-role split is in the object, so the "
+                    "read-out split must have declined (its attach point moved "
+                    "past the exit drain) -- a read-out entry point alongside "
+                    "the role channel would mean both splits fired on one "
+                    "kernel, which the composition rule forbids",
+                )
+                continue
             missing = _split_is_in_object(symbols)
             self.assertEqual([], missing, f"[{name}] " + "; ".join(missing))
 
@@ -776,7 +824,21 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
         # Undefined here, resolved at device link. Asserted separately from the
         # definitions above because the two mean different things: `T` is code
         # this kernel carries, `U` is a demand it places on the runtime archive.
+        #
+        # The dual-role substitution of test_the_outlined_readout_is_in_the_object
+        # applies here too: where the role split fired, the demanded runtime is
+        # the ROLE executor's submit/drain, not the vector executor's
+        # configure/publish/drain.
         for name, (_obj, _stderr, symbols) in self.compiled.items():
+            if _role_split_is_in_object(symbols):
+                for required in ROLE_REFERENCED_REQUIRED:
+                    self.assertEqual(
+                        "U", symbols.get(required),
+                        f"[{name}] {required} should be an undefined reference "
+                        f"resolved at device link (the dual-role kernel's "
+                        f"runtime demand), got {symbols.get(required)!r}",
+                    )
+                continue
             for required in REFERENCED_REQUIRED:
                 self.assertEqual(
                     "U", symbols.get(required),

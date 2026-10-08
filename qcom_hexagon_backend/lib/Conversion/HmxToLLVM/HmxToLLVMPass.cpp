@@ -25,8 +25,15 @@
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxRoleHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxVtcmAccounting.h"
+
+// The runtime half of the channel's shared names: the suffixes that build
+// the exported entry-point and depth-object symbols. Same header the
+// launch-side probe includes (see HmxToLLVM's CMakeLists for why this
+// include dir is on this target's path).
+#include "HmxRoleChannel.h"
 
 #include "mlir/Analysis/DataLayoutAnalysis.h"
 #include "mlir/Conversion/LLVMCommon/ConversionTarget.h"
@@ -577,9 +584,18 @@ static bool isHmxEngineLeaf(StringRef callee) {
   /// to be a *silent* missing pair, into a compile-time error. It never
   /// selects a function for insertion.
 static void verifyHmxLeafCallers(ModuleOp moduleOp,
-                                 const llvm::StringSet<> &engineKernels) {
+                                 const llvm::StringSet<> &engineKernels,
+                                 const llvm::StringSet<> &roleWorkFns) {
   auto verify = [&](auto fn) {
     if (fn.isDeclaration() || engineKernels.count(fn.getName()))
+      return;
+    // The role split's work function is the one deliberate exception: it
+    // runs on the bound thread, whose lifetime lock (taken once at thread
+    // start) replaces the per-kernel pair. An unlock inserted here would
+    // release that lifetime lock; a missing ensure would be equally wrong
+    // in the other direction. The exemption is the channel's contract, not
+    // a check someone forgot.
+    if (roleWorkFns.count(fn.getName()))
       return;
     bool found = false;
     fn->walk([&](LLVM::CallOp call) {
@@ -1110,6 +1126,239 @@ static LogicalResult wireVectorReadout(ModuleOp moduleOp) {
   // nothing to re-wire and would silently leave the kernel publishing to a
   // function nobody registered, rather than failing on a stale record.
   moduleOp->removeAttr(kHmxReadoutHandoffsAttr);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// THREAD-ROLE CHANNEL (S3; ROADMAP1001 sections 3.2, 4.6)
+//===----------------------------------------------------------------------===//
+//
+// ThreadRolePartition outlined the engine section into a private work function
+// and rewrote the kernel into the producer side (submit/drain). Two things are
+// still missing, and both need this pass's position after
+// convert-func-to-llvm:
+//
+//   * the ENTRY POINT, `<engine>__hmx_section`, adapting the runtime's
+//     `HmxSectionFn` (void(const HmxTileGroupDesc*, uint32_t)) onto the work
+//     function -- the same adapter-with-addresses arrangement the read-out
+//     entry uses, except the buffers' addresses come from the per-launch
+//     table (HmxRoleHandoff.h), because the frozen 24-byte descriptor has no
+//     address words;
+//   * the DEPTH OBJECT, `<engine>__hmx_role_depth`, the exported uint32_t the
+//     launch-side probe reads to bind with the ring depth the producer
+//     derived from the tile-ring geometry.
+//
+// Plus one change to existing machinery: the work function must NOT get the
+// per-kernel ensure/unlock pair. Its lock is the bound thread's lifetime lock
+// (HmxRoleExecutor.cpp's roleThreadEntry calls ensure once at thread start and
+// never unlocks), and an inserted unlock at the work function's exit would
+// RELEASE that lifetime lock under the executor's feet -- the exact
+// "per-kernel pairing" the lock migration's first half retires. The exemption
+// is keyed on the handoff record's names, and verifyHmxLeafCallers gets the
+// same set so the exemption is visible as an exemption, not as a missed pair.
+//
+// The work function also gets the LLVM fn attribute that carries the thread
+// contract to the backend: `passthrough = ["hexagon_hmx"]`, which the LLVM IR
+// translation turns into the string fn attribute upstream PR #222340's TTI
+// hooks read (the S0 backport). It is set here, on the llvm.func, because the
+// `hex.thread_role` marker on the func.func does not survive every conversion
+// in between (the readout marker's lesson); CollapseAddressSpace, which
+// rebuilds llvm.func, copies the passthrough attribute explicitly.
+
+/// Build the section entry point: `void(<engine>__hmx_section)(ptr, i32)`.
+///
+/// What it forwards, and what it does not:
+///
+///   * `rowStart`/`rowCount` come out of descriptor words 1 and 2, zero
+///     extended to the i64 the work function's `index` parameters became.
+///   * the four buffer addresses come out of the per-launch table's words,
+///     each rebuilt into the work function's exploded memref arguments
+///     (`appendMemrefArgs` -- the same reconstruction the read-out entry
+///     does for its two buffers).
+///   * `slot` (word 0) is NOT forwarded: the work function derives the
+///     crouton row from `rowStart` directly (one row per tile, so the row is
+///     the tile index). Reading the word and doing nothing with it would be
+///     a lie about the dependency -- the same rule the read-out entry
+///     applies to its informational words.
+///   * `count` is not used: the runtime calls the section once per
+///     descriptor with count == 1 (HmxRoleExecutor.h's per-item discipline),
+///     and the descriptor's own `rowCount` is the loop bound. The parameter
+///     stays because the ABI carries it.
+///
+/// PUBLIC, unlike the read-out entry: the launch-side probe dlsym's this
+/// symbol in the loaded module, so it must survive as an exported symbol.
+static LLVM::LLVMFuncOp emitRoleEntry(OpBuilder &builder, ModuleOp moduleOp,
+                                      LLVM::LLVMFuncOp work,
+                                      MemRefType rowsType, MemRefType wtType,
+                                      MemRefType biasType, MemRefType arType,
+                                      StringRef name) {
+  MLIRContext *context = moduleOp.getContext();
+  auto i32Ty = builder.getI32Type();
+  auto i64Ty = builder.getI64Type();
+  auto ptrTy = LLVM::LLVMPointerType::get(context, 0);
+  // The descriptor as a value: six i32 words in the frozen field order
+  // (HmxRoleHandoff.h), read as one struct the same way the read-out entry
+  // reads its batch -- the layout agreement is with the header both sides
+  // include, and reading it as a struct states that.
+  auto descTy = LLVM::LLVMStructType::getLiteral(
+      context, SmallVector<Type>(kHmxRoleDescWords, i32Ty));
+
+  LLVM::LLVMFunctionType fnType = LLVM::LLVMFunctionType::get(
+      LLVM::LLVMVoidType::get(context), {ptrTy, i32Ty}, /*isVarArg=*/false);
+  OpBuilder funcBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
+  LLVM::LLVMFuncOp entry =
+      LLVM::LLVMFuncOp::create(funcBuilder, moduleOp.getLoc(), name, fnType);
+  // Public on purpose -- see the function comment.
+  Block *block = entry.addEntryBlock(funcBuilder);
+  OpBuilder body = OpBuilder::atBlockEnd(block);
+  Location loc = moduleOp.getLoc();
+
+  Value desc = LLVM::LoadOp::create(body, loc, descTy, block->getArgument(0));
+  auto word = [&](int64_t index) -> Value {
+    return LLVM::ExtractValueOp::create(body, loc, i32Ty, desc,
+                                        ArrayRef<int64_t>{index});
+  };
+  Value rowStart = word(kHmxRoleDescRowStart);
+  Value rowCount = word(kHmxRoleDescRowCount);
+
+  // The per-launch buffer table. Four loads per section call: four DDR
+  // loads against an engine section's worth of work is noise, and the table
+  // is the only per-launch channel the frozen descriptor leaves.
+  auto tableAddr = [&](StringRef global) -> Value {
+    LLVM::GlobalOp word = moduleOp.lookupSymbol<LLVM::GlobalOp>(global);
+    assert(word && "ThreadRolePartition created the table words");
+    Value slot = LLVM::AddressOfOp::create(body, loc, word);
+    return LLVM::LoadOp::create(body, loc, i32Ty, slot);
+  };
+
+  SmallVector<Value> args;
+  appendMemrefArgs(body, loc, rowsType, tableAddr(kHmxRoleRowsGlobal), args);
+  appendMemrefArgs(body, loc, wtType, tableAddr(kHmxRoleWtGlobal), args);
+  appendMemrefArgs(body, loc, biasType, tableAddr(kHmxRoleBiasGlobal), args);
+  appendMemrefArgs(body, loc, arType, tableAddr(kHmxRoleArGlobal), args);
+  args.push_back(LLVM::ZExtOp::create(body, loc, i64Ty, rowStart));
+  args.push_back(LLVM::ZExtOp::create(body, loc, i64Ty, rowCount));
+
+  LLVM::CallOp::create(body, loc, TypeRange{},
+                       FlatSymbolRefAttr::get(work.getOperation()), args);
+  LLVM::ReturnOp::create(body, loc, ValueRange{});
+  return entry;
+}
+
+/// The thread-role channel's compiler half: entry point, depth object, the
+/// LLVM thread-contract attribute. The ensure/unlock exemption is consumed
+/// earlier -- the work-function names have to be known before the
+/// engine-kernel collection runs (see runOnOperation), which is why the
+/// sidecar is read twice: once for the names, once for the types.
+static LogicalResult wireRoleChannel(ModuleOp moduleOp) {
+  auto handoffs = moduleOp->getAttrOfType<ArrayAttr>(kHmxRoleHandoffsAttr);
+  if (!handoffs || handoffs.empty())
+    return success();
+
+  OpBuilder builder(moduleOp.getContext());
+  for (Attribute record : handoffs.getValue()) {
+    auto dict = cast<DictionaryAttr>(record);
+    auto engineName = dict.getAs<StringAttr>(kHmxRoleEngineField);
+    auto workName = dict.getAs<StringAttr>(kHmxRoleWorkField);
+    auto depthAttr = dict.getAs<IntegerAttr>(kHmxRoleDepthField);
+    auto rowsTypeAttr = dict.getAs<TypeAttr>(kHmxRoleRowsField);
+    auto wtTypeAttr = dict.getAs<TypeAttr>(kHmxRoleWtField);
+    auto biasTypeAttr = dict.getAs<TypeAttr>(kHmxRoleBiasField);
+    auto arTypeAttr = dict.getAs<TypeAttr>(kHmxRoleArField);
+    if (!engineName || !workName || !depthAttr || !rowsTypeAttr ||
+        !wtTypeAttr || !biasTypeAttr || !arTypeAttr)
+      return moduleOp.emitError()
+             << "hmx.role.handoffs record is missing a field; the producer "
+                "pass and this pass disagree on the schema";
+
+    auto rowsType = dyn_cast<MemRefType>(rowsTypeAttr.getValue());
+    auto wtType = dyn_cast<MemRefType>(wtTypeAttr.getValue());
+    auto biasType = dyn_cast<MemRefType>(biasTypeAttr.getValue());
+    auto arType = dyn_cast<MemRefType>(arTypeAttr.getValue());
+    if (!rowsType || !wtType || !biasType || !arType)
+      return moduleOp.emitError()
+             << "hmx.role.handoffs buffer fields are not memref types";
+
+    LLVM::LLVMFuncOp work =
+        moduleOp.lookupSymbol<LLVM::LLVMFuncOp>(workName.getValue());
+    if (!work)
+      return moduleOp.emitError()
+             << "handoff names work function '" << workName.getValue()
+             << "', which is not an llvm.func; HmxToLLVM must run after "
+                "convert-func-to-llvm";
+    if (work.isDeclaration())
+      return work.emitError() << "work function '" << workName
+                              << "' is a declaration; it has no body to run";
+
+    // The work function's signature, verified rather than trusted: four
+    // memrefs then two i64s under the default convert-func-to-llvm
+    // convention. A mismatch would pass the wrong words in the wrong order
+    // -- a silent mis-read, not a crash.
+    unsigned expanded = 0;
+    for (MemRefType type : {rowsType, wtType, biasType, arType})
+      expanded += 3 + 2 * static_cast<unsigned>(type.getRank());
+    expanded += 2;
+    if (work.getNumArguments() != expanded)
+      return work.emitError()
+             << "work function '" << workName.getValue() << "' has "
+             << work.getNumArguments()
+             << " parameters; the section entry models exactly (memref x4, "
+                "index, index) under the default convert-func-to-llvm "
+                "convention, which is "
+             << expanded << ". Refusing to guess which words are which buffer";
+
+    // The LLVM thread contract (see the section banner): passthrough is the
+    // standard route to a string fn attribute, and CollapseAddressSpace
+    // copies it when it rebuilds the function.
+    SmallVector<Attribute> passthrough;
+    if (auto existing = work->getAttrOfType<ArrayAttr>(
+            work.getPassthroughAttrName()))
+      passthrough.assign(existing.getValue().begin(),
+                         existing.getValue().end());
+    passthrough.push_back(builder.getStringAttr("hexagon_hmx"));
+    work.setPassthroughAttr(builder.getArrayAttr(passthrough));
+
+    // The exported channel symbols. Both names are built from the suffixes
+    // in HmxRoleChannel.h -- the same header the runtime probe includes --
+    // so the spellings cannot drift.
+    std::string entryName =
+        (engineName.getValue() + HMX_ROLE_SECTION_SUFFIX).str();
+    if (moduleOp.lookupSymbol(entryName))
+      return moduleOp.emitError()
+             << "thread-role entry point '" << entryName
+             << "' already exists; the handoff was already wired";
+    LLVM::LLVMFuncOp entry = emitRoleEntry(builder, moduleOp, work, rowsType,
+                                           wtType, biasType, arType,
+                                           entryName);
+    (void)entry;
+
+    std::string depthName =
+        (engineName.getValue() + HMX_ROLE_DEPTH_SUFFIX).str();
+    if (moduleOp.lookupSymbol(depthName))
+      return moduleOp.emitError()
+             << "thread-role depth object '" << depthName
+             << "' already exists; the handoff was already wired";
+    // External linkage AND an initializer: a defined, exported object --
+    // dlsym finds it in the loaded module, and the probe reads the depth
+    // the producer derived from the tile-ring geometry (the ring is as deep
+    // as the tile count; see ThreadRolePartition's emission).
+    OpBuilder globalBuilder = OpBuilder::atBlockEnd(moduleOp.getBody());
+    LLVM::GlobalOp::create(
+        globalBuilder, moduleOp.getLoc(), builder.getI32Type(),
+        /*isConstant=*/true, LLVM::Linkage::External, depthName,
+        builder.getIntegerAttr(builder.getI32Type(),
+                               static_cast<int32_t>(depthAttr.getInt())),
+        /*alignment=*/0, /*addrSpace=*/0, /*dsoLocal=*/false,
+        /*thread_local=*/false);
+
+    // The ensure/unlock exemption (the section banner): the work function's
+    // lock is the bound thread's lifetime lock. Recorded for
+    // runOnOperation's collection, which already skipped these names.
+  }
+
+  // Consumed, like the read-out record: a second consumer would emit a
+  // second entry point and shadow the first.
+  moduleOp->removeAttr(kHmxRoleHandoffsAttr);
   return success();
 }
 
@@ -2580,15 +2829,30 @@ struct HmxToLLVMPass : public ::impl::HmxToLLVMBase<HmxToLLVMPass> {
     // recording the symbol names here identifies the same functions after it,
     // even if a future lowering were to rebuild a function while keeping its
     // name.
+    //
+    // The role split's work functions are EXEMPT from the pair, and the
+    // exemption has to be known here, before the collection: their lock is
+    // the bound thread's lifetime lock (HmxRoleExecutor.cpp's
+    // roleThreadEntry takes it once and never releases), and an unlock
+    // inserted at a work function's exit would release that lifetime lock
+    // under the executor's feet. verifyHmxLeafCallers sees the same set so
+    // the exemption shows up as an exemption, not as a missed pair.
+    llvm::StringSet<> roleWorkFns;
+    if (auto roleHandoffs =
+            moduleOp->getAttrOfType<ArrayAttr>(kHmxRoleHandoffsAttr))
+      for (Attribute record : roleHandoffs.getValue())
+        if (auto workName =
+                cast<DictionaryAttr>(record).getAs<StringAttr>(kHmxRoleWorkField))
+          roleWorkFns.insert(workName.getValue());
+
     llvm::StringSet<> engineKernels;
-    moduleOp.walk([&](LLVM::LLVMFuncOp fn) {
-      if (!fn.isDeclaration() && issuesHmxEngineLeaves(fn))
+    auto collectEngineKernel = [&](auto fn) {
+      if (!fn.isDeclaration() && issuesHmxEngineLeaves(fn) &&
+          roleWorkFns.count(fn.getName()) == 0)
         engineKernels.insert(fn.getName());
-    });
-    moduleOp.walk([&](func::FuncOp fn) {
-      if (!fn.isDeclaration() && issuesHmxEngineLeaves(fn))
-        engineKernels.insert(fn.getName());
-    });
+    };
+    moduleOp.walk([&](LLVM::LLVMFuncOp fn) { collectEngineKernel(fn); });
+    moduleOp.walk([&](func::FuncOp fn) { collectEngineKernel(fn); });
 
     const auto &dataLayoutAnalysis = getAnalysis<DataLayoutAnalysis>();
 
@@ -2609,8 +2873,10 @@ struct HmxToLLVMPass : public ::impl::HmxToLLVMBase<HmxToLLVMPass> {
     // Invariant check before anything is inserted: a leaf caller the dialect
     // test declined must fail the build loudly, not ship without a pair (see
     // verifyHmxLeafCallers). Existing control flow is untouched: after
-    // signalPassFailure() this still runs, exactly as it always has.
-    verifyHmxLeafCallers(moduleOp, engineKernels);
+    // signalPassFailure() this still runs, exactly as it always has. The
+    // role work functions are exempt with their reason: their lock is the
+    // bound thread's lifetime lock, not a per-kernel pair.
+    verifyHmxLeafCallers(moduleOp, engineKernels, roleWorkFns);
 
     // Every function collected above as issuing HMX leaves has to power the
     // engine on and release it (one ensure/unlock pair per kernel); no other
@@ -2624,6 +2890,16 @@ struct HmxToLLVMPass : public ::impl::HmxToLLVMBase<HmxToLLVMPass> {
     // section comment above wireVectorReadout). A module with no handoff record
     // is untouched, which is what keeps the default-off path byte-identical.
     if (failed(wireVectorReadout(moduleOp))) {
+      signalPassFailure();
+      return;
+    }
+
+    // The thread-role channel's compiler half: the exported entry point and
+    // depth object the launch-side probe looks for, and the LLVM
+    // thread-contract attribute on the work function. Same position rule as
+    // the read-out wiring above; a module with no role handoff record is
+    // untouched.
+    if (failed(wireRoleChannel(moduleOp))) {
       signalPassFailure();
       return;
     }

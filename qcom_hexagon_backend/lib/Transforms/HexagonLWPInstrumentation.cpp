@@ -14,6 +14,7 @@
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxRoleHandoff.h"
 #include "hexagon/Transforms/OptionsParsing.h"
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
@@ -210,6 +211,15 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
     // first. It also keeps the read-out's own loop out of the timed path the
     // measurement is taking.
     if (func->hasAttr(mlir::hmx::kHmxReadoutOutlinedAttr))
+      return;
+
+    // The role split's outlined engine section is the same kind of
+    // bystander, for the same two reasons (same call in
+    // ThreadRolePartition): it is not a kernel -- it runs on the bound
+    // thread, reached only through the channel's bind -- and instrumenting
+    // it would corrupt the ID space the partition tooling reads. The marker
+    // is the `hex.thread_role` region attribute (HmxRoleHandoff.h).
+    if (func->hasAttr(mlir::hmx::kHmxThreadRoleAttr))
       return;
 
     // Instrument one function at a time. The module-level get-or-creates below
