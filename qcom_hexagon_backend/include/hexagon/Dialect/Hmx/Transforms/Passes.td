@@ -98,10 +98,13 @@ def ThreadRolePartition : InterfacePass<"thread-role-partition",
 
       `topology-single-role-hmx`    engine only; an HMX thread is required
       `topology-single-role-hvx`    no engine work at all
-      `role-split-ok`               a pack shares a loop with an engine op, so
-                                    there is a per-tile producer stream to
-                                    overlap: while tile i is in the matrix
-                                    engine, another thread builds tile i+1
+      `role-split-ok`               a pack sits directly in a loop whose body
+                                    holds engine work -- the engine ops may be
+                                    one loop deeper, which is where every
+                                    emitter puts them -- so there is a per-tile
+                                    producer stream to overlap: while tile i is
+                                    in the matrix engine, another thread builds
+                                    tile i+1
       `role-mixed-irreducible`      layout work is co-located with engine work
                                     but is only `unpack_acc`/`unpack_acc_f32`.
                                     It consumes what the engine op just wrote,
@@ -120,12 +123,19 @@ def ThreadRolePartition : InterfacePass<"thread-role-partition",
     hoisted onto the other thread ahead of time.
 
     `role-split-ok` is the one that decides real workloads, and it is decided
-    by a single existing knob: `enable-hmx-pipeline-depth`. At depth 1 the pack
-    loop completes before the tile loop and the verdict is `role-split-nopack`;
-    at depth 2 hmx-partition moves the pack inside the tile loop and the
-    verdict becomes `role-split-ok`. That is the same switch the measured A/B
-    turns on, where staging overlap is worth 14% (1024x512x64) to 35%
-    (256x64x2048) -- docs/results/t1c-residual-and-thmx-real-ceiling-2026-10-02.md.
+    by whether the kernel's activation pack rides the tile loop. Every STAGED
+    arm puts the pack inside the m-tile loop, one pack per tile -- depth 2
+    (pipelined) and depth 1 (the serial ring) alike, because both are the same
+    source loop -- so both stage to `role-split-ok`. The plain serial arm
+    (`pipeline-depth=3`, and every `auto` decline) leaves the whole-array pack
+    loop in front of the tile loop, and the verdict is `role-split-nopack`.
+    (2026-10-08, S2.5: this paragraph used to say "depth 1 -> nopack, depth 2
+    -> ok", which misread the depth-1 arm -- it is the staged serial RING,
+    whose pack is as per-tile as depth 2's; only the single-thread overlap is
+    missing, and the overlap is what a thread split would add. The measured A/B
+    that made the knob interesting is that depth-1 -> depth-2 overlap on one
+    thread, worth 14% (1024x512x64) to 35% (256x64x2048) --
+    docs/results/t1c-residual-and-thmx-real-ceiling-2026-10-02.md.)
 
     It runs AFTER hmx-partition, and that order is load-bearing. Before
     hmx-partition every HMX kernel looks the same: one `hmx.matmul` between two

@@ -88,6 +88,23 @@ llama 侧分母 = **51.42 / 53.95 / 14.34 µs**（同二进制 3 rep 中位数�
   零旋钮默认面变成 **S1 38 / S2 32 / S3 3**，三个形状**全部快过手写**
   （`docs/results/auto-convergence-2026-10-04.md`）。
 
+> **📌 上表"我们"两列已被本次取代（2026-10-08，Phase 0.1 冻结构建重测）**
+>
+> 冻结构建 `libtriton.so 78865e23309d282c41c974462ef9ded8` / `libhmxapi.a f42384f2c7e176e6a0dbb538bdffcb78`，
+> 同一仪器（`s23_sweep.py` 的 def/g4dw 臂，iters=1000/20000，逐 launch 前后指纹一致）重测：
+>
+> | 形状 | 零旋钮 def | 组合 g4dw | 锚点 base 口径 |
+> |---|---:|---:|---:|
+> | S1 1024×512×64 | **38 / 37**（N=1000/20000） | **35 / 34** | 37 |
+> | S2 256×64×2048 | **32 / 33** | **31 / 34** | 32–34 |
+> | S3 128×128×128 | **3 / 3** | **6 / 6** | 3 |
+>
+> 零旋钮面与 2026-10-04 终验**逐位一致**（默认面未再漂）。出处：`docs/results/phase01-anchor-2026-10-08.md`
+> （原始 JSON：`logs/phase01-anchor-2026-10-08/`）。
+> ⛔ **llama 列仍是 2026-09 的数 ⇒ 上表两个"比（我们/llama）"列全部待 llama 侧同窗口重测，
+> 在那之前不得引用任何方向判词**（llama 侧重测是另一张卡）。
+
+
 > **⚠️ 勘误（2026-10-06）：本行原先是一次"裁决"，现整体作废。**
 >
 > **原写**：「2026-10-01 已按权威源 `docs/state/STATE-OF-PLAY.md:559` 判定本行为准、
@@ -231,6 +248,7 @@ llama 侧分母 = **51.42 / 53.95 / 14.34 µs**（同二进制 3 rep 中位数�
 | **R1/R2 两行已结案 —— step 4 不得重开** | 上两行（`enableMaxnumLegalize` / `enableVectorRowReduce`）的退出条件**已满足**：上机 A/B 跑完，结论=**保持 OFF**（`docs/codegen/r1-ab-2026-09-30.md:145-149`；R1 −4.9% / ≈0 / 反慢 1.1%，R2 +1.4% 而差值 CV 6.4%，三个配置全部低于 `max(3×CV, 15%)`） | 本仓 | **无退出计划：已结案。** ⛔ **A1 step 4（S 组）不得重开这两条。** 它们已经是「默认 OFF 的已测项」，不是「待处理项」；S 组的 27 个数字里含它们只是因为本表按**决策点**计数，不按**待办**计数。下次触发：随「FA 行归约向量化」落地后**重测一次**，届时若仍无效则连 pass 一起删 |
 | **`backend/compiler.py` 的 `scratch>0` 静默改写（独立缺陷，需用户）** | `backend/compiler.py:292-299`：`scratch > 0` 时用 `dataclasses.replace` **静默改写 4 个 flag** —— `enableMultiThreading=False`、`enableConvertToHexagonmem=False`、`enableVTCMTiling=True`、`enableThreadedDispatch=True`，**用户完全不被告知**。⚠️ 其中 `enableConvertToHexagonmem=False` **正是那个会干净拒绝全部 HMX 的开关**（`reason=vtcm-allocator-disabled`，见 §1.2 / `docs/codegen/knob-fork-classification-2026-09-30.md §1.2`）。它确实进了编译 key（`backend/hexagon_options.py:187`）⇒ A/B 本身可靠，但「**用户设的值 ≠ 被编译的值**」，违反项目硬规则「不许静默回退」 | **用户**（不是本仓 agent） | **无 agent 退出计划：这是需要用户决定的契约变更，不在 A1 的工作面内。** 三个选项：(a) 改成 loud 拒绝（`scratch>0` 与用户显式设的 flag 冲突时报错）；(b) 保留静默但**在编译日志里逐条打印**改写了什么；(c) 删掉这个隐式耦合、让 `scratch>0` 不再改写任何 flag。⚠️ **本行只是登记，不代表已批准任何一项**（`AGENTS.md`：未经用户批准不得自动变更契约）。**分类表 §3 已定性它是「独立缺陷，不是冗余旋钮」** ⇒ **不许把它当成 S 组旋钮顺手改掉** |
 | **HMX v3 record（`HmxRecordV3.cpp` / `HmxRecordV3.h`，marker 门控的 record-only 诊断记录）— 冻结**（2026-10-07 用户裁决） | **冻结规则：v3 的授权消费者落地之前，不加新字段、不加新序列化事实。** 背景：v2 manifest / VtcmAccounting 记账 / v3 record 三套并行记录系统里，v3 今天没有授权消费者（marker 门控、record-only；`backend/driver.py` 的 `hmx_record_diagnostic()` 只是只读诊断口，不驱动任何决策）；`HmxRecordV3.h` 自我声明 "never a converter of the serialized v2 contract" ⇒ 每个新事实要经两个 skeleton builder 各写一遍。现有字段的行为有锁（`test_hmx_record_v3.py` 钉「closed schema + grants nothing + v2 边界不变」）。冻结 = 止住平行生长，**不动任何现有字段** | 本仓（裁决：用户） | **退出条件 = 二选一**：① v3 的授权消费者落地 ⇒ 解冻，并重评三套是否收敛为「一套事实收集 + 多个 serializer 视图」（⚠️ 收敛方案违反 `HmxRecordV3.h` 的 "never a converter" 不变式 ⇒ 按项目规则需用户先拍板）；② 用户决定删除 v3。**触发条件：任何人想给 v3 加字段/加 schema 项时，先回本条**——冻结期内加字段 = 违反本节规则 1（四项缺一不许加） |
+| `enableEarlyUnpack`（**T11 重排探针，临时门**，2026-10-07 登记；✅ **已执行退出条件并删除（2026-10-08）**） | **默认 OFF**（`backend/hexagon_options.py` 字段 `enableEarlyUnpack`；`.td` flag `early-unpack`（HmxPartition）与 `enable-early-unpack`（LinalgToLLVM）两级接线，`MLLVMIRTranslation.cpp` 容错读）。**做什么**：`HmxPartitionPass.cpp` 的 `emitStageLoop` 把 hoisted read-out 的发射从 tile 循环**迭代尾巴**（最后一个 `acc_read` 之后，引擎已排空、unpack 纯串行）挪到 **N 循环内 `mma` 之后、`acc_read` 之前**，读**上一个 tile 的 AR 行**——那是引擎在执行本 tile 的 mma 链、发起线程空闲的唯一窗口，正是探针要测的「引擎缝里的净增量」。`m==0` 无前 tile ⇒ `scf.if` 守卫跳过（`max(m-1,0)` 会对行 0 解包两次、其中一次读未写的 AR）；最后一行 `Mt-1` 的 read-out 发射在环后（pipeliner 之前钉好插入点，落在 peeled epilogue 之后）。OFF = **同一条发射代码路径**（`if` 只包住挪动的那一小段，OFF 臂字节同一性由构建验证）。⚠️ **与 `enableHmxVectorReadout`（默认 ON）的交互，测量前必读**：挪进 N 循环的 read-out 不再是 m-tile loop body 的直属 op ⇒ `hmx-vector-readout` 对该函数 decline、readout 留在本线程 inline ⇒ **探针 A/B 两臂都必须显式 `enableHmxVectorReadout=False`**，否则两臂同时差「线程位置」与「发射位置」两件事。`test_option_surface_agreement.py` 的 Hmx option 字段计数随本旋钮 +1（已在该测试注明「临时探针旋钮，T11 结束后删除」） | **T11 战役卡**（`roadmap/ROADMAP1001.md` §9.3 T11；细则与防复活记录 `docs/architecture/hmx-coscheduling-followups-2026-10-07.md` §2 P0 / §5） | **T11 探针测量结束即删除本旋钮与本次发射顺序分支**：Python 字段、两级 `.td` option、`emitTileCompute`/`emitStageLoop` 的 early 分支、`test_option_surface_agreement.py` 计数回落、lit 的 EARLY 臂，一并删。判决按 `ROADMAP1001.md` §5.1 的 N 规则，无论正负都落盘；**探针不付费 ⇒ W4/W5（引擎完成 token）永久砍掉**。**已执行（2026-10-08）**：判决 **NOT-PROVEN——效应 < 15% 材料性地板**（S2-class 256×64×2048，Δ̂=−1.00 µs/−3.1%，N=1000 与 N=20000 两个保守区间均排除 −4.8 µs 地板；pcyc 互证 ~−1.2 µs、11/11 session 同号——「~1 µs 改善为真」可能性高但未过门，引用须注明；判据 = `docs/analysis/criterion-paired-se-v2-2026-10-07.md`，原始数据 `logs/t11-ab-2026-10-08/`）。旋钮与发射分支已按本条删除（Python 字段 / 两级 .td / early 分支 / 计数回落 / EARLY lit 臂）；**W4/W5 按本条永久砍掉** |
 
 #### 2.1b 2026-09/10 新增旋钮与决策常数（**2026-10-06 补登记，此前 9 项零登记 ⇒ 违反本节规则**）
 

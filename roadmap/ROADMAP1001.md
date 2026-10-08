@@ -327,13 +327,15 @@ Kt=4 → `serial:shallow-k`；`attn_qk_d256` Kt=8 同样。
 | **S0**（~半天） | 查 pinned llvm_triton/llvm-project 是否含 `2e055b8de1a1`；无则 backport TTI 两个 hunk（~30 行）。HMX leaf 函数带 `hexagon_hmx` 编译通过 | lit 全绿 | ✅ **已完成**，见 §5.0 |
 | **S1**（host 全验） | ThreadRolePartition pass + attr + verifier + manifest 字段；默认只 emit 单角色 | FileCheck 全套（成功/拒绝/mixed-irreducible/半HMX→PARTIAL+dual-role）；零行为变化 | 纯编译期。⚠️ 开工前须先落 §5.4 的四条修法 |
 | **S2**（运行时底座） | 角色执行器 + T_HMX + SPSC 环 + 锁迁移（legacy 共存）；4 个探针：环吞吐、锁长持、DMA 跨线程等待、VTCM 跨线程 alloc/free | host 单元测试 + 探针报告；不跑真 kernel | [未验证]×4 见 §6 |
-| **S2.5**（⛔ 硬前置） | **给 S1-class 引入 per-tile pack**：把整数组 prologue 的 pack（`MatmulToHmxPass.cpp:1139-1163`）折进 tile 循环，让 S1 形状**有可重叠对象** | 纯 host：manifest `pack_act_sites` 从 1 变 2（对齐 `s2_anchor`）；lit 全绿 | ⛔ **S3 的硬前置**。不做这步，S3 在 S1-class 上按 §3.1 自己的判据就是 no-op（`role-split-nopack`） |
+| **S2.5**（⛔ 硬前置） | **给 serial 形状引入 per-tile pack**：把整数组 prologue 的 pack 折进 tile 循环，让 serial 形状**有可重叠对象**。⚠️ **2026-10-08 重定域（用户裁决 A）**：本行原前提（`s1_anchor` serial）已过期——`s1_anchor` 自 2026-10-04 readout 默认翻面后已是 staged/`pack_act_sites=2`；今天真正 serial 的是**浅 K 小 Mt 形状**（S3 anchor 128×128×128 Mt=4、FA QK、readout-off 臂）。折进移到 **`HmxPartitionPass.cpp` 的 `emitSerialTileLoop`**（解封后开工；从 MatmulToHmxPass 侧做的等价物已被三处冲突证伪——目标循环在 HmxPartitionPass 现建/等价物回归 staged 收益/复刻决策常数违反 §7.8——**别重试**）。看板卡已按重定域重建 | 纯 host：manifest `pack_act_sites` 从 1 变 2（**S3 anchor 口径**，非 s1_anchor）；lit 全绿；staged 路径（`s2_anchor`）零回归 | ⛔ **S3 的硬前置**。不做这步，S3 在 serial 形状上按 §3.1 自己的判据就是 no-op（`role-split-nopack`）。ThreadRolePartition 的判定修复（2026-10-08）对折进后形态已前向兼容 |
 | **S3**（首个双线程 kernel） | **S2-class** matmul（`256×64×2048`，Kt=64，**唯一已有 per-tile pack 的稳态形态**）：<br>**HVX 侧 `pack_act(i+1)` ‖ `unpack(i)`；HMX 侧 `mma(i+1)`/`bias_load`/`acc_read`** | ① 同构建双指纹 A/B，**判决四选一**见 §5.1.3<br>② ⭐ **LWP 归因探针臂：显式输出「跨线程相对单线程已有 37% 重叠的净增量」**<br>③ ⛔ **先过 §5.1.7 的 reject 判据** | ⚠️ 不能是 S1-class（见 S2.5）。⛔ **不得以 47.2% 为预期**——S2-class 已有一笔 **1.92× staging 重叠**入账（`hmx-perf-findings-2026-09-27.md:183`/`:293`），真实上限更低（§5.1.5②）。⛔ **47.2% 与 37% 不许相减**（§5.1.5①）。⚠️ **净增量 < 门 ⇒ 默认保持 OFF + 负结果收档** |
 | **S4a**（观测台架，**无 FA 性能门**） | 搭 LWP 归因的重叠率**观测台架**（只测不承诺）；量 M3.2（锁持有后 per-launch 固定税降幅） | **LWP 归因的重叠率报告**（不设 FA 性能门）；<br>**只有 M3.2 减税那项**套 `max(3×CV,15%)` + §5.1 的 N 规则 | ✅ **纯拓扑过门不可达已接受**（引擎份额 0.6% ≪ 15%），本阶段改为先把测量能力建起来 |
 | **S4b**（真收益） | **组合机制**：FA 的 15% = **softmax 链去串行化（43.7%，M4.1 工作面）+ 本拓扑提供并行底座** | 组合门：softmax 侧与拓扑侧**合并**计 ≥ max(3×CV,15%)<br>⛔ **必须单独列交互项** `A_both − max(A_topo, A_softmax)` | ⛔ **拓扑单独份额 ≤ 0.6% 写死在本文档里，不再宣称独立功劳。** ⛔ **合并门在数学上不可证伪拓扑**（§5.1.6）。⚠️ QK 落 `serial:shallow-k`（`attn_qk_d128` Kt=4）⇒ 重叠主体是 softmax 链，QK 走 serial 不影响 |
 | **S5**（收口） | S3/S4b 过门 ⇒ 报用户批准翻默认；per-kernel 配对降级 legacy-only；经验推上游（hexagon 侧 RFC / async affinity） | 门数字 + 契约评审 | 翻默认须用户批准（你们规则） |
 
 **依赖：`S0 → S1 → S2 → S2.5 → S3 → S4a → S4b → S5`**
+
+📌 **暂停期与 S5 之后的工作项**（重排探针 / 定价诊断表 / 枚举选择器 / 着色转正 / 引擎 token——2026-10-07 对抗评审修订版，四层框架已拆绑）→ `docs/architecture/hmx-coscheduling-followups-2026-10-07.md`。
 
 ⚠️ **S1 与 S2 不能并行**，有两处真实的**写-读**依赖：
 
@@ -660,6 +662,14 @@ RoPE 那 9 个样本是**单调斜坡不是噪声**（`32.57 / 27.24 / 23.29`，
 
 📄 `docs/results/t-hmx-staging-gate-dead-2026-10-02.md`（逐档数据、traceback、复现命令）
 
+### 5.1.8 配对标准误门（v2，2026-10-08 用户签认）——噪声项换代
+
+**全文 = `docs/analysis/criterion-paired-se-v2-2026-10-07.md`**（已签认并入本节；取代已撤回的 per-N v1 提案——v1 死于两点割线在 `A + B/N` 下恒负、量级错 3000×，可辨识性问题不是 bug）。要点：
+
+- **噪声项换代**：`max(3×CV, 15%)` 的 `3×CV` 用的是样本标准差（不随样本数收缩——v1 §1 实测证伪）→ 换成**配对差的标准误**（`SE = sd(Δ)/√n_eff`，按 `1/√n` 收缩，"加样本"从此有效）。**其余全部照旧**：15% 材料性地板、`once_share ≤ 2%`（5.1.2）、禁算术（5.1.5）、斜坡先行（5.1.4 的 A/B 交错/丢暖机/中位数成为采样协议的组成部分）。
+- **新增**：null 同臂对守门（null 区间不含 0 = 仪器问题，当次测量作废——Phase 0.1 卡已有实践的形式化）；判决词表（5.1.3 四类）加**优先级**解决"前两类同时成立"的重叠。
+- **首次完整实战**：T11 探针判决（2026-10-08，`logs/t11-ab-2026-10-08/`——两个 N 独立判决一致、null 臂守门生效、pcyc 互证）。RoPE 立论案例用原数据翻案（PROVEN）。
+
 ---
 
 ## 5.2 ⛔ 设备窗口：S3 / S4a / S4b 的硬前置
@@ -784,6 +794,7 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
    - 暂停期间不占设备窗口、不排 S1/S2 的期。
    - §5.4 的四条 trait 修法**照旧要做**（那是 `HmxLayoutHvx` 的正确性前提，独立于本方案是否推进）。
    - 解封条件见 §9 任务清单 T4。
+   - **暂停期内可做、且正服务解封条件的两项（2026-10-07 登记）**：**T11 重排探针**（测「引擎缝里的净增量」——正是本条暂停理由的后半句）+ **T12 定价诊断表**（修定量基础——前半句）。细则与验收见 `docs/architecture/hmx-coscheduling-followups-2026-10-07.md`（对抗评审修订版，含被砍项防复活记录）。
 1. [未验证] DMA 事件跨线程等待语义（UserDMA 描述符由谁 poll、能否在另一线程 await）。
 2. [未验证] VTCMPool 并发 alloc/free 真实覆盖（`bin/runtime/include/VTCMPool.h:15` 有 `#include <mutex>`，`:444` 有 `mutable std::mutex mutex_`，但所有权交接语义需探针）。
 3. [未验证] `HAP_compute_res_hmx_lock` 长期持有与其他进程/驱动的交互（探针：独占 N 分钟 + 释放重取）。
@@ -896,8 +907,9 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 | **T2** | **重算「真实核比各部分上界之和低 37%」** | 新分区表出来后的重算值 | §6 第 10 条的现状基线；依赖 T1 |
 | **T3** | **把 `2^20` 是 tile 上限这条写进代码注释**（已做 `HmxPartitionPass.cpp` 一处） | — | ✅ **已完成 2026-10-02 17:32** |
 | **T4** | **重测 43 份作废日志里被文档引用为结论的那些** | 逐条重跑或标注作废 | `docs/results/b3-voided-baselines-2026-10-02.md` §6 |
+| **T12** | **定价诊断表（W1）**：叶子 pcyc 表（独立 cost 结构，不进 `HmxTarget`）+ manifest `modeled_ii`（只诊断不接决策）；**验收 = 从表复现 K=1024 翻转与 Mt=4/Mt=32 两端点**，复现不了不许进决策 | 表与 manifest 部分纯 host；数据来自 T1/T11 的设备产出 | `docs/architecture/hmx-coscheduling-followups-2026-10-07.md` §2 W1 |
 
-⚠️ **T1 需要设备窗口**（真机、同构建、`N ≥ 20000`）；T2–T4 是 host-only 或纯文档。
+⚠️ **T1 需要设备窗口**（真机、同构建、`N ≥ 20000`）；T2–T4 与 T12 的表/manifest 部分是 host-only 或纯文档。
 
 ### 9.2 P1 — trait 修法（T_HMX 暂停期间照做）
 
@@ -919,6 +931,7 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 |---|---|---|
 | **T9** | **重测 llama.cpp 那一侧** | bench 在手机 Termux 上，本机跑不了 ⇒ S1/S2/S3 所有比值至今是条件句 |
 | **T10** | T1 的设备窗口 | 需用户签认 |
+| **T11** | **重排探针（P0，全清单性价比最高）**✅ **已完成（2026-10-08）——判决 NOT-PROVEN（效应 < 15% 材料性地板，Δ̂=−1.00 µs/−3.1%，两个 N 独立一致；pcyc 互证 ~1 µs 未过门）**；旋钮与发射分支已按预注册退出条件删除（`ROADMAP.md` §2.1 已闭环），**W4/W5（引擎 token）永久砍掉**；判据 = `docs/analysis/criterion-paired-se-v2-2026-10-07.md`（v2 首次完整实战），原始数据 `logs/t11-ab-2026-10-08/`：`HmxPartitionPass.cpp` 的 `emitStageLoop` 内把 `unpack(i-1)` 挪到 `mma(i)` 之后、`acc_read(i)` 之前（~20 行发射顺序改动，**零语义**，pipeliner 无需看见新依赖）；同构建双指纹 A/B，判决按 §5.1 的 N 规则；**探针不付费 ⇒ 引擎 token（W4/W5）永久砍掉** | 需用户签认设备窗口 · 细则 `docs/architecture/hmx-coscheduling-followups-2026-10-07.md` §2 P0 |
 
 ### 9.4 已完成（本轮）
 

@@ -12,6 +12,8 @@
 
 #include "hexagon/Common/Common.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
+#include "hexagon/Dialect/Hmx/Transforms/HmxReadoutHandoff.h"
 #include "hexagon/Transforms/OptionsParsing.h"
 #include "hexagon/Transforms/Passes.h"
 #include "hexagon/Transforms/Transforms.h"
@@ -29,6 +31,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <mutex>
 #include <string>
 
 #define DEBUG_TYPE "hexagon-lwp-instrumentation"
@@ -51,6 +54,15 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
   explicit HexagonLWPPass(const HexagonLWPPassOptions &options)
       : HexagonLWPPassBase(options) {}
 
+  // The instrumentation below creates LLVM-dialect ops -- the handler global,
+  // the intrinsic declaration, the GEP and the calls. Declaring the
+  // dependency makes the pass runnable on IR that holds none yet (a module
+  // with only the kernel to instrument); in the full pipeline other passes
+  // load the dialect first, which is why this never fired there.
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<LLVM::LLVMDialect>();
+  }
+
   // Compute loop depth (distance to outermost loop)
   static int getLoopDepth(Operation *op) {
     int depth = 0;
@@ -61,14 +73,15 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
     return depth;
   }
 
-  // Check if a loop has at least one sibling scf.for loop
+  // Check if a loop has at least one sibling scf.for loop. Siblings are ops
+  // in the loop's OWN block, not in the parent op's first region: a loop can
+  // sit in any region of a multi-region parent (an scf.if branch, say), and
+  // region 0 of such a parent can be empty -- `front()` on an empty region
+  // dereferences the block-list sentinel (`!isKnownSentinel()`), and even
+  // when region 0 is populated it is the wrong block for a loop that lives
+  // in a later region.
   static bool hasSiblingLoop(scf::ForOp forOp) {
-    Operation *parentOp = forOp->getParentOp();
-    if (!parentOp || parentOp->getNumRegions() == 0)
-      return false;
-
-    auto &block = parentOp->getRegion(0).front();
-    for (auto &op : block) {
+    for (Operation &op : *forOp->getBlock()) {
       if (&op != forOp.getOperation() && isa<scf::ForOp>(op))
         return true;
     }
@@ -172,6 +185,42 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
 
   void runOnOperation() override {
     auto func = getOperation();
+
+    // A declaration has no body: nothing to instrument, and the entry
+    // instrumentation below dereferences the body's entry block
+    // (`func.getBody().front()`), which on an empty region is the block-list
+    // sentinel -- the `!isKnownSentinel()` assert, at compile time.
+    // Declarations in this pipeline are not hypothetical: the HMX read-out
+    // split publishes its runtime entry points as private declarations
+    // (HmxVectorReadoutPass::declareRuntime), and this pass is scheduled
+    // addNestedPass<func::FuncOp>, so it visits every function the module
+    // holds, declarations included. Before the guard, enableLWP x
+    // enableHmxVectorReadout aborted on the first such declaration on every
+    // shape whose read-out the pass rewrites.
+    if (func.isDeclaration())
+      return;
+
+    // The read-out split's outlined function is the executor's work function,
+    // not a kernel (same call in ThreadRolePartition, same reason). Skipping
+    // it is what keeps the ID space deterministic: the IDs below come from a
+    // process-wide counter, the partition tooling reads "ID 1" as the kernel's
+    // total row (exp/hmx/t1_partition_2026_10_08/parse_partition.py), and a
+    // second instrumented function would take ID 1 whenever the pass manager
+    // -- which runs sibling functions concurrently -- happened to reach it
+    // first. It also keeps the read-out's own loop out of the timed path the
+    // measurement is taking.
+    if (func->hasAttr(mlir::hmx::kHmxReadoutOutlinedAttr))
+      return;
+
+    // Instrument one function at a time. The module-level get-or-creates below
+    // are the check-then-insert class hmxModuleStateMutex exists for (sibling
+    // functions run concurrently; two racing inserts are a redefinition), and
+    // the ID counter and the /tmp dump file it feeds are shared state of the
+    // same kind. The lambdas run only inside this scope, so they lock nothing
+    // themselves.
+    std::lock_guard<std::mutex> moduleStateGuard(
+        mlir::hmx::hmxModuleStateMutex());
+
     ModuleOp module = func->getParentOfType<ModuleOp>();
     MLIRContext *ctx = &getContext();
     OpBuilder builder(module.getContext());
@@ -184,8 +233,16 @@ struct HexagonLWPPass : public ::impl::HexagonLWPPassBase<HexagonLWPPass> {
     static int increment_loopId = 1;
 
     // Retrieve an existing LLVM global variable named "handler_name" or
-    // create it to store the string "lwp_handler".
+    // create it to store the string "lwp_handler". The lookup is
+    // load-bearing, not bookkeeping: this pass runs once per function, and a
+    // module can hold more than one instrumentable function -- the read-out
+    // era's kernel plus, in general, any helper -- so an unconditional create
+    // is a redefinition of `handler_name` on the second function.
     auto getOrCreateHandlerGlobal = [&]() -> LLVM::GlobalOp {
+      if (auto existing =
+              module.lookupSymbol<LLVM::GlobalOp>("handler_name"))
+        return existing;
+
       OpBuilder::InsertionGuard guard(builder);
       builder.setInsertionPointToStart(module.getBody());
       auto str = builder.getStringAttr("lwp_handler\0"s);

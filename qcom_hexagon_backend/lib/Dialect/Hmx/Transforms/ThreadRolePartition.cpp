@@ -107,18 +107,53 @@ bool isRegionRoot(Operation *op) {
   return isa<func::FuncOp, scf::ForOp, scf::IfOp, scf::WhileOp>(op);
 }
 
+/// Whether any engine op lives anywhere inside `root`'s subtree.
+///
+/// The beside-flags' same-iteration half (see `classifyRegions`): engine ops
+/// nested inside a loop that also holds a pack directly are in that pack's
+/// iteration stream, not in a disjoint region of the kernel. Only loops ask
+/// this question -- the function body has no iterations, and its subtree is
+/// the whole kernel.
+bool holdsEngineWork(Operation *root) {
+  bool engine = false;
+  root->walk([&](Operation *op) { engine |= mustRunOnEngineThread(op); });
+  return engine;
+}
+
 /// Attribute every op to the region root that most tightly encloses it, then
 /// reduce the regions to kernel-level facts.
 ///
-/// The nearest-enclosing-root rule is the whole correctness of this function.
-/// Taking each region's full subtree instead -- which is the obvious reading of
-/// "what is in this loop" -- makes the function body contain every pack and
-/// every engine op in the kernel, so `packBesideEngine` is true for all HMX
-/// kernels and every mixed kernel comes out `role-split-ok`. That was measured:
-/// the verdict did not move when pipeline-depth went 1 -> 2, the very switch
-/// that decides whether a pack sits inside the tile loop. Under the nearest-root
-/// rule the body holds only the ops written directly in it, and a pack in its
-/// own loop stays in its own loop.
+/// The nearest-enclosing-root rule is the attribution half, and it is what
+/// keeps a pack in its own loop in its own loop. Taking each region's full
+/// subtree instead -- which is the obvious reading of "what is in this loop"
+/// -- makes the function body contain every pack and every engine op in the
+/// kernel, so `packBesideEngine` is true for all HMX kernels and every mixed
+/// kernel comes out `role-split-ok`. That was measured: the verdict did not
+/// move when pipeline-depth went 1 -> 2, the very switch that decides whether
+/// a pack sits inside the tile loop. Under the nearest-root rule the body
+/// holds only the ops written directly in it.
+///
+/// The beside-flags need a second half, added 2026-10-08 for S2.5: a
+/// same-iteration test. No emitter puts a pack and an engine op in the SAME
+/// region -- hmx-partition's emitters always nest the engine ops one loop
+/// deeper (the (m, n) tile loops hold acc_clear/mma/acc_read while the pack
+/// sits directly in the m-tile loop around them, in the staged ring today and
+/// in any per-tile serial form S2.5 builds), so nearest-root alone makes
+/// `packBesideEngine` false for every mixed kernel and `role-split-ok`
+/// unreachable on production IR -- including the staged s2_anchor form, the
+/// one shape ROADMAP1001 section 3.1 names as the canonical split. The
+/// producer-stream question is not "same region" but "same iteration": a pack
+/// held directly by a LOOP whose body carries engine work executes once per
+/// iteration alongside that work, which is exactly the object
+/// "pack_act(i+1) || mma(i)" needs. So a pack- or unpack-holding region whose
+/// root is a loop also counts as beside engine when engine work lives
+/// anywhere in that loop's body. Two boundaries keep this from collapsing
+/// back into the subtree bug: the function body never asks (it has no
+/// iterations, and its subtree is the whole kernel), and the pack's own loop
+/// must be its nearest root -- a pack loop nested inside a bigger loop that
+/// also holds the engine work (the per-chunk attention bridge, the serial
+/// whole-array bridge) still runs to completion within each outer iteration
+/// and stays `role-split-nopack`.
 void classifyRegions(func::FuncOp fn, KernelVerdict &out) {
   llvm::DenseMap<Operation *, RegionVerdict> byRoot;
   llvm::SmallVector<Operation *> roots;
@@ -156,6 +191,16 @@ void classifyRegions(func::FuncOp fn, KernelVerdict &out) {
       out.packBesideEngine = true;
     if (region.engine && region.unpack)
       out.unpackBesideEngine = true;
+    // The same-iteration half: a pack or unpack held DIRECTLY by a loop whose
+    // body carries engine work anywhere beneath it. Only loops ask, and only
+    // the nearest root counts -- both boundaries are documented above.
+    if (!region.engine && (region.pack || region.unpack) &&
+        isa<scf::ForOp, scf::WhileOp>(root) && holdsEngineWork(root)) {
+      if (region.pack)
+        out.packBesideEngine = true;
+      if (region.unpack)
+        out.unpackBesideEngine = true;
+    }
   }
 }
 
@@ -172,7 +217,9 @@ StringRef decideTopology(const KernelVerdict &v) {
     return kSingleRoleEngine; // engine only, and an HMX thread is required
   // Mixed. Ordered by how much there is to hand across:
   //
-  //  1. A pack shares a loop with an engine op. That is a per-tile producer
+  //  1. A pack runs inside the same loop as the engine work -- directly in
+  //     the loop, with the engine ops possibly one loop deeper (every emitter
+  //     nests them there; see `classifyRegions`). That is a per-tile producer
   //     stream: while tile i is in the matrix engine, the other thread can be
   //     building tile i+1. This is the only shape where a thread split pays.
   //  2. Layout work is co-located but is only unpack. It consumes what the
