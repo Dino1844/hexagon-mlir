@@ -795,6 +795,10 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
    - §5.4 的四条 trait 修法**照旧要做**（那是 `HmxLayoutHvx` 的正确性前提，独立于本方案是否推进）。
    - 解封条件见 §9 任务清单 T4。
    - **暂停期内可做、且正服务解封条件的两项（2026-10-07 登记）**：**T11 重排探针**（测「引擎缝里的净增量」——正是本条暂停理由的后半句）+ **T12 定价诊断表**（修定量基础——前半句）。细则与验收见 `docs/architecture/hmx-coscheduling-followups-2026-10-07.md`（对抗评审修订版，含被砍项防复活记录）。
+   - ✅ **[解封 2026-10-08，用户指示「继续完成链条和折进」] 两条解封条件均已备齐数据：**
+     **① 定量基础** = T1 同构建分区表（默认面 + 复刻臂，`docs/results/t1-lwp-partition-2026-10-08.md` §2b/§7，构建 `fa79e610`，N=20000/pcyc 口径；7/8 槽已填，S2 unpack 默认面无干净区域、保持 pending）。
+     **② 净增量** = T11 判决 NOT-PROVEN（Δ̂=−1.00 µs/−3.1% < 15% 材料性地板，两个 N 独立判决一致，`logs/t11-ab-2026-10-08/`）⇒ **S2-class 跨线程净增量预期相应下调**（followups §2 P0〔推断〕：engine 40.58% ≈ unpack 40.18% 时配——出处 T1 复刻臂表）；**最终裁决仍归 S3 自己的同构建 A/B**（第 10 条框架：净增量是 S3 的一等验收输出，不是立项前置）。
+     执行序：**S2.5 折进（host，已开工）→ S2 运行时底座（trait 前置已满足——T5–T8 经核实已随 `22e6230`/`646f4b6` 落地在 HEAD，见 §9.2 修正注记）→ S3（设备窗口，届时签认）**。
 1. [未验证] DMA 事件跨线程等待语义（UserDMA 描述符由谁 poll、能否在另一线程 await）。
 2. [未验证] VTCMPool 并发 alloc/free 真实覆盖（`bin/runtime/include/VTCMPool.h:15` 有 `#include <mutex>`，`:444` 有 `mutable std::mutex mutex_`，但所有权交接语义需探针）。
 3. [未验证] `HAP_compute_res_hmx_lock` 长期持有与其他进程/驱动的交互（探针：独占 N 分钟 + 释放重取）。
@@ -924,6 +928,13 @@ pack/unpack 降到的正是 `hmx_pack_act_f16` / `hmx_unpack_acc_f32`（`HmxExte
 | **T8** | 逐个列出那 32 个函数的 CHECK 行变化，写进 commit message | 随 T5–T7 |
 
 ⚠️ **T5/T6 有先后依赖**：一个 bit 不能同时对两个方向 fail-safe（§5.4 ②）。
+
+✅ **[已落地，2026-10-08 核实] T5–T8 全部完成且在 HEAD 祖先链上**（本表「待签认」状态过期）：
+- **T5**：四个布局 op 均挂 `NativeOpTrait<"HmxLayoutHvx">`（`HmxOps.td` 的 pack_act/pack_weight/unpack_acc/unpack_acc_f32 四处）——commit `22e6230`（"Stop charging an engine lock to the four HMX layout ops"）；
+- **T6**：正向 trait `HmxEngineIns`（`HmxDialect.h`，与 `HmxDmaOnly` 并列）且已被 `ThreadRolePartition.cpp` 的 `mustRunOnEngineThread` 消费——commit `646f4b6`；
+- **T7**：`verifyHmxLeafCallers` 已收窄到 5 个引擎符号（`isHmxEngineLeaf`，`issuesHmxEngineLeaves` 同时排除 `HmxDmaOnly` 与 `HmxLayoutHvx`）——同 `22e6230`；
+- **T8**：CHECK 行随上述提交同步（HEAD lit 全绿为证）。
+⇒ **S2 的 trait 前置已满足，链条执行序修正为：S2.5 折进（进行中）→ S2 运行时底座 → S3（设备窗口届时签认）。**
 
 ### 9.3 P2 — 需要设备窗口 / 外部条件
 
