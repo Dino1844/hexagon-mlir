@@ -8,6 +8,7 @@
 # ===------------------------------------------------------------------------===
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -29,6 +30,7 @@ from triton.backends.qcom_hexagon_backend.utils import (
     TRANSLATION_METADATA_SCHEMA,
     apply_translation_metadata,
     hmx_cache_identity,
+    hmx_fallback_notice,
     validate_pack_metadata,
 )
 
@@ -200,6 +202,25 @@ def ttsharedir_to_obj(mod: str, options, metadata=None) -> bytes:
         qcom_hexagon_backend.translate_linalg_to_obj(mlir_mod, options_map, True)
     )
     apply_translation_metadata(metadata, translation_metadata)
+    # Read point for silently-refused HMX sites (route B of docs/evidence/
+    # 2026-10-01/why-hmx-refusals-are-invisible-2026-10-01.md): the manifest
+    # just validated carries an exact reason code for every matmul that fell
+    # back to HVX -- 6 of the 8 measured silent fallbacks had one -- and no
+    # default path read it.  Emit the one-line notice here, where the
+    # manifest first exists in Python.  Compile time is also the right
+    # cadence: a launch-side reader stays invisible to compile-only warmup
+    # probes (the measured ones), a per-launch reader would print once per
+    # launch, and a cache hit re-runs no stage and so prints nothing.  A
+    # plain print, not warnings.warn: the notice reports a fact about the
+    # artifact rather than an option interaction at the caller's line (the
+    # scratch>0 warning below is the precedent for the latter), and the
+    # warnings machinery would dedup a second kernel whose line happened to
+    # match the first one's text.
+    notice = hmx_fallback_notice(
+        json.loads(metadata["hmx_manifest"]), metadata.get("name")
+    )
+    if notice is not None:
+        print(notice)
     # Note: translate_linalg_to_obj() now returns a collection of object codes in general,
     # which in the case of the triton flow will only contain one element (i.e. one object code)
     # since there is no separation of constants for the triton flow.

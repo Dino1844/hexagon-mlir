@@ -272,7 +272,11 @@ class HmxManifestSummary(unittest.TestCase):
             ("driver.py", "summarize_hmx_manifest"): {
                 "from triton.backends.qcom_hexagon_backend.utils import "
                 "summarize_hmx_manifest",
-                "return summarize_hmx_manifest(self.hmx_manifest)",
+                # The retained value is the JSON string the launcher consumes,
+                # so the reader parses before summarizing; until 2026-10-08 it
+                # did not and every real launch answered "nothing to
+                # summarize".  Still exactly one call, still opt-in.
+                "return summarize_hmx_manifest(json.loads(self.hmx_manifest))",
             },
             ("driver.py", "hmx_manifest_verdict"): {
                 "def hmx_manifest_verdict(self):",

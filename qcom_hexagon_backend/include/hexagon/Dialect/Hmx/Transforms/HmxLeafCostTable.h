@@ -125,6 +125,8 @@ enum class Src {
   FeedBwL2,      // the L2 boundary the heat band leans on
   WarmupB,       // the once-per-launch warm-up term
   T1Pending,     // reserved: the 2026-10-08 campaign's LWP partition rerun
+  T1Replica0810, // in-kernel LWP regions, 10-02-config replica arm (readout/WSR/L2 off)
+  T1Default0810, // in-kernel LWP regions, default-face backfill (readout ON)
 };
 
 struct SourceRef {
@@ -192,9 +194,29 @@ constexpr SourceRef kSources[] = {
     {Src::T1Pending,
      "RESERVED for logs/t1-lwp-partition-2026-10-08/ (the 2026-10-08 "
      "campaign's LWP partition rerun on the frozen build libtriton 78865e23 "
-     "/ libhmxapi f42384f2). Cells citing this source carry value 0 = not "
-     "yet measured; fill them from that run with ITS OWN fingerprint, "
-     "replacing nothing -- the 2026-10-02 cells stay for lineage"},
+     "/ libhmxapi f42384f2). [2026-10-08 filled: 7 of the 8 reserved slots "
+     "now cite T1Replica0810 / T1Default0810, each carrying its own run's "
+     "fingerprint. The one cell still citing this source is the S2 unpack "
+     "slot: no clean S2 unpack region exists in either arm (fused into the "
+     "staged ring on the replica arm, outlined-and-LWP-skipped on the "
+     "default face). Value 0 = not yet measured; the 2026-10-02 cells stay "
+     "for lineage, replacing nothing]"},
+    {Src::T1Replica0810,
+     "logs/t1-lwp-partition-2026-10-08/ lwpreplica_{S1,S3}_wr1_20261008_015029"
+     ".json (region means: pcycles / iter_count over the LWP collector's 100 "
+     "records) + docs/results/t1-lwp-partition-2026-10-08.md section 2b: "
+     "in-kernel LWP regions, replica of the 2026-10-02 table's exact config "
+     "(readout=0 WSR=0 L2=0, WR=1), frozen build libtriton 78865e23 / "
+     "libhmxapi f42384f2"},
+    {Src::T1Default0810,
+     "logs/t1-lwp-partition-2026-10-08/ default-face_lwp_S2_wr1_20261008_"
+     "135510.json + results_default-face.json + docs/results/"
+     "t1-lwp-partition-2026-10-08.md section 7: in-kernel LWP fused "
+     "staged-ring region on the DEFAULT surface (readout=1 WSR=1 L2=1, "
+     "WR=1), post-fix build libtriton fa79e610 (commit f16a7b0; LWP skips "
+     "the readout-outlined consumer, so the fused producer region carries "
+     "the GROUP handoff func.call and holds no unpack work) / libhmxapi "
+     "f42384f2"},
 };
 
 //===----------------------------------------------------------------------===//
@@ -331,18 +353,25 @@ constexpr LeafPriceEntry kLeafPrices[] = {
     {Leaf::MmaF16,            Family::S1,   Cond::Historical,        22.6,  2560,  57856, Src::LwpS1_2709},
     {Leaf::UnpackAccF16,      Family::S1,   Cond::Historical,        87.4,   512,  44731, Src::LwpS1_2709},
 
-    // ---- RESERVED: the 2026-10-08 campaign's LWP partition rerun ----
-    // (frozen build libtriton 78865e23 / libhmxapi f42384f2). Fill from
-    // logs/t1-lwp-partition-2026-10-08/ when it lands; zero = pending, not
-    // a price. Do NOT wait for these to read the table.
-    {Leaf::PackActF16,        Family::S1,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::MmaF16,            Family::S1,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::UnpackAccF16,      Family::S1,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::PackActF16,        Family::S2,   Cond::FusedStagedRing,     0.0,     0,      0, Src::T1Pending},
+    // ---- the 2026-10-08 campaign's LWP partition rerun (filled 2026-10-08) ----
+    // Two arms in logs/t1-lwp-partition-2026-10-08/: the 10-02-config replica
+    // (readout=0 WSR=0 L2=0, frozen build 78865e23) carries the clean WR=1
+    // regions for S1/S3; the post-f16a7b0 default-face backfill (readout=1
+    // WSR=1 L2=1, build fa79e610) carries the S2 fused region -- its ops hold
+    // no unpack_acc (readout outlined the consumer), so it matches the
+    // FusedStagedRing cond exactly. The S2 unpack slot stays pending: neither
+    // arm yields a clean S2 unpack region (fused on the replica,
+    // outlined-and-skipped on the default face). Region means = pcycles /
+    // iter_count over 100 collector records.
+    //        leaf                family     cond                  perUnit unitCt region  src
+    {Leaf::PackActF16,        Family::S1,   Cond::InKernelWR1,      114.3,    64,   7312, Src::T1Replica0810},
+    {Leaf::MmaF16,            Family::S1,   Cond::InKernelWR1,       22.0,  2048,  45116, Src::T1Replica0810},
+    {Leaf::UnpackAccF16,      Family::S1,   Cond::InKernelWR1,       87.3,   512,  44675, Src::T1Replica0810},
+    {Leaf::PackActF16,        Family::S2,   Cond::FusedStagedRing,     0.0,     0,  51235, Src::T1Default0810},
     {Leaf::UnpackAccF16,      Family::S2,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::PackActF16,        Family::S3,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::MmaF16,            Family::S3,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
-    {Leaf::UnpackAccF16,      Family::S3,   Cond::InKernelWR1,         0.0,     0,      0, Src::T1Pending},
+    {Leaf::PackActF16,        Family::S3,   Cond::InKernelWR1,      103.9,    16,   1663, Src::T1Replica0810},
+    {Leaf::MmaF16,            Family::S3,   Cond::InKernelWR1,       26.3,    64,   1684, Src::T1Replica0810},
+    {Leaf::UnpackAccF16,      Family::S3,   Cond::InKernelWR1,      126.0,    16,   2016, Src::T1Replica0810},
 };
 
 //===----------------------------------------------------------------------===//

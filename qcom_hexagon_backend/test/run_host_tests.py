@@ -25,27 +25,49 @@ So this runner does three things:
    ``sys.path`` for every subprocess it starts.
 2. Runs every discovered file **both** ways and fails if either is red.
 3. Asserts the two structural invariants that made the disagreement possible:
-   no file is silently empty in either style, and no file's collected test count
-   depends on which other files are in the invocation.
+   no file is silently empty in either style, and no file's collected test
+   count depends on which other files are in the invocation.
 
 It needs no device, no network and no build.  It runs no test itself; it only
 supervises interpreters and compares results.
 
+Speed
+-----
+Passes 1 and 2 are independent subprocesses per file, so they run in parallel:
+one worker per file (capped by ``--jobs``, default one per file up to the CPU
+count).  The subprocesses of the SAME file stay sequential inside its worker --
+a file must never race itself -- and the per-file pytest children run with the
+cache provider disabled so parallel invocations cannot race on
+``.pytest_cache``.  Pass 3 is a single pytest invocation over the whole suite
+and stays serial: observing every file in one process is its entire purpose.
+
+``--gate`` skips pass 3.  It is the fast regression gate for agent final
+checks (both styles + the non-emptiness invariant, tens of seconds): it does
+NOT check the order-independence invariant, which needs the whole suite in one
+process.  Run the full mode when a test file is new or its structure changed.
+
 Usage
 -----
-    python qcom_hexagon_backend/test/run_host_tests.py
+    python qcom_hexagon_backend/test/run_host_tests.py              # full: all three passes
+    python qcom_hexagon_backend/test/run_host_tests.py --gate       # fast gate: passes 1+2 only
+    python qcom_hexagon_backend/test/run_host_tests.py --files A B  # full treatment on a subset
+    python qcom_hexagon_backend/test/run_host_tests.py --jobs 8     # cap the parallelism
 
-Exit status is 0 only if every discovered file is green in both styles and both
-structural invariants hold.  Set ``HEXMLIR_TEST_PYTHON`` to force a particular
+Exit status is 0 only if every discovered file is green in both styles and
+both structural invariants hold (in ``--gate`` mode: both styles and the
+non-emptiness invariant).  Set ``HEXMLIR_TEST_PYTHON`` to force a particular
 interpreter.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -122,10 +144,14 @@ class FileReport:
     isolated_tests: int = 0
     batch_tests: int = 0
     problems: list[str] = field(default_factory=list)
+    seconds: float = 0.0
 
     @property
     def rel(self) -> str:
-        return str(self.path.relative_to(REPO))
+        try:
+            return str(self.path.relative_to(REPO))
+        except ValueError:  # --files may point outside the repository
+            return str(self.path)
 
     @property
     def green(self) -> bool:
@@ -272,9 +298,20 @@ def _collected_counts(python: Path, files: list[Path]) -> dict[Path, int]:
 
     Collection only: it is cheap, and comparing it across invocations is what
     detects a file whose tests appear or vanish depending on its neighbours.
+    The cache provider is disabled: these run in parallel per file, and the
+    collect-only cache has no reader.
     """
     outcome = _run(
-        [str(python), "-m", "pytest", "--collect-only", "-q", *map(str, files)],
+        [
+            str(python),
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            *map(str, files),
+        ],
         REPO,
     )
     counts: dict[Path, int] = {path: 0 for path in files}
@@ -290,6 +327,65 @@ def _collected_counts(python: Path, files: list[Path]) -> dict[Path, int]:
     return counts
 
 
+def _run_one_file(python: Path, path: Path) -> FileReport:
+    """One file's two styles plus its isolated collection count.
+
+    The three subprocesses of ONE file run sequentially -- a file must never
+    race itself (its script run and its pytest run can share in-process state
+    conventions, and some tests mutate ``os.environ`` for their own duration).
+    Different files run in parallel; see :func:`main`.
+    """
+    report = FileReport(path)
+    file_started = time.perf_counter()
+    report.script = _run([str(python), str(path)], path.parent)
+    report.isolated = _run(
+        [
+            str(python),
+            "-m",
+            "pytest",
+            "-q",
+            # Parallel per-file invocations would otherwise race on
+            # .pytest_cache in the repository root; the per-file cache has no
+            # reader (the whole-suite pass keeps its own).
+            "-p",
+            "no:cacheprovider",
+            str(path),
+        ],
+        REPO,
+    )
+    report.isolated_tests = _collected_counts(python, [path]).get(path, 0)
+    report.seconds = time.perf_counter() - file_started
+    return report
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the host-only Python test suite both ways (script + pytest)."
+    )
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="fast regression gate: parallel passes 1+2, skip the whole-suite "
+        "pass 3 (and with it the order-independence invariant -- use the full "
+        "mode when a test file is new or its structure changed)",
+    )
+    parser.add_argument(
+        "--files",
+        nargs="+",
+        type=Path,
+        default=None,
+        help="run only these test files (full treatment on the subset)",
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=None,
+        help="max files running in parallel in passes 1+2 "
+        "(default: one per file, capped at the CPU count)",
+    )
+    return parser.parse_args()
+
+
 def _parse_summary(output: str) -> str:
     """The trailing 'N passed' style clause, for the report."""
     tail = output.strip().splitlines()[-6:]
@@ -300,49 +396,84 @@ def _parse_summary(output: str) -> str:
 
 
 def main() -> int:
+    started = time.perf_counter()
+    args = _parse_args()
     python = select_interpreter()
-    files = discover()
+
+    if args.files:
+        files: list[Path] = []
+        for requested in args.files:
+            path = requested.resolve()
+            if not path.is_file():
+                print(f"error: no such test file {requested}", file=sys.stderr)
+                raise SystemExit(2)
+            files.append(path)
+    else:
+        files = discover()
+
+    jobs = min(len(files), max(1, args.jobs or (os.cpu_count() or 4)))
+    total_passes = 2 if args.gate else 3
 
     print(f"interpreter : {python}")
     print(f"repository  : {REPO}")
     print(f"files       : {len(files)}")
+    print(
+        f"mode        : "
+        f"{'gate (passes 1+2, parallel, no whole-suite pass)' if args.gate else 'full (all three passes)'}"
+        f"  jobs={jobs}"
+    )
     print()
 
-    reports = {path: FileReport(path) for path in files}
+    # Passes 1+2 -- one worker per file.  The subprocesses of a single file
+    # stay sequential (see _run_one_file); different files have no shared
+    # mutable state on disk (audited: tempdirs only, no fixed paths), so they
+    # run concurrently.
+    phase_started = time.perf_counter()
+    reports: dict[Path, FileReport] = {path: FileReport(path) for path in files}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(_run_one_file, python, path): path for path in files}
+        for future in as_completed(futures):
+            path = futures[future]
+            try:
+                reports[path] = future.result()
+            except Exception as exc:  # noqa: BLE001 - report, do not lose the file
+                reports[path].problems.append(f"worker crashed: {exc!r}")
+    phase_seconds = time.perf_counter() - phase_started
 
-    # Pass 1 -- each file as a script.  This is the style the runtime contracts
-    # in bin/runtime/test/ are written for.
-    print("== pass 1/3: as a script ==", flush=True)
+    print(f"== pass 1/{total_passes}: as a script ==", flush=True)
     for path in files:
         report = reports[path]
-        report.script = _run([str(python), str(path)], path.parent)
+        assert report.script is not None
         state = "ok" if report.script.returncode == 0 else f"rc={report.script.returncode}"
         if report.script.quiet:
             state += " SILENT"
-        print(f"  {state:>16}  {report.rel}", flush=True)
+        print(f"  {state:>16}  {report.rel}")
 
-    # Pass 2 -- each file under pytest on its own.
-    print("\n== pass 2/3: pytest, one file per invocation ==", flush=True)
+    print(f"\n== pass 2/{total_passes}: pytest, one file per invocation ==", flush=True)
     for path in files:
         report = reports[path]
-        report.isolated = _run(
-            [str(python), "-m", "pytest", "-q", str(path)], REPO
-        )
-        report.isolated_tests = _collected_counts(python, [path]).get(path, 0)
+        assert report.isolated is not None
         state = "ok" if report.isolated.returncode == 0 else f"rc={report.isolated.returncode}"
-        print(f"  {state:>16}  {report.rel}  ({report.isolated_tests} tests)", flush=True)
+        print(f"  {state:>16}  {report.rel}  ({report.isolated_tests} tests)")
+    print(f"  (passes 1+2 wall: {phase_seconds:.1f}s, {jobs} parallel workers)")
 
     # Pass 3 -- the whole suite in one pytest invocation, plus a collection-only
-    # pass over the same file set for the order-dependence comparison.
-    print("\n== pass 3/3: pytest, whole suite in one invocation ==", flush=True)
-    batch = _run([str(python), "-m", "pytest", "-q", *map(str, files)], REPO)
-    batch_counts = _collected_counts(python, files)
-    for path in files:
-        reports[path].batch_tests = batch_counts.get(path, 0)
-    print(f"  {'ok' if batch.returncode == 0 else f'rc={batch.returncode}':>16}  whole suite")
-    if batch.returncode != 0:
-        print("\n--- whole-suite pytest output ---")
-        print(batch.output.rstrip())
+    # pass over the same file set for the order-dependence comparison.  Skipped
+    # in --gate mode: its whole point is every file in ONE process, which
+    # neither parallelism nor a subset can substitute for.
+    batch: Outcome | None = None
+    if not args.gate:
+        print(f"\n== pass 3/{total_passes}: pytest, whole suite in one invocation ==", flush=True)
+        batch = _run(
+            [str(python), "-m", "pytest", "-q", *map(str, files)], REPO
+        )
+        batch_counts = _collected_counts(python, files)
+        for path in files:
+            reports[path].batch_tests = batch_counts.get(path, 0)
+        print(f"  {'ok' if batch.returncode == 0 else f'rc={batch.returncode}':>16}  whole suite")
+        if batch.returncode != 0:
+            print("\n--- whole-suite pytest output ---")
+            print(batch.output.rstrip())
     print()
 
     # ---- structural invariants -------------------------------------------
@@ -361,7 +492,7 @@ def main() -> int:
             report.problems.append(
                 "prints nothing when run as a script: the file is a no-op in that style"
             )
-        if report.isolated_tests != report.batch_tests:
+        if batch is not None and report.isolated_tests != report.batch_tests:
             report.problems.append(
                 f"collected test count depends on invocation order: "
                 f"{report.isolated_tests} alone vs {report.batch_tests} in the suite"
@@ -384,7 +515,7 @@ def main() -> int:
     # its own verdict rather than folded into a file, because in that case no single
     # file is at fault and blaming one would send the reader to the wrong place.
     batch_problems: list[str] = []
-    if batch.returncode != 0:
+    if batch is not None and batch.returncode != 0:
         green_in_isolation = all(reports[p].green for p in files)
         batch_problems.append(
             f"whole-suite pytest is red (rc={batch.returncode})"
@@ -417,7 +548,20 @@ def main() -> int:
     total_tests = sum(report.isolated_tests for report in reports.values())
     green = [r for r in reports.values() if r.green]
     print(f"{len(green)}/{len(files)} files green in both styles, {total_tests} tests")
-    print(f"whole-suite pytest: {_parse_summary(batch.output) or f'rc={batch.returncode}'}")
+    slowest = sorted(reports.values(), key=lambda r: r.seconds, reverse=True)[:3]
+    print(
+        "slowest files: "
+        + ", ".join(f"{r.rel} ({r.seconds:.0f}s)" for r in slowest)
+    )
+    if batch is not None:
+        print(
+            f"whole-suite pytest: {_parse_summary(batch.output) or f'rc={batch.returncode}'}"
+        )
+    else:
+        print(
+            "whole-suite pytest: SKIPPED (--gate; run the full mode for the "
+            "cross-file interference check)"
+        )
     if failures or batch_problems:
         if failures:
             print(
@@ -435,7 +579,7 @@ def main() -> int:
                 file=sys.stderr,
             )
         return 1
-    print("PASS")
+    print(f"PASS  (total wall: {time.perf_counter() - started:.1f}s)")
     return 0
 
 

@@ -506,21 +506,83 @@ class TableContractTests(unittest.TestCase):
             },
         )
 
-    def test_t1_pending_slots_exist_and_are_empty(self):
+    def test_t1_slots_filled_with_their_own_fingerprints(self):
         # The 2026-10-08 campaign's LWP partition rerun
         # (logs/t1-lwp-partition-2026-10-08/, frozen build libtriton 78865e23
-        # / libhmxapi f42384f2) gets one reserved slot per priced in-kernel
-        # family cell -- present, zero-valued, citing the pending source, so
-        # filling them later is a diff the contract test can see.
+        # / libhmxapi f42384f2, plus the post-f16a7b0 default-face backfill on
+        # fa79e610) filled the reserved slots. The fill contract, pinned here:
+        #   * every FILLED cell cites the arm it came from, and that source's
+        #     citation carries that run's OWN build fingerprint;
+        #   * the one slot neither arm can measure (S2 unpack: fused into the
+        #     staged ring on the replica, outlined-and-LWP-skipped on the
+        #     default face) stays T1Pending at zero;
+        #   * the 2026-10-02 lineage cells are NOT replaced -- every
+        #     REGION_CROSSCHECK key still resolves to its LwpT1T2_0210 cell
+        #     with the frozen values.
         pending = [e for e in LEAF_PRICES if e["src"] == "T1Pending"]
-        self.assertEqual(len(pending), 8, "the T1 slot set changed size")
+        self.assertEqual(
+            [(e["leaf"], e["family"], e["cond"]) for e in pending],
+            [("UnpackAccF16", "S2", "InKernelWR1")],
+            "the still-pending T1 slot set changed",
+        )
+        for e in pending:
+            self.assertEqual(
+                (e["per_unit"], e["region_pcyc"]),
+                (0.0, 0),
+                "a pending T1 slot carries a value -- fill it or re-reserve it",
+            )
+        # the filled replica cells carry the frozen build's fingerprint
+        self.assertIn("78865e23", SOURCES["T1Replica0810"])
+        replica = sorted(
+            (e["leaf"], e["family"], e["cond"])
+            for e in LEAF_PRICES
+            if e["src"] == "T1Replica0810"
+        )
+        self.assertEqual(
+            replica,
+            [
+                ("MmaF16", "S1", "InKernelWR1"),
+                ("MmaF16", "S3", "InKernelWR1"),
+                ("PackActF16", "S1", "InKernelWR1"),
+                ("PackActF16", "S3", "InKernelWR1"),
+                ("UnpackAccF16", "S1", "InKernelWR1"),
+                ("UnpackAccF16", "S3", "InKernelWR1"),
+            ],
+            "the replica-filled T1 slot set changed",
+        )
+        # the filled default-face cell carries the post-fix build fingerprint
+        self.assertIn("fa79e610", SOURCES["T1Default0810"])
+        default = sorted(
+            (e["leaf"], e["family"], e["cond"])
+            for e in LEAF_PRICES
+            if e["src"] == "T1Default0810"
+        )
+        self.assertEqual(
+            default,
+            [("PackActF16", "S2", "FusedStagedRing")],
+            "the default-face-filled T1 slot set changed",
+        )
+        # the 2026-10-02 lineage cells are NOT replaced
+        for (fam, leaf, cond), (region, units) in REGION_CROSSCHECK.items():
+            lineage = [
+                e
+                for e in LEAF_PRICES
+                if e["family"] == fam
+                and e["leaf"] == leaf
+                and e["cond"] == cond
+                and e["src"] == "LwpT1T2_0210"
+            ]
+            self.assertTrue(
+                lineage, f"{fam}/{leaf}/{cond}: the 2026-10-02 cell was replaced"
+            )
+            self.assertEqual(
+                (lineage[0]["region_pcyc"], lineage[0]["unit_count"]),
+                (region, units),
+                f"{fam}/{leaf}/{cond}: the 2026-10-02 cell drifted",
+            )
+        # the pending source still names its campaign build
         self.assertIn("T1Pending", SOURCES)
         self.assertIn("78865e23", SOURCES["T1Pending"])
-        for fam in ("S1", "S2", "S3"):
-            self.assertTrue(
-                any(e["family"] == fam for e in pending),
-                f"no T1 slot reserved for {fam}",
-            )
 
     def test_every_model_scalar_has_a_traceability_block(self):
         # The repo's own gate (test_hmx_constant_traceability.py) demands a

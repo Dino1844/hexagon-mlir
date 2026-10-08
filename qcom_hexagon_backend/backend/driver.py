@@ -7,6 +7,8 @@
 #
 # ===------------------------------------------------------------------------===
 
+import json
+
 from math import prod
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
@@ -95,6 +97,13 @@ def getHexagonLauncherClass():
             is how many contraction sites reached the HMX engine, how many were
             refused, and which ones reached it but run serially.
 
+            The retained value is the JSON string the launcher itself consumes
+            -- that is the whole packed-metadata contract -- so this parses it
+            before summarizing.  Until 2026-10-08 it did not, and every real
+            launch answered "nothing to summarize": the reader is unreachable
+            without a launch, and no launch-path test could exercise it with
+            the string form.  Pinned host-side by the fallback-notice tests.
+
             Measured 2026-10-01: 8 of 41 dot-bearing operators fall back to HVX
             and every identifiable one carries an exact reason code, so the
             information is present in the artifact; what was missing was a way
@@ -103,7 +112,7 @@ def getHexagonLauncherClass():
             """
             if self.hmx_manifest is None:
                 return None
-            return summarize_hmx_manifest(self.hmx_manifest)
+            return summarize_hmx_manifest(json.loads(self.hmx_manifest))
 
         def hmx_record_diagnostic(self):
             """Return the validated record-only v3 child, or None.

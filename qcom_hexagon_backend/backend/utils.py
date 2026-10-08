@@ -1363,6 +1363,87 @@ def summarize_hmx_manifest(manifest):
     return "\n".join(lines)
 
 
+# The default-path reader.  The opt-in reporter above answers "tell me
+# everything about this kernel" for a caller who already knows to ask; this
+# one answers the question a caller did not know to ask -- "did this kernel
+# silently lose HMX, and why?" -- on the one default path every Triton
+# compilation takes.  Measured 2026-10-01: 8 of 41 dot-bearing operators fall
+# back to HVX with zero diagnostics, and 6 of those 8 carry an exact reason
+# code in this very manifest (docs/evidence/2026-10-01/
+# why-hmx-refusals-are-invisible-2026-10-01.md).  The data was never missing;
+# the reader was.
+
+
+def hmx_fallback_notice(manifest, kernel_name=None):
+    """One line naming the contraction sites that fell back to HVX, and why.
+
+    Returns None when nothing fell back, so a kernel whose every matmul
+    reached the engine contributes no line at all -- the noise rule that
+    leaves the default path exactly as quiet as it was for every kernel that
+    did not fall back.  When at least one site fell back, the answer is one
+    line:
+
+        hmx: <kernel>: 2/5 matmuls fell back to HVX (tile-alignment x2,
+        min-rows x1) -- per-site reasons: kernel.packed_metadata[...]
+
+    Properties, each pinned by the host suite:
+
+    * **Never raises.**  A record this boundary cannot read -- a missing,
+      null or unrecognized reason, the state 2 of the 8 measured fallbacks
+      were in -- contributes `reason unavailable` instead of an exception or
+      silence.  A reporter that dies on the manifest it exists to read is
+      worse than no reporter.
+    * **No invented vocabulary.**  A refusal is a `plan` in HMX_PLANS minus
+      HMX_NON_HVX_PLANS, the same sets the launch contract decides "on the
+      engine" with, and a reason is only quoted when it is in HMX_PLAN_REASONS
+      for that record's plan.  Anything else is `reason unavailable`: an
+      unrecognized code is never quoted back as if the compiler had emitted
+      it.
+    * **One line per kernel, reasons grouped.**  N refusals produce one line
+      with per-reason counts, not N lines, and only reasons that occurred are
+      named.
+    * **Pure and read-only.**  Builds a string and nothing else: no printing,
+      no warnings, no mutation.  The emission is the compile-time read
+      point's job (backend/compiler.py), not this function's, so the two can
+      be tested separately.
+    """
+    if not isinstance(manifest, dict):
+        return None
+    records = manifest.get("matmuls")
+    if not isinstance(records, list) or not records:
+        return None
+
+    refused = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and record.get("plan") in HMX_PLANS - HMX_NON_HVX_PLANS
+    ]
+    if not refused:
+        return None
+
+    unavailable = "reason unavailable"
+    counts = {}
+    for record in refused:
+        reason = record.get("reason")
+        allowed = HMX_PLAN_REASONS.get(record.get("plan"), frozenset())
+        if not isinstance(reason, str) or reason not in allowed:
+            reason = unavailable
+        counts[reason] = counts.get(reason, 0) + 1
+    # Most frequent first, then alphabetical, so the line is deterministic
+    # and the reason a user is most likely acting on comes first.
+    grouped = ", ".join(
+        f"{reason} x{counts[reason]}"
+        for reason in sorted(counts, key=lambda r: (-counts[r], r))
+    )
+
+    who = f"{kernel_name}: " if isinstance(kernel_name, str) and kernel_name else ""
+    return (
+        f"hmx: {who}{len(refused)}/{len(records)} matmuls fell back to HVX "
+        f'({grouped}) -- per-site reasons: kernel.packed_metadata["hmx_manifest"]'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Record-only v3 consumer
 # ---------------------------------------------------------------------------
