@@ -951,21 +951,29 @@ constexpr ChainRow kS1DefaultChain[] = {
 //     max(engine 21.0, unpack 20.8, main chain 16.6) ~= 21-26 us,
 //     -30~-45% vs 38.
 //
-// Evidence leans both ways (toward A: S2's readout on/off arms measured
+// Evidence leaned both ways (toward A: S2's readout on/off arms measured
 // equal, A=C=32.0 us -- unpack issue once hid inside an engine busy
 // window; toward B: 22 pcyc/leaf sits near the pure-issue estimate, and
 // S1 carries ~2x the engine leaves per unit of engine work that S2 does
-// -- the issue-dense vs engine-waiting shape split, review §2.2). WHICH
-// WORLD S1 LIVES IN IS UNDECIDED; the R1 window (review §5: the
-// T11-on-S1 rearrangement + the S1 four-arm) is the adjudicator. These
-// two rows are its reading frame, not predictions.
+// -- the issue-dense vs engine-waiting shape split, review §2.2). THE
+// R1 WINDOW DECIDED IT (docs/results/s1-window-2026-10-09.md,
+// logs/s1-window-2026-10-09/): World B. The rearrangement probe did not
+// gain -- it measured +1.00 us, CI [+0.32, +1.68], time and pcyc rising
+// together (a THIRD signature: inserting work into the engine window
+// COSTS cycles -- guard overhead plus issue-stream perturbation; the
+// window is occupied by engine feeding, not empty). World A is refuted
+// and its carrier is dead; the thread topology is the only carrier
+// left. The four-arm also re-priced the chain: readout deferral +10.0,
+// the true depth-1 debt ~12 us (P-D -- the review's ~3 us premise was
+// falsified), mechanism net -4.0 (D-B).
 struct WorldBoundRow {
   const char *world;   // "A" (engine-wait) | "B" (issue-saturated)
   double baselineUs;   // the measured default-face S1 anchor (T1 §7a: 38)
   double boundUsLo;    // the bound's range in us (lo == hi: a point bound)
   double boundUsHi;
   const char *carrier; // the mechanism that reaches the bound
-  const char *caliber; // names the undecided question and the adjudicator
+  const char *caliber; // names the world's R1-verdict status and the
+                       // adjudicating measurement
   Src src;
 };
 
@@ -974,14 +982,20 @@ constexpr WorldBoundRow kWorldBounds[] = {
      "single-threaded rearrangement (T11-style pack hoisting / ping-pong "
      "scratch) hides pack+DMA+glue inside the engine window -- no thread "
      "topology",
-     "derived-inferred-world-undecided: adjudicator = the R1 window "
-     "(review §5; rearrangement gain >= ~4 us -> World A)",
+     "derived-inferred-world-REFUTED: R1 "
+     "(docs/results/s1-window-2026-10-09.md) measured the rearrangement "
+     "at +1.00 us, CI [+0.32, +1.68] -- inserting work into the engine "
+     "window costs cycles; no single-thread window exists, this carrier "
+     "is dead",
      Src::ArchReview1009},
     {"B", 38.0, 21.0, 26.0,
      "thread topology only: the engine issue stream moves to T_HMX; "
      "3-thread bound = max(engine, unpack, main chain)",
-     "derived-inferred-world-undecided: adjudicator = the R1 window "
-     "(review §5; rearrangement gain ~= 0, < 1 us -> World B)",
+     "derived-inferred-world-CONFIRMED: R1 "
+     "(docs/results/s1-window-2026-10-09.md) -- no single-thread window; "
+     "four-arm: readout deferral +10.0 us, depth-1 debt ~12 us (P-D, the "
+     "review's ~3 us premise falsified), mechanism net -4.0 us (D-B, the "
+     "topology cuts at matched depth)",
      Src::ArchReview1009},
 };
 

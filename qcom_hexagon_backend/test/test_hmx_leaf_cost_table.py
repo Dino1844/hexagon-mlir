@@ -971,11 +971,18 @@ class DerivedEntryContractTests(unittest.TestCase):
                 "ArchReview1009",
                 f"{name}: a derived row cites something other than the review",
             )
-        # the world bounds additionally name the undecided question and
-        # the R1 adjudicator -- the honesty label the close-out requires
+        # the world bounds additionally name their R1-verdict status and
+        # the adjudicating measurement -- the honesty label the close-out
+        # requires (World A refuted: the rearrangement measured +1.00 us,
+        # CI [+0.32, +1.68]; World B confirmed)
+        statuses = {"A": "REFUTED", "B": "CONFIRMED"}
         for w in WORLD_ROWS:
-            self.assertIn("undecided", w["caliber"], f"World {w['world']}")
+            self.assertIn(
+                f"world-{statuses[w['world']]}", w["caliber"],
+                f"World {w['world']}")
             self.assertIn("R1", w["caliber"], f"World {w['world']}")
+            self.assertIn(
+                "s1-window-2026-10-09", w["caliber"], f"World {w['world']}")
 
     def test_the_review_citation_carries_the_full_evidence_chain(self):
         # 出处纪律: the review doc + the T1 doc + BOTH arms' build
