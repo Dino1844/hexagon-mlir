@@ -325,6 +325,23 @@ LogicalResult replaceTiledGenericWithVTCMSlices(IRRewriter &rewriter,
   return success();
 }
 
+/// Can every consumer of `v` take the VTCM buffer directly? The copy-back
+/// below exists to serve DDR consumers, so a result no DDR consumer remains
+/// for keeps its VTCM buffer. `hmx.pack_act` / `hmx.pack_weight` qualify:
+/// `verifyPackSource` constrains the source's shape and row stride but not
+/// its address space, and the matmul ring has `pack_act` reading VTCM slots
+/// on device (the staged matmul path, 2026-09-21). A result with no user at
+/// all and a result with even one non-pack user both keep the copy-back: an
+/// unused buffer is the bufferizer's business, and a mixed user set means
+/// the copy is what serves the DDR consumer.
+static bool everyUserIsPackOp(Value v) {
+  if (v.use_empty())
+    return false;
+  return llvm::all_of(v.getUsers(), [](Operation *user) {
+    return isa<hmx::PackActOp, hmx::PackWeightOp>(user);
+  });
+}
+
 /// Copying the results corresponding to the operands to be "prefetched" for a
 /// linalg op to DDR and replacing the uses to the copied tensor on DDR.
 /// Results that were never staged were computed directly on their DDR
@@ -343,6 +360,18 @@ void copyResultsToDDR(IRRewriter &rewriter, GenericOp op,
             return isa<hmx::MatmulOp>(user);
           }))
         continue;
+      // The pack ops read their source wherever it lives, so a result whose
+      // every consumer is a pack was copied back to DDR only to be read from
+      // there again -- a round trip with no consumer that needs the DDR copy.
+      // (LowerPack runs before this pass, so the consumer of a crouton-shaped
+      // generic result is a `hmx.pack_*` and never the matmul above; that is
+      // why the matmul guard could not see these results.)
+      if (everyUserIsPackOp(resultTensor)) {
+        op->emitRemark("vtcm-tiling: staged result stays in VTCM; every "
+                       "consumer is an hmx.pack_* that reads the buffer "
+                       "directly, so the DDR copy-back is dropped");
+        continue;
+      }
       auto newTensor = copyToDDR(rewriter, resultTensor, op.getLoc());
       rewriter.replaceAllUsesExcept(resultTensor, newTensor,
                                     newTensor.getDefiningOp());
