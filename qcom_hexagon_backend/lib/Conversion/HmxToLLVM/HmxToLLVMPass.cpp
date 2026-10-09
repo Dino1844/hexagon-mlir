@@ -1545,8 +1545,11 @@ Value croutonAddr(ConversionPatternRewriter &rewriter, Location loc,
 /// `width` is the already-materialised column-count value, returned unchanged
 /// when the buffer is dense (stride(rank-2) == width) or has an identity
 /// layout, so the dense path emits exactly the IR it did before. A dynamic
-/// stride cannot be read here, so it falls back to `width` (the dense contract)
-/// rather than mis-addressing.
+/// stride cannot be read from the TYPE here, so it is read from the RUNTIME
+/// descriptor instead (MemRefDescriptor::stride -- the same struct read
+/// `asAddress` already performs): the width substitution that used to stand in
+/// there is only valid for dense sources and silently shears a raw strided
+/// view (see the TRACEABILITY note below).
 ///
 /// A STATIC non-inner-contiguous layout is the case that used to be silent, and
 /// it is not a stride question at all. The leaf walks ROWS, so no `row_stride`
@@ -1569,10 +1572,29 @@ Value croutonAddr(ConversionPatternRewriter &rewriter, Location loc,
 /// -- which is how the mistake became visible. The memrefs that broke are
 /// `memref<64x64xf16, strided<[?, ?], offset: ?>>` weight-RESIDENT source views
 /// (`hmx-weight-resident-pipeline.mlir` and siblings): a resident weight is a
-/// view into a packed buffer whose stride only resolves at run time, and that
-/// `rowStride` returns a `Value` rather than a constant is the mechanism, not
-/// an oversight. Gating it would have broken the feature on the strength of a
-/// guess.
+/// view into a packed buffer whose stride only resolves at run time, so the
+/// answer has to be a `Value`, not a constant. 2026-10-09: substituting
+/// `width` for that Value was the wrong Value -- correct for the dense
+/// resident contract, a silent shear for any raw view whose real stride is
+/// wider than its width (measured on device object code, below). Extracting
+/// the runtime stride keeps those 12 tests' semantics (their stride resolves
+/// to the same number at run time) while making the raw-view branch correct.
+///
+/// TRACEABILITY: rowStride dynamic-stride extraction
+///   mechanism: bufferization's branch merge (dense edge-temp gather vs raw
+///     strided view) casts both sources to `strided<[?, ?]>`; memref.cast
+///     erases the stride from the TYPE only -- the runtime descriptor still
+///     carries it, so MemRefDescriptor::stride recovers the truth per branch.
+///   measurement: 2026-10-09 device object code (mm_user.o, the binary the
+///     measured launch ran): pack_weight called with src = raw B + n0 and
+///     src_stride = the slice width (r4 = #0x200) while B's rows are the
+///     whole N apart; the leaf addresses rows at `mpyi(row, src_stride)`
+///     (libhmxapi.a) -> sheared weight; the packed crouton feeds hmx.mma
+///     (same SSA value). Pinned host-side by
+///     test/Conversion/HmxToLLVM/pack-dynamic-stride.mlir.
+///   shape set: n/a (layout, not shape).
+///   failure mode: before the fix, silent wrong values; after, each branch
+///     passes its own runtime stride, and the static paths are bit-identical.
 ///
 /// The genuinely unknown case is narrower and is still open, NOT fixed here: a
 /// dynamic INNER stride means the leaf's contiguous inner run is not
@@ -1626,8 +1648,8 @@ Value croutonAddr(ConversionPatternRewriter &rewriter, Location loc,
 //     audit measured that it cannot; a test would have to assert the op
 //     verifier's message instead.
 LogicalResult rowStride(ConversionPatternRewriter &rewriter, Location loc,
-                        MemRefType type, Value width, Operation *anchor,
-                        Value &out) {
+                        MemRefType type, Value src, Value width,
+                        Operation *anchor, Value &out) {
   SmallVector<int64_t, 2> strides;
   int64_t offset;
   int64_t widthC = type.getDimSize(type.getRank() - 1);
@@ -1643,7 +1665,26 @@ LogicalResult rowStride(ConversionPatternRewriter &rewriter, Location loc,
              << " memref. The leaf walks rows, so a transposed layout cannot be "
                 "addressed by any row stride -- passing one would store to the "
                 "wrong elements silently.";
-    if (!ShapedType::isDynamic(stride) && stride != widthC) {
+    if (ShapedType::isDynamic(stride)) {
+      // A dynamic outer stride is the type-erased form of a REAL runtime
+      // stride: reconciling the gather branch (dense edge temp) with the
+      // raw-view branch casts both into `strided<[?, ?]>`, and the width
+      // fallback below reads the wrong row distance for the raw branch --
+      // the leaf then walks `B[n0 + width*r + c]` where the source row is
+      // wider than `width`, i.e. a sheared matrix (measured on the device
+      // object code 2026-10-09: pack_weight src = raw B + n0, stride = the
+      // slice width, true stride = the whole N). The static type lost the
+      // stride, but the runtime descriptor still carries it, so take it
+      // from there instead of substituting an unrelated number -- the same
+      // read `asAddress` already does on these operands (MemRefDescriptor),
+      // one step less strict than the inner gate because the value IS
+      // recoverable.
+      MemRefDescriptor desc(src);
+      out = toI32(rewriter, loc,
+                  desc.stride(rewriter, loc, type.getRank() - 2));
+      return success();
+    }
+    if (stride != widthC) {
       out = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI32Type(),
                                      rewriter.getI32IntegerAttr(stride));
       return success();
@@ -2141,7 +2182,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
       Value rows = dimCst(rewriter, loc, srcType.getDimSize(0));
       Value cols = dimCst(rewriter, loc, srcType.getDimSize(1));
       Value srcStride;
-      if (failed(rowStride(rewriter, loc, srcType, cols, op,
+      if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(), cols, op,
                                     srcStride)))
         return failure();
       SmallVector<Value> args{dst,
@@ -2180,7 +2221,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
     Value rows = dimCst(rewriter, loc, srcType.getDimSize(0));
     Value cols = dimCst(rewriter, loc, srcType.getDimSize(1));
     Value srcStride;
-    if (failed(rowStride(rewriter, loc, srcType, cols, op, srcStride)))
+    if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(), cols, op, srcStride)))
       return failure();
 
     SmallVector<Value> args{dst,
@@ -2258,7 +2299,8 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
       Value k = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 1 : 0));
       Value n = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 0 : 1));
       Value srcStride;
-      if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
+      if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(),
+                           srcTransposed ? k : n, op,
                            srcStride)))
         return failure();
       SmallVector<Value> args{dst,
@@ -2301,7 +2343,8 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
     Value k = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 1 : 0));
     Value n = dimCst(rewriter, loc, srcType.getDimSize(srcTransposed ? 0 : 1));
     Value srcStride;
-    if (failed(rowStride(rewriter, loc, srcType, srcTransposed ? k : n, op,
+    if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(),
+                         srcTransposed ? k : n, op,
                          srcStride)))
       return failure();
 
@@ -2394,7 +2437,7 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
       Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
       Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
       Value dstStride;
-      if (failed(rowStride(rewriter, loc, dstType,
+      if (failed(rowStride(rewriter, loc, dstType, adaptor.getDst(),
                            nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                            dstStride)))
         return failure();
@@ -2452,7 +2495,7 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
     Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
     Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
     Value dstStride;
-    if (failed(rowStride(rewriter, loc, dstType,
+    if (failed(rowStride(rewriter, loc, dstType, adaptor.getDst(),
                          nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                          dstStride)))
       return failure();
@@ -2569,7 +2612,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
           return failure();
         hasRes = dimCst(rewriter, loc, 1);
         Value resWidth = dimCst(rewriter, loc, resType.getDimSize(1));
-        if (failed(rowStride(rewriter, loc, resType, resWidth, op,
+        if (failed(rowStride(rewriter, loc, resType, residual, resWidth, op,
                               resStride)))
           return failure();
       } else {
@@ -2584,7 +2627,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
       Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
       Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
       Value dstStride;
-      if (failed(rowStride(rewriter, loc, dstType,
+      if (failed(rowStride(rewriter, loc, dstType, adaptor.getDst(),
                            nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                            dstStride)))
         return failure();
@@ -2656,7 +2699,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
       // `src_stride` / unpack `dst_stride` cases. Dense falls back to the
       // width.
       Value resWidth = dimCst(rewriter, loc, resType.getDimSize(1));
-      if (failed(rowStride(rewriter, loc, resType, resWidth, op, resStride)))
+      if (failed(rowStride(rewriter, loc, resType, residual, resWidth, op, resStride)))
         return failure();
     } else {
       res = dimCst(rewriter, loc, 0);
@@ -2672,7 +2715,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
     Value rows = dimCst(rewriter, loc, dstType.getDimSize(0));
     Value cols = dimCst(rewriter, loc, nTile ? localColCount : dstType.getDimSize(1));
     Value dstStride;
-    if (failed(rowStride(rewriter, loc, dstType,
+    if (failed(rowStride(rewriter, loc, dstType, adaptor.getDst(),
                          nTile ? dimCst(rewriter, loc, dstType.getDimSize(1)) : cols, op,
                          dstStride)))
       return failure();
@@ -2738,7 +2781,7 @@ struct LowerStage : public ConvertOpToLLVMPattern<StageOp> {
     Value row = toI32(rewriter, loc, adaptor.getRow());
     Value srcCols = cst(srcType.getDimSize(1));
     Value srcStride;
-    if (failed(rowStride(rewriter, loc, srcType, srcCols, op, srcStride)))
+    if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(), srcCols, op, srcStride)))
       return failure();
     Value rowBytes = LLVM::MulOp::create(
         rewriter, loc, i32Ty,
