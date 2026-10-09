@@ -143,6 +143,65 @@ def _reject_cacheable_record_only_module(mod: str) -> None:
     )
 
 
+# The tt.scan -> ttx.scan dialect-boundary rewrite, applied at the single
+# shared parse point ``_parse_ttsharedir`` below.  ARCH-REVIEW #7: this rewrite
+# used to live only inside ttsharedir_to_obj, so a tt.scan kernel produced an
+# object while ttsharedir_to_llir -- which never rewrote -- failed to lower it;
+# the two compile entries disagreed on the same input.  Both now funnel through
+# ``_parse_ttsharedir``, so they cannot diverge.
+#
+# The rewrite is one left-to-right pass matching, in order, a comment, a quoted
+# string, or a bare ``tt.scan`` reference:
+#   * comments (``//`` and ``/* */``) are never rewritten;
+#   * a quoted string is rewritten only when its *whole* content is the op name
+#     -- TT_ScanOp has no assemblyFormat, so the op prints in MLIR generic form
+#     as ``"tt.scan"``; a data string that merely mentions tt.scan is kept;
+#   * a bare ``tt.scan`` (e.g. the custom-form ``tt.scan.return`` terminator,
+#     whose ``tt.scan`` prefix matches \btt\.scan\b) is rewritten as before.
+# Residual risk: a string attribute whose entire value happens to be exactly
+# "tt.scan" is textually indistinguishable from a generic-form op name and would
+# still be rewritten, as would tt.scan inside an unterminated string.  The old
+# regex rewrote every comment and every string unconditionally, so this is a
+# strict narrowing, not a claim of completeness.
+_TT_SCAN_REWRITE = re.compile(
+    r'//[^\n]*'  # line comment
+    r'|/\*.*?\*/'  # block comment
+    r'|"(?:[^"\\\n]|\\.)*"'  # quoted string
+    r'|\btt\.scan\b',  # bare tt.scan reference
+    re.DOTALL,
+)
+
+
+def _apply_ttx_scan_rewrite(mod: str) -> str:
+    """Rewrite tt.scan -> ttx.scan, leaving comments and data strings alone."""
+
+    def _repl(m: "re.Match[str]") -> str:
+        text = m.group(0)
+        if text[0] == "/":
+            return text  # comment
+        if text[0] == '"':
+            # Quoted op name (MLIR generic form) vs. a data string: only the
+            # former is an op reference, so only a whole-content op name moves.
+            if re.fullmatch(r"tt\.scan(\.\w+)*", text[1:-1]):
+                return text.replace("tt.scan", "ttx.scan", 1)
+            return text
+        return "ttx.scan"  # bare tt.scan reference
+
+    return _TT_SCAN_REWRITE.sub(_repl, mod)
+
+
+def _parse_ttsharedir(mod: str, context):
+    """The single point where ttsharedir text becomes a parsed module.
+
+    Both compile entries (ttsharedir_to_llir, ttsharedir_to_obj) parse through
+    here, so the tt.scan -> ttx.scan dialect-boundary rewrite cannot diverge
+    between them (ARCH-REVIEW #7).  The caller owns ``context``: an MLIR module
+    does not keep its context alive, so the context must outlive the module.
+    """
+    mod = _apply_ttx_scan_rewrite(mod)
+    return qcom_hexagon_backend.parse_mlir_module_from_str(mod, context)
+
+
 # NOTE: This func has significant overlap with ttsharedir_to_obj(). This is intentional.
 # This is a stopgap solution to allow more control over compiling kernels for QNN custom ops.
 # When we later have a better way to pass compilation flags to ttsharedir_to_obj(),
@@ -153,7 +212,7 @@ def ttsharedir_to_llir(mod: str, options, metadata=None):
         metadata = {}
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
-    mlir_mod = qcom_hexagon_backend.parse_mlir_module_from_str(mod, context)
+    mlir_mod = _parse_ttsharedir(mod, context)
 
     metadata["name"] = qcom_hexagon_backend.extract_func_name_from_mlir_module(mlir_mod)
     return_values = qcom_hexagon_backend.get_return_list(mlir_mod, metadata["name"])
@@ -173,9 +232,7 @@ def ttsharedir_to_obj(mod: str, options, metadata=None) -> bytes:
         metadata = {}
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
-    # Temporary regex substitution to lower tt.scan
-    mod = re.sub(r"\btt\.scan\b", "ttx.scan", mod)
-    mlir_mod = qcom_hexagon_backend.parse_mlir_module_from_str(mod, context)
+    mlir_mod = _parse_ttsharedir(mod, context)
 
     # Parses kernel name and return signature from mlir module
     metadata["name"] = qcom_hexagon_backend.extract_func_name_from_mlir_module(mlir_mod)
