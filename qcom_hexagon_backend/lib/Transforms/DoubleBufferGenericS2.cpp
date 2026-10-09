@@ -80,9 +80,21 @@ void insertDMAWaits(Location loc, IRRewriter &rewriter, ArrayRef<Value> tags,
   }
 }
 
+/// Report a `memref.copy` that `createDMAStartOp` refused to convert. Fail
+/// closed: the caller must leave the copy in place (do not erase it) and must
+/// not emit the matching `dma_wait`, then propagate the failure so the pass
+/// signals it. Erasing the copy and emitting the wait anyway would silently
+/// drop the data movement.
+LogicalResult rejectDMAStart(memref::CopyOp copy) {
+  copy.emitError("failed to create memref.dma_start: source and target must "
+                 "be statically shaped rank<=2 memrefs in different memory "
+                 "spaces");
+  return failure();
+}
+
 /// Replace `memref.copy` with `dma_start` using provided tags.
-void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
-                            scf::IfOp schedule, ArrayRef<Value> tags) {
+LogicalResult replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
+                                     scf::IfOp schedule, ArrayRef<Value> tags) {
   SmallVector<memref::CopyOp, 3> copies;
   Region &thenRegion = schedule.getThenRegion();
   assert(!thenRegion.empty() && thenRegion.getBlocks().size() == 1);
@@ -97,34 +109,40 @@ void replacePrefetchWithDMA(Location loc, IRRewriter &rewriter,
   for (int i = 0; i < copies.size(); ++i) {
     auto copy = copies[i];
     rewriter.setInsertionPoint(copy);
-    bool created = createDMAStartOp(loc, rewriter, copy.getSource(),
-                                    copy.getTarget(), tags[i]);
-    assert(created && "unable to create dma_start");
+    if (!createDMAStartOp(loc, rewriter, copy.getSource(), copy.getTarget(),
+                          tags[i]))
+      return rejectDMAStart(copy);
     rewriter.eraseOp(copy);
   }
+  return success();
 }
 
 // Replace Stores with DMA Waits.
-void replaceStoreshWithDMA(Location loc, IRRewriter &rewriter,
-                           KernelSchedule &schedule, ArrayRef<Value> tags,
-                           ArrayRef<Value> tagIndex,
-                           ArrayRef<Value> numElements) {
+LogicalResult replaceStoreshWithDMA(Location loc, IRRewriter &rewriter,
+                                    KernelSchedule &schedule,
+                                    ArrayRef<Value> tags,
+                                    ArrayRef<Value> tagIndex,
+                                    ArrayRef<Value> numElements) {
   auto tagType = rewriter.getI32Type();
   auto waitMemrefType = MemRefType::get({1}, tagType);
 
   for (int i = 0; i < schedule.stores.size(); ++i) {
     auto copy = schedule.stores[i];
     rewriter.setInsertionPoint(copy);
-    bool created = createDMAStartOp(loc, rewriter, copy.getSource(),
-                                    copy.getTarget(), tags[i]);
+    if (!createDMAStartOp(loc, rewriter, copy.getSource(), copy.getTarget(),
+                          tags[i]))
+      return rejectDMAStart(copy);
     memref::DmaWaitOp::create(rewriter, loc, tags[i], tagIndex, numElements[i]);
     rewriter.eraseOp(schedule.stores[i]);
   }
+  return success();
 }
 
 /// Rewrite the double-buffered loop operating on memref.copy as
-/// dma_start and dma_wait sequence.
-void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
+/// dma_start and dma_wait sequence. Fails (without erasing the offending
+/// copy or emitting its wait) if any copy cannot become a dma_start.
+LogicalResult rewriteAsDMATransfers(IRRewriter &rewriter,
+                                    DBSchedule schedule) {
   RewriterBase::InsertionGuard guard(rewriter);
   Location loc = schedule.kernel.getLoc();
 
@@ -196,9 +214,9 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   for (auto i = 0; i < preloads.size(); i++) {
     memref::CopyOp op = preloads[i];
     rewriter.setInsertionPoint(op);
-    bool created = createDMAStartOp(loc, rewriter, op.getSource(),
-                                    op.getTarget(), pingWaits[i]);
-    assert(created && "unable to create dma_start");
+    if (!createDMAStartOp(loc, rewriter, op.getSource(), op.getTarget(),
+                          pingWaits[i]))
+      return rejectDMAStart(op);
     rewriter.eraseOp(op);
   }
 
@@ -209,15 +227,21 @@ void rewriteAsDMATransfers(IRRewriter &rewriter, DBSchedule schedule) {
   insertDMAWaits(loc, rewriter, pongWaits, tagIndex, numElements);
 
   // Replace memref.copy with dma-start (and dma-wait for stores).
-  replacePrefetchWithDMA(loc, rewriter, schedule.pingSchedule.prefetch,
-                         pongWaits);
-  replacePrefetchWithDMA(loc, rewriter, schedule.pongSchedule.prefetch,
-                         pingWaits);
+  if (failed(replacePrefetchWithDMA(loc, rewriter,
+                                    schedule.pingSchedule.prefetch,
+                                    pongWaits)) ||
+      failed(replacePrefetchWithDMA(loc, rewriter,
+                                    schedule.pongSchedule.prefetch,
+                                    pingWaits)) ||
+      failed(replaceStoreshWithDMA(loc, rewriter, schedule.pingSchedule,
+                                   pingStoreWaits, tagIndex,
+                                   numElementsStores)) ||
+      failed(replaceStoreshWithDMA(loc, rewriter, schedule.pongSchedule,
+                                   pongStoreWaits, tagIndex,
+                                   numElementsStores)))
+    return failure();
 
-  replaceStoreshWithDMA(loc, rewriter, schedule.pingSchedule, pingStoreWaits,
-                        tagIndex, numElementsStores);
-  replaceStoreshWithDMA(loc, rewriter, schedule.pongSchedule, pongStoreWaits,
-                        tagIndex, numElementsStores);
+  return success();
 }
 
 /// Extract the prefetch section of ping-pong sub-kernels.
@@ -336,15 +360,18 @@ struct HexagonDoubleBufferGenericS2Pass
 
   void runOnOperation() override {
     auto func = getOperation();
-    func.walk([](scf::ForOp forOp) {
+    WalkResult result = func.walk([&](scf::ForOp forOp) {
       DBSchedule schedule;
       bool res = extractSchedule(forOp, schedule);
       if (res) {
         IRRewriter rewriter(forOp.getContext());
-        rewriteAsDMATransfers(rewriter, schedule);
+        if (failed(rewriteAsDMATransfers(rewriter, schedule)))
+          return WalkResult::interrupt();
       }
       return WalkResult::advance();
     });
+    if (result.wasInterrupted())
+      signalPassFailure();
   }
 };
 } // namespace
