@@ -54,7 +54,12 @@ public:
    * \param length Length in bytes to copy
    * \param bypassCacheSrc should cache be bypassed when reading from src?
    * \param bypassCacheDst should cache be bypassed when writing to dst?
-   * \returns a token that could be used for waiting on this DMA
+   * \param status out-parameter for DMASuccess/DMAFailure. It must be a word
+   * of its own: it must not be storage that later holds the returned token,
+   * or the token store erases the report (see RuntimeDMA.h).
+   * \returns a token that could be used for waiting on this DMA, or
+   * DMA_TOKEN_NONE when the transfer was refused (nothing was enqueued and
+   * wait() returns immediately for that value)
    */
   uint32_t copy(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
                 uint32_t length, bool bypassCacheSrc, bool bypassCacheDst,
@@ -76,7 +81,10 @@ public:
       b01 - No read, write allocation
       b10 - Read allocation, no write allocation
       b11 - Read, Write allocation
-   * \returns a token that could be used for waiting on this DMA transfer
+   * \param status out-parameter for DMASuccess/DMAFailure, a word of its own
+   * (never the storage of the returned token -- see RuntimeDMA.h)
+   * \returns a token that could be used for waiting on this DMA transfer, or
+   * DMA_TOKEN_NONE when the transfer was refused (nothing was enqueued)
   */
   uint32_t copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
                   uint32_t width, uint32_t height, uint32_t srcStride,
@@ -87,7 +95,8 @@ public:
   /*!
    * \brief Wait till the DMA transfer corresponding to the input token is
    * complete
-   * \param token - token to wait
+   * \param token - token to wait; DMA_TOKEN_NONE (the return of a refused
+   * start) returns immediately, since no transfer was enqueued for it
    */
   void wait(uint32_t token);
 

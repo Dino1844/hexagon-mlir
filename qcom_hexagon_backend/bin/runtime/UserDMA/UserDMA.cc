@@ -19,24 +19,6 @@
 namespace hexagon {
 namespace userdma {
 
-namespace {
-// Hand back a token whose wait() returns even though no transfer was started.
-// DMAToLLVMPass stores the token and never inspects `status`, so a rejected
-// transfer that returned 0 could make a later dma_wait(0) spin on an unrelated
-// descriptor. The descriptor below is left unlinked (the DMA engine never sees
-// it) and marked done, so the caller's wait() completes immediately.
-uint32_t enqueueRejectedDesc(RingBuffer<DMADesc2D> *queue, DMAStatus *status) {
-  uint32_t token = 0;
-  DMADesc2D *dmaDesc = queue->alloc(token);
-  std::memset(dmaDesc, 0, sizeof(DMADesc2D));
-  dmaDescSetState(dmaDesc, DESC_STATE_READY);
-  dmaDescSetNext(dmaDesc, DMA_NULL_PTR);
-  dmaDescSetDone(dmaDesc, DESC_DONE_COMPLETE);
-  *status = DMAFailure;
-  return token;
-}
-} // namespace
-
 bool inFlight(void *ptr) {
   DMADesc2D *dmaDesc = static_cast<DMADesc2D *>(ptr);
   dmpoll(); // Catch any exception occured during DMA transfer
@@ -52,24 +34,28 @@ uint32_t UserDMA::copy(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
   // Enqueue critical section: alloc + descriptor fill + dmstart/dmlink run as
   // one unit (see enqueueMutex_ for scope and lock order).
   std::lock_guard<std::mutex> lock(enqueueMutex_);
+  // Refusals below report through `status` and return DMA_TOKEN_NONE: no ring
+  // descriptor is enqueued, and wait(DMA_TOKEN_NONE) returns immediately (see
+  // RuntimeDMA.h). The caller's status word must be storage of its own -- it
+  // must not be the tag that later holds this token, or the report is erased.
   // length limited to 24 bits
   if (numBytes > DESC_LENGTH_MASK) {
     *status = DMAFailure;
-    return 0;
+    return DMA_TOKEN_NONE;
   }
 
   // source address limited to 32 bits
   uint64_t src64 = reinterpret_cast<uint64_t>(src);
   if (!src64 || src64 > DESC_SRC_MASK) {
     *status = DMAFailure;
-    return 0;
+    return DMA_TOKEN_NONE;
   }
 
   // destination address limited to 32 bits
   uint64_t dst64 = reinterpret_cast<uint64_t>(dst);
   if (!dst64 || dst64 > DESC_DST_MASK) {
     *status = DMAFailure;
-    return 0;
+    return DMA_TOKEN_NONE;
   }
 
   uint32_t src32 = static_cast<uint32_t>(src64);
@@ -126,9 +112,11 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
                          bool bypassCacheDst, bool isOrdered,
                          uint32_t cacheAllocationPolicy, DMAStatus *status) {
 
-  // Enqueue critical section: alloc + descriptor fill + dmstart/dmlink (and
-  // the rejected-descriptor path) run as one unit (see enqueueMutex_ for
-  // scope and lock order).
+  // Enqueue critical section: alloc + descriptor fill + dmstart/dmlink run as
+  // one unit (see enqueueMutex_ for scope and lock order). The refusal checks
+  // below run under the same lock but only write the caller's status word and
+  // return DMA_TOKEN_NONE: no ring entry is taken, and there is no forged
+  // completed descriptor (that bypass was removed with the status/token split).
   std::lock_guard<std::mutex> lock(enqueueMutex_);
 
   *status = DMAFailure;
@@ -140,19 +128,19 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
   // refusal, not an assert: the device runtime is built at -O2 without
   // -DNDEBUG, so assert() would abort the DSP on a data-dependent value.
   if (!dma2DGeometryFits(width, height, srcStride, dstStride)) {
-    return enqueueRejectedDesc(dmaQueue, status);
+    return DMA_TOKEN_NONE;
   }
 
   // source address limited to 32 bits
   uint64_t src64 = reinterpret_cast<uint64_t>(src);
   if (!src64 || src64 > DESC_SRC_MASK) {
-    return enqueueRejectedDesc(dmaQueue, status);
+    return DMA_TOKEN_NONE;
   }
 
   // destination address limited to 32 bits
   uint64_t dst64 = reinterpret_cast<uint64_t>(dst);
   if (!dst64 || dst64 > DESC_DST_MASK) {
-    return enqueueRejectedDesc(dmaQueue, status);
+    return DMA_TOKEN_NONE;
   }
 
   uint32_t src32 = static_cast<uint32_t>(src64);
@@ -211,6 +199,10 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
 }
 
 void UserDMA::wait(uint32_t token) {
+  // A refused start enqueued no descriptor and returned DMA_TOKEN_NONE;
+  // there is nothing to poll, and the report is the caller's status word.
+  if (token == DMA_TOKEN_NONE)
+    return;
   DMADesc2D *dmaDesc = dmaQueue->getDataPtr(token);
   assert(dmaDesc != nullptr);
   while (inFlight(dmaDesc))

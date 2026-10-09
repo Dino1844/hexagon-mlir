@@ -21,6 +21,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "llvm/Support/Debug.h"
 #define DEBUG_TYPE "dma-to-llvm"
 
@@ -80,7 +81,11 @@ struct LowerDMAStart : public ConvertOpToLLVMPattern<memref::DmaStartOp> {
                   ConversionPatternRewriter &rewriter) const override;
 };
 
-// Function to get or create the DMA start function in the module
+// Function to get or create the DMA start function in the module.
+// ABI (must match bin/runtime/include/RuntimeDMA.h): the final !llvm.ptr is
+// `DMAStatus *status` -- an out-parameter pointing at a dedicated word, never
+// the tag the returned token is stored into; a refused start returns
+// `DMA_TOKEN_NONE` from this call with `*status = DMAFailure`.
 static FailureOr<LLVM::LLVMFuncOp>
 getDMAStartFn(ModuleOp module, StringRef fnName,
               ConversionPatternRewriter &rewriter) {
@@ -93,7 +98,9 @@ getDMAStartFn(ModuleOp module, StringRef fnName,
                                 rewriter.getI32Type());
 }
 
-// Function to get or create the 2D DMA start function in the module
+// Function to get or create the 2D DMA start function in the module.
+// Same status/token ABI as getDMAStartFn above: final !llvm.ptr = status,
+// never the tag; refusal returns DMA_TOKEN_NONE.
 static FailureOr<LLVM::LLVMFuncOp>
 getDMA2DStartFn(ModuleOp module, StringRef fnName,
                 ConversionPatternRewriter &rewriter) {
@@ -126,6 +133,31 @@ static Value AddrSpaceCast(mlir::Location loc, Value inputPtr,
   auto asI32 = LLVM::PtrToIntOp::create(rewriter, loc, i32Type, inputPtr);
   return LLVM::IntToPtrOp::create(rewriter, loc, getPtrTy(context),
                                   asI32->getResult(0));
+}
+
+// A dedicated i32 slot for the runtime's `DMAStatus` out-parameter of
+// `hexagon_runtime_dma{,2d}_start`.
+//
+// Status must never share storage with the token: the token returned by the
+// call is stored into the *tag* word for `dma_wait` to poll, and when this
+// pass passed the tag pointer as the status pointer too, that store
+// overwrote the runtime's `*status = DMAFailure` one instruction later --
+// a refused transfer was reported nowhere (roadmap/ARCH-REVIEW.md bug #2;
+// the runtime papered over it with a forged completed descriptor, since
+// removed in favor of `DMA_TOKEN_NONE`, see bin/runtime/include/RuntimeDMA.h).
+//
+// One slot per start, hoisted to the function entry block: an alloca created
+// where the `dma_start` sits would sit inside the double-buffering loop and
+// lower to a dynamic stack allocation that grows every iteration.
+static Value createDMAStatusSlot(ConversionPatternRewriter &rewriter,
+                                 mlir::Location loc, Operation *op) {
+  RewriterBase::InsertionGuard guard(rewriter);
+  if (auto func = op->getParentOfType<FunctionOpInterface>())
+    rewriter.setInsertionPointToStart(&func.getBlocks().front());
+  Value count = LLVM::ConstantOp::create(rewriter, loc, rewriter.getI64Type(),
+                                         rewriter.getI64IntegerAttr(1));
+  return LLVM::AllocaOp::create(rewriter, loc, getPtrTy(rewriter.getContext()),
+                                rewriter.getI32Type(), count);
 }
 
 // Function to create DMAStart operation
@@ -206,6 +238,9 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
   auto dstMemSpace = getI32Constant(rewriter, loc, isVTCM(dstMemref) ? 1 : 0);
   // Set the bypass cache flag to 0
   auto bypassCache = getI32Constant(rewriter, loc, 0);
+  // Status out-word: a slot of its own (createDMAStatusSlot). The tag below
+  // carries the token only -- status and token must never be the same word.
+  Value statusPtr = createDMAStatusSlot(rewriter, loc, op);
   SmallVector<Value, 16> operands;
 
   if (op.isStrided()) {
@@ -253,12 +288,12 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
                 bypassCache,
                 getI32Constant(rewriter, loc, 0), // isOrdered
                 getI32Constant(rewriter, loc, 0), // Cache Allocation Policy
-                llvmTagPtr};
+                statusPtr};
   } else {
     dmaStartFnName = mlir::hexagon::getDMAStartFnName();
     funcOp = getDMAStartFn(module, dmaStartFnName, rewriter);
     operands = {llvmSrcPtr,   srcMemSpace, llvmDstPtr,  dstMemSpace,
-                transferSize, bypassCache, bypassCache, llvmTagPtr};
+                transferSize, bypassCache, bypassCache, statusPtr};
   }
   // Erase the original operation
   rewriter.eraseOp(op);
@@ -270,7 +305,9 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
   // Get the token from the DMA copy operation
   auto token = *dmaCopyOp.getODSResults(0).begin();
 
-  // Store the token in the tag memory reference
+  // Store the token in the tag memory reference. The tag word holds the
+  // token and nothing else; the runtime's status report lives in statusPtr,
+  // so this store can no longer erase `*status = DMAFailure`.
   LLVM::StoreOp::create(rewriter, loc, token, llvmTagPtr);
 
   return success();
