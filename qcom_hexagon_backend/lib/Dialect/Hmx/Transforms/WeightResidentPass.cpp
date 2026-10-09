@@ -739,6 +739,35 @@ static bool isMultipleOf(Value v, int64_t factor, int depth = 0) {
   return false;
 }
 
+/// True when *any additive term* of `v` is provably a multiple of `factor`.
+///
+/// The K-block guard on `underlyingSliceArgument` needs the term-level form.
+/// An N-block offset is a sum of column offsets -- a program's `pid * BN` and
+/// an N loop's induction variable, each strictly narrower than N -- while a
+/// K-block offset *contains a row term*: `k0 * N` for the K loop. The
+/// whole-value `isMultipleOf` above answers the second question only when the
+/// sum is a multiple of N, which a K loop nested in an N loop never is:
+/// `k0 * N + n0` keeps the residual `n0`, so the proof fails and the K block
+/// is accepted as the column offset it is not. That is exactly the form that
+/// broke the 2048^3 / 1024^3-tile shape (A form, real K loop over 2048/1024
+/// and N loop over 2048/1024): the resident then holds one K block, the
+/// published contract describes that K block rather than the whole `[K, N]`
+/// argument, and the launch dies on the host's shape check
+/// (`weight slot 1 has shape (2048, 2048), expected (1024, 2048)`;
+/// docs/results/device-why-slow-2026-10-10.md §3). Decomposing the sum and
+/// proving each term separately is what tells the two apart: a term that
+/// carries a whole number of rows is a row displacement wherever it appears.
+static bool anyTermIsMultipleOf(Value v, int64_t factor, int depth = 0) {
+  if (depth > 8)
+    return false;
+  if (isMultipleOf(v, factor, depth))
+    return true;
+  if (auto add = v.getDefiningOp<arith::AddIOp>())
+    return anyTermIsMultipleOf(add.getLhs(), factor, depth + 1) ||
+           anyTermIsMultipleOf(add.getRhs(), factor, depth + 1);
+  return false;
+}
+
 /// An N-slice of a wider runtime weight (B2): the pack bridge covers one N block
 /// of a `[K, N]` matrix. The whole N is the view's row stride, so the argument's
 /// bytes *are* the whole weight's bytes and one resident copy serves every
@@ -1138,12 +1167,15 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
   // The offset is the descriptor's element offset (a one-element list), i.e. the
   // N block this program owns. A static offset is checked directly; a dynamic
   // one has to be provably tile-aligned (`pid * BN`, or a static-step loop's
-  // induction variable -- see `isMultipleOf`) *and* provably a column offset: in
-  // a row-major [K, N] matrix every whole number of rows is a multiple of N, so
-  // an offset that is provably a multiple of N is a row (K) offset -- a
+  // induction variable -- see `isMultipleOf`) *and* provably a column offset:
+  // in a row-major [K, N] matrix every whole number of rows is a multiple of
+  // N, so any term that is a multiple of N is a row (K) offset -- a
   // loop-varying block of an activation consumed as a weight, whose resident
   // holds one block while the offset walks past its end. A column offset is
-  // never such a multiple (offset 0 is the dense path's business).
+  // never such a multiple (offset 0 is the dense path's business). The proof
+  // is per additive term (`anyTermIsMultipleOf`), not over the whole value: a
+  // K loop nested inside an N loop offset (`k0 * N + n0`) is exactly the sum
+  // whose whole value is not a multiple of N while one of its terms is.
   if (reinterpret.getStaticOffsets().size() != 1)
     return decline("the entry-argument view does not name one element offset");
   WeightSlice slice;
@@ -1164,9 +1196,10 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
     if (!isMultipleOf(offset, hmx::layout::kTileEdge))
       return decline("the N offset is not provably a multiple of 32, so the "
                      "resident's crouton subview cannot be indexed exactly");
-    if (isMultipleOf(offset, n))
-      return decline("the offset is provably a multiple of N, so it selects "
-                     "rows (a K block), not an N block");
+    if (anyTermIsMultipleOf(offset, n))
+      return decline("the offset contains a whole number of rows (a multiple "
+                     "of the weight's N), so the view is a K block of the "
+                     "weight, not one N block");
     slice.dynamicOffset = offset;
   }
   return slice;

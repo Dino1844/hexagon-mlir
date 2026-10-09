@@ -23,7 +23,7 @@
 //       `scf.for %n0 = 0 to N step BN`, not a `pid * BN` multiply. Both the
 //       tile-edge proof and the "provably a multiple of N means rows" guard
 //       read it through `isMultipleOf`, which understands the IV.
-//   [3]-[5] the refusals that must stay refusals, each with its reason.
+//   [3]-[6] the refusals that must stay refusals, each with its reason.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(func.func(weight-resident{prepack-runtime-weights=true}))' -verify-diagnostics -split-input-file | FileCheck %s
 //===----------------------------------------------------------------------===//
@@ -238,13 +238,66 @@ module {
                 : memref<64x32xf16, strided<[64, 1], offset: ?>>)
             outs(%wa : memref<1x2x16x32x2xf16, 1>)
       }
-// expected-remark @+1 {{resident weight declined: the offset is provably a multiple of N, so it selects rows (a K block), not an N block; the weight keeps its per-launch pack bridge}}
+// expected-remark @+1 {{resident weight declined: the offset contains a whole number of rows (a multiple of the weight's N), so the view is a K block of the weight, not one N block; the weight keeps its per-launch pack bridge}}
       hmx.matmul ins(%ca, %wa : memref<2x2x16x32x2xf16, 1>,
                             memref<1x2x16x32x2xf16, 1>)
           outs(%ar : memref<2x1x16x32x2xf16, 1>)
     }
     memref.dealloc %wa : memref<1x2x16x32x2xf16, 1>
     memref.dealloc %ca : memref<2x2x16x32x2xf16, 1>
+    memref.dealloc %ar : memref<2x1x16x32x2xf16, 1>
+    return
+  }
+}
+
+// -----
+
+// [6] a K loop nested inside an N loop: the offset is `k0 * N + n0`, so one
+// additive term is a whole number of rows while the whole value is not a
+// multiple of N (the residual `n0` keeps it off). That is the form that slipped
+// through as an "N slice" on the 2048^3 / 1024^3-tile shape, where the resident
+// held one K block and the published contract described that K block instead
+// of the whole [K, N] argument -- the host then refused the launch
+// (`weight slot 1 has shape (2048, 2048), expected (1024, 2048)`;
+// docs/results/device-why-slow-2026-10-10.md §3). The term-level proof
+// (`anyTermIsMultipleOf`) refuses it, so the kernel keeps the per-launch bridge
+// and publishes no contract.
+module {
+  // CHECK-LABEL: func.func @runtime_weight_k_inside_n_loop
+  // CHECK: hmx.pack_weight
+  // CHECK-NOT: hexagonmem.alloc
+  func.func @runtime_weight_k_inside_n_loop(%a: memref<64x64xf16>,
+                                             %w: memref<*xf16>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c2 = arith.constant 2 : index
+    %c32 = arith.constant 32 : index
+    %c64 = arith.constant 64 : index
+    %ca = memref.alloc() : memref<2x1x16x32x2xf16, 1>
+    %wa = memref.alloc() : memref<1x1x16x32x2xf16, 1>
+    %ar = memref.alloc() : memref<2x1x16x32x2xf16, 1>
+    scf.for %k0 = %c0 to %c64 step %c32 {
+      scf.for %n0 = %c0 to %c64 step %c32 {
+        %rows = arith.muli %k0, %c64 : index
+        %off = arith.addi %rows, %n0 : index
+        %view = memref.reinterpret_cast %w to offset: [%off], sizes: [32, 32],
+            strides: [64, 1]
+            : memref<*xf16> to memref<32x32xf16, strided<[64, 1], offset: ?>>
+        scf.for %i = %c0 to %c2 step %c1 {
+          %r = arith.divui %i, %c1 : index
+          %cc = arith.remui %i, %c1 : index
+          hmx.pack_weight ins(%view, %r, %cc
+                  : memref<32x32xf16, strided<[64, 1], offset: ?>>)
+              outs(%wa : memref<1x1x16x32x2xf16, 1>)
+        }
+// expected-remark @+1 {{resident weight declined: the offset contains a whole number of rows (a multiple of the weight's N), so the view is a K block of the weight, not one N block; the weight keeps its per-launch pack bridge}}
+        hmx.matmul ins(%ca, %wa : memref<2x1x16x32x2xf16, 1>,
+                              memref<1x1x16x32x2xf16, 1>)
+            outs(%ar : memref<2x1x16x32x2xf16, 1>)
+      }
+    }
+    memref.dealloc %wa : memref<1x1x16x32x2xf16, 1>
+    memref.dealloc %ca : memref<2x1x16x32x2xf16, 1>
     memref.dealloc %ar : memref<2x1x16x32x2xf16, 1>
     return
   }
