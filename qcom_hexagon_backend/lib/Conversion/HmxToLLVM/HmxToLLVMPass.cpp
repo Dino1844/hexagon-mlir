@@ -20,6 +20,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Conversion/HmxToLLVM/HmxExternalFnNames.h"
+#include "hexagon/Conversion/HmxToLLVM/HmxLeafSignatures.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
@@ -62,19 +63,33 @@ using namespace mlir::hmx;
 
 namespace {
 
-/// Declare (once) a runtime leaf with the given argument types and no result.
+/// Declare (once) an HMX runtime leaf with no result.
+///
+/// The argument types come from HmxLeafSignatures.h, never from the call site:
+/// a lowering that spelled its own `SmallVector<Type>(9, i32Ty)` could not
+/// disagree with HMXAPI.h at compile time, and did disagree on the device. A
+/// name with no row, or a row whose C spelling `argTys` cannot place, is a
+/// bug in the compiler, so both fail here with the leaf named rather than
+/// falling back to a guess.
 FailureOr<LLVM::LLVMFuncOp> getVoidLeaf(ModuleOp module, StringRef name,
-                                        ArrayRef<Type> argTys,
                                         ConversionPatternRewriter &rewriter) {
-  auto voidTy = LLVM::LLVMVoidType::get(module->getContext());
-  return LLVM::lookupOrCreateFn(rewriter, module, name, argTys, voidTy);
-}
-
-/// Declare (once) a runtime leaf that returns a value.
-FailureOr<LLVM::LLVMFuncOp> getLeaf(ModuleOp module, StringRef name,
-                                    ArrayRef<Type> argTys, Type resultTy,
-                                    ConversionPatternRewriter &rewriter) {
-  return LLVM::lookupOrCreateFn(rewriter, module, name, argTys, resultTy);
+  MLIRContext *ctx = module->getContext();
+  const HmxLeafSignature *signature = lookupHmxLeafSignature(name);
+  if (!signature) {
+    module.emitError() << "hmx lowering calls '" << name
+                       << "', which is not a leaf HMXAPI.h declares "
+                          "(no row in HmxLeafSignatures.h)";
+    return failure();
+  }
+  FailureOr<SmallVector<Type>> argTys = signature->argTys(ctx);
+  if (failed(argTys)) {
+    module.emitError() << "HMX leaf '" << name
+                       << "' has a parameter type with no MLIR image "
+                          "(HmxLeafSignatures.h::argTys)";
+    return failure();
+  }
+  auto voidTy = LLVM::LLVMVoidType::get(ctx);
+  return LLVM::lookupOrCreateFn(rewriter, module, name, *argTys, voidTy);
 }
 
 /// Runtime entry that constructs the runtime's global singleton, i.e. powers
@@ -1890,21 +1905,28 @@ static int64_t memrefAddressSpace(MemRefType type, int64_t fallback) {
 /// signature is the one DMAToLLVMPass declares for the same symbol: the pointer
 /// arguments are real `!llvm.ptr`s (the host data layout widens them), while
 /// the address spaces and the two bypass flags travel as i32.
+///
+/// Spelled out here rather than looked up: the DMA ABI is DMAToLLVMPass's
+/// contract, and HmxLeafSignatures.h deliberately has no row for it so the
+/// leaf table never becomes a second opinion about the DMA signature.
 static FailureOr<LLVM::LLVMFuncOp>
 getDmaStartLeaf(ModuleOp module, ConversionPatternRewriter &rewriter) {
   MLIRContext *context = module->getContext();
   auto ptrTy = LLVM::LLVMPointerType::get(context);
   auto i32Ty = rewriter.getI32Type();
-  return getLeaf(module, getStageDmaStartFnName(),
-                 {ptrTy, i32Ty, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty, ptrTy},
-                 i32Ty, rewriter);
+  return LLVM::lookupOrCreateFn(rewriter, module, getStageDmaStartFnName(),
+                                {ptrTy, i32Ty, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
+                                 ptrTy},
+                                i32Ty);
 }
 
-/// The DMA wait entry `hmx.await` lowers to: `void dma_wait(i32 token)`.
+/// The DMA wait entry `hmx.await` lowers to: `void dma_wait(i32 token)`. Same
+/// reason as getDmaStartLeaf for not consulting the leaf table.
 static FailureOr<LLVM::LLVMFuncOp>
 getDmaWaitLeaf(ModuleOp module, ConversionPatternRewriter &rewriter) {
-  return getVoidLeaf(module, getAwaitDmaWaitFnName(), {rewriter.getI32Type()},
-                     rewriter);
+  auto voidTy = LLVM::LLVMVoidType::get(module->getContext());
+  return LLVM::lookupOrCreateFn(rewriter, module, getAwaitDmaWaitFnName(),
+                                {rewriter.getI32Type()}, voidTy);
 }
 
 /// Emit a runtime leaf call and bind the op's result. The memref-form
@@ -1938,8 +1960,7 @@ struct LowerMma : public ConvertOpToLLVMPattern<MmaOp> {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     auto i32Ty = rewriter.getI32Type();
 
-    auto fn =
-        getVoidLeaf(module, getMmaF16FnName(), {i32Ty, i32Ty, i32Ty}, rewriter);
+    auto fn = getVoidLeaf(module, getMmaF16FnName(), rewriter);
     if (failed(fn))
       return failure();
 
@@ -1977,10 +1998,8 @@ struct LowerAccRead : public ConvertOpToLLVMPattern<AccReadOp> {
     ModuleOp module = op->getParentOfType<ModuleOp>();
     auto i32Ty = rewriter.getI32Type();
 
-    auto loadFn =
-        getVoidLeaf(module, getBiasLoadF16FnName(), {i32Ty, i32Ty}, rewriter);
-    auto storeFn =
-        getVoidLeaf(module, getAccStoreF16FnName(), {i32Ty, i32Ty}, rewriter);
+    auto loadFn = getVoidLeaf(module, getBiasLoadF16FnName(), rewriter);
+    auto storeFn = getVoidLeaf(module, getAccStoreF16FnName(), rewriter);
     if (failed(loadFn) || failed(storeFn))
       return failure();
 
@@ -2012,10 +2031,8 @@ struct LowerBiasInit : public ConvertOpToLLVMPattern<BiasInitOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
-    auto i32Ty = rewriter.getI32Type();
 
-    auto fn =
-        getVoidLeaf(module, getBiasInitUnitF16FnName(), {i32Ty}, rewriter);
+    auto fn = getVoidLeaf(module, getBiasInitUnitF16FnName(), rewriter);
     if (failed(fn))
       return failure();
 
@@ -2036,7 +2053,7 @@ struct LowerAccClear : public ConvertOpToLLVMPattern<AccClearOp> {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
 
-    auto fn = getVoidLeaf(module, getAccClearF16FnName(), {}, rewriter);
+    auto fn = getVoidLeaf(module, getAccClearF16FnName(), rewriter);
     if (failed(fn))
       return failure();
 
@@ -2146,7 +2163,6 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
-    auto i32Ty = rewriter.getI32Type();
 
     auto dstType = cast<MemRefType>(op.getDst().getType());
     auto srcType = cast<MemRefType>(op.getSrc().getType());
@@ -2170,8 +2186,7 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
           packActLeafFamily(op.getOperation(), srcType.getElementType());
       if (failed(family))
         return failure();
-      auto fn = getVoidLeaf(module, (*family).tail,
-                            SmallVector<Type>(9, i32Ty), rewriter);
+      auto fn = getVoidLeaf(module, (*family).tail, rewriter);
       if (failed(fn))
         return failure();
       Value dst = croutonAddr(rewriter, loc, adaptor.getDst(), dstType,
@@ -2198,18 +2213,18 @@ struct LowerPackAct : public ConvertOpToLLVMPattern<PackActOp> {
       return success();
     }
     bool bulk = count > 1;
-    SmallVector<Type> argTys(7, i32Ty);
-    if (bulk)
-      argTys.push_back(i32Ty);
     // The source's element type picks the leaf family (packActLeafFamily): an
     // f32 source is quantised to the engine's fp16 inside the pack, so it has
     // its own entry rather than a narrowing op of its own ahead of the pack.
+    // The single and `_bulk` forms have different arities, and which one is
+    // called is decided by the name, so the table carries both -- there is no
+    // `argTys(7); if (bulk) push_back(i32Ty)` left to keep in step with it.
     FailureOr<PackActLeafFamily> family =
         packActLeafFamily(op.getOperation(), srcType.getElementType());
     if (failed(family))
       return failure();
     auto fn = getVoidLeaf(module, bulk ? (*family).bulk : (*family).single,
-                          argTys, rewriter);
+                          rewriter);
     if (failed(fn))
       return failure();
 
@@ -2257,7 +2272,6 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
-    auto i32Ty = rewriter.getI32Type();
 
     auto dstType = cast<MemRefType>(op.getDst().getType());
     auto srcType = cast<MemRefType>(op.getSrc().getType());
@@ -2283,8 +2297,7 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
       if (failed(family))
         return failure();
       auto fn = getVoidLeaf(
-          module, srcTransposed ? (*family).tailT : (*family).tail,
-          SmallVector<Type>(9, i32Ty), rewriter);
+          module, srcTransposed ? (*family).tailT : (*family).tail, rewriter);
       if (failed(fn))
         return failure();
       Value dst = croutonAddr(rewriter, loc, adaptor.getDst(), dstType,
@@ -2316,19 +2329,18 @@ struct LowerPackWeight : public ConvertOpToLLVMPattern<PackWeightOp> {
       return success();
     }
     bool bulk = count > 1;
-    SmallVector<Type> argTys(7, i32Ty);
-    if (bulk)
-      argTys.push_back(i32Ty);
     bool srcTransposed = op.getSrcTransposed().value_or(false);
     FailureOr<PackWeightLeafFamily> family =
         packWeightLeafFamily(op.getOperation(), srcType.getElementType());
     if (failed(family))
       return failure();
+    // All four forms (single / bulk, straight / transposed) are separate rows,
+    // so the name that is chosen decides the arity -- see LowerPackAct.
     auto fn = getVoidLeaf(
         module,
         bulk ? (srcTransposed ? (*family).bulkT : (*family).bulk)
              : (srcTransposed ? (*family).singleT : (*family).single),
-        argTys, rewriter);
+        rewriter);
     if (failed(fn))
       return failure();
 
@@ -2378,7 +2390,6 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
-    auto i32Ty = rewriter.getI32Type();
 
     int64_t count = op.getCount().value_or(1);
     IntegerAttr validRows = op.getValidRowsAttr();
@@ -2416,8 +2427,7 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
                                         "unpack destination",
                                         /*rowMajor=*/true)))
         return failure();
-      auto fn = getVoidLeaf(module, getUnpackAccTailF16FnName(),
-                            SmallVector<Type>(9, i32Ty), rewriter);
+      auto fn = getVoidLeaf(module, getUnpackAccTailF16FnName(), rewriter);
       if (failed(fn))
         return failure();
       Value dst = asAddress(rewriter, loc, adaptor.getDst(),
@@ -2456,12 +2466,12 @@ struct LowerUnpackAcc : public ConvertOpToLLVMPattern<UnpackAccOp> {
     bool bulk = count > 1;
     // The bulk leaf has the same arity as the single one: it replaces the
     // single form's `col` (always 0 here, the leaf walks the crouton row
-    // itself) with the row-pair count. Appending it instead would shift the ABI
-    // and the leaf would read n_pairs = 0, writing nothing.
-    SmallVector<Type> argTys(7, i32Ty);
+    // itself) with the row-pair count. The two are separate rows with equal
+    // arity, so the table states that fact twice instead of this call site
+    // assuming it.
     auto fn = getVoidLeaf(
         module, bulk ? getUnpackAccF16BulkFnName() : getUnpackAccF16FnName(),
-        argTys, rewriter);
+        rewriter);
     if (failed(fn))
       return failure();
 
@@ -2530,7 +2540,6 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
     ModuleOp module = op->getParentOfType<ModuleOp>();
-    auto i32Ty = rewriter.getI32Type();
 
     int64_t count = op.getCount().value_or(1);
     IntegerAttr validRows = op.getValidRowsAttr();
@@ -2578,8 +2587,7 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
                                         "unpack destination",
                                         /*rowMajor=*/true)))
         return failure();
-      auto fn = getVoidLeaf(module, getUnpackAccTailF32FnName(),
-                            SmallVector<Type>(12, i32Ty), rewriter);
+      auto fn = getVoidLeaf(module, getUnpackAccTailF32FnName(), rewriter);
       if (failed(fn))
         return failure();
       Value dst = asAddress(rewriter, loc, adaptor.getDst(),
@@ -2649,10 +2657,9 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
     bool bulk = count > 1;
     // Same arity rule as the fp16 unpack: `n_pairs` replaces `col`, it is not
     // an extra argument.
-    SmallVector<Type> argTys(10, i32Ty);
     auto fn = getVoidLeaf(
         module, bulk ? getUnpackAccF32BulkFnName() : getUnpackAccF32FnName(),
-        argTys, rewriter);
+        rewriter);
     if (failed(fn))
       return failure();
 
