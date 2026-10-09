@@ -178,6 +178,25 @@ void *hexagon_runtime_weight_resident_v2_dsp(uint64_t src, uint32_t bytes,
       HexagonAPI::Global()->WeightResidentV2(src, bytes, alignment));
 }
 
+/// Versioned **DDR** weight resident ABI: (source, bytes, alignment), the same
+/// three arguments and the same exact-descriptor reuse rule as the VTCM entry
+/// above -- only the home of the buffer differs. Used when the compiler's
+/// placement gate found the weight too large for the persistent VTCM pool
+/// (`hmx.weight_resident` carries `location = "ddr"`); the kernel then reads
+/// the block it needs out of this mirror with a contiguous copy instead of
+/// packing a strided view on every launch. The image lives until
+/// `ReleaseResources`; see HexagonAPI::WeightResidentDdrV2.
+void *hexagon_runtime_weight_resident_ddr_v2_dsp(uint64_t src, uint32_t bytes,
+                                                 uint32_t alignment) {
+  if (!residentScopeRegistered()) {
+    FARF(ERROR, "DDR weight resident requested before scope entry");
+    return requireAllocationResult(nullptr);
+  }
+  _trc("WR3");
+  return requireAllocationResult(
+      HexagonAPI::Global()->WeightResidentDdrV2(src, bytes, alignment));
+}
+
 int32_t hexagon_runtime_resident_free_v2_dsp(void *ptr, uint32_t bytes) {
   if (!residentScopeRegistered()) {
     FARF(ERROR, "VTCM resident free requested before scope entry");

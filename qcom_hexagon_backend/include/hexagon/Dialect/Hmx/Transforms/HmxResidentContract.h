@@ -81,6 +81,20 @@ inline constexpr StringLiteral kHmxWeightPrepackAttr = "hmx.weight_prepack";
 inline constexpr StringLiteral kHmxWeightPrepackLayoutAttr =
     "hmx.weight_prepack_layout";
 
+/// Where a resident weight's buffer lives. The fact rides three places that
+/// must agree: the `hmx.weight_resident` descriptor (IR), the `location` field
+/// of each `hmx.weight_prepack` entry (host contract), and the manifest policy
+/// name (`resident-prepack` / `resident-prepack-ddr`).
+///
+/// The descriptor spells VTCM by *absence*: VTCM is what a resident was before
+/// there was anywhere else to put one, and leaving it off keeps every existing
+/// VTCM resident's IR byte-identical. Only a DDR resident carries the key. The
+/// contract, which is a host-facing fact sheet rather than IR, always carries
+/// the explicit value.
+inline constexpr StringLiteral kHmxWeightResidentLocationKey = "location";
+inline constexpr StringLiteral kHmxWeightResidentLocationVtcm = "vtcm";
+inline constexpr StringLiteral kHmxWeightResidentLocationDdr = "ddr";
+
 /// Stable hash domain for compiler-derived resident identities.  Keep this
 /// independent from `hmx.kernel_vtcm_identity`'s accounting schema: evolving
 /// the diagnostic census must not silently redefine an existing resident key.

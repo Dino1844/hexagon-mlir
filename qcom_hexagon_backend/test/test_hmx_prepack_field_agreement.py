@@ -5,8 +5,8 @@
 cannot see each other:
 
 * the producer, `WeightResidentPass.cpp`, which builds each entry by string
-  concatenation (`{"func",...,"slot",...,"shape",...,"crouton",...,"dtype"}`)
-  plus the top-level `{"layout",...,"weights"}` object;
+  concatenation (`{"func",...,"slot",...,"shape",...,"crouton",...,"dtype",
+  ...,"location"}`) plus the top-level `{"layout",...,"weights"}` object;
 * a second C++ reader, `HmxManifest.cpp`, which re-spells `"func"`, `"slot"`
   and `"shape"` as inline literals to recover the logical N per resident slot;
 * the consumer, `backend/utils.py::validate_weight_prepack`, which requires an
@@ -55,7 +55,7 @@ _BINDING_SRC = _BACKEND / "python" / "triton_qcom_hexagon_backend_api.cc"
 # ---------------------------------------------------------------------------
 # The frozen boundary, written out rather than derived, on purpose.
 # ---------------------------------------------------------------------------
-ENTRY_FIELDS = ("func", "slot", "shape", "crouton", "dtype")
+ENTRY_FIELDS = ("func", "slot", "shape", "crouton", "dtype", "location")
 TOP_LEVEL_FIELDS = ("layout", "weights")
 #: Rank of `shape` (logical [N, K]) and of `crouton` ([Nt, Kt, 16, 32, 2]).
 LOGICAL_RANK = 2
@@ -65,6 +65,12 @@ CROUTON_RANK = 5
 #: fp16 crouton, and an f32 source is quantised by the host.
 DTYPES = ("f16", "f32")
 DTYPE = DTYPES[0]
+#: The placements the producer may name: the VTCM pool, or the permanent DDR
+#: mirror the compiler falls back to when the pool cannot hold the weight. The
+#: consumer validates it (it is a fact the host contract carries) but does not
+#: act on it: the image bytes are the same either way.
+LOCATIONS = ("vtcm", "ddr")
+LOCATION = LOCATIONS[0]
 
 # A layout the consumer accepts, mirroring the producer's `prepackLayoutJson`
 # coefficient map: physical (d0=n_tile, d1=k_tile, d2=j, d3=c, d4=h) maps to
@@ -92,6 +98,7 @@ def _conforming_entry(**overrides):
         "shape": [64, 32],
         "crouton": [2, 1, 16, 32, 2],
         "dtype": DTYPE,
+        "location": LOCATION,
     }
     entry.update(overrides)
     return entry
@@ -218,6 +225,20 @@ class PrepackBehaviourTest(unittest.TestCase):
     def test_a_wrong_dtype_is_refused(self):
         self._rejects(
             _prepack(_conforming_entry(dtype="bf16")), "must be 'f16' or 'f32'"
+        )
+
+    def test_both_placements_are_accepted_and_anything_else_refused(self):
+        # `location` is new with the DDR mirror (docs/hmx/
+        # pack-redundancy-fix-plan-2026-10-09.md P1): the producer emits it on
+        # every entry, so a consumer that did not learn it would reject every
+        # kernel compiled after the change -- and one that accepted any string
+        # would let a typo become a placement nobody can find in the IR.
+        for location in LOCATIONS:
+            with self.subTest(location=location):
+                self._accepts(_conforming_entry(location=location))
+        self._rejects(
+            _prepack(_conforming_entry(location="pool")),
+            "location must be one of",
         )
 
     def test_the_two_ranks_are_refused_when_wrong(self):

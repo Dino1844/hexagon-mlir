@@ -202,6 +202,12 @@ _VALID_WEIGHT = {
             "shape": [64, 64],
             "crouton": [2, 2, 16, 32, 2],
             "dtype": "f16",
+            # The placement fact the compiler publishes on every entry (P1 of
+            # docs/hmx/pack-redundancy-fix-plan-2026-10-09.md): the image lives
+            # in the VTCM pool here, in the permanent DDR mirror when the pool
+            # cannot hold it. A fixture without it is a contract from before the
+            # field existed, which is exactly what the consumer now refuses.
+            "location": "vtcm",
         }
     ],
 }

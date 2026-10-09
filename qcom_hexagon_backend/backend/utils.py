@@ -391,9 +391,22 @@ HMX_VTCM_ACCOUNTING = frozenset({"bridge-only"})
 HMX_WEIGHT_BINDING_KINDS = frozenset(
     {"argument-slot", "compile-time-constant", "internal-value"}
 )
-HMX_WEIGHT_POLICIES = frozenset({"resident-prepack", "device-pack"})
+#: The two placements of a host pre-packed weight image: the VTCM pool, or the
+#: permanent DDR mirror the compiler falls back to when the pool cannot hold
+#: the weight (`hmx.weight_prepack` entry's `location` field, which the C++
+#: producer writes and this validator closes).
+HMX_WEIGHT_LOCATIONS = frozenset({"vtcm", "ddr"})
+HMX_WEIGHT_POLICIES = frozenset(
+    {"resident-prepack", "resident-prepack-ddr", "device-pack"}
+)
+#: What makes a weight packable does not depend on where its image ends up, so
+#: the two resident policies share one reason vocabulary (mirrors the C++
+#: `isResidentPrepackPolicy`).
 HMX_WEIGHT_POLICY_REASONS = {
     "resident-prepack": frozenset(
+        {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
+    ),
+    "resident-prepack-ddr": frozenset(
         {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
     ),
     "device-pack": frozenset(
@@ -900,7 +913,7 @@ def _validate_weight_policies(value, path):
                 f"{policy_path} duplicates slot policy for function {function!r}, "
                 f"slot {slot}"
             )
-        if name == "resident-prepack":
+        if name in ("resident-prepack", "resident-prepack-ddr"):
             resident_functions.add(function)
         result[key] = policy
     if len(resident_functions) > 1:
@@ -2092,7 +2105,7 @@ def validate_weight_prepack(weight_prepack, field_name="weight_prepack"):
             "non-empty"
         )
 
-    required = ("func", "slot", "shape", "crouton", "dtype")
+    required = ("func", "slot", "shape", "crouton", "dtype", "location")
     seen_slots = set()
     functions = set()
     for index, entry in enumerate(weights):
@@ -2113,6 +2126,14 @@ def validate_weight_prepack(weight_prepack, field_name="weight_prepack"):
         if entry["dtype"] not in ("f16", "f32"):
             raise ValueError(
                 f"{path}.dtype must be 'f16' or 'f32', got {entry['dtype']!r}"
+            )
+        # Where the compiler put the image. The host writes the same bytes
+        # either way -- the field is a fact about the kernel, not an
+        # instruction -- so it is validated rather than acted on.
+        if entry["location"] not in HMX_WEIGHT_LOCATIONS:
+            raise ValueError(
+                f"{path}.location must be one of {sorted(HMX_WEIGHT_LOCATIONS)}, "
+                f"got {entry['location']!r}"
             )
     if len(functions) > 1:
         raise ValueError(
@@ -2138,7 +2159,7 @@ def _validate_manifest_weight_prepack(manifest, weight_prepack):
     }
     for key, policy in policies.items():
         entry = entries.get(key)
-        if policy["policy"] == "resident-prepack":
+        if policy["policy"] in ("resident-prepack", "resident-prepack-ddr"):
             if entry is None:
                 raise ValueError(
                     "resident-prepack policy has no matching weight_prepack entry"
@@ -2166,7 +2187,10 @@ def _validate_manifest_weight_prepack(manifest, weight_prepack):
             )
     for key in entries:
         policy = policies.get(key)
-        if policy is None or policy["policy"] != "resident-prepack":
+        if policy is None or policy["policy"] not in (
+            "resident-prepack",
+            "resident-prepack-ddr",
+        ):
             raise ValueError(
                 "weight_prepack entry is not referenced by a resident-prepack policy"
             )

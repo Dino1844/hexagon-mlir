@@ -322,6 +322,48 @@ void *HexagonAPI::WeightResidentV2(uint64_t source, size_t nbytes,
       /*slot=*/0);
 }
 
+void *HexagonAPI::WeightResidentDdrV2(uint64_t source, size_t nbytes,
+                                      size_t alignment) {
+  // The same two refusals the VTCM entry makes, for the same reason: a zero
+  // image or a placement the allocator cannot honour must never become a
+  // descriptor, because the caller builds one from whatever comes back.
+  if (nbytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0)
+    return nullptr;
+  std::lock_guard<std::mutex> lock(ddrMirrorMutex);
+  auto existing = ddrMirrors.find(source);
+  if (existing != ddrMirrors.end()) {
+    // A key identifies one process-local image. Reuse only on an exact
+    // descriptor; a same-address request that disagrees is reported rather
+    // than served a shorter or longer copy.
+    if (existing->second.second != nbytes) {
+      FARF(ERROR, "DDR weight resident descriptor mismatch for key 0x%llx",
+           static_cast<unsigned long long>(source));
+      return nullptr;
+    }
+    return existing->second.first;
+  }
+  void *mirror = Alloc(nbytes, alignment, /*isVtcm=*/false);
+  if (mirror == nullptr)
+    return nullptr;
+  // The argument already holds the pre-packed crouton image (the host contract
+  // says so), so the mirror is a byte copy of it -- the same one-shot copy the
+  // VTCM entry makes, into a buffer that does not come out of the pool.
+  Copy(mirror, reinterpret_cast<void *>(static_cast<uintptr_t>(source)), nbytes);
+  ddrMirrors.emplace(source, std::make_pair(mirror, nbytes));
+  return mirror;
+}
+
+void HexagonAPI::freeDdrWeightResidents() {
+  std::lock_guard<std::mutex> lock(ddrMirrorMutex);
+  if (!bufferManager) {
+    ddrMirrors.clear();
+    return;
+  }
+  for (const auto &entry : ddrMirrors)
+    bufferManager->FreeHexagonBuffer(entry.second.first);
+  ddrMirrors.clear();
+}
+
 void *HexagonAPI::WorkspaceResidentV2(uint64_t key, size_t nbytes,
                                       size_t alignment, uint32_t instance) {
   return runtimeVtcm->Resident(VtcmPool::ResidentKind::kWorkspace, key, nbytes,

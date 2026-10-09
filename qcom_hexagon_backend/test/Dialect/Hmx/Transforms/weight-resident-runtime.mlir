@@ -190,7 +190,7 @@ module {
 // the contract names the *source* dtype (`"f32"`) and the image stays an fp16
 // crouton. The resident byte count is therefore the crouton's 8192, not the
 // argument's 16384, and the bridge is still erased.
-// CHECK: hmx.weight_prepack = "[{\22func\22:\22runtime_weight_f32\22,\22slot\22:1,\22shape\22:[64,64],\22crouton\22:[2,2,16,32,2],\22dtype\22:\22f32\22}]"
+// CHECK: hmx.weight_prepack = "[{\22func\22:\22runtime_weight_f32\22,\22slot\22:1,\22shape\22:[64,64],\22crouton\22:[2,2,16,32,2],\22dtype\22:\22f32\22,\22location\22:\22vtcm\22}]"
 // CHECK: hmx.weight_prepack_layout = "{{[{]\\22ndims\\22:5,\\22results\\22:\[\[\[1,32\],\[2,2\],\[4,1\]\],\[\[0,32\],\[3,1\]\]\][}]}}"
 // CHECK: hmx.weight_resident_bytes = 8192 : i64
 module {

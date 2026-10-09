@@ -47,9 +47,10 @@
 //
 // Residency is declared once, in the module attribute
 // `hmx.weight_resident_bytes` (the aggregate of the per-buffer byte counts the
-// pass computes), and the runtime receives the same number on the lowering's
-// call, so the declared footprint and what the device reserves cannot drift
-// apart.
+// pass computes -- VTCM buffers only, because that aggregate is the pool
+// footprint the other budget readers compare against), and the runtime receives
+// the same number on the lowering's call, so the declared footprint and what the
+// device reserves cannot drift apart.
 //
 // The two static VTCM budgets are checked by two different passes, at the two
 // points where the information exists, and they are not the same question:
@@ -62,12 +63,18 @@
 //   * This pass creates a buffer that occupies VTCM for the whole kernel, so it
 //     checks the persistent total here, before it commits. What happens on a
 //     refusal depends on which of the two sources above it is, because only one
-//     of them has a fallback:
+//     of them has somewhere else to go:
 //
-//       - A runtime weight keeps the per-launch `hmx.pack_weight` bridge, which
-//         is this pass's existing way of declining a weight (a non-pinnable view
-//         takes the same route). The contraction is untouched, so the cost is
-//         the prepack optimisation for that weight and nothing else.
+//       - A runtime weight that does not fit the pool is placed in the
+//         permanent **DDR mirror** instead (`hmx.weight_resident`'s `location`
+//         key): the host's pre-pack image is copied into a process-lifetime
+//         DDR buffer once, and the pack bridge becomes one contiguous fetch of
+//         the block the engine is about to read -- no VTCM, no device-side
+//         permutation, and the capacity number picks the placement rather than
+//         deciding whether the weight is resident at all. A weight whose
+//         *view* cannot be pinned in the first place (a non-pinnable offset,
+//         a K-block source) still keeps the per-launch bridge: nothing about
+//         its bytes is proven, so there is no image to mirror.
 //       - A constant weight has no such route: the resident VTCM buffer is the
 //         only form its operand can legally take, because `hmx.mma` requires
 //         its weight in VTCM and the operand it replaces is a DDR
@@ -143,6 +150,26 @@ constexpr const char *kResidentKeyBytes = "bytes";
 
 /// Aggregate of every resident buffer in the module, in bytes.
 constexpr const char *kResidentBytesAttr = "hmx.weight_resident_bytes";
+
+/// The descriptor's placement fact, read fail-closed: absent means VTCM (the
+/// only placement before DDR residency existed, and what keeps a VTCM
+/// resident's IR byte-identical), `ddr` means the permanent DDR mirror, and
+/// anything else is a producer/consumer disagreement rather than a placement.
+/// Only the VTCM total is counted in `hmx.weight_resident_bytes`: that
+/// aggregate is the persistent footprint of the *pool* the budget readers
+/// check, and a DDR mirror does not come out of it.
+static FailureOr<bool> residentIsDdr(DictionaryAttr resident,
+                                     Operation *anchor) {
+  auto location = resident.getAs<StringAttr>(kHmxWeightResidentLocationKey);
+  if (!location)
+    return false;
+  if (location.getValue() == kHmxWeightResidentLocationDdr)
+    return true;
+  if (location.getValue() == kHmxWeightResidentLocationVtcm)
+    return false;
+  return anchor->emitError("resident weight location must be \"vtcm\" or "
+                           "\"ddr\"");
+}
 
 /// JSON array of the runtime weights the host must pre-pack: each entry names
 /// the function, the argument slot, the logical shape and the crouton shape.
@@ -406,6 +433,17 @@ static LogicalResult verifyResidentByteAggregate(ModuleOp module) {
     auto resident = operation->getAttrOfType<DictionaryAttr>(kResidentAttr);
     if (!resident)
       return;
+    // A DDR mirror is resident but not *VTCM*-resident, so it is deliberately
+    // not part of this aggregate -- the sum is the pool footprint the budget
+    // readers compare against, and adding DDR bytes to it would make every
+    // later admission refuse.
+    FailureOr<bool> ddr = residentIsDdr(resident, operation);
+    if (failed(ddr)) {
+      result = failure();
+      return;
+    }
+    if (*ddr)
+      return;
     auto bytes = resident.getAs<IntegerAttr>(kResidentKeyBytes);
     if (!bytes || bytes.getInt() < 0 ||
         sum > std::numeric_limits<int64_t>::max() - bytes.getInt()) {
@@ -529,17 +567,43 @@ admitResidentVtcm(func::FuncOp func, ModuleOp module, int64_t addedBytes,
   return admission;
 }
 
-/// The decline, spelled once so a reader can tell it from a weight that was
-/// never eligible. `slot` is the residency key the descriptors use, so the
-/// message points at the thing to look for in the IR.
-static InFlightDiagnostic describeVtcmRefusal(MatmulOp op, int64_t slot,
-                                              const ResidentVtcmAdmission &a) {
+/// The placement decision, spelled once so a reader can tell a weight that ran
+/// out of pool from one that was never eligible. `slot` is the residency key
+/// the descriptors use, so the message points at the thing to look for in the
+/// IR. All four numbers stay in it: they are what says *why* the buffer could
+/// not be VTCM, and the last term (the buffer being placed) is the one a reader
+/// cannot reconstruct from the manifest.
+static InFlightDiagnostic describeVtcmDdrPlacement(MatmulOp op, int64_t slot,
+                                                   const ResidentVtcmAdmission &a) {
   InFlightDiagnostic diag = op.emitRemark();
-  diag << "resident weight for argument slot " << slot << " declined: "
-       << a.requested << " bytes would make the persistent VTCM total "
-       << a.total << " bytes, over the " << a.budget << " byte budget ("
-       << "transient " << a.transient << " + resident " << a.resident
-       << " + this buffer); the weight keeps its per-launch pack bridge";
+  diag << "resident weight for argument slot " << slot
+       << " does not fit the persistent VTCM pool: " << a.requested
+       << " bytes would make the persistent VTCM total " << a.total
+       << " bytes, over the " << a.budget << " byte budget (" << "transient "
+       << a.transient << " + resident " << a.resident << " + this buffer); "
+       << "placed in the DDR permanent region instead and its pack bridge "
+       << "becomes a contiguous fetch";
+  return diag;
+}
+
+/// Every way the runtime-weight path can decline a weight, reported where the
+/// decline happens instead of being dropped. The pass had two silent `continue`s
+/// in this path (the view matcher's, and the affine-proof one inside it), which
+/// is how a bench could pay a per-launch pack with no diagnostic anywhere in the
+/// pipeline to explain it -- see docs/hmx/pack-redundancy-fix-plan-2026-10-09.md
+/// §2.2. A remark rather than an error even under the strict resident contract:
+/// a weight this pass does not model is a correct kernel with an unclaimed
+/// optimisation, not a malformed module. `slot` is unknown before the argument
+/// has resolved, so the message drops the slot rather than naming the wrong one.
+static InFlightDiagnostic describeWeightDecline(MatmulOp op,
+                                                std::optional<int64_t> slot,
+                                                StringRef reason) {
+  InFlightDiagnostic diag = op.emitRemark();
+  diag << "resident weight";
+  if (slot)
+    diag << " for argument slot " << *slot;
+  diag << " declined: " << reason << "; the weight keeps its per-launch pack "
+       << "bridge";
   return diag;
 }
 
@@ -642,10 +706,28 @@ static std::optional<int64_t> tensorArgumentSlot(func::FuncOp func,
 }
 
 /// True when `v` is provably a multiple of `factor`, for the small affine forms
-/// a program-id offset takes (`pid * BN`, sums of such). The subview that reads
-/// one N block of the resident weight is indexed in croutons, so the block
-/// offset has to land on a tile edge; anything not provably a multiple keeps the
-/// per-launch bridge rather than truncating a division.
+/// an N-block offset takes (`pid * BN`, sums of such, and the induction variable
+/// of a static-step loop). The subview that reads one N block of the resident
+/// weight is indexed in croutons, so the block offset has to land on a tile
+/// edge; anything not provably a multiple keeps the per-launch bridge rather
+/// than truncating a division.
+///
+/// This is a *proof*, not a pattern match: `false` means "not established" and
+/// only ever costs the optimisation, while `true` has to be true for every
+/// value the offset can take. That asymmetry is why the `mul` case is an `||`
+/// (either factor already carries the product) while the `add` case and the
+/// loop case below are `&&`.
+///
+/// Loop case (A2): `scf.for %iv = lb to ub step st` runs `%iv = lb + k * st`
+/// for every `k >= 0`, so every value it takes is a multiple of `factor` exactly
+/// when both `lb` and `st` are -- sign is irrelevant, because a multiple of
+/// `factor` stays one under negation. That covers the form a real kernel's N
+/// block actually takes (the inner loop's own induction variable, usually
+/// behind an `index_cast`), which the affine forms above never see. The
+/// companion guard in the caller (`offset` provably a multiple of `n` is a K
+/// offset, so it is refused) keeps the same property: it also needs both terms,
+/// so a loop whose step is smaller than N cannot prove itself a row offset and
+/// is still accepted as the column offset it is.
 static bool isMultipleOf(Value v, int64_t factor, int depth = 0) {
   if (depth > 8)
     return false;
@@ -664,6 +746,12 @@ static bool isMultipleOf(Value v, int64_t factor, int depth = 0) {
   if (auto mul = v.getDefiningOp<arith::MulIOp>())
     return isMultipleOf(mul.getLhs(), factor, depth + 1) ||
            isMultipleOf(mul.getRhs(), factor, depth + 1);
+  if (auto arg = dyn_cast<BlockArgument>(v))
+    if (arg.getArgNumber() == 0)
+      if (auto loop =
+              dyn_cast_or_null<scf::ForOp>(arg.getOwner()->getParentOp()))
+        return isMultipleOf(loop.getLowerBound(), factor, depth + 1) &&
+               isMultipleOf(loop.getStep(), factor, depth + 1);
   return false;
 }
 
@@ -676,6 +764,11 @@ struct WeightSlice {
   int64_t n = 0;          // whole logical columns (N)
   Value dynamicOffset;    // N block offset in elements, when dynamic
   std::optional<int64_t> staticOffset; // N block offset in elements, when static
+  // The entry-argument view this slice was proven against. It is the view's own
+  // geometry, not the bridge source's: a tail guard merges its arms into a
+  // result type whose strides and offset are both dynamic, while the contract
+  // describes the concrete `[K, N]` view behind it.
+  memref::ReinterpretCastOp view;
 };
 
 /// Capture the semantic source view that authorizes an address-keyed resident.
@@ -687,7 +780,13 @@ struct WeightSlice {
 static std::optional<DictionaryAttr>
 makeRuntimeSourceView(MLIRContext *context, Value source,
                       BlockArgument argument, const WeightSlice *slice) {
-  auto type = dyn_cast<MemRefType>(source.getType());
+  // A tail guard's merged result type is `strided<[?,?], offset:?>` -- both
+  // dynamic, because two arms of different provenance meet there. The contract
+  // describes the view behind it, which is where the whole-N row stride and the
+  // concrete offset live, so take the geometry from there when there is one.
+  Value geometry =
+      slice && slice->view ? slice->view->getResult(0) : source;
+  auto type = dyn_cast<MemRefType>(geometry.getType());
   if (!type || type.getRank() != 2 || !type.hasStaticShape() ||
       !dtype::isAdmittedFloat(type.getElementType()))
     return std::nullopt;
@@ -820,34 +919,217 @@ static LogicalResult validateRuntimeSourceView(DictionaryAttr sourceView,
   return success();
 }
 
+/// Peel the `memref.cast`s a tail guard inserts to merge two differently-typed
+/// arms into the one result type `scf.if` requires.
+static Value peelViewCasts(Value v) {
+  for (int depth = 0; depth < 4; ++depth) {
+    auto cast = v.getDefiningOp<memref::CastOp>();
+    if (!cast)
+      break;
+    v = cast.getSource();
+  }
+  return v;
+}
+
+/// The buffer a `memref.copy` writes into: the value itself, or the view of a
+/// buffer it is a subview of.
+static Value copyTargetBuffer(Value target) {
+  if (auto sub = target.getDefiningOp<memref::SubViewOp>())
+    return sub.getSource();
+  return target;
+}
+
+/// True when `sub` selects a *prefix* of `view`: offset 0 on every dimension,
+/// unit strides, every row, and a column extent the view itself bounds (a
+/// dynamic extent is admitted because it is the guard's own clamp of
+/// `min(n0 + BN, N) - n0`, which is bounded by the view by construction, while
+/// a static one is range-checked here).
+///
+/// "Prefix" is the load-bearing half. The arm a guard like this replaces is the
+/// arm that reads real bytes for exactly these columns and something else for
+/// the rest; see the acceptance note on `underlyingSliceArgument` for why the
+/// rest may be anything at all.
+static bool isViewPrefix(memref::SubViewOp sub, memref::ReinterpretCastOp view) {
+  auto viewType = dyn_cast<MemRefType>(view.getResult().getType());
+  if (!viewType || !viewType.hasStaticShape())
+    return false;
+  int64_t rank = viewType.getRank();
+  if (sub.getStaticOffsets().size() != static_cast<size_t>(rank) ||
+      sub.getStaticStrides().size() != static_cast<size_t>(rank) ||
+      sub.getStaticSizes().size() != static_cast<size_t>(rank))
+    return false;
+  for (int64_t offset : sub.getStaticOffsets())
+    if (offset != 0) // a dynamic slot prints as kDynamic, which is not 0
+      return false;
+  for (int64_t stride : sub.getStaticStrides())
+    if (stride != 1)
+      return false;
+  // Every row of the view is in bounds no matter where the N block starts, so
+  // a gather that skips rows would differ from the resident in columns the
+  // kernel does store. Require them all.
+  if (sub.getStaticSizes().front() != viewType.getDimSize(0))
+    return false;
+  for (int64_t dim = 1; dim < rank; ++dim) {
+    int64_t size = sub.getStaticSizes()[dim];
+    if (ShapedType::isDynamic(size))
+      continue;
+    if (size <= 0 || size > viewType.getDimSize(dim))
+      return false;
+  }
+  return true;
+}
+
+/// What one arm of a tail guard reads: the entry-argument view the arm reads,
+/// or null when the arm cannot be shown to read one.
+static memref::ReinterpretCastOp armView(Block &arm, Value yielded) {
+  Value inner = peelViewCasts(yielded);
+  if (auto direct = inner.getDefiningOp<memref::ReinterpretCastOp>())
+    return direct;
+  // The gather arm: a fresh dense buffer this arm allocates, zeroes and then
+  // fills by copying a prefix of an entry-argument view into it.
+  auto buffer = inner.getDefiningOp<memref::AllocOp>();
+  if (!buffer)
+    return nullptr;
+  memref::ReinterpretCastOp view = nullptr;
+  for (Operation &op : arm.without_terminator()) {
+    auto copy = dyn_cast<memref::CopyOp>(op);
+    if (!copy)
+      continue;
+    if (copyTargetBuffer(copy.getTarget()) != buffer.getResult())
+      continue;
+    auto source = copy.getSource().getDefiningOp<memref::SubViewOp>();
+    if (!source)
+      return nullptr;
+    auto sourceView =
+        dyn_cast_or_null<memref::ReinterpretCastOp>(source.getSource()
+                                                        .getDefiningOp());
+    if (!sourceView)
+      return nullptr;
+    if (!isViewPrefix(source, sourceView))
+      return nullptr;
+    if (view && view != sourceView)
+      return nullptr;
+    view = sourceView;
+  }
+  return view;
+}
+
+/// The entry-argument N view a pack source reads through, or null.
+///
+/// Two shapes reach here (A1 of docs/hmx/pack-redundancy-fix-plan-2026-10-09.md):
+///
+///   * the bare `reinterpret_cast` of the argument; and
+///   * a **tail-guarded** view: a real kernel guards the last N block with
+///     `if NN - n0 < BN`, so the masked load becomes an `scf.if` whose arms
+///     `memref.cast` into one merged type -- the direct arm yields the view
+///     itself, the gather arm yields a dense buffer it filled from a prefix of
+///     that view. The pack source is then the `scf.if`'s result, and the bare
+///     `getDefiningOp<ReinterpretCastOp>()` misses it.
+///
+/// Both arms must resolve to the *same* `reinterpret_cast` operation: two views
+/// of the same argument at different offsets are not one N block, and a guard
+/// over an internal buffer is not an entry-argument view at all.
+static memref::ReinterpretCastOp resolvePackSourceView(Value v,
+                                                       std::string *reason,
+                                                       int depth = 0) {
+  auto decline = [&](const char *message) {
+    if (reason && reason->empty())
+      *reason = message;
+    return nullptr;
+  };
+  if (auto view = v.getDefiningOp<memref::ReinterpretCastOp>())
+    return view;
+  auto guard = depth < 2 ? v.getDefiningOp<scf::IfOp>() : nullptr;
+  if (!guard || guard->getNumResults() != 1 || guard->getResult(0) != v)
+    return decline(
+        "the pack source is neither an entry-argument view nor a tail guard "
+        "over one");
+  auto &thenBlock = guard.getThenRegion().front();
+  auto &elseBlock = guard.getElseRegion().front();
+  auto yieldThen = dyn_cast<scf::YieldOp>(thenBlock.getTerminator());
+  auto yieldElse = dyn_cast<scf::YieldOp>(elseBlock.getTerminator());
+  if (!yieldThen || !yieldElse || yieldThen.getNumOperands() != 1 ||
+      yieldElse.getNumOperands() != 1)
+    return decline("the tail guard over the pack source does not yield one view");
+  memref::ReinterpretCastOp thenView = armView(thenBlock, yieldThen.getOperand(0));
+  memref::ReinterpretCastOp elseView = armView(elseBlock, yieldElse.getOperand(0));
+  if (!thenView || !elseView || thenView != elseView)
+    return decline(
+        "the tail guard's arms do not all read the same entry-argument N view");
+  return thenView;
+}
+
 /// Match the bridge source as `reinterpret_cast(arg, offset=[n0], sizes=[K, BN],
-/// strides=[N, 1])` over an entry argument: one N block of a `[K, N]` weight.
+/// strides=[N, 1])` over an entry argument: one N block of a `[K, N]` weight,
+/// either directly or behind the tail guard `resolvePackSourceView` describes.
 /// Returns null for anything whose whole weight cannot be pinned -- not a 2D
 /// row-major view, a non-argument source, a dynamic/unaligned offset, a view the
 /// crouton grid disagrees with, or a block that does not tile N. The caller then
 /// keeps the old per-launch bridge: guessing would silently pack the wrong bytes.
+/// `reason` (when given) names the first check that refused, so the caller can
+/// report the decline instead of dropping it silently.
+///
+/// **Why the guarded form may be matched (A1, the correctness argument).**
+/// Replacing the bridge makes the resident serve bytes the gather arm did not:
+/// the guard zeroes (in practice: leaves unpadded) the columns of the last tile
+/// that run past `NN`, and the resident, built from the argument, holds the
+/// argument's real bytes for those same columns. The two images therefore
+/// differ only in the columns `n0 + c >= NN`. Each of those columns feeds
+/// exactly one output column -- `acc[m, c]` sums `A[m, k] * B[k, c]`, so no
+/// reduction ever mixes weight columns -- and those output columns are past the
+/// logical N. A kernel that stores them would store past the end of the output
+/// row, which is an out-of-bounds write into the next row; a kernel that is
+/// correct masks them off (the bench kernel does: its store carries the same
+/// guard its load does). So the differing bytes are written nowhere a later
+/// read can observe, and the gather arm's fill value -- zero or otherwise --
+/// cannot matter. The argument assumes the kernel stores what it computes only
+/// for in-range columns, which is the same assumption the unguarded form of
+/// this matcher already relies on when it hands the resident the whole slice.
+///
+/// What must *not* be relaxed for this to hold: both arms have to read the same
+/// view (`resolvePackSourceView`), and the gather has to cover every row of it
+/// (`isViewPrefix`) -- a row the gather skipped would differ in columns the
+/// kernel does store.
 static std::optional<WeightSlice> underlyingSliceArgument(Value v,
-                                                          MemRefType crouton) {
-  auto reinterpret = v.getDefiningOp<memref::ReinterpretCastOp>();
+                                                          MemRefType crouton,
+                                                          std::string *reason =
+                                                              nullptr) {
+  auto decline = [&](const char *message) -> std::optional<WeightSlice> {
+    if (reason && reason->empty())
+      *reason = message;
+    return std::nullopt;
+  };
+  memref::ReinterpretCastOp reinterpret = resolvePackSourceView(v, reason);
   if (!reinterpret)
     return std::nullopt;
-  auto viewType = dyn_cast<MemRefType>(v.getType());
+  auto srcType = dyn_cast<MemRefType>(v.getType());
+  if (!srcType || srcType.getRank() != 2 || !srcType.hasStaticShape())
+    return decline("the pack source is not a static 2D view");
+  auto viewType = dyn_cast<MemRefType>(reinterpret.getResult().getType());
   if (!viewType || viewType.getRank() != 2 || !viewType.hasStaticShape())
-    return std::nullopt;
+    return decline("the entry-argument view is not a static 2D view");
+  // A guard merges its arms into one result type; the bridge packs whatever
+  // that type says, so it has to be the view's geometry (same shape, same
+  // element type) for the proven slice to describe the bytes actually read.
+  if (srcType.getShape() != viewType.getShape() ||
+      srcType.getElementType() != viewType.getElementType())
+    return decline("the pack source type does not match the entry-argument "
+                   "view it reads");
   // The pre-pack contract is a function-argument contract: the source must be
   // the entry argument itself, not an internal buffer.
   auto arg = dyn_cast<BlockArgument>(reinterpret.getSource());
   if (!arg)
-    return std::nullopt;
+    return decline("the pack source view does not start at a function argument");
   // A row-major view with unit inner stride: the underlying matrix is [K, N]
   // with N = stride(0), and the view is one N block of it.
   auto strided = dyn_cast<StridedLayoutAttr>(viewType.getLayout());
   if (!strided)
-    return std::nullopt;
+    return decline("the entry-argument view is not strided row-major");
   auto strides = strided.getStrides();
   if (strides.size() != 2 || strides[1] != 1 ||
       ShapedType::isDynamic(strides[0]) || strides[0] <= 0)
-    return std::nullopt;
+    return decline("the entry-argument view is not a row-major [K, N] N block "
+                   "(unit inner stride, whole-N row stride)");
   int64_t n = strides[0];
   int64_t k = viewType.getDimSize(0);
   int64_t bn = viewType.getDimSize(1);
@@ -858,7 +1140,8 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
   if (crouton.getRank() != 5 ||
       hmx::weightKTiles(crouton) * hmx::layout::kTileEdge != k ||
       hmx::weightNTiles(crouton) * hmx::layout::kTileEdge != bn)
-    return std::nullopt;
+    return decline("the entry-argument view does not describe the same [K, BN] "
+                   "block as the crouton grid");
   // Strictly narrower than the whole N: the model is "the view is *one* N block
   // of a wider weight", so a view as wide as the whole N is a block of nothing
   // (there are no other blocks for an offset to select) and any offset into it
@@ -866,32 +1149,40 @@ static std::optional<WeightSlice> underlyingSliceArgument(Value v,
   // One N block means at least two.
   if (n % hmx::layout::kTileEdge != 0 || bn % hmx::layout::kTileEdge != 0 || n <= bn ||
       n % bn != 0)
-    return std::nullopt;
+    return decline("the N block does not tile the weight's N into whole 32-wide "
+                   "blocks");
   // The offset is the descriptor's element offset (a one-element list), i.e. the
   // N block this program owns. A static offset is checked directly; a dynamic
-  // one has to be provably tile-aligned (`pid * BN`) *and* provably a column
-  // offset: in a row-major [K, N] matrix every whole number of rows is a
-  // multiple of N, so an offset that is provably a multiple of N is a row (K)
-  // offset -- a loop-varying block of an activation consumed as a weight, whose
-  // resident holds one block while the offset walks past its end. A column
-  // offset is never such a multiple (offset 0 is the dense path's business).
+  // one has to be provably tile-aligned (`pid * BN`, or a static-step loop's
+  // induction variable -- see `isMultipleOf`) *and* provably a column offset: in
+  // a row-major [K, N] matrix every whole number of rows is a multiple of N, so
+  // an offset that is provably a multiple of N is a row (K) offset -- a
+  // loop-varying block of an activation consumed as a weight, whose resident
+  // holds one block while the offset walks past its end. A column offset is
+  // never such a multiple (offset 0 is the dense path's business).
   if (reinterpret.getStaticOffsets().size() != 1)
-    return std::nullopt;
+    return decline("the entry-argument view does not name one element offset");
   WeightSlice slice;
   slice.arg = arg;
   slice.n = n;
+  slice.view = reinterpret;
   int64_t staticOffset = reinterpret.getStaticOffsets().front();
   if (staticOffset != ShapedType::kDynamic) {
     if (staticOffset < 0 || staticOffset % hmx::layout::kTileEdge != 0 ||
         staticOffset + bn > n)
-      return std::nullopt;
+      return decline("the static N offset is negative, off the 32-element tile "
+                     "edge, or runs past the weight's N");
     slice.staticOffset = staticOffset;
   } else {
     if (reinterpret.getOffsets().size() != 1)
-      return std::nullopt;
+      return decline("the entry-argument view does not name one element offset");
     Value offset = reinterpret.getOffsets().front();
-    if (!isMultipleOf(offset, hmx::layout::kTileEdge) || isMultipleOf(offset, n))
-      return std::nullopt;
+    if (!isMultipleOf(offset, hmx::layout::kTileEdge))
+      return decline("the N offset is not provably a multiple of 32, so the "
+                     "resident's crouton subview cannot be indexed exactly");
+    if (isMultipleOf(offset, n))
+      return decline("the offset is provably a multiple of N, so it selects "
+                     "rows (a K block), not an N block");
     slice.dynamicOffset = offset;
   }
   return slice;
@@ -939,7 +1230,10 @@ validateStrictRuntimeSource(Value src, MemRefType crouton, func::FuncOp func,
     return anchor->emitError(
         "strict resident runtime weight source is not an entry argument");
   if (slice) {
-    auto strided = cast<StridedLayoutAttr>(srcMemref.getLayout());
+    // The view, not the pack source: a tail guard's merged result type has a
+    // dynamic layout offset even when the view it merges has a concrete one.
+    auto viewType = cast<MemRefType>(slice->view.getResult().getType());
+    auto strided = cast<StridedLayoutAttr>(viewType.getLayout());
     int64_t layoutOffset = strided.getOffset();
     if (!slice->staticOffset || ShapedType::isDynamic(layoutOffset) ||
         layoutOffset != *slice->staticOffset)
@@ -1203,12 +1497,21 @@ validateExistingWeightResident(Operation *operation,
         principal, parentFunction.getSymName(), site, "weight-resident", *slot);
     if (siteId == 0)
       return anchor->emitError("strict resident weight site identity is zero");
-    expectedResident = DictionaryAttr::get(
-        context,
-        {NamedAttribute(StringAttr::get(context, kResidentKeyAddress), address),
-         NamedAttribute(
-             StringAttr::get(context, kResidentKeyBytes),
-             IntegerAttr::get(IntegerType::get(context, 64), *bytes))});
+    // Rebuilt from the allocation's own memory space rather than echoed from
+    // the descriptor: a `location` the IR claims and the placement disagree
+    // about fails the equality below instead of being read twice. VTCM is
+    // spelled by absence, so a resident the producer labelled `vtcm` in the
+    // IR is rejected as non-canonical.
+    NamedAttrList residentFields;
+    residentFields.append(kResidentKeyAddress, address);
+    residentFields.append(
+        kResidentKeyBytes,
+        IntegerAttr::get(IntegerType::get(context, 64), *bytes));
+    if (!hexagon::isInVTCMAddressSpace(type))
+      residentFields.append(
+          StringAttr::get(context, kHmxWeightResidentLocationKey),
+          StringAttr::get(context, kHmxWeightResidentLocationDdr));
+    expectedResident = residentFields.getDictionary(context);
     expectedProvenance = makeWeightProvenance(
         context, principal, parentFunction.getSymName(), site, *slot, *bytes,
         residentAlignment(alloc), siteId, "argument-address",
@@ -1734,14 +2037,30 @@ struct WeightResidentPass
           continue;
 
         std::optional<WeightPack> pack = findWeightPack(operand.get());
-        if (!pack)
+        if (!pack) {
+          // Not every rhs is a decline: an operand that never was a bridge (a
+          // buffer the kernel built itself) is this pass's business only when it
+          // looks like an entry weight, which is the same test the strict walk
+          // uses to decide whether "no bridge" is worth reporting at all.
+          if (!strictResidentContract && looksLikeEntryWeightSource(operand.get()))
+            describeWeightDecline(
+                op, std::nullopt,
+                "this runtime weight has no pack bridge the pass can model (its "
+                "source is not a view of a function argument)");
           continue;
+        }
         // Same transposed-source refusal as the strict walk above, minus the
         // error: decline, and the per-launch `_T` bridge keeps the kernel
         // correct.
         if (llvm::any_of(pack->packs,
-                         [](PackWeightOp p) { return p.getSrcTransposed().value_or(false); }))
+                         [](PackWeightOp p) { return p.getSrcTransposed().value_or(false); })) {
+          if (!strictResidentContract)
+            describeWeightDecline(
+                op, std::nullopt,
+                "the pack source is transposed, which the host pre-pack "
+                "contract does not cover");
           continue;
+        }
         // The bridge must pack one runtime input, not an internal buffer. It
         // usually reads layout-only views (`reinterpret_cast` from
         // bufferization); resolve those to the entry argument and to the *whole*
@@ -1763,6 +2082,10 @@ struct WeightResidentPass
                 "strict resident weight bridge has multiple source views");
             return signalPassFailure();
           }
+          describeWeightDecline(
+              op, std::nullopt,
+              "the weight bridge packs more than one source view, so one "
+              "resident cannot describe what it reads");
           continue;
         }
         // The pre-pack contract is defined on the crouton image: the host
@@ -1781,12 +2104,20 @@ struct WeightResidentPass
         MemRefType residentType;
         int64_t logicalN = hmx::weightNTiles(type) * hmx::layout::kTileEdge;
         std::optional<WeightSlice> slice;
+        // Why the slice matcher said no, kept for the decline remark: without
+        // it every refusal in this path looks identical from the outside, and
+        // the two that were silent until 2026-10-09 (a tail-guarded source, and
+        // a loop induction variable) are indistinguishable from "never
+        // eligible" in the pipeline's output.
+        std::string sliceDecline;
+        bool matched = false;
         if (BlockArgument denseArg = underlyingDenseArgument(src)) {
           arg = denseArg;
           residentType = MemRefType::get(type.getShape(), type.getElementType(),
                                          AffineMap{},
                                          hexagon::VTCM_ADDRESS_SPACE);
-        } else if ((slice = underlyingSliceArgument(src, type))) {
+          matched = true;
+        } else if ((slice = underlyingSliceArgument(src, type, &sliceDecline))) {
           if (strictResidentContract && slice->dynamicOffset) {
             op.emitError(
                 "strict resident runtime weight source has a dynamic offset");
@@ -1800,13 +2131,21 @@ struct WeightResidentPass
           residentType = MemRefType::get(wholeShape, type.getElementType(),
                                          AffineMap{},
                                          hexagon::VTCM_ADDRESS_SPACE);
-        } else {
+          matched = true;
+        }
+        if (!matched) {
           if (strictResidentContract) {
             op.emitError(
                 "strict resident runtime weight source is not an exact entry "
                 "view");
             return signalPassFailure();
           }
+          describeWeightDecline(
+              op, std::nullopt,
+              sliceDecline.empty()
+                  ? "the pack source does not cover a whole function argument "
+                    "and is not a whole-N slice of one"
+                  : StringRef(sliceDecline));
           continue;
         }
         if (arg.getOwner() != &func.getBody().front()) {
@@ -1815,6 +2154,10 @@ struct WeightResidentPass
                 "strict resident runtime weight source is not an entry argument");
             return signalPassFailure();
           }
+          describeWeightDecline(
+              op, std::nullopt,
+              "the pack source view does not start at a function entry "
+              "argument, so there is no host object to pre-pack");
           continue;
         }
         std::optional<int64_t> tensorSlot = tensorArgumentSlot(func, arg);
@@ -1839,6 +2182,10 @@ struct WeightResidentPass
                 "strict resident runtime weight source must be f16/f32");
             return signalPassFailure();
           }
+          describeWeightDecline(
+              op, slot,
+              "the pack source element type is not one the host pre-pack "
+              "contract can reproduce (f16/f32 crouton image)");
           continue;
         }
 
@@ -1886,6 +2233,10 @@ struct WeightResidentPass
                 "strict resident runtime weight slot has conflicting shapes");
             return signalPassFailure();
           }
+          describeWeightDecline(
+              op, slot,
+              "this slot already has a resident of a different shape, and one "
+              "slot is one buffer");
           continue;
         }
         if (!resident) {
@@ -1912,18 +2263,28 @@ struct WeightResidentPass
               return signalPassFailure();
             }
           }
-          // --- Capacity gate. ---
+          // --- Placement gate: VTCM if it fits, the DDR mirror if it does not. ---
           //
-          // A runtime weight has a real fallback, so this is a decline and not a
-          // failure: `continue` at this point is the pass's existing way of
-          // keeping the per-launch bridge (the same state a non-pinnable view
-          // takes), and it is clean here because nothing has been rewritten yet
-          // -- the pack loop, its crouton array and its deallocation are all
-          // still intact, and `hmx.weight_prepack` is appended further down, so
-          // a declined slot is simply absent from the contract and keeps
-          // packing on the device. The contraction is untouched: the `hmx.matmul`
-          // below still reads the crouton array the bridge fills, so HMX is not
-          // lost, only the prepack optimisation for this one weight.
+          // The pool is a single 8 MiB of `HmxTarget::defaultVtcmBudget`,
+          // shared with the kernel's own crouton arrays and accumulators, and
+          // the device's `requireAllocationResult` is fail-closed -- an
+          // allocation that does not fit aborts the whole PD at load time.
+          // Deciding here is what turns that into a compile-time outcome.
+          //
+          // What happens next depends on which of the two sources this is,
+          // because only one of them has somewhere else to go:
+          //
+          //   * A runtime weight has a second home: the permanent DDR mirror
+          //     the host's pre-pack image is copied into once, from which the
+          //     kernel then takes each block it needs by a contiguous fetch.
+          //     It costs a copy the engine waits for instead of the strided
+          //     per-launch pack the bridge paid, and it costs no VTCM at all,
+          //     so a weight the pool cannot hold is still worth making
+          //     resident. That is the placement below: the capacity number
+          //     chooses *where* the weight lives, not whether it lives.
+          //   * A constant has nowhere to go (see the gate above): its only
+          //     legal form *is* the resident VTCM buffer, so an overrun there
+          //     is reported as an error instead.
           //
           // A remark rather than an error even under the strict resident
           // contract, which turns every *other* decline in this pass into a
@@ -1935,11 +2296,18 @@ struct WeightResidentPass
               admitResidentVtcm(func, module, addedBytes, bytes);
           if (failed(admission))
             return signalPassFailure();
-          if (!admission->admitted) {
-            describeVtcmRefusal(op, slot, *admission);
-            continue;
-          }
-          rewriter.setInsertionPoint(op);
+          const bool ddr = !admission->admitted;
+          if (ddr)
+            describeVtcmDdrPlacement(op, slot, *admission);
+          // Where the buffer is *declared*. The engine operand is the matmul's
+          // own position; a DDR mirror has a second reader, the fetch that
+          // replaces the pack, and that one sits where the pack loop sits --
+          // earlier in the block, because the pack fed the matmul. Declaring it
+          // there is what lets the fetch reference it without a use-before-def.
+          Operation *residentAt = op.getOperation();
+          if (ddr)
+            residentAt = pack->loops.front();
+          rewriter.setInsertionPoint(residentAt);
           // The residency key: the argument's aligned pointer. It is passed as
           // an operand (the allocation itself stays static; the verifier allows
           // this one resident-only operand) so the lowering reads it after the
@@ -1948,16 +2316,30 @@ struct WeightResidentPass
           // identical above, and the argument survives lowering more robustly.
           Value address = memref::ExtractAlignedPointerAsIndexOp::create(
               rewriter, op.getLoc(), arg);
-          auto alloc = hexagonmem::AllocOp::create(
-              rewriter, op.getLoc(), residentType, ValueRange{address},
-              rewriter.getI64IntegerAttr(128));
-          alloc->setAttr(
-              kResidentAttr,
-              rewriter.getDictionaryAttr(
-                  {rewriter.getNamedAttr(kResidentKeyAddress,
-                                         rewriter.getUnitAttr()),
-                   rewriter.getNamedAttr(kResidentKeyBytes,
-                                         rewriter.getI64IntegerAttr(bytes))}));
+          // The buffer's own placement. A DDR resident is an ordinary DDR
+          // allocation (no memory space attribute) carrying the location fact;
+          // a VTCM resident is byte-for-byte what it was before placement
+          // existed, descriptor included.
+          MemRefType bufferType =
+              ddr ? MemRefType::get(residentType.getShape(),
+                                   residentType.getElementType(), AffineMap{})
+                  : residentType;
+          auto alloc = hexagonmem::AllocOp::create(rewriter, op.getLoc(),
+                                                   bufferType,
+                                                   ValueRange{address},
+                                                   rewriter.getI64IntegerAttr(128));
+          NamedAttrList residentFields;
+          residentFields.append(kResidentKeyAddress, rewriter.getUnitAttr());
+          residentFields.append(kResidentKeyBytes,
+                                rewriter.getI64IntegerAttr(bytes));
+          if (ddr)
+            residentFields.append(
+                StringAttr::get(rewriter.getContext(),
+                                kHmxWeightResidentLocationKey),
+                StringAttr::get(rewriter.getContext(),
+                                kHmxWeightResidentLocationDdr));
+          alloc->setAttr(kResidentAttr,
+                         residentFields.getDictionary(rewriter.getContext()));
           if (strictResidentContract) {
             DictionaryAttr expected = makeWeightProvenance(
                 func.getContext(), residentPrincipalName(module),
@@ -1977,12 +2359,17 @@ struct WeightResidentPass
           residentBySlot.insert({slot, resident});
           if (strictResidentContract)
             runtimeViewBySlot[slot] = strictSourceView;
-          if (strictResidentContract &&
-              bytes > std::numeric_limits<int64_t>::max() - addedBytes) {
-            op.emitError("resident byte aggregate overflows int64");
-            return signalPassFailure();
+          // The module aggregate is the *pool* footprint the budget readers
+          // compare against; a DDR mirror does not come out of it, so only a
+          // VTCM placement is added.
+          if (!ddr) {
+            if (strictResidentContract &&
+                bytes > std::numeric_limits<int64_t>::max() - addedBytes) {
+              op.emitError("resident byte aggregate overflows int64");
+              return signalPassFailure();
+            }
+            addedBytes += bytes;
           }
-          addedBytes += bytes;
 
           // Publish the pre-pack contract: the host packs the whole argument,
           // and the permutation comes from the compiler's own layout map. The
@@ -1999,26 +2386,42 @@ struct WeightResidentPass
           // weight and differ for an f32 one, where the host quantises.
           std::string sourceDtype =
               dtype::isF32(srcMemref.getElementType()) ? "f32" : "f16";
+          // `location` is a fact about this weight, not a host instruction --
+          // the image bytes are the same either way, and the host writes them
+          // the same way -- but it is the field that lets a reader of the
+          // contract tell a pool-resident weight from a mirror one without
+          // going back to the IR.
           std::string entry =
               "{\"func\":\"" + func.getSymName().str() + "\",\"slot\":" +
               std::to_string(slot) + ",\"shape\":" + jsonArray(logical) +
               ",\"crouton\":" + jsonArray(residentType.getShape()) +
-              ",\"dtype\":\"" + sourceDtype + "\"}";
+              ",\"dtype\":\"" + sourceDtype + "\",\"location\":\"" +
+              (ddr ? kHmxWeightResidentLocationDdr.str()
+                   : kHmxWeightResidentLocationVtcm.str()) +
+              "\"}";
           appendPrepackEntry(module, entry);
           if (!module->getAttrOfType<StringAttr>(kPrepackLayoutAttr))
             module->setAttr(kPrepackLayoutAttr,
                             rewriter.getStringAttr(prepackLayoutJson()));
           LLVM_DEBUG(llvm::dbgs() << "[" DEBUG_TYPE "] resident runtime slot "
-                                  << slot << " (" << bytes << " bytes)\n");
+                                  << slot << " (" << bytes << " bytes, "
+                                  << (ddr ? "ddr" : "vtcm") << ")\n");
         }
 
-        // The engine reads the block this program owns: the resident itself for a
-        // dense whole argument, or a subview over the crouton grid's N tiles for
-        // an N-slice. A weight grid is [Nt, Kt, ...] (dim0 = N, dim1 = K), so the
-        // N block offset lands on dim0.
-        Value rhs = resident;
-        if (slice) {
-          rewriter.setInsertionPoint(op);
+        // Where this slot's buffer lives was decided when it was created;
+        // every later consumer of the same slot follows that decision, because
+        // one slot is one buffer.
+        const bool ddrResident =
+            !hexagon::isInVTCMAddressSpace(cast<MemRefType>(resident.getType()));
+        // The block this program reads: the resident itself for a dense whole
+        // argument, or a subview over the crouton grid's N tiles for an
+        // N-slice. A weight grid is [Nt, Kt, ...] (dim0 = N, dim1 = K), so the
+        // N block offset lands on dim0. The insertion point must already be
+        // where this value has to be defined: at the matmul for the engine
+        // operand, at the bridge for the fetch.
+        auto blockView = [&](Value base) -> Value {
+          if (!slice)
+            return base;
           // The block's N offset in croutons: a static offset was proven
           // tile-aligned when it matched, a dynamic one is divided (exactly, by
           // the same proof).
@@ -2043,18 +2446,56 @@ struct WeightResidentPass
               rewriter.getIndexAttr(type.getDimSize(3)),
               rewriter.getIndexAttr(type.getDimSize(4))};
           SmallVector<OpFoldResult> strides(5, rewriter.getIndexAttr(1));
-          rhs = memref::SubViewOp::create(rewriter, op.getLoc(), resident,
-                                          offsets, sizes, strides);
-        }
-        rewriter.modifyOpInPlace(op, [&]() { operand.set(rhs); });
+          return memref::SubViewOp::create(rewriter, op.getLoc(), base,
+                                           offsets, sizes, strides);
+        };
 
-        // The bridge is now dead: drop the pack loop, the crouton array and its
-        // deallocation. Everything was verified to be the bridge before this
-        // point, so nothing else can observe the buffer. The pack ops go with
-        // their loop when it is the bridge and nothing else.
+        if (ddrResident) {
+          // The mirror lives in DDR, the engine reads VTCM, and a crouton grid
+          // row (a whole range of N tiles) is contiguous in the mirror because
+          // N is its outermost dimension. So the bridge's pack becomes one
+          // contiguous copy at the pack's own program point: same writes, same
+          // place in the loop, no strided scatter and no device-side
+          // permutation -- the host already permuted the bytes. Blocking, per
+          // §7-5 of the plan: an asynchronous stage would *replace* this copy,
+          // not sit beside it.
+          Operation *at = pack->loops.front();
+          rewriter.setInsertionPoint(at);
+          Value source = blockView(resident);
+          memref::CopyOp::create(rewriter, op.getLoc(), source,
+                                 pack->array.getResult());
+          // The matmul keeps reading the buffer the bridge used to fill; for
+          // the carried-loop form of the bridge that is the loop's init value,
+          // so it has to be re-pointed before the loop goes away.
+          rewriter.modifyOpInPlace(op, [&]() {
+            operand.set(pack->array.getResult());
+          });
+        } else {
+          rewriter.setInsertionPoint(op);
+          rewriter.modifyOpInPlace(op, [&]() { operand.set(blockView(resident)); });
+        }
+
+        // The bridge is now dead: drop the pack loop and, for a weight whose
+        // resident took the bridge's place in the engine's operand, the
+        // crouton array and its deallocation too. Everything was verified to
+        // be the bridge before this point, so nothing else can observe those.
+        // A DDR-resident weight keeps its array -- the fetch copies *into* it
+        // every iteration -- so it keeps the deallocation that pairs with it
+        // as well. The pack ops go with their loop when it is the bridge and
+        // nothing else.
         for (scf::ForOp loop : pack->loops)
           if (loop.use_empty())
             rewriter.eraseOp(loop);
+        // The view the bridge read goes with it when it is dead, and a
+        // tail-guarded one must go: its arms allocate and copy a dense staging
+        // buffer, so leaving it behind would pay a masked gather per (m, n) for
+        // a value nothing reads any more -- the exact cost this pass exists to
+        // remove. A bare `reinterpret_cast` is pure and cheap, so it is left to
+        // the canonicalizer rather than erased here.
+        if (auto guard = src.getDefiningOp<scf::IfOp>(); guard && guard->use_empty())
+          rewriter.eraseOp(guard);
+        if (ddrResident)
+          continue;
         SmallVector<memref::DeallocOp> deallocs;
         for (Operation *user : pack->array->getUsers())
           if (auto d = dyn_cast<memref::DeallocOp>(user))

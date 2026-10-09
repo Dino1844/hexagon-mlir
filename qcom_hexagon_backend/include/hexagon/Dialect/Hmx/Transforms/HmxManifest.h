@@ -163,6 +163,14 @@ inline constexpr StringLiteral kHmxLayoutRowMajorInnerContiguous =
 inline constexpr StringLiteral kHmxVtcmAccountingBridgeOnly = "bridge-only";
 
 inline constexpr StringLiteral kHmxWeightResidentPrepack = "resident-prepack";
+/// The same host pre-pack contract with the image in the permanent DDR mirror
+/// instead of the VTCM pool (the compiler's placement gate chose it: the weight
+/// would not fit). One policy name rather than a `location` field on
+/// `resident-prepack` because a reader of `weight_policies` should not have to
+/// join a second field to learn where the bytes live; the reasons are the same
+/// three, since what made the weight *eligible* did not change.
+inline constexpr StringLiteral kHmxWeightResidentPrepackDdr =
+    "resident-prepack-ddr";
 inline constexpr StringLiteral kHmxWeightDevicePack = "device-pack";
 inline constexpr StringLiteral kHmxWeightEligibleAlignedF16 =
     "eligible-aligned-f16";

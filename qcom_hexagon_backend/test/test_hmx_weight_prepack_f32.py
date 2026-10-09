@@ -63,6 +63,7 @@ def _contract(dtype: str) -> str:
                     "shape": list(_SHAPE),
                     "crouton": list(_CROUTON),
                     "dtype": dtype,
+                    "location": "vtcm",
                 }
             ],
         }

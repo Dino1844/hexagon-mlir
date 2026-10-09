@@ -140,6 +140,8 @@ constexpr StringLiteral kTailMNPolicy = kHmxTailMNPolicy;
 // predicate the attribution applies, so it reads the same constant.
 
 constexpr StringLiteral kWeightResidentPrepack = kHmxWeightResidentPrepack;
+constexpr StringLiteral kWeightResidentPrepackDdr =
+    kHmxWeightResidentPrepackDdr;
 constexpr StringLiteral kWeightDevicePack = kHmxWeightDevicePack;
 constexpr StringLiteral kWeightEligibleAlignedF16 = kHmxWeightEligibleAlignedF16;
 constexpr StringLiteral kWeightEligibleQuantizedF32 =
@@ -175,8 +177,18 @@ bool isCanonicalGridPolicy(StringRef value) {
   return value == kGridSingleInstance || value == kGridLegacyRuntime;
 }
 
+/// True for both placements of a host pre-packed weight. Where the image lives
+/// (the VTCM pool, or the permanent DDR mirror the compiler falls back to when
+/// the pool cannot hold it) is a placement fact, not an eligibility one: what
+/// made the weight packable is the same either way, so the reason vocabulary,
+/// the one-function contract and the consumer checks below all apply to both.
+bool isResidentPrepackPolicy(StringRef policy) {
+  return policy == kWeightResidentPrepack ||
+         policy == kWeightResidentPrepackDdr;
+}
+
 bool isCanonicalWeightReason(StringRef policy, StringRef reason) {
-  if (policy == kWeightResidentPrepack)
+  if (isResidentPrepackPolicy(policy))
     return reason == kWeightEligibleAlignedF16 ||
            reason == kWeightEligibleQuantizedF32 ||
            reason == kWeightEligibleB2NSlice;
@@ -1105,7 +1117,7 @@ LogicalResult validateWeightPolicies(ModuleOp module, DictionaryAttr manifest,
              .second)
       return emitManifestError(
           module, report, "HMX manifest has duplicate weight policy slots");
-    if (policy.getValue() == kWeightResidentPrepack)
+    if (isResidentPrepackPolicy(policy.getValue()))
       residentFunctions.insert(function.getValue().str());
   }
   if (residentFunctions.size() > 1)
@@ -1471,7 +1483,7 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
           return emitManifestError(
               module, reportErrors,
               "HMX weight policy consumer is bound to a different slot");
-        if (summary.policy == kWeightResidentPrepack) {
+        if (isResidentPrepackPolicy(summary.policy)) {
           auto consumer = cast<DictionaryAttr>(matmuls[index]);
           StringAttr dtypesValue =
               stringField(dictionaryField(consumer, kKeyDtypes), kKeyRhsElem);
@@ -1859,11 +1871,11 @@ LogicalResult mlir::hmx::setHmxManifestWeightPolicy(
            cast<IntegerAttr>(right.get(kKeySlot)).getInt();
   });
 
-  if (policyName == kWeightResidentPrepack) {
+  if (isResidentPrepackPolicy(policyName)) {
     std::set<std::string> residentFunctions;
     for (Attribute item : entries) {
       auto value = cast<DictionaryAttr>(item);
-      if (stringField(value, kKeyPolicy).getValue() == kWeightResidentPrepack)
+      if (isResidentPrepackPolicy(stringField(value, kKeyPolicy).getValue()))
         residentFunctions.insert(
             stringField(value, kKeyFunction).getValue().str());
     }
@@ -1895,6 +1907,11 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
     // The source dtype of the contract's crouton image: an f32 source is
     // quantised by the host, which the policy reason distinguishes.
     bool quantizedF32 = false;
+    // Where the compiler put the image: the VTCM pool (absent/`vtcm`) or the
+    // permanent DDR mirror it falls back to when the pool cannot hold the
+    // weight. The contract is the only place this pass can see the placement,
+    // so it is read here rather than derived twice.
+    bool inDdr = false;
   };
   std::map<std::string, PrepackInfo> prepackedSlots;
   if (auto prepack =
@@ -1930,6 +1947,14 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
       }
       if (auto sourceDtype = object->getString("dtype"))
         info.quantizedF32 = *sourceDtype == kHmxDTypeF32;
+      if (auto location = object->getString("location")) {
+        if (*location != kHmxWeightResidentLocationVtcm &&
+            *location != kHmxWeightResidentLocationDdr)
+          return emitManifestError(module, true,
+                                   "hmx.weight_prepack entry has an invalid "
+                                   "location");
+        info.inDdr = *location == kHmxWeightResidentLocationDdr;
+      }
       std::string key = (*function).str() + "\x1f" + std::to_string(*slot);
       if (!prepackedSlots.emplace(std::move(key), info).second)
         return emitManifestError(
@@ -2007,7 +2032,11 @@ mlir::hmx::reconcileHmxManifestWeightPolicies(ModuleOp module,
     StringRef policy = kWeightDevicePack;
     StringRef reason = kWeightPrepackDisabled;
     if (prepacked != prepackedSlots.end()) {
-      policy = kWeightResidentPrepack;
+      // Placement is the contract's `location` fact, restated as the policy
+      // name so a manifest reader does not have to join two structures to find
+      // out where the bytes are.
+      policy = prepacked->second.inDdr ? kWeightResidentPrepackDdr
+                                       : kWeightResidentPrepack;
       bool b2 = prepacked->second.logicalN && info.logical &&
                 *prepacked->second.logicalN != (*info.logical)[1];
       reason = b2 ? kWeightEligibleB2NSlice

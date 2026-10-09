@@ -664,6 +664,56 @@ class PackedMetadataTest(unittest.TestCase):
         self.assertIs(_UTILS.validate_pack_metadata(packed), packed)
 
 
+# ---------------------------------------------------------------------------
+# The producer: one compile per distinct module text
+# ---------------------------------------------------------------------------
+
+_COMPILE_CACHE = {}
+
+
+def _producer_options():
+    from triton.backends.qcom_hexagon_backend.hexagon_options import (  # noqa: PLC0415
+        HexagonOptions,
+    )
+
+    return {k: str(v) for k, v in HexagonOptions().__dict__.items()}
+
+
+def _compile(source, *, fresh=False):
+    """``translate_linalg_to_obj`` on ``source``, once per distinct text.
+
+    Every test below that reaches the C++ producer asks it the same question
+    about one of four fixture texts, and a single compile costs seconds, so the
+    suite used to pay for the same compile up to four times.  The call is a pure
+    function of the module text plus the default options, and the part the tests
+    read -- the metadata child -- is reproducible: two compiles of one text
+    return the identical JSON string (only the object bytes differ, and that
+    difference lives downstream of the metadata).
+
+    The cache key carries the options as well as the text, so a future change to
+    what is passed to the producer cannot silently reuse a stale result.
+
+    ``fresh=True`` deliberately bypasses and skips the cache; the only caller
+    that wants it is the test whose subject *is* run-to-run nondeterminism.
+    """
+    options = _producer_options()
+    key = (source, tuple(sorted(options.items())))
+    if not fresh:
+        cached = _COMPILE_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    from triton._C.libtriton import ir, qcom_hexagon_backend  # noqa: PLC0415
+
+    context = ir.context()
+    qcom_hexagon_backend.load_dialects(context)
+    module = qcom_hexagon_backend.parse_mlir_module_from_str(source, context)
+    result = qcom_hexagon_backend.translate_linalg_to_obj(module, options, True)
+    if not fresh:
+        _COMPILE_CACHE[key] = result
+    return result
+
+
 class CppRoundTripTest(unittest.TestCase):
     """The producer and the consumer must agree on the wire contract.
 
@@ -675,16 +725,7 @@ class CppRoundTripTest(unittest.TestCase):
     """
 
     def _translate(self, source):
-        from triton._C.libtriton import ir, qcom_hexagon_backend  # noqa: PLC0415
-        from triton.backends.qcom_hexagon_backend.hexagon_options import (  # noqa: PLC0415
-            HexagonOptions,
-        )
-
-        options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
-        context = ir.context()
-        qcom_hexagon_backend.load_dialects(context)
-        module = qcom_hexagon_backend.parse_mlir_module_from_str(source, context)
-        return qcom_hexagon_backend.translate_linalg_to_obj(module, options, True)[1]
+        return _compile(source)[1]
 
     def _sources(self):
         fixture = (
@@ -1042,27 +1083,20 @@ class GeneratedCodeInvarianceTest(unittest.TestCase):
         If the object ever becomes reproducible, this test fails and the
         docstring above should be narrowed to the stronger claim.  While it
         holds, it is the evidence for why the IR is the oracle.
-        """
-        from triton._C.libtriton import ir, qcom_hexagon_backend  # noqa: PLC0415
-        from triton.backends.qcom_hexagon_backend.hexagon_options import (  # noqa: PLC0415
-            HexagonOptions,
-        )
 
+        The two compiles are both ``fresh``: sharing one with the cache would
+        make the run-to-run comparison depend on whether some other test
+        happened to compile this text first, which is not the fact under test.
+        """
         source = (
             _HERE.parent
             / "Conversion"
             / "LinalgToLLVM"
             / "hmx-record-v3-pipeline.mlir"
         ).read_text()
-        options = {k: str(v) for k, v in HexagonOptions().__dict__.items()}
         runs = []
         for _ in range(2):
-            context = ir.context()
-            qcom_hexagon_backend.load_dialects(context)
-            module = qcom_hexagon_backend.parse_mlir_module_from_str(source, context)
-            objs, _ = qcom_hexagon_backend.translate_linalg_to_obj(
-                module, options, True
-            )
+            objs, _ = _compile(source, fresh=True)
             runs.append(bytes(objs[0]))
         self.assertNotEqual(
             runs[0],

@@ -97,6 +97,14 @@ WEIGHT_POLICY_REASONS = {
     "resident-prepack": frozenset(
         {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
     ),
+    # The DDR mirror's placement of the same host pre-pack (P1 of
+    # docs/hmx/pack-redundancy-fix-plan-2026-10-09.md). Where the image lives
+    # does not change what made the weight packable, so it carries the same
+    # three reasons as `resident-prepack` -- that equality is exactly what the
+    # producer-side helper below is read for.
+    "resident-prepack-ddr": frozenset(
+        {"eligible-aligned-f16", "eligible-quantized-f32", "eligible-b2-n-slice"}
+    ),
     "device-pack": frozenset(
         {
             "tail-consumer",
@@ -267,17 +275,49 @@ def _cpp_weight_policy_reasons() -> dict[str, frozenset[str]]:
     def resolve(name: str) -> str:
         return values[aliases.get(name, name)]
 
-    arms = re.findall(r"if \(policy == (kWeight\w+)\)\s*return (.*?);", cpp, re.S)
+    # The predicate's resident arm is written over a *family* of placements (the
+    # VTCM pool and the DDR mirror share one reason vocabulary), so the family is
+    # read from its own declaration rather than assumed here: a policy added to
+    # `isResidentPrepackPolicy` then has to appear in the vocabulary below too,
+    # which is the boundary this file pins.
+    family_match = re.search(
+        r"bool isResidentPrepackPolicy\(StringRef policy\) \{(.*?)\n\}", cpp, re.S
+    )
+    if family_match is None:
+        raise AssertionError(
+            "isResidentPrepackPolicy is gone; the resident family no longer has "
+            "a single spelling to read"
+        )
+    family = [
+        resolve(name)
+        for name in re.findall(r"policy == (kWeight\w+)", family_match.group(1))
+    ]
+    if not family:
+        raise AssertionError("the resident policy family reads as empty")
+
+    arms = re.findall(
+        r"if \((?:policy == (kWeight\w+)|isResidentPrepackPolicy\(policy\))\)"
+        r"\s*return (.*?);",
+        cpp,
+        re.S,
+    )
     if len(arms) != 2:
         raise AssertionError(
             f"expected two policy arms in isCanonicalWeightReason, found {len(arms)}"
         )
-    return {
-        resolve(policy): frozenset(
+    vocabulary: dict[str, frozenset[str]] = {}
+    for policy, body in arms:
+        reasons = frozenset(
             resolve(name) for name in re.findall(r"reason == (kWeight\w+)", body)
         )
-        for policy, body in arms
-    }
+        if not policy:
+            # The family arm: the first alternative did not participate, which
+            # `re.findall` reports as an empty string rather than None.
+            for name in family:
+                vocabulary[name] = reasons
+        else:
+            vocabulary[resolve(policy)] = reasons
+    return vocabulary
 
 
 def _python_weight_policy_reasons() -> dict[str, frozenset[str]]:

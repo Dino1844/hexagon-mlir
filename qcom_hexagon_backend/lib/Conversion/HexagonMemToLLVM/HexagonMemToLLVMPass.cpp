@@ -430,6 +430,122 @@ public:
     auto loc = op->getLoc();
     auto type = op.getBuffer().getType();
 
+    // A resident weight is handled before the flat-DDR shortcut below, because
+    // its *placement* decides which allocator entry it goes through and both
+    // placements are still keyed on the argument address: VTCM pins the buffer
+    // in the pool, DDR puts the image in the permanent mirror. The two entries
+    // have the same signature, so the only thing that changes here is the name.
+    if (auto resident = op->getAttrOfType<DictionaryAttr>(
+            mlir::hmx::kHmxWeightResidentAttr)) {
+      auto bytesAttr = resident.getAs<IntegerAttr>("bytes");
+      if (!bytesAttr) {
+        op.emitError("resident weight is missing its byte count");
+        return failure();
+      }
+      // Fail closed on placement: the descriptor's location and the buffer's
+      // memory space have to say the same thing, and an unrecognised spelling
+      // is a producer this conversion does not know rather than a VTCM default.
+      auto location =
+          resident.getAs<StringAttr>(mlir::hmx::kHmxWeightResidentLocationKey);
+      bool ddr = false;
+      if (location) {
+        if (location.getValue() !=
+            mlir::hmx::kHmxWeightResidentLocationDdr) {
+          op.emitError("resident weight location must be \"ddr\"");
+          return failure();
+        }
+        ddr = true;
+      }
+      if (ddr == isInVtcm) {
+        op.emitError("resident weight location disagrees with its memory space");
+        return failure();
+      }
+
+      FailureOr<SiteScopeBracket> bracket = readSiteScope(op, isInVtcm);
+      if (failed(bracket))
+        return failure();
+
+      Type srcType = rewriter.getI64Type();
+      Value src;
+      if (auto globalRef = resident.getAs<FlatSymbolRefAttr>("global")) {
+        Operation *symbolTable = op->getParentWithTrait<OpTrait::SymbolTable>();
+        Operation *global = SymbolTable::lookupSymbolIn(symbolTable, globalRef);
+        if (auto memrefGlobal = dyn_cast_or_null<memref::GlobalOp>(global)) {
+          // Still a memref.global here: finalize-memref-to-llvm lowers the pair
+          // into llvm.mlir.addressof + llvm.ptrtoint after this pass.
+          Value loaded = memref::GetGlobalOp::create(rewriter, loc,
+                                                     memrefGlobal.getType(),
+                                                     globalRef.getValue());
+          Value asIndex =
+              memref::ExtractAlignedPointerAsIndexOp::create(rewriter, loc, loaded);
+          src = arith::IndexCastUIOp::create(rewriter, loc, srcType, asIndex);
+        } else if (auto llvmGlobal = dyn_cast_or_null<LLVM::GlobalOp>(global)) {
+          Value address = LLVM::AddressOfOp::create(
+              rewriter, loc, getPtrTy(rewriter.getContext()),
+              llvmGlobal.getSymName());
+          src = LLVM::PtrToIntOp::create(rewriter, loc, srcType, address);
+        } else {
+          op.emitError("resident weight source is not a global: ") << globalRef;
+          return failure();
+        }
+      } else if (resident.get("address")) {
+        // The runtime weight's residency key: the source argument's aligned
+        // pointer, carried as the alloc's extra operand. It has already crossed
+        // index -> i64 by the time this conversion runs.
+        if (adaptor.getOperands().empty()) {
+          op.emitError("resident weight is missing its source address operand");
+          return failure();
+        }
+        Value address = adaptor.getOperands().front();
+        if (address.getType().isIndex())
+          address =
+              arith::IndexCastUIOp::create(rewriter, loc, srcType, address);
+        src = address;
+      } else {
+        op.emitError("resident weight is missing its source");
+        return failure();
+      }
+
+      FailureOr<LLVM::LLVMFuncOp> residentFn = LLVM::lookupOrCreateFn(
+          rewriter, op->getParentOfType<ModuleOp>(),
+          ddr ? "hexagon_runtime_weight_resident_ddr_v2_dsp"
+              : "hexagon_runtime_weight_resident_v2_dsp",
+          {srcType, rewriter.getI32Type(), rewriter.getI32Type()},
+          getPtrTy(rewriter.getContext()));
+      if (failed(residentFn))
+        return failure();
+      (*residentFn)->setAttr(
+          "passthrough",
+          rewriter.getArrayAttr({rewriter.getStringAttr("noinline"),
+                                 rewriter.getStringAttr("willreturn")}));
+      Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
+      Value residentAlignmentValue = getI32Constant(
+          rewriter, loc, static_cast<int64_t>(op.getAlignment()));
+      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
+        return failure();
+      auto callOp = LLVM::CallOp::create(
+          rewriter, loc, residentFn.value(),
+          ValueRange({src, bytesValue, residentAlignmentValue}));
+      if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
+        return failure();
+
+      auto origMemRefType = mlir::cast<MemRefType>(type);
+      auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
+      SmallVector<Value, 4> sizes;
+      SmallVector<Value, 4> strides;
+      Value size;
+      // The resident buffer is static; its operands (the source address) are not
+      // shape. Build the descriptor from the type alone.
+      this->getMemRefDescriptorSizes(loc, memRefType, ValueRange{}, rewriter,
+                                     sizes, strides, size,
+                                     /* sizeInBytes */ true);
+      auto memRefDescriptor = this->createMemRefDescriptor(
+          loc, memRefType, callOp.getResult(), callOp.getResult(), sizes,
+          strides, rewriter);
+      rewriter.replaceOp(op, {memRefDescriptor});
+      return success();
+    }
+
     // Replace "hexagonmem.alloc" with "memref.alloc" for flat DDR allocations
     if (!isInVtcm && !isCroutonType) {
       // A stamp on a DDR allocation is a producer disagreement, not a no-op: the
@@ -539,98 +655,6 @@ public:
       SmallVector<Value, 4> strides;
       Value size;
       // The resident buffer is static; there is no shape operand.
-      this->getMemRefDescriptorSizes(loc, memRefType, ValueRange{}, rewriter,
-                                     sizes, strides, size,
-                                     /* sizeInBytes */ true);
-      auto memRefDescriptor = this->createMemRefDescriptor(
-          loc, memRefType, callOp.getResult(), callOp.getResult(), sizes,
-          strides, rewriter);
-      rewriter.replaceOp(op, {memRefDescriptor});
-      return success();
-    }
-
-    // A resident weight is not allocated per launch: the runtime hands back the
-    // same pinned VTCM buffer every time and fills it on the first call only.
-    // The kernel-side alloc/free disappears entirely (the free is still emitted
-    // and swallowed by the pool), so the only per-launch cost left is the call.
-    // Two sources: the address of a prepacked compile-time global, or the data
-    // pointer of the runtime function argument the host has pre-packed.
-    if (auto resident = op->getAttrOfType<DictionaryAttr>(mlir::hmx::kHmxWeightResidentAttr)) {
-      auto bytesAttr = resident.getAs<IntegerAttr>("bytes");
-      if (!bytesAttr) {
-        op.emitError("resident weight is missing its byte count");
-        return failure();
-      }
-      Type srcType = rewriter.getI64Type();
-      Value src;
-      if (auto globalRef = resident.getAs<FlatSymbolRefAttr>("global")) {
-        Operation *symbolTable = op->getParentWithTrait<OpTrait::SymbolTable>();
-        Operation *global = SymbolTable::lookupSymbolIn(symbolTable, globalRef);
-        if (auto memrefGlobal = dyn_cast_or_null<memref::GlobalOp>(global)) {
-          // Still a memref.global here: finalize-memref-to-llvm lowers the pair
-          // into llvm.mlir.addressof + llvm.ptrtoint after this pass.
-          Value loaded = memref::GetGlobalOp::create(rewriter, loc,
-                                                      memrefGlobal.getType(),
-                                                      globalRef.getValue());
-          Value asIndex =
-              memref::ExtractAlignedPointerAsIndexOp::create(rewriter, loc, loaded);
-          src = arith::IndexCastUIOp::create(rewriter, loc, srcType, asIndex);
-        } else if (auto llvmGlobal = dyn_cast_or_null<LLVM::GlobalOp>(global)) {
-          Value address = LLVM::AddressOfOp::create(
-              rewriter, loc, getPtrTy(rewriter.getContext()),
-              llvmGlobal.getSymName());
-          src = LLVM::PtrToIntOp::create(rewriter, loc, srcType, address);
-        } else {
-          op.emitError("resident weight source is not a global: ") << globalRef;
-          return failure();
-        }
-      } else if (resident.get("address")) {
-        // The runtime weight's residency key: the source argument's aligned
-        // pointer, carried as the alloc's extra operand. It has already crossed
-        // index -> i64 by the time this conversion runs.
-        if (adaptor.getOperands().empty()) {
-          op.emitError("resident weight is missing its source address operand");
-          return failure();
-        }
-        Value address = adaptor.getOperands().front();
-        if (address.getType().isIndex())
-          address =
-              arith::IndexCastUIOp::create(rewriter, loc, srcType, address);
-        src = address;
-      } else {
-        op.emitError("resident weight is missing its source");
-        return failure();
-      }
-
-      FailureOr<LLVM::LLVMFuncOp> residentFn = LLVM::lookupOrCreateFn(
-          rewriter, op->getParentOfType<ModuleOp>(),
-          "hexagon_runtime_weight_resident_v2_dsp",
-          {srcType, rewriter.getI32Type(), rewriter.getI32Type()},
-          getPtrTy(rewriter.getContext()));
-      if (failed(residentFn))
-        return failure();
-      (*residentFn)->setAttr(
-          "passthrough",
-          rewriter.getArrayAttr({rewriter.getStringAttr("noinline"),
-                                 rewriter.getStringAttr("willreturn")}));
-      Value bytesValue = getI32Constant(rewriter, loc, bytesAttr.getInt());
-      Value residentAlignmentValue =
-          getI32Constant(rewriter, loc, static_cast<int64_t>(alignment));
-      if (failed(emitSiteScopeEnter(rewriter, op, *bracket)))
-        return failure();
-      auto callOp = LLVM::CallOp::create(
-          rewriter, loc, residentFn.value(),
-          ValueRange({src, bytesValue, residentAlignmentValue}));
-      if (failed(emitSiteScopeLeave(rewriter, op, callOp)))
-        return failure();
-
-      auto origMemRefType = mlir::cast<MemRefType>(type);
-      auto memRefType = mlir::affine::normalizeMemRefType(origMemRefType);
-      SmallVector<Value, 4> sizes;
-      SmallVector<Value, 4> strides;
-      Value size;
-      // The resident buffer is static; its operands (the source address) are not
-      // shape. Build the descriptor from the type alone.
       this->getMemRefDescriptorSizes(loc, memRefType, ValueRange{}, rewriter,
                                      sizes, strides, size,
                                      /* sizeInBytes */ true);

@@ -44,7 +44,7 @@
 // CHECK-DAG: site_count = 3 : i64
 // CHECK-DAG: identity_status = "complete", principal = "acc_identity_f32", principal_status = "module-symbol", requested_bytes = 8192 : i64, resident_provenance_status = "checked", role = "weight-resident", role_status = "reviewed", runtime_observation_status = "not-integrated", site_id = {{-?[0-9]+}} : i64, size_status = "complete", slot = 1 : i64, slot_status = "provenance"
 // The host contract names the f32 source; the image is the fp16 crouton.
-// CHECK: hmx.weight_prepack = "[{\22func\22:\22runtime_weight_f32\22,\22slot\22:1,\22shape\22:[64,64],\22crouton\22:[2,2,16,32,2],\22dtype\22:\22f32\22}]"
+// CHECK: hmx.weight_prepack = "[{\22func\22:\22runtime_weight_f32\22,\22slot\22:1,\22shape\22:[64,64],\22crouton\22:[2,2,16,32,2],\22dtype\22:\22f32\22,\22location\22:\22vtcm\22}]"
 module @acc_identity_f32 attributes {
     hmx.diagnostic_vtcm_accounting,
     hmx.diagnostic_vtcm_identity} {

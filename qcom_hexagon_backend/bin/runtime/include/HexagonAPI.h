@@ -15,6 +15,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -75,6 +76,11 @@ public:
 
   /// Ensures all runtime resources are freed
   void ReleaseResources() {
+    // The DDR mirrors are live BufferManager allocations, and BufferManager's
+    // own destructor refuses to be destroyed while one is outstanding, so they
+    // go back first. See WeightResidentDdrV2 for why they are not freed per
+    // launch.
+    freeDdrWeightResidents();
     CHECK((bufferManager), "bufferManager was not created in AcquireResources");
     bufferManager.reset();
 
@@ -115,6 +121,21 @@ public:
   /// block. Scope registration is enforced by the C API before this method is
   /// reached.
   void *WeightResidentV2(uint64_t source, size_t nbytes, size_t alignment);
+
+  /// Allocate (once) a **permanent DDR mirror** of the same image, for a weight
+  /// whose crouton image does not fit the VTCM pool. Same versioned contract as
+  /// `WeightResidentV2` -- key = source address, exact descriptor on reuse, one
+  /// image per process -- but the buffer comes out of ordinary DDR instead of
+  /// the pool, so it costs no VTCM and the kernel takes the block it needs from
+  /// it with a contiguous copy instead of packing a strided view in place.
+  ///
+  /// Lifetime (docs/hmx/pack-redundancy-fix-plan-2026-10-09.md §7-2): the
+  /// mirror lives as long as the runtime does and is returned in
+  /// `ReleaseResources`, before the allocator it came from is destroyed. There
+  /// is deliberately no per-launch free: the kernel never holds it, and a
+  /// mirror that vanished between launches would turn the fetch into a
+  /// use-after-free rather than a copy.
+  void *WeightResidentDdrV2(uint64_t source, size_t nbytes, size_t alignment);
   /// `instance` is the caller's flat program id: concurrent instances of a
   /// grid>1 launch carry distinct pids, so each gets its own resident buffer,
   /// and the same pid across launches reuses the same buffer. A thread id
@@ -181,6 +202,17 @@ private:
 
   /// VTCM memory manager
   std::unique_ptr<VtcmPool> runtimeVtcm;
+
+  /// The permanent DDR weight mirrors, keyed by the source address the same way
+  /// `VtcmPool::Resident` keys its blocks: one process, one image per key.
+  /// Values are (buffer, bytes) so a repeat request with a different byte count
+  /// is a descriptor mismatch rather than a silently shorter copy.
+  std::mutex ddrMirrorMutex;
+  std::unordered_map<uint64_t, std::pair<void *, size_t>> ddrMirrors;
+
+  /// Return every mirror to `bufferManager`. Called from `ReleaseResources`
+  /// before the manager is destroyed; safe to call twice (the map is cleared).
+  void freeDdrWeightResidents();
 
   /// HMX Context
   uint32_t hmx_context_id = 0;
