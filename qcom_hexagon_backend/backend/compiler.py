@@ -291,9 +291,15 @@ def obj_to_so(mod, metadata={}) -> str:
     tmpdir = tempfile.mkdtemp()
     kernel_code = os.path.join(tmpdir, metadata["name"] + ".o")
     Path(kernel_code).write_bytes(mod)
-    so_path = HexagonExecutor(compile_only=True).generate_shared_object(
-        "", kernel_code, htp_kernel_gen=True
-    )
+    # kernel_run_id names the device leaf dir, and compile_only pushes/runs
+    # nothing (generate_shared_object derives the .so path from the object
+    # path), so the empty id is legal -- HexagonExecutor skips the non-empty
+    # check for compile_only for exactly this caller. It still must be passed:
+    # the parameter is positional-required, and omitting it raises TypeError
+    # before any compile starts.
+    so_path = HexagonExecutor(
+        kernel_run_id="", compile_only=True
+    ).generate_shared_object("", kernel_code, htp_kernel_gen=True)
     return so_path
 
 
