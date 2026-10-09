@@ -132,6 +132,37 @@ ROLE_REFERENCED_REQUIRED = (
     "hexagon_runtime_hmx_role_wait_retired",
 )
 
+# The m-tile count of each shape, for the one demand that is shape-dependent:
+# `wait_retired`. 32 is the crouton M (one m-tile = 32 rows), the same fact
+# the fixtures' `divui/remui` pairs encode.
+M_TILES = {
+    "whole-matrix": M // 32,
+    "grid-tiled": BLOCK_M // 32,
+    "grid-tiled-small": BLOCK_M_SMALL // 32,
+}
+
+
+def _has_live_wait(m_tiles, group=4):
+    """Whether a `wait_retired` call can execute on this shape at all.
+
+    The lagged emission (2026-10-09, after the zero-lag form measured +10us
+    / +27% on the S1-class shape: docs/results/r2r3-ab-2026-10-09.md) waits
+    only where a publish boundary is REACHABLE -- the wait ahead of a publish
+    targets the previous boundary's group, so a loop that never reaches even
+    one boundary (fewer m-tiles than one read-out batch) publishes every row
+    through the tail publish instead, and the tail publish's proof is the
+    exit drain: the tail wait is gone by design, so such a shape places no
+    `wait_retired` demand on the runtime archive, and the object compiler is
+    free to drop the never-firing in-loop wait with it.
+
+    `upper` is the steady loop's exclusive bound: above the depth-2 ring cap
+    (2 m-tiles) hmx-partition peels one tile into the epilogue, so the loop
+    stops one short; at or below the cap it is the serial ring, which stops
+    at the tile count. `group` is the shipped read-out batch.
+    """
+    upper = m_tiles - 1 if m_tiles > 2 else m_tiles
+    return upper // group >= 1
+
 
 def _role_split_is_in_object(symbols):
     """Whether the object carries the thread-role split instead of the
@@ -836,9 +867,20 @@ class VectorReadoutReachesTheObject(unittest.TestCase):
         # configure/publish/drain, because the read-out split fired too (it
         # runs before the role split) and the role split only re-establishes
         # its completion proof per group instead of moving it out of the loop.
+        #
+        # The ONE shape-dependent demand is wait_retired: it is demanded only
+        # where a publish boundary is reachable (see _has_live_wait). On a
+        # shape whose loop never reaches one, no wait can execute -- the tail
+        # publish carries every row and its proof is the exit drain -- so the
+        # absence there is the lagged emission's honest answer, not a missing
+        # coexistence. The two shapes that can wait still demand it, which is
+        # what keeps this a gate on the composition rather than a tautology.
         for name, (_obj, _stderr, symbols) in self.compiled.items():
             if _role_split_is_in_object(symbols):
                 for required in ROLE_REFERENCED_REQUIRED:
+                    if (required == "hexagon_runtime_hmx_role_wait_retired"
+                            and not _has_live_wait(M_TILES[name])):
+                        continue
                     self.assertEqual(
                         "U", symbols.get(required),
                         f"[{name}] {required} should be an undefined reference "

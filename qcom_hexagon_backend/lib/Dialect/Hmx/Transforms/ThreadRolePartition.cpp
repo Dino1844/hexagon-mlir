@@ -375,6 +375,19 @@ constexpr int64_t kRoleSubmitBatch = 4;
 /// (rows, wt, bias, ar, m0, count) signature already covers it. That is the
 /// "peel 尾的 tile 就是最后几个 descriptor" property the merged R2+R3 plan
 /// rests on.
+/// One in-loop publish boundary of the read-out split (R2): the boundary
+/// block itself plus the descriptor facts its publish hands the vector
+/// thread, extracted once at match time. The emission erases the block and
+/// MOVES its stores and call into a lagged boundary block one submit batch
+/// later, so the facts extracted here are the ones the emission cannot
+/// re-derive: the read-out batch descriptor and its address (the clamped
+/// tail-site publish re-creates a whole call on them).
+struct PublishSite {
+  scf::IfOp ifOp;  ///< the boundary block (guarded `(m+1) % G == 0`)
+  Value readoutBuf;  ///< the read-out batch descriptor (memref<6xi32>)
+  Value readoutAddr; ///< its i32 base address (the publish call's operand 0)
+};
+
 struct RoleSplitMatch {
   scf::ForOp mLoop;
   PackActOp pack;         ///< the producer work, directly in the m-loop body
@@ -395,10 +408,12 @@ struct RoleSplitMatch {
   /// production pipeline, so the in-loop read-outs arrive as publishes to the
   /// vector executor rather than as `hmx.unpack_acc` ops. The two forms are
   /// mutually exclusive and shape everything the emission does with the
-  /// read-out: publishes stay in the loop behind a retire wait; unpacks move
-  /// past the exit drain (the first form's behavior).
-  SmallVector<scf::IfOp> publishIfs;   ///< in-loop publish boundaries
+  /// read-out: publishes are re-emitted one submit batch LATE (the zero-lag
+  /// form serialized the producer behind the engine -- see the emission
+  /// comment); unpacks move past the exit drain (the first form's behavior).
+  SmallVector<PublishSite> publishIfs; ///< in-loop publish boundaries (R2)
   SmallVector<func::CallOp> tailPublishes; ///< post-loop publish(es)
+  int64_t readoutGroup = 0; ///< G: the publish boundary's group size
   bool readoutOn = false;
 
   // ---- the pipelined (depth-2) form ----
@@ -532,16 +547,21 @@ static bool nestEquivalent(Operation *a, Operation *b, Value rowA, Value rowB,
 /// BOUND THREAD writes, not this loop's body -- the read-out split matched
 /// when its own proof (an in-body `acc_read`) was still there, and this pass
 /// is about to move that `acc_read` onto T_HMX. The order the two passes
-/// established is what carries the proof across that move: the publish sits
-/// at the position of the read-out it replaced, which is AFTER the engine
-/// nest, and the split re-emits the submit and a `wait_retired` barrier at
-/// the nest's own position -- BEFORE the publish, in the same iteration. So
-/// the composed order is submit(i) ... wait_retired(i+1) ... publish(i), and
-/// "publish only after the engine section retired" is re-established at a
-/// finer grain than the exit drain the first form used. The emission's
-/// comment carries the full argument.
+/// established is what carries the proof across that move: each publish
+/// names the group the read-out it replaced covered, and the split re-emits
+/// it one submit batch LATE with a `wait_retired` barrier AHEAD of it, so
+/// the composed order at the lagged boundary is submit(batch) ...
+/// wait_retired(previous batch's end + 1) ... publish(previous batch's
+/// group), and "publish only after the engine sections of every tile the
+/// publish names have RETIRED" is re-established at a finer grain than the
+/// exit drain the first form used. The lag is a scheduling fact, not a
+/// correctness one: the wait still precedes its own publish, and the groups
+/// published are exactly the groups the read-out split published. The
+/// emission's comment carries the full argument, including why the lag
+/// exists at all.
 static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
   // In-loop: publish-if blocks and/or unpacks, as DIRECT children of the body.
+  SmallVector<scf::IfOp> publishIfs;
   for (Operation &op : m.mLoop.getBody()->without_terminator()) {
     if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
       bool publish = false;
@@ -550,13 +570,13 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
           publish |= call.getCallee() == kHmxExecPublishFn;
       });
       if (publish)
-        m.publishIfs.push_back(ifOp);
+        publishIfs.push_back(ifOp);
       continue;
     }
     if (isa<UnpackAccOp, UnpackAccF32Op>(op))
       m.unpacks.push_back(&op);
   }
-  if (!m.publishIfs.empty() && !m.unpacks.empty()) {
+  if (!publishIfs.empty() && !m.unpacks.empty()) {
     fn.emitRemark("thread-role split not applied: the tile loop holds both a "
                   "vector-executor publish and an inline read-out; the two "
                   "read-out forms are mutually exclusive and this shape is "
@@ -575,7 +595,7 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
       m.tailPublishes.push_back(call);
   });
 
-  m.readoutOn = !m.publishIfs.empty() || !m.tailPublishes.empty();
+  m.readoutOn = !publishIfs.empty() || !m.tailPublishes.empty();
   if (m.readoutOn &&
       (!m.unpacks.empty() ||
        (m.pipelined && m.epilogueUnpack != nullptr))) {
@@ -585,20 +605,32 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
     return failure();
   }
 
-  // THE COVERAGE GATE (a deadlock-prevention check, not a preference): the
-  // wait this pass emits before a publish targets the tiles the publish
-  // names, and it can only be satisfied if those tiles were SUBMITTED -- the
-  // submit fires every kRoleSubmitBatch tiles, the publish every G tiles, and
-  // a publish boundary that is not also a submit boundary would wait for
-  // tiles the ring has not been handed. G is read off the publish-if's own
-  // boundary condition (`(m+1) % G == 0`, the read-out split's emission), and
-  // the requirement is kRoleSubmitBatch divides G: every multiple of G is
-  // then a multiple of the submit batch, so the covering submit fired earlier
-  // in the same iteration. A finer read-out batch declines the split, loudly,
-  // and the kernel keeps the single-thread pipeline with its read-out intact.
-  if (!m.publishIfs.empty()) {
+  // THE COVERAGE GATE (re-derived for the lagged emission, 2026-10-09). The
+  // original gate was a deadlock check: a wait ahead of a publish at its OWN
+  // boundary could target tiles the covering submit had not handed the ring
+  // yet, so the submit batch had to divide G. The lagged emission publishes
+  // one submit batch LATE, and its wait's target was necessarily submitted
+  // iterations earlier -- tiles 0..m are all in the ring once the producer
+  // reaches iteration m + batch, because the last of them rides the submit
+  // at or before iteration m + batch - 1 -- so THAT deadlock is structurally
+  // gone: the lag is strictly safer than the gate's original demand.
+  //
+  // The divisibility is KEPT, for the shape property it still buys: with the
+  // submit batch dividing G, every publish boundary is also a submit
+  // boundary, so each lagged publish fires exactly at the NEXT submit
+  // boundary after its group (the `submit(batch k+1) -> wait_retired(batch
+  // k's end + 1) -> publish(batch k's group)` position structure), and at
+  // most ONE live group's lag falls past the loop (the second-to-last lags
+  // to `(K-1)G + batch <= KG <= upper`, inside) -- which is what lets the
+  // after-loop emission place that one group, with its wait, at the single
+  // tail-submit boundary. A G finer than the submit batch would scatter
+  // publishes across non-boundary iterations and could clamp several groups
+  // past the loop at once -- a form this emission's position argument does
+  // not describe, so it declines loudly and the kernel keeps the
+  // single-thread pipeline with its read-out intact.
+  if (!publishIfs.empty()) {
     Value iv = m.mLoop.getInductionVar();
-    for (scf::IfOp ifOp : m.publishIfs) {
+    for (scf::IfOp ifOp : publishIfs) {
       auto cmp = ifOp.getCondition().getDefiningOp<arith::CmpIOp>();
       if (!cmp || cmp.getPredicate() != arith::CmpIPredicate::eq) {
         fn.emitRemark("thread-role split not applied: a publish boundary "
@@ -624,11 +656,23 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
       std::optional<int64_t> group = foldIndex(remsi.getRhs());
       std::optional<int64_t> one = addi ? foldIndex(addi.getRhs()) : std::nullopt;
       std::optional<int64_t> zeroV = foldIndex(zero);
-      if (!addi || addi.getLhs() != iv || !group || !one || !zeroV ||
-          *one != 1 || *zeroV != 0) {
+      if (!addi || addi.getLhs() != iv || !group || *group < 1 || !one ||
+          !zeroV || *one != 1 || *zeroV != 0) {
         fn.emitRemark("thread-role split not applied: a publish boundary "
                       "condition is not the `(m+1) %% G == 0` form the "
                       "read-out split emits");
+        return failure();
+      }
+      // One group size for every boundary: the read-out split runs with one
+      // `hmx-readout-batch` per function, and the lagged emission below
+      // guards every re-emitted publish with the one G it parsed -- two
+      // different Gs in one loop is a form this pass did not make.
+      if (m.readoutGroup == 0) {
+        m.readoutGroup = *group;
+      } else if (*group != m.readoutGroup) {
+        fn.emitRemark("thread-role split not applied: the tile loop's publish "
+                      "boundaries do not share one group size (the read-out "
+                      "split emits one `hmx-readout-batch` per function)");
         return failure();
       }
       if (*group % kRoleSubmitBatch != 0) {
@@ -636,11 +680,104 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
             << "thread-role split not applied: the read-out publishes every "
             << *group << " tiles but the role submit batches every "
             << kRoleSubmitBatch
-            << "; a publish boundary the submit does not cover would wait "
-               "for tiles the ring never received (deadlock). The kernel "
-               "keeps the single-thread pipeline with its read-out intact";
+            << "; the lagged publish rides the submit boundary after its "
+               "group, which only exists when every publish boundary is a "
+               "submit boundary. The kernel keeps the single-thread "
+               "pipeline with its read-out intact";
         return failure();
       }
+    }
+
+    // The site facts, extracted once here (never re-parsed in the emission):
+    // the read-out batch descriptor a publish hands the vector thread, and
+    // the rowStart arithmetic the lagged emission patches. The emission
+    // MOVES each boundary block's stores and call into the lagged block and
+    // re-bases one operand of the rowStart subtraction, so what it patches
+    // is verified here -- where a surprise is a loud decline instead of a
+    // silent coverage change.
+    for (scf::IfOp ifOp : publishIfs) {
+      func::CallOp publish;
+      unsigned publishCalls = 0;
+      ifOp->walk([&](func::CallOp call) {
+        if (call.getCallee() == kHmxExecPublishFn) {
+          publish = call;
+          ++publishCalls;
+        }
+      });
+      if (publishCalls != 1) {
+        fn.emitRemark("thread-role split not applied: a publish boundary "
+                      "block does not hold exactly one publish call (the "
+                      "read-out split emits one per boundary)");
+        return failure();
+      }
+      // The descriptor address: index_cast(extract_aligned_pointer_as_index(
+      // buffer)) -- the read-out split's own spelling (emitPublish), so the
+      // buffer it names is recovered by walking it rather than guessed.
+      auto addrCast =
+          publish.getOperand(0).getDefiningOp<arith::IndexCastOp>();
+      auto extract =
+          addrCast ? addrCast.getIn().getDefiningOp<
+                         memref::ExtractAlignedPointerAsIndexOp>()
+                   : nullptr;
+      if (!addrCast || !extract) {
+        fn.emitRemark("thread-role split not applied: a publish call's "
+                      "descriptor address is not the read-out split's "
+                      "extract-and-cast form");
+        return failure();
+      }
+      Value readoutBuf = extract.getOperand();
+      for (Value v : {readoutBuf, publish.getOperand(0)}) {
+        Operation *def = v.getDefiningOp();
+        if (def && m.mLoop->isAncestor(def)) {
+          fn.emitRemark("thread-role split not applied: a publish descriptor "
+                        "is built inside the tile loop (the read-out split "
+                        "builds it before the loop so it dominates every "
+                        "publish)");
+          return failure();
+        }
+      }
+      // The per-item calling discipline: one descriptor per publish call.
+      // The count operand is an i32 constant, read directly -- foldIndex
+      // folds index-typed chains only.
+      auto count = publish.getOperand(1).getDefiningOp<arith::ConstantOp>();
+      auto countAttr =
+          count ? dyn_cast_or_null<IntegerAttr>(count.getValue()) : nullptr;
+      if (!countAttr || countAttr.getInt() != 1) {
+        fn.emitRemark("thread-role split not applied: a publish call does not "
+                      "carry exactly one batch (the read-out split's "
+                      "per-item calling discipline)");
+        return failure();
+      }
+      // The rowStart store: index_cast(subi(iv, G-1)) into the descriptor's
+      // rowStart field -- the arithmetic the lagged emission re-bases from
+      // the induction to `iv - batch`.
+      memref::StoreOp rowStartStore;
+      for (Operation &op : ifOp.getThenRegion().front()) {
+        auto store = dyn_cast<memref::StoreOp>(op);
+        if (!store || store.getMemRef() != readoutBuf)
+          continue;
+        auto at = store.getIndices()[0].getDefiningOp<arith::ConstantIndexOp>();
+        if (at && at.value() == kHmxReadoutRowStart) {
+          rowStartStore = store;
+          break;
+        }
+      }
+      auto rowCast = rowStartStore
+                         ? dyn_cast_or_null<arith::IndexCastOp>(
+                               rowStartStore.getValueToStore().getDefiningOp())
+                         : nullptr;
+      auto rowSub = rowCast ? dyn_cast_or_null<arith::SubIOp>(
+                                  rowCast.getIn().getDefiningOp())
+                            : nullptr;
+      if (!rowSub || rowSub.getLhs() != iv ||
+          foldIndex(rowSub.getRhs()).value_or(-1) != m.readoutGroup - 1) {
+        fn.emitRemark("thread-role split not applied: a publish's rowStart is "
+                      "not the read-out split's `iv - (G-1)` form, so the "
+                      "lagged re-emission cannot re-base it");
+        return failure();
+      }
+      m.publishIfs.push_back(PublishSite{ifOp, readoutBuf,
+                                         publish.getOperand(0)});
     }
   }
   return success();
@@ -1247,6 +1384,54 @@ static void storeRoleDescWord(OpBuilder &b, Location loc, Value descBuf,
   memref::StoreOp::create(b, loc, word, descBuf, ValueRange{idx});
 }
 
+/// Erase `value`'s defining op once nothing uses it, cascading up its
+/// operands -- the read-out pass's own helper (HmxVectorReadoutPass.cpp),
+/// spelled here again because it is file-static there. Used to take out a
+/// replaced publish boundary's guard arithmetic, whose pieces (the induction
+/// arithmetic especially) may be shared with ops that must survive.
+/// `isOpTriviallyDead`, never "would be dead if unused": the second says yes
+/// for a value some other op still reads, and erasing that destroys a live
+/// op.
+static void eraseDeadDefiners(Value value, unsigned depth = 0) {
+  if (depth > 8 || !value)
+    return;
+  Operation *def = value.getDefiningOp();
+  if (!def || !mlir::isOpTriviallyDead(def))
+    return;
+  SmallVector<Value> operands(def->getOperands());
+  def->erase();
+  for (Value operand : operands)
+    eraseDeadDefiners(operand, depth + 1);
+}
+
+/// One publish of a FIXED group (rowStart/rowCount as constants): the
+/// read-out split's own store-and-call shape on a matched site's descriptor.
+///
+/// The in-loop lagged publish MOVES the read-out split's boundary block
+/// instead of calling this (see the emission) -- whatever that pass emits
+/// per publish rides along, and only one operand is re-based. This helper is
+/// for the one position with no block to move: the CLAMPED group, whose
+/// lagged position is the tail-submit boundary past the loop, so its publish
+/// is re-created from the site facts the matcher extracted and verified.
+static void emitFixedPublish(OpBuilder &b, Location loc, ModuleOp module,
+                             const PublishSite &site, int64_t rowStart,
+                             int64_t rowCount) {
+  Type i32 = b.getI32Type();
+  auto store = [&](int64_t field, Value word) {
+    Value at = arith::ConstantIndexOp::create(b, loc, field);
+    memref::StoreOp::create(b, loc, word, site.readoutBuf, ValueRange{at});
+  };
+  store(kHmxReadoutRowStart,
+        arith::IndexCastOp::create(
+            b, loc, i32, arith::ConstantIndexOp::create(b, loc, rowStart)));
+  store(kHmxReadoutRowCount,
+        arith::ConstantIntOp::create(b, loc, rowCount, 32));
+  func::CallOp::create(
+      b, loc, module.lookupSymbol<func::FuncOp>(kHmxExecPublishFn),
+      ValueRange{site.readoutAddr,
+                 arith::ConstantIntOp::create(b, loc, 1, 32)});
+}
+
 /// Record the handoff for HmxToLLVMPass: the one place the outlined work
 /// function's identity, the ring depth and the four buffer types survive
 /// the conversions between here and there.
@@ -1664,51 +1849,123 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
         arith::ConstantIntOp::create(b, loc, 0, 32));
   }
 
-  // ---- the read-out coexistence barriers (R2; the mechanism this half
-  // exists for) -------------------------------------------------------------
+  // ---- the read-out coexistence, LAGGED one batch (R2; the mechanism this
+  // half exists for) ---------------------------------------------------------
   //
-  // THE SAFETY ARGUMENT, UPGRADED (and this comment is where it lives): the
-  // first form moved every in-loop read-out past the exit drain because
-  // "after drain, every section has returned" was the only producer-side
-  // proof that an `ar` row was complete. The read-out split (which ran
-  // BEFORE this pass) already put the read-out back inside the loop as a
-  // publish to the vector executor; what its match-time proof (an in-body
-  // `acc_read`) cannot survive is THIS pass moving that `acc_read` onto
-  // T_HMX. The wait re-establishes the proof at a finer grain: retire
-  // happens only after the bound section RETURNS (HmxSpscRing.h's ownership
-  // model), so `wait_retired(m+1)` in iteration m means tiles 0..m's engine
-  // work has landed -- semantically the same statement as the drain's, one
-  // tile instead of all of them. The emitted order per iteration is
-  // submit(batch) ... wait_retired(m+1) ... publish(group), and the same
-  // for the tail after the loop; the vector thread's unpack of group k
-  // therefore overlaps group k+1's engine work, which is exactly the
-  // llama.cpp `pop C_{i-1}` shape the co-scheduling review identified as
-  // the missing mechanism (docs/architecture/
-  // hmx-coscheduling-architecture-review-2026-10-09.md section 4f).
+  // THE ZERO-LAG LESSON (2026-10-09, the merged R2+R3 A/B): the first
+  // coexistence emission kept the read-out split's publish at its OWN
+  // boundary and inserted the wait ahead of it, so one boundary iteration
+  // read submit(batch) -> wait_retired(m+1) -> publish(group ending at m) --
+  // the wait targeted the batch the SAME iteration had just submitted. The
+  // producer parked until the engine chewed exactly that batch, then
+  // published, then packed the next batch while the engine idled: producer
+  // and engine serialized per batch, both engines took turns idling, and
+  // every batch paid the wait round-trip. The S1-class A/B measured it at
+  // +10.0 us / +27% against the default face (docs/results/
+  // r2r3-ab-2026-10-09.md), and the arithmetic closed the case: producer
+  // 8.3 + engine 21 (serialized) + ~9 wait round-trip + residual 8.3 ~= the
+  // measured 47 us. THE RULE: a publish must lag the submit front --
+  // waiting on the batch just submitted is putting the producer in line
+  // behind the engine.
   //
-  // The wait goes in the PUBLISH's own boundary block, not the submit's:
-  // the publish is what needs the proof, and a read-out batch wider than
-  // the submit batch (the coverage gate in collectReadoutState guarantees
-  // the submit batch divides it) then keeps its producer running free
-  // between the submit boundaries instead of stalling at each one.
+  // THE LAGGED FORM (llama.cpp's `pop C_{i-1}` shape, the co-scheduling
+  // review's section 4f): the publish of the group ending at tile m fires
+  // at iteration m + kRoleSubmitBatch -- the NEXT submit boundary -- and
+  // that iteration reads submit(batch k+1) -> wait_retired(m+1) ->
+  // publish(batch k's group). The wait's target was submitted a full batch
+  // of iterations earlier, so the engine has been chewing it the whole time
+  // the producer packed and submitted the next batch: the target is met or
+  // nearly met (`target <= retired returns immediately`, HmxRoleExecutor.h),
+  // the producer stays a batch ahead, and the engine no longer idles
+  // between batches. The vector thread's unpack of group k still overlaps
+  // group k+1's engine work -- the coexistence's whole point -- without the
+  // producer and the engine taking turns.
+  //
+  // The guard is the read-out split's own boundary test evaluated one batch
+  // late (`(m-b+1) % G == 0`), plus `m-b+1 >= G`, which excludes the one
+  // spurious firing at m = batch-1 (where `m-b+1 = 0` satisfies the
+  // remainder test but would name a group ending before row 0). That
+  // exclusion is also the FIRST group's edge case: the first boundary
+  // publishes nothing, and group 0's publish fires at the second boundary --
+  // the normal lag structure, not a special case. The published ops are the
+  // boundary block's own stores and call, MOVED into the lagged block with
+  // the rowStart arithmetic re-based from the induction to `m - batch`; the
+  // coverage is therefore the read-out split's own -- every group it
+  // published is published exactly once, one batch later. The LAST live
+  // group's lagged position falls past the loop when `K*G + batch > upper`
+  // (K the live group count): its publish moves to the first submit
+  // boundary after the loop -- the tail submit -- and keeps its wait (see
+  // the after-loop emission); `G >= batch` (the coverage gate) is what
+  // makes at most ONE group fall out. The tail publish (the rows no in-loop
+  // group named) needs no wait at all any more: it sits behind the exit
+  // drain, which is the all-groups proof the wait used to stand in for.
   if (m.readoutOn) {
-    // In-loop: at the top of each publish boundary block, before everything
-    // in it. The target is m+1: the tiles the boundary's publish names end
-    // at m, and retire-count m+1 covers exactly those.
-    for (scf::IfOp publishIf : m.publishIfs) {
+    for (PublishSite &site : m.publishIfs) {
+      scf::IfOp ifOp = site.ifOp;
+      // The lagged guard, at the boundary block's own position -- which is
+      // after the submit-if the emission created at the engine nest's old
+      // position, so the lagged publish reads submit-first, wait-second,
+      // publish-third inside one iteration.
+      b.setInsertionPoint(ifOp);
+      Value cBatchL = arith::ConstantIndexOp::create(b, loc,
+                                                     kRoleSubmitBatch);
+      Value mPrev = arith::SubIOp::create(b, loc, mInd, cBatchL);
+      Value cOneL = arith::ConstantIndexOp::create(b, loc, 1);
+      Value completed = arith::AddIOp::create(b, loc, mPrev, cOneL);
+      Value cGroupL = arith::ConstantIndexOp::create(b, loc,
+                                                     m.readoutGroup);
+      Value remainder = arith::RemSIOp::create(b, loc, completed, cGroupL);
+      Value cZeroL = arith::ConstantIndexOp::create(b, loc, 0);
+      Value atBoundary = arith::CmpIOp::create(
+          b, loc, arith::CmpIPredicate::eq, remainder, cZeroL);
+      Value isRealBoundary = arith::CmpIOp::create(
+          b, loc, arith::CmpIPredicate::sge, completed, cGroupL);
+      Value laggedBoundary =
+          arith::AndIOp::create(b, loc, atBoundary, isRealBoundary);
+      scf::IfOp laggedIf = scf::IfOp::create(b, loc, laggedBoundary,
+                                             /*withElseRegion=*/false);
+      // The wait first, at the top of the lagged block: it is the publish's
+      // proof (the group's tiles have all RETIRED -- retire happens only
+      // after the bound section returns), and the publish is what it
+      // unblocks. The target is `mPrev + 1`: the tiles of the group the
+      // block publishes end at mPrev, and retire-count mPrev+1 covers
+      // exactly those.
       OpBuilder pb(b.getContext());
-      pb.setInsertionPointToStart(&publishIf.getThenRegion().front());
-      Value waited = arith::AddIOp::create(pb, loc, mInd, cOne);
-      Value target = arith::IndexCastOp::create(pb, loc, i32, waited);
-      func::CallOp::create(pb, loc, waitFn, ValueRange{target});
-    }
-    // After the loop: the tail publish names the tail rows, whose end is
-    // the tile count -- the wait lands immediately before it (and after
-    // the tail submit below, which is the order that makes it satisfiable).
-    for (func::CallOp publish : m.tailPublishes) {
-      b.setInsertionPoint(publish);
-      Value target = arith::ConstantIntOp::create(b, loc, m.mt, 32);
-      func::CallOp::create(b, loc, waitFn, ValueRange{target});
+      pb.setInsertionPointToStart(&laggedIf.getThenRegion().front());
+      Value waitTarget = arith::IndexCastOp::create(pb, loc, i32, completed);
+      func::CallOp::create(pb, loc, waitFn, ValueRange{waitTarget});
+      // The rowStart subtraction the matcher verified (`iv - (G-1)`) is the
+      // one operand the lag re-bases; everything else in the block moves
+      // untouched.
+      arith::SubIOp rowSub;
+      for (Operation &op : ifOp.getThenRegion().front()) {
+        auto sub = dyn_cast<arith::SubIOp>(op);
+        if (sub && sub.getLhs() == mInd &&
+            foldIndex(sub.getRhs()).value_or(-1) == m.readoutGroup - 1) {
+          rowSub = sub;
+          break;
+        }
+      }
+      assert(rowSub && "rowStart form validated at match time");
+      // The boundary block's own ops -- the read-out split's stores and
+      // call -- MOVE into the lagged block (not re-created), so whatever
+      // that pass emits per publish rides along; only the rowStart's
+      // induction operand is re-based to one batch back.
+      Block &from = ifOp.getThenRegion().front();
+      Block &to = laggedIf.getThenRegion().front();
+      for (Operation &op :
+           llvm::make_early_inc_range(from.getOperations())) {
+        if (op.hasTrait<OpTrait::IsTerminator>())
+          continue;
+        op.moveBefore(to.getTerminator());
+      }
+      rowSub.setOperand(0, mPrev);
+      // The boundary block and its guard arithmetic leave; the guard's
+      // pieces die with the block unless something else reads them, which
+      // the dead-definer walk checks rather than assumes.
+      Value oldCondition = ifOp.getCondition();
+      ifOp.erase();
+      eraseDeadDefiners(oldCondition);
     }
   }
 
@@ -1741,12 +1998,47 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
     emitRoleSubmit(b, loc, submitFn, drainFn, descBuf, cTail,
                    arith::ConstantIntOp::create(b, loc, tailCount, 32));
   }
+  // THE CLAMPED GROUP (readout on): the last live in-loop group's publish,
+  // whose lagged position fell past the loop (`K*G + batch > upper`, K the
+  // live group count -- at most one group can fall out, the coverage gate's
+  // `G >= batch` is what guarantees it). Its lag target is the first submit
+  // boundary after the loop -- this tail submit -- so it publishes here,
+  // AFTER the submit and BEFORE the drain, keeping its wait: the vector
+  // thread chews this group while the engine finishes the tail batch, which
+  // is the same one-batch-lead the in-loop lagged publishes keep.
+  int64_t liveGroups =
+      m.publishIfs.empty() ? 0 : m.upper / m.readoutGroup;
+  bool clampedGroup =
+      !m.publishIfs.empty() && liveGroups >= 1 &&
+      liveGroups * m.readoutGroup + kRoleSubmitBatch > m.upper;
+  if (clampedGroup && tailCount > 0) {
+    for (const PublishSite &site : m.publishIfs) {
+      Value target = arith::ConstantIntOp::create(
+          b, loc, liveGroups * m.readoutGroup, 32);
+      func::CallOp::create(b, loc, waitFn, ValueRange{target});
+      emitFixedPublish(b, loc, module, site,
+                       liveGroups * m.readoutGroup - m.readoutGroup,
+                       m.readoutGroup);
+    }
+  }
   // The exit drain: the kernel does not return until every group's engine
-  // work has landed in `ar`, because `ar` is the caller's memory. After the
-  // read-out coexistence's tail wait it is trivially satisfied; it is
-  // emitted anyway because the ABI's contract is positional (before the
-  // kernel returns), not incidental.
+  // work has landed in `ar`, because `ar` is the caller's memory. It is the
+  // all-groups proof the tail publish's wait used to stand in for: the tail
+  // publish (and, in the serial no-tail-batch case below, the clamped
+  // group's publish) sits behind it with no wait of its own.
   func::CallOp::create(b, loc, drainFn, ValueRange{});
+  // The clamped group when there is NO tail batch to lag to (the serial
+  // form with `Mt % batch == 0`): its lagged position does not exist, so
+  // this publish IS the last batch's, and the drain just proved everything
+  // retired -- it publishes here with no wait. (There is no tail publish in
+  // this case either: `Mt % batch == 0` with the gate's `batch | G` forces
+  // `Mt % G == 0`, so the read-out split's tail range is empty.)
+  if (clampedGroup && tailCount == 0) {
+    for (const PublishSite &site : m.publishIfs)
+      emitFixedPublish(b, loc, module, site,
+                       liveGroups * m.readoutGroup - m.readoutGroup,
+                       m.readoutGroup);
+  }
   // The inline read-outs are MOVED, not dropped: each is cloned into a
   // fresh loop after the exit drain (the only producer-side point where
   // every tile's engine work is provably done -- the consumer owns `ar`

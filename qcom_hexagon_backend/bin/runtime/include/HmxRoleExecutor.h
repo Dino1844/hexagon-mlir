@@ -192,8 +192,15 @@ void hexagon_runtime_hmx_role_drain(void);
 /// statement (retire happens only after the section returns,
 /// HmxSpscRing.h's ownership model) at per-group granularity, which is exactly
 /// the upgrade "same semantics, finer grain" the review asked for. The
-/// producer-side order the compiler emits is submit(i) ... wait_retired(i+1)
-/// ... publish(i): the wait is the proof, the publish is what it unblocks.
+/// producer-side order the compiler emits is submit(batch k+1) ...
+/// wait_retired(batch k's last row + 1) ... publish(batch k): the wait
+/// is the proof, the publish is what it unblocks, and the publish LAGS
+/// the submit frontier by one batch. The first emission waited for the
+/// batch it had just submitted (lag zero), which serialized the producer
+/// behind the engine -- measured +10 us on S1 (r2r3-ab-2026-10-09) -- so
+/// the lag is load-bearing: waiting for already-submitted, almost-
+/// certainly-retired tiles costs nothing, while waiting for the batch
+/// just handed over parks the only thread that could keep the engine fed.
 ///
 /// PARK POLICY: identical to drain -- a bounded spin (kPollCount), then
 /// qurt_futex_wait on the ring's `tail` word with a re-check before the park

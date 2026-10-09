@@ -19,20 +19,35 @@
 // publishes, and thread-role-partition splits what is left. What this file
 // pins is the composed mechanism, in order:
 //
-//   SPLIT     the two-role form with readout coexistence: the steady loop
-//             keeps the DMA ring and pack (into the rotating rows), the
-//             engine nest is GONE, and the in-loop order inside one
-//             iteration is submit(batch) -> wait_retired(m+1) ->
-//             publish(group) -- the protocol chain the R2 mechanism exists
-//             to establish, with the wait as the per-group completion proof
-//             that replaces the first form's exit-drain proof. The peeled
-//             epilogue: await, pack into rows[Mt-1], the tail submit (which
-//             carries the peeled tile as its last descriptor -- the
-//             "peel tail into the section" property), the tail wait, then
-//             the read-out split's tail publish. One work function covers
-//             every tile: its per-tile loop derives the row from the
-//             descriptor's rowStart, so the peeled tile is just the last
-//             descriptor.
+//   SPLIT     the two-role form with the read-out coexistence, LAGGED one
+//             submit batch: the steady loop keeps the DMA ring and pack
+//             (into the rotating rows), the engine nest is GONE, and the
+//             in-loop order inside one iteration is submit(batch) ->
+//             wait_retired(previous boundary + 1) -> publish(previous
+//             batch's group). The publish of the group ending at tile m
+//             fires at iteration m + batch -- the NEXT submit boundary --
+//             so the wait targets a batch the ring has had for a full batch
+//             of iterations (the zero-lag form waited on the batch the same
+//             iteration had just submitted, serializing producer behind
+//             engine: +10.0 us / +27% on the S1-class shape, see
+//             docs/results/r2r3-ab-2026-10-09.md and the emission comment in
+//             ThreadRolePartition.cpp). The peeled epilogue: await, pack
+//             into rows[Mt-1], the tail submit (which carries the peeled
+//             tile as its last descriptor -- the "peel tail into the
+//             section" property), the exit drain, then the read-out split's
+//             tail publish with NO wait of its own: behind the drain, every
+//             group is provably retired, which is the proof the tail wait
+//             used to stand in for. One work function covers every tile:
+//             its per-tile loop derives the row from the descriptor's
+//             rowStart, so the peeled tile is just the last descriptor.
+//   SPLIT12   the same pipeline on a 12-tile shape (384x64x1024, Mt=12),
+//             where the steady loop actually REACHES publish boundaries: the
+//             lagged publish fires in the loop (at iv=7, publishing group
+//             [0..4) behind wait_retired(4)), and the LAST live group
+//             [4..8) CLAMPS -- its lagged position (iv=11) is past the
+//             loop, so it publishes at the tail-submit boundary instead,
+//             keeping its wait_retired(8): submit -> wait -> publish ->
+//             drain -> tail publish (rows [8..12), no wait) -> exec drain.
 //   WIRE      the same shape through convert-func-to-llvm and hmx-to-llvm:
 //             the exported entry point and depth object, the thread
 //             contract on the work function, and -- load-bearing for the
@@ -44,10 +59,12 @@
 //             emitted (nothing in the loop reads `ar`, so there is nothing
 //             to prove to). The declaration may exist; a call may not.
 //   DECLINE   the coverage gate: a read-out batch (2) finer than the role
-//             submit batch (4) would make the producer wait for tiles the
-//             ring has not been handed -- a deadlock, so the split declines
-//             loudly and the kernel keeps the single-thread pipeline with
-//             its read-out intact.
+//             submit batch (4) puts publishes at iterations that are not
+//             submit boundaries (and could clamp several groups past the
+//             loop at once) -- a form the lagged emission's position
+//             argument does not describe, so the split declines loudly and
+//             the kernel keeps the single-thread pipeline with its read-out
+//             intact.
 //   OFF       the byte-laziness arm: the same shape with
 //             thread-role-partition absent. No submit, no drain, no wait,
 //             no work function, no handoff record.
@@ -95,13 +112,30 @@
 // SPLIT: memref.subview {{.*}}[{{.*}}, 0, 0, 0, 0] [1, 32, 16, 32, 2]
 // SPLIT: hmx.pack_act
 
-// THE PROTOCOL CHAIN, in emission order inside one steady iteration: the
-// batched submit (with its short-return recovery), then the granular
-// barrier, then the publish. The wait is the R2 mechanism's whole point --
-// "publish only after the engine section of every tile the publish names has
-// RETIRED", the per-group upgrade of the first form's exit-drain proof.
+// THE LAGGED PROTOCOL CHAIN, in emission order inside one steady iteration:
+// the batched submit (with its short-return recovery), then the lagged
+// publish-if. Its guard is the read-out split's boundary test evaluated one
+// batch late -- mPrev = iv - batch, boundary = (mPrev+1) % G == 0 -- plus
+// `mPrev+1 >= G`, which keeps the first boundary publishless (group 0
+// publishes at the SECOND boundary; at mPrev+1 = 0 the remainder test holds
+// but the group would start below row 0). Inside: the wait -- target
+// mPrev+1, the previous boundary's group end, one full batch behind the
+// iteration, so the engine has been chewing it since before the producer
+// packed this batch -- then the boundary block's own stores and call, with
+// the rowStart re-based to mPrev - (G-1). (This 4-tile fixture never
+// reaches a boundary -- the loop stops at m=2 -- so the block is statically
+// present and dynamically dead; SPLIT12 below exercises it firing.)
 // SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
-// SPLIT: call @hexagon_runtime_hmx_role_wait_retired({{.*}}) : (i32) -> ()
+// SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: %[[MPREV:.*]] = arith.subi %{{.*}}, %{{.*}} : index
+// SPLIT: %[[DONE:.*]] = arith.addi %[[MPREV]], %{{.*}} : index
+// SPLIT: %{{.*}} = arith.remsi %[[DONE]], %{{.*}} : index
+// SPLIT: %{{.*}} = arith.cmpi sge, %[[DONE]], %{{.*}} : index
+// SPLIT: %[[LAG:.*]] = arith.andi %{{.*}}, %{{.*}} : i1
+// SPLIT: scf.if %[[LAG]] {
+// SPLIT: %[[TGT:.*]] = arith.index_cast %[[DONE]] : index to i32
+// SPLIT: call @hexagon_runtime_hmx_role_wait_retired(%[[TGT]]) : (i32) -> ()
+// SPLIT: %[[ROW:.*]] = arith.subi %[[MPREV]], %{{.*}} : index
 // SPLIT: call @hexagon_runtime_hmx_exec_publish({{.*}}, {{.*}}) : (i32, i32) -> i32
 // SPLIT: scf.yield
 
@@ -116,17 +150,19 @@
 // descriptor (rowStart 3 rides the same 24-byte descriptor as every other
 // tile -- the section's (rows, wt, bias, ar, m0, count) signature covers it
 // with no special case). Then the kernel's own exit barrier (the role
-// drain: no section writes into caller memory after it returns), the tail
-// wait (target = the tile count: every tile retired -- trivially satisfied
-// behind the drain, emitted anyway because the publish's proof is the
-// wait, not the drain), the read-out split's tail publish, and the vector
-// drain (the read-out's own barrier, before the AR release).
+// drain: no section writes into caller memory after it returns), the
+// read-out split's tail publish, and the vector drain (the read-out's own
+// barrier, before the AR release). NO tail wait any more: the drain is the
+// all-groups proof -- and on this 4-tile shape no clamped group exists
+// (the loop never reaches a publish boundary, so the tail publish is the
+// only one after the loop).
 // SPLIT: hmx.await
 // SPLIT: memref.subview {{.*}}[{{.*}}] [1, 32, 16, 32, 2]
 // SPLIT: hmx.pack_act
 // SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
 // SPLIT: call @hexagon_runtime_hmx_role_drain() : () -> ()
-// SPLIT: call @hexagon_runtime_hmx_role_wait_retired({{.*}}) : (i32) -> ()
+// SPLIT: call @hexagon_runtime_hmx_role_drain() : () -> ()
+// SPLIT-NOT: call @hexagon_runtime_hmx_role_wait_retired
 // SPLIT: call @hexagon_runtime_hmx_exec_publish({{.*}}, {{.*}}) : (i32, i32) -> i32
 // SPLIT: call @hexagon_runtime_hmx_exec_drain() : () -> ()
 
@@ -187,16 +223,19 @@
 
 // == The coverage gate decline == -------------------------------------------
 //
-// A read-out batch of 2 against a submit batch of 4: the publish at m=1
-// would wait for tiles 0..1 whose descriptors are only submitted at m=3 --
-// a deadlock, so the split declines with the reason named, and the kernel
-// keeps the single-thread pipelined form WITH its read-out (the publish
-// machinery is still there; the role machinery is not).
+// A read-out batch of 2 against a submit batch of 4: the lagged publish
+// rides the submit boundary AFTER its group (submit(batch k+1) -> wait ->
+// publish(batch k)), which only exists when every publish boundary is also
+// a submit boundary -- and a G finer than the submit batch could also
+// clamp several groups past the loop at once. So the split declines with
+// the reason named, and the kernel keeps the single-thread pipelined form
+// WITH its read-out (the publish machinery is still there; the role
+// machinery is not).
 // DECLINE: func.func @deep_k(
 // DECLINE: call @hexagon_runtime_hmx_exec_publish
 // DECLINE-NOT: call @hexagon_runtime_hmx_role_submit
 // DECLINE-NOT: __hmx_role_section
-// DECLINE-MSG: remark: thread-role split not applied: the read-out publishes every 2 tiles but the role submit batches every 4; a publish boundary the submit does not cover would wait for tiles the ring never received (deadlock). The kernel keeps the single-thread pipeline with its read-out intact
+// DECLINE-MSG: remark: thread-role split not applied: the read-out publishes every 2 tiles but the role submit batches every 4; the lagged publish rides the submit boundary after its group, which only exists when every publish boundary is a submit boundary. The kernel keeps the single-thread pipeline with its read-out intact
 
 // == The byte-laziness arm == -------------------------------------------
 //
@@ -210,6 +249,61 @@
 // OFF-LABEL: func.func @deep_k(
 // OFF: hmx.mma
 // OFF: call @hexagon_runtime_hmx_exec_publish
+
+// == The 12-tile shape: the lagged publish FIRES, and the clamped group ==
+// ========================================================================
+//
+// The 4-tile fixture above never reaches a publish boundary, so its lagged
+// block is statically present but dynamically dead. This section is the
+// same pipeline on a shape that does: 384x64x1024, Mt=12, steady loop
+// m=0..10 (upper 11), live publish boundaries at m=3 and m=7, tail rows
+// [8..12).
+//
+// The lagged publish fires ONCE in the loop, at iv=7: it publishes group
+// [0..4) (rowStart = 7-4-3 = 0) behind wait_retired(4) -- one full batch
+// after that group's own boundary, which is the whole point of the lag.
+// Group [4..8) CLAMPS: its lagged position (iv=11) is past the loop, so it
+// publishes at the tail-submit boundary instead -- after the tail submit
+// (which hands the engine tiles [8..12)), before the exit drain, keeping
+// its wait_retired(8): the vector thread chews rows [4..8) while the
+// engine finishes the tail batch. The tail publish (rows [8..12)) follows
+// the drain with NO wait: the drain is the all-groups proof. Rows
+// published: [0..4) in-loop, [4..8) clamped, [8..12) tail -- every row
+// exactly once.
+// SPLIT-LABEL: func.func @deep_k12(
+// The steady loop's own submit, then the lagged publish-if (the same
+// structure as the 4-tile fixture's, firing here at iv=7).
+// SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: %[[MPREV2:.*]] = arith.subi %{{.*}}, %{{.*}} : index
+// SPLIT: %[[DONE2:.*]] = arith.addi %[[MPREV2]], %{{.*}} : index
+// SPLIT: %{{.*}} = arith.remsi %[[DONE2]], %{{.*}} : index
+// SPLIT: %[[LAG2:.*]] = arith.andi %{{.*}}, %{{.*}} : i1
+// SPLIT: scf.if %[[LAG2]] {
+// SPLIT: %[[TGT2:.*]] = arith.index_cast %[[DONE2]] : index to i32
+// SPLIT: call @hexagon_runtime_hmx_role_wait_retired(%[[TGT2]]) : (i32) -> ()
+// SPLIT: %[[ROW2:.*]] = arith.subi %[[MPREV2]], %{{.*}} : index
+// SPLIT: call @hexagon_runtime_hmx_exec_publish({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: scf.yield
+// The epilogue's tail submit (tiles [8..12), the peeled tile 11 included),
+// then the CLAMPED group: wait_retired(8) -- K*G with K=2 live groups --
+// and the publish of rows [4..8) (rowStart 4, rowCount 4).
+// SPLIT: call @hexagon_runtime_hmx_role_submit({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: %[[W8:.*]] = arith.constant 8 : i32
+// SPLIT: call @hexagon_runtime_hmx_role_wait_retired(%[[W8]]) : (i32) -> ()
+// SPLIT: %[[RS4:.*]] = arith.constant 4 : index
+// SPLIT: %[[RS4I:.*]] = arith.index_cast %[[RS4]] : index to i32
+// SPLIT: memref.store %[[RS4I]], %{{.*}}[%{{.*}}] : memref<6xi32>
+// SPLIT: call @hexagon_runtime_hmx_exec_publish({{.*}}, {{.*}}) : (i32, i32) -> i32
+// The exit drain, then the tail publish of rows [8..12) (rowStart 8) with
+// NO wait between them, then the vector drain.
+// SPLIT: call @hexagon_runtime_hmx_role_drain() : () -> ()
+// SPLIT-NOT: call @hexagon_runtime_hmx_role_wait_retired
+// SPLIT: %[[RS8:.*]] = arith.constant 8 : index
+// SPLIT: %[[RS8I:.*]] = arith.index_cast %[[RS8]] : index to i32
+// SPLIT: memref.store %[[RS8I]], %{{.*}}[%{{.*}}] : memref<6xi32>
+// SPLIT: call @hexagon_runtime_hmx_exec_publish({{.*}}, {{.*}}) : (i32, i32) -> i32
+// SPLIT: call @hexagon_runtime_hmx_exec_drain() : () -> ()
 
 module attributes {hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{dtypes = {crouton = "f16", lhs = "f16", out = "f16", rhs = "f16"}, execution = {block_m = 128 : i64, blocking = "whole", bridge_counts = {count_semantics = "ir_sites", pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, unpack_sites = 1 : i64}}, full = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, function = "deep_k", id = 0 : i64, layout = "row-major-inner-contiguous", logical = {k = {kind = "static", value = 1024 : i64}, m = {kind = "static", value = 128 : i64}, n = {kind = "static", value = 64 : i64}}, padded = {k = 1024 : i64, m = 128 : i64, n = 64 : i64}, plan = "full-hmx", reason = "selected-aligned", shape_state = "static", tail = {k = 0 : i64, m = 0 : i64, n = 0 : i64}, vtcm_accounting = "bridge-only", vtcm_before_bytes = 0 : i64, vtcm_bridge_peak_bytes = 532480 : i64, vtcm_budget_bytes = 8388608 : i64, weight_binding = {kind = "argument-slot", policy_ref = {function = "deep_k", slot = 1 : i64}}, workspace_class = "runtime-internal"}], pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, schema = "hex.hmx.kernel_manifest/v2", unpack_sites = 1 : i64, weight_policies = []}} {
 func.func @deep_k(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>, %out: memref<128x64xf16>) {
@@ -241,6 +335,47 @@ func.func @deep_k(%a: memref<128x1024xf16>, %w: memref<1024x64xf16>, %out: memre
   memref.dealloc %ca : memref<4x32x16x32x2xf16, 1>
   memref.dealloc %cw : memref<2x32x16x32x2xf16, 1>
   memref.dealloc %ar : memref<4x2x16x32x2xf16, 1>
+  return
+}
+}
+
+// -----
+
+// The 12-tile shape (Mt=12): the lagged publish FIRES and the last live
+// group CLAMPS; see the SPLIT12 block at the top of this file. The fixture
+// is the 4-tile one with M=384 (12 m-tiles); everything else -- Kt=32,
+// Nt=2, the hoistable read-out -- is identical.
+module attributes {hmx.kernel_manifest = {count_semantics = "ir_sites", matmuls = [{dtypes = {crouton = "f16", lhs = "f16", out = "f16", rhs = "f16"}, execution = {block_m = 384 : i64, blocking = "whole", bridge_counts = {count_semantics = "ir_sites", pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, unpack_sites = 1 : i64}}, full = {k = 1024 : i64, m = 384 : i64, n = 64 : i64}, function = "deep_k12", id = 0 : i64, layout = "row-major-inner-contiguous", logical = {k = {kind = "static", value = 1024 : i64}, m = {kind = "static", value = 384 : i64}, n = {kind = "static", value = 64 : i64}}, padded = {k = 1024 : i64, m = 384 : i64, n = 64 : i64}, plan = "full-hmx", reason = "selected-aligned", shape_state = "static", tail = {k = 0 : i64, m = 0 : i64, n = 0 : i64}, vtcm_accounting = "bridge-only", vtcm_before_bytes = 0 : i64, vtcm_bridge_peak_bytes = 532480 : i64, vtcm_budget_bytes = 8388608 : i64, weight_binding = {kind = "argument-slot", policy_ref = {function = "deep_k12", slot = 1 : i64}}, workspace_class = "runtime-internal"}], pack_act_sites = 1 : i64, pack_weight_sites = 1 : i64, schema = "hex.hmx.kernel_manifest/v2", unpack_sites = 1 : i64, weight_policies = []}} {
+func.func @deep_k12(%a: memref<384x1024xf16>, %w: memref<1024x64xf16>, %out: memref<384x64xf16>) {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %c4 = arith.constant 4 : index
+  %c12 = arith.constant 12 : index
+  %c32 = arith.constant 32 : index
+  %c384 = arith.constant 384 : index
+  %c1024 = arith.constant 1024 : index
+  %ca = memref.alloc() : memref<12x32x16x32x2xf16, 1>
+  scf.for %i = %c0 to %c384 step %c1 {
+    %r = arith.divui %i, %c32 : index
+    %cc = arith.remui %i, %c32 : index
+    hmx.pack_act ins(%a, %r, %cc : memref<384x1024xf16>) outs(%ca : memref<12x32x16x32x2xf16, 1>) {hmx.decision_id = 0 : i64}
+  }
+  %cw = memref.alloc() : memref<2x32x16x32x2xf16, 1>
+  scf.for %i = %c0 to %c1024 step %c2 {
+    %r = arith.divui %i, %c2 : index
+    %cc = arith.remui %i, %c2 : index
+    hmx.pack_weight ins(%w, %r, %cc : memref<1024x64xf16>) outs(%cw : memref<2x32x16x32x2xf16, 1>) {hmx.decision_id = 0 : i64}
+  }
+  %ar = memref.alloc() : memref<12x2x16x32x2xf16, 1>
+  hmx.matmul ins(%ca, %cw : memref<12x32x16x32x2xf16, 1>, memref<2x32x16x32x2xf16, 1>)
+             outs(%ar : memref<12x2x16x32x2xf16, 1>) {hmx.decision_id = 0 : i64}
+  scf.for %i = %c0 to %c12 step %c1 {
+    %r = hmx.unpack_acc ins(%ar, %i, %c0 : memref<12x2x16x32x2xf16, 1>) outs(%out : memref<384x64xf16>) {count = 16 : i64, hmx.decision_id = 0 : i64} -> memref<384x64xf16>
+  }
+  memref.dealloc %ca : memref<12x32x16x32x2xf16, 1>
+  memref.dealloc %cw : memref<2x32x16x32x2xf16, 1>
+  memref.dealloc %ar : memref<12x2x16x32x2xf16, 1>
   return
 }
 }
