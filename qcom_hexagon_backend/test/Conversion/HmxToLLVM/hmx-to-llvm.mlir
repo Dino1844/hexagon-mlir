@@ -284,6 +284,9 @@ func.func @bridge_offset(%base: memref<128x64xf16>, %o: index,
 // address is base + row * stride(0) * elemBytes, and the wait takes the token
 // the start returned. There is no out-of-range branch and no token sentinel --
 // the runtime's real tokens start at 0, so 0 cannot mean "no transfer".
+// The transfer itself is the 2D entry, one 32-row rectangle per tile; see
+// stage-strided-src-2d.mlir for why a 1D run of the slot's bytes is not that
+// rectangle on a strided source.
 // A function that only stages and awaits issues no HMX instruction, so it needs
 // no engine ensure/unlock: the calls are plain DMA. (A kernel that also runs
 // `hmx.mma` still gets the pair; see @tile.)
@@ -291,22 +294,24 @@ func.func @bridge_offset(%base: memref<128x64xf16>, %o: index,
 // Source address = src base + descriptor offset, then row * 1024 * 2 bytes.
 // CHECK: %[[ROW_I64:.*]] = builtin.unrealized_conversion_cast %arg3 : index to i64
 // CHECK: %[[ROW:.*]] = llvm.trunc %[[ROW_I64]] : i64 to i32
-// CHECK: %[[STRIDE:.*]] = llvm.mlir.constant(1024 : i32)
-// CHECK: %[[ROW_STRIDE:.*]] = llvm.mul %[[ROW]], %[[STRIDE]] : i32
+// CHECK: %[[COLS:.*]] = llvm.mlir.constant(1024 : i32)
 // CHECK: %[[ESZ:.*]] = llvm.mlir.constant(2 : i32)
-// CHECK: %[[ROW_BYTES:.*]] = llvm.mul %[[ROW_STRIDE]], %[[ESZ]] : i32
+// width = cols * elemBytes, height = one crouton tile.
+// CHECK: %[[WIDTH:.*]] = llvm.mul %[[COLS]], %[[ESZ]] : i32
+// CHECK: %[[HEIGHT:.*]] = llvm.mlir.constant(32 : i32)
+// srcStride = the source's row stride (1024, dense) * elemBytes.
+// CHECK: %[[ESZ2:.*]] = llvm.mlir.constant(2 : i32)
+// CHECK: %[[STRIDE_BYTES:.*]] = llvm.mul %[[COLS]], %[[ESZ2]] : i32
+// CHECK: %[[ROW_BYTES:.*]] = llvm.mul %[[ROW]], %[[STRIDE_BYTES]] : i32
 // CHECK: %[[SRC_BASE:.*]] = llvm.add %{{.*}}, %{{.*}} : i32
 // CHECK: %[[SRC_ADDR:.*]] = llvm.add %[[SRC_BASE]], %[[ROW_BYTES]] : i32
-// Length = the slot's 32768 elements * 2 bytes.
-// CHECK: %[[LEN_ELEMS:.*]] = llvm.mlir.constant(32768 : i32)
-// CHECK: %[[LEN:.*]] = llvm.mul %[[LEN_ELEMS]], %{{.*}} : i32
 // The source is DDR (space 0), the slot VTCM (space 1), the status a pointer.
 // CHECK: %[[SRC_PTR:.*]] = llvm.inttoptr %[[SRC_ADDR]] : i32 to !llvm.ptr
 // CHECK: %[[SRC_SPACE:.*]] = llvm.mlir.constant(0 : i32)
 // CHECK: %[[DST_PTR:.*]] = llvm.inttoptr %{{.*}} : i32 to !llvm.ptr
 // CHECK: %[[DST_SPACE:.*]] = llvm.mlir.constant(1 : i32)
 // CHECK: %[[STATUS_PTR:.*]] = llvm.inttoptr %{{.*}} : i32 to !llvm.ptr
-// CHECK: %[[TOKEN:.*]] = llvm.call @hexagon_runtime_dma_start(%[[SRC_PTR]], %[[SRC_SPACE]], %[[DST_PTR]], %[[DST_SPACE]], %[[LEN]], {{.*}}, {{.*}}, %[[STATUS_PTR]]) : (!llvm.ptr, i32, !llvm.ptr, i32, i32, i32, i32, !llvm.ptr) -> i32
+// CHECK: %[[TOKEN:.*]] = llvm.call @hexagon_runtime_dma2d_start(%[[SRC_PTR]], %[[SRC_SPACE]], %[[DST_PTR]], %[[DST_SPACE]], %[[WIDTH]], %[[HEIGHT]], %[[STRIDE_BYTES]], %[[WIDTH]], {{.*}}, {{.*}}, {{.*}}, {{.*}}, %[[STATUS_PTR]]) : (!llvm.ptr, i32, !llvm.ptr, i32, i32, i32, i32, i32, i32, i32, i32, i32, !llvm.ptr) -> i32
 // The wait is unconditional: one call on the token the start returned, with no
 // `icmp`/`cf` sentinel branch.
 // CHECK: llvm.call @hexagon_runtime_dma_wait(%[[TOKEN]]) : (i32) -> ()

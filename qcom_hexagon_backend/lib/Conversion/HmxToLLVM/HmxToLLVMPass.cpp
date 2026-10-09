@@ -19,6 +19,7 @@
 // to this runtime.
 //===----------------------------------------------------------------------===//
 
+#include "hexagon/Common/Common.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxExternalFnNames.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxLeafSignatures.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
@@ -1872,25 +1873,6 @@ static LogicalResult verifyStaticTailLayout(Operation *op, MemRefType type,
   return success();
 }
 
-/// The element count of a memref as an i32. A static shape is a constant; a
-/// dynamic one is the product of the descriptor's sizes.
-static Value memrefNumElements(ConversionPatternRewriter &rewriter,
-                               Location loc, Value memrefDesc,
-                               MemRefType type) {
-  auto i32Ty = rewriter.getI32Type();
-  if (type.hasStaticShape())
-    return LLVM::ConstantOp::create(
-        rewriter, loc, i32Ty,
-        rewriter.getI32IntegerAttr(type.getNumElements()));
-  MemRefDescriptor desc(memrefDesc);
-  Value n = LLVM::ConstantOp::create(rewriter, loc, i32Ty,
-                                     rewriter.getI32IntegerAttr(1));
-  for (unsigned i = 0; i < type.getRank(); ++i)
-    n = LLVM::MulOp::create(rewriter, loc, i32Ty, n,
-                            toI32(rewriter, loc, desc.size(rewriter, loc, i)));
-  return n;
-}
-
 /// The runtime's `AddrSpace` for a memref: the memref's own memory space (0 =
 /// DDR, 1 = VTCM), which is exactly the enum. `fallback` is used when the
 /// memref has no space attribute, so the lowering never silently invents a
@@ -1901,27 +1883,28 @@ static int64_t memrefAddressSpace(MemRefType type, int64_t fallback) {
   return fallback;
 }
 
-/// Declare (once) the DMA start entry the `hmx.stage` op lowers to. The
-/// signature is the one DMAToLLVMPass declares for the same symbol: the pointer
-/// arguments are real `!llvm.ptr`s (the host data layout widens them), while
-/// the address spaces and the two bypass flags travel as i32.
+/// The DMA 2D start entry the `hmx.stage` op lowers to. The signature is the
+/// one DMAToLLVMPass declares for the same symbol: the pointer arguments are
+/// real `!llvm.ptr`s (the host data layout widens them), while the address
+/// spaces, the two bypass flags, `isOrdered` and the cache allocation policy
+/// travel as i32.
 ///
 /// Spelled out here rather than looked up: the DMA ABI is DMAToLLVMPass's
 /// contract, and HmxLeafSignatures.h deliberately has no row for it so the
 /// leaf table never becomes a second opinion about the DMA signature.
 static FailureOr<LLVM::LLVMFuncOp>
-getDmaStartLeaf(ModuleOp module, ConversionPatternRewriter &rewriter) {
+getDma2DStartLeaf(ModuleOp module, ConversionPatternRewriter &rewriter) {
   MLIRContext *context = module->getContext();
   auto ptrTy = LLVM::LLVMPointerType::get(context);
   auto i32Ty = rewriter.getI32Type();
-  return LLVM::lookupOrCreateFn(rewriter, module, getStageDmaStartFnName(),
+  return LLVM::lookupOrCreateFn(rewriter, module, getStageDma2DStartFnName(),
                                 {ptrTy, i32Ty, ptrTy, i32Ty, i32Ty, i32Ty, i32Ty,
-                                 ptrTy},
+                                 i32Ty, i32Ty, i32Ty, i32Ty, i32Ty, ptrTy},
                                 i32Ty);
 }
 
 /// The DMA wait entry `hmx.await` lowers to: `void dma_wait(i32 token)`. Same
-/// reason as getDmaStartLeaf for not consulting the leaf table.
+/// reason as getDma2DStartLeaf for not consulting the leaf table.
 static FailureOr<LLVM::LLVMFuncOp>
 getDmaWaitLeaf(ModuleOp module, ConversionPatternRewriter &rewriter) {
   auto voidTy = LLVM::LLVMVoidType::get(module->getContext());
@@ -2740,16 +2723,26 @@ struct LowerUnpackAccF32 : public ConvertOpToLLVMPattern<UnpackAccF32Op> {
   }
 };
 
-/// `hmx.stage` -> `hexagon_runtime_dma_start(src_row, DDR, slot, VTCM,
-/// slot_bytes, 0, 0, status)`, returning the DMA token. The slot is filled by
-/// one 1D DMA, so the source is addressed as `base + row * stride(0) *
-/// elemBytes`: the memref's *real* row stride, not its width, otherwise a
-/// source that is one tile of a wider matrix starts at the wrong column. The
-/// length is the destination's element count in bytes (the whole slot is
-/// filled).
+/// `hmx.stage` -> `hexagon_runtime_dma2d_start(src_row, DDR, slot, VTCM, width,
+/// height, srcStride, dstStride, bypassSrc, bypassDst, isOrdered, cap, status)`,
+/// returning the DMA token.
+///
+/// The transfer is a 2D one: a `kTileEdge` x `srcCols` rectangle, each row read
+/// at the source's own row stride and written into the slot at the column width.
+/// The op's contract *is* that rectangle (HmxOps.td: "lowering 按源自身的 row
+/// stride 缩放"), so the strides travel per axis and nothing is assumed about
+/// the source being contiguous. A 1D run of `slotBytes` bytes would satisfy the
+/// same total length only when the rows happen to be packed back to back; on a
+/// source that is one tile of a wider matrix (row stride > width) it walks off
+/// the tile into the neighbouring columns and the engine contracts a sheared
+/// activation -- measured on the device as a uniform ~2% relative error on the
+/// 2048^3 A shape, root-caused bit for bit in
+/// docs/analysis/a-kloop-rel-investigation-2026-10-09.md. The 2D form degenerates
+/// to exactly that 1D movement when the stride equals the width (dense source),
+/// so there is no layout branch here and no shape special case.
 ///
 /// `row` is an element row offset into `src` (not a tile index); the verifier
-/// pins `src` to a static rank-2 f16 memref. The op issues its transfer
+/// pins `src` to a static rank-2 f16/f32 memref. The op issues its transfer
 /// unconditionally: the partition pass keeps every row in range (its pipelined
 /// kernel stops one iteration short per pipeline stage and the peeled tail only
 /// awaits and computes, staging nothing), so there is no out-of-range case to
@@ -2767,7 +2760,7 @@ struct LowerStage : public ConvertOpToLLVMPattern<StageOp> {
     auto i32Ty = rewriter.getI32Type();
     auto ptrTy = LLVM::LLVMPointerType::get(context);
 
-    auto fn = getDmaStartLeaf(module, rewriter);
+    auto fn = getDma2DStartLeaf(module, rewriter);
     if (failed(fn))
       return failure();
 
@@ -2781,44 +2774,57 @@ struct LowerStage : public ConvertOpToLLVMPattern<StageOp> {
                                       rewriter.getI32IntegerAttr(v));
     };
 
-    // Source address: descriptor base+offset, then the row's byte offset. The
-    // row stride comes from the operand's own layout (dense falls back to the
-    // width); the verifier pins a static source, so the column count is a
+    // Source geometry: the row's byte offset, and the tile's own width/stride in
+    // bytes. The row stride comes from the operand's layout (dense falls back to
+    // the width); the verifier pins a static source, so the column count is a
     // constant and the dense `memref<MxK>` emits stride(0) == K == width.
     Value row = toI32(rewriter, loc, adaptor.getRow());
     Value srcCols = cst(srcType.getDimSize(1));
     Value srcStride;
     if (failed(rowStride(rewriter, loc, srcType, adaptor.getSrc(), srcCols, op, srcStride)))
       return failure();
-    Value rowBytes = LLVM::MulOp::create(
-        rewriter, loc, i32Ty,
-        LLVM::MulOp::create(rewriter, loc, i32Ty, row, srcStride),
-        cst(srcElemBytes));
+    Value widthBytes =
+        LLVM::MulOp::create(rewriter, loc, i32Ty, srcCols, cst(srcElemBytes));
+    Value height = cst(layout::kTileEdge);
+    Value srcStrideBytes = LLVM::MulOp::create(rewriter, loc, i32Ty, srcStride,
+                                               cst(srcElemBytes));
+    Value rowBytes = LLVM::MulOp::create(rewriter, loc, i32Ty, row,
+                                         srcStrideBytes);
     Value srcAddr = LLVM::AddOp::create(
         rewriter, loc, i32Ty,
         asAddress(rewriter, loc, adaptor.getSrc(), srcElemBytes), rowBytes);
 
     // Destination and status are write-through pointers. The DMA address spaces
     // are the memrefs' own memory spaces (0 = DDR, 1 = VTCM), which is exactly
-    // the runtime's AddrSpace enum.
+    // the runtime's AddrSpace enum. The slot is one contiguous crouton tile, so
+    // its row distance is the width.
     Value dstAddr = asAddress(rewriter, loc, adaptor.getDst(), dstElemBytes);
     int64_t statusElemBytes =
         cast<MemRefType>(op.getStatus().getType()).getElementTypeBitWidth() / 8;
     Value statusAddr =
         asAddress(rewriter, loc, adaptor.getStatus(), statusElemBytes);
-    Value lengthBytes = LLVM::MulOp::create(
-        rewriter, loc, i32Ty,
-        memrefNumElements(rewriter, loc, adaptor.getDst(), dstType),
-        cst(dstElemBytes));
+
+    // `bypassCache` per endpoint: the descriptor's snoop-and-invalidate is
+    // redundant on an endpoint that is not cacheable memory at all, and must be
+    // kept on a DDR one (RuntimeDMA.cc; the reference implementation in
+    // llama.cpp/ggml-hexagon uses the same "VTCM endpoint -> 1, else 0" rule).
+    auto bypassCache = [&](MemRefType type, int64_t fallback) -> Value {
+      return cst(memrefAddressSpace(type, fallback) == hexagon::VTCM_ADDRESS_SPACE ? 1 : 0);
+    };
 
     SmallVector<Value> args{
         LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, srcAddr),
         cst(memrefAddressSpace(srcType, 0)),
         LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, dstAddr),
         cst(memrefAddressSpace(dstType, 1)),
-        lengthBytes,
-        cst(0), // bypassCacheSrc: the source may be cached DDR
-        cst(0), // bypassCacheDst
+        widthBytes,
+        height,
+        srcStrideBytes,
+        widthBytes, // dstStride
+        bypassCache(srcType, 0),
+        bypassCache(dstType, 1),
+        cst(0), // isOrdered
+        cst(0), // cacheAllocationPolicy
         LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, statusAddr)};
 
     // The call's i32 token is the loop-carried handle: the value an external

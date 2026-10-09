@@ -70,10 +70,10 @@ std::string hmx::getPackWeightTailF32TFnName() {
   return "hmx_pack_weight_tail_f32_T";
 }
 
-// The staging ops are DMA runtime calls, so the names are the DMA ones; see the
-// header for why they are re-exported here.
-std::string hmx::getStageDmaStartFnName() {
-  return mlir::hexagon::getDMAStartFnName();
+// The staging op is a DMA runtime call, so the name is the DMA one; see the
+// header for why it is re-exported here.
+std::string hmx::getStageDma2DStartFnName() {
+  return mlir::hexagon::getDMA2DStartFnName();
 }
 std::string hmx::getAwaitDmaWaitFnName() {
   return mlir::hexagon::getDMAWaitFnName();

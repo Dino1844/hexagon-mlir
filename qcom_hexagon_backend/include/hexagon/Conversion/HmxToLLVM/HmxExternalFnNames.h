@@ -63,10 +63,10 @@ std::string getPackWeightTailF32TFnName();
 // `hmx.stage` / `hmx.await` deliberately reuse the existing DMA runtime entries
 // (the interface plan fixes the cost at "the same one call as today's
 // memref.dma_start/dma_wait"), and those symbols live in the DMA table rather
-// than in libhmxapi.a. The forwarders below keep this file the single source of
-// hmx runtime symbol names and make that reuse explicit instead of having the
+// than in libhmxapi.a. The forwarder below keeps this file the single source of
+// hmx runtime symbol names and makes that reuse explicit instead of having the
 // lowering reach across into the DMA table.
-std::string getStageDmaStartFnName();
+std::string getStageDma2DStartFnName();
 std::string getAwaitDmaWaitFnName();
 
 } // namespace hmx

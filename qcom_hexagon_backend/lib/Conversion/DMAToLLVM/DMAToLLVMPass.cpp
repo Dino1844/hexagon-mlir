@@ -236,8 +236,16 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
   // Get the source and destination memory spaces
   auto srcMemSpace = getI32Constant(rewriter, loc, isVTCM(srcMemref) ? 1 : 0);
   auto dstMemSpace = getI32Constant(rewriter, loc, isVTCM(dstMemref) ? 1 : 0);
-  // Set the bypass cache flag to 0
-  auto bypassCache = getI32Constant(rewriter, loc, 0);
+  // The bypass flags are taken per endpoint, never shared: the descriptor's
+  // "snoop and invalidate" is redundant on an endpoint that is not cacheable
+  // memory at all (VTCM) and must be kept on a DDR one, where skipping it
+  // would break coherence (bin/runtime/UserDMA/RuntimeDMA.cc; the same rule
+  // the reference implementation in llama.cpp's dma-queue.h uses:
+  // `src_bypass = dma_is_vtcm(ptr) ? 1 : q->nocache`). A DDR endpoint
+  // therefore stays 0, exactly as before.
+  auto bypassCache = [&](Value memref) -> Value {
+    return getI32Constant(rewriter, loc, isVTCM(memref) ? 1 : 0);
+  };
   // Status out-word: a slot of its own (createDMAStatusSlot). The tag below
   // carries the token only -- status and token must never be the same word.
   Value statusPtr = createDMAStatusSlot(rewriter, loc, op);
@@ -284,8 +292,8 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
                 height,
                 srcStrideInBytes,
                 dstStrideInBytes,
-                bypassCache,
-                bypassCache,
+                bypassCache(srcMemref),
+                bypassCache(dstMemref),
                 getI32Constant(rewriter, loc, 0), // isOrdered
                 getI32Constant(rewriter, loc, 0), // Cache Allocation Policy
                 statusPtr};
@@ -293,7 +301,8 @@ LowerDMAStart::matchAndRewrite(memref::DmaStartOp op, OpAdaptor adaptor,
     dmaStartFnName = mlir::hexagon::getDMAStartFnName();
     funcOp = getDMAStartFn(module, dmaStartFnName, rewriter);
     operands = {llvmSrcPtr,   srcMemSpace, llvmDstPtr,  dstMemSpace,
-                transferSize, bypassCache, bypassCache, statusPtr};
+                transferSize, bypassCache(srcMemref), bypassCache(dstMemref),
+                statusPtr};
   }
   // Erase the original operation
   rewriter.eraseOp(op);
