@@ -11,10 +11,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
 from .. import parameterize_func_name
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 ATOL_FP32 = 1e-5
 

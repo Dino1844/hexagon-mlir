@@ -12,10 +12,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
 from .. import parameterize_func_name
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 # 1e-2 is the minimum power of 10 which passes for the fp16 variant
 ATOL = 1e-2

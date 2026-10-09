@@ -10,9 +10,6 @@
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 NUM_ELEMENTS = 131072
 NUM_THREADS = 4

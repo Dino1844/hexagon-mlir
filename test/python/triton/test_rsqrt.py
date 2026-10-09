@@ -10,10 +10,7 @@
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
 from triton.language.extra import libdevice
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 
 @triton.jit

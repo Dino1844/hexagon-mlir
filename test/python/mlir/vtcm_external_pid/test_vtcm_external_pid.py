@@ -21,11 +21,8 @@
 import pytest
 import os
 import subprocess
-import sys
 import tempfile
 import textwrap
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from triton.backends.qcom_hexagon_backend.mlir_launcher import MLIRHexagonLauncher
 from triton.backends.qcom_hexagon_backend.compiler import HexagonOptions

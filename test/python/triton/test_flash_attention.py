@@ -13,9 +13,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 Z, H, N_CTX, D_HEAD = 1, 1, 1024, 64
 BLOCK_N = 64

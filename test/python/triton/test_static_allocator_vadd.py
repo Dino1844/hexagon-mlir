@@ -18,9 +18,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 
 @triton.jit

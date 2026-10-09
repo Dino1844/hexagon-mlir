@@ -12,9 +12,6 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 # 2e-1 is the minimum ATOL where the matmul test succeeds
 ATOL = 2e-1

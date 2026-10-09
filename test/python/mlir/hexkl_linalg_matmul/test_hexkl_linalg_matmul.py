@@ -9,10 +9,7 @@
 
 import pytest
 import os
-import sys
 
-# Add parent directory to path to import mlir_test_utils
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from mlir_test_utils import run_mlir_kernel_test
 
 

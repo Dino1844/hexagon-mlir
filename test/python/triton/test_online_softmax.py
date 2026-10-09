@@ -13,10 +13,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from triton.backends.qcom_hexagon_backend.driver import HexagonDriver
 from .. import parameterize_func_name
-
-triton.runtime.driver.set_active(HexagonDriver())
 
 CONSTANTS = {"NUM_ROWS": 128, "NUM_COLS": 128}
 
