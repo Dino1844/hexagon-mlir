@@ -344,10 +344,14 @@ public:
     pm.addNestedPass<func::FuncOp>(createDecomposeTensorConcatPass());
     if (forceHVXCroutonization) {
       pm.addNestedPass<func::FuncOp>(createForceHVXCroutonPass());
+      // setExtendPack unconditionally assigns upperFrontier from the
+      // extendPackUpperFrontier option (default true), so it would clobber a
+      // designated initializer: run the wrapper first and force upper=false
+      // afterwards, otherwise this path silently runs with upper=true.
+      auto forceExtendPackOpts = setExtendPack(HexagonExtendPackOptions{});
+      forceExtendPackOpts.upperFrontier = false;
       pm.addNestedPass<func::FuncOp>(
-          createHexagonExtendPackPass(setExtendPack(HexagonExtendPackOptions{
-              .upperFrontier = false,
-          })));
+          createHexagonExtendPackPass(forceExtendPackOpts));
     }
 
     pm.addNestedPass<func::FuncOp>(createLowerPackPass());

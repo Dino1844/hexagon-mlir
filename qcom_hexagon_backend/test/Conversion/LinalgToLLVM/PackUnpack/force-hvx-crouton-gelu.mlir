@@ -40,7 +40,9 @@ module {
 
 // --- pack ops ---
 // CHECK: linalg.pack
+// CHECK-SAME: inner_dims_pos = [1, 2, 3] inner_tiles = [8, 4, 32]
 // CHECK: linalg.pack
+// CHECK-SAME: inner_dims_pos = [5] inner_tiles = [2]
 
 // --- main generic op ---
 // CHECK: linalg.generic
