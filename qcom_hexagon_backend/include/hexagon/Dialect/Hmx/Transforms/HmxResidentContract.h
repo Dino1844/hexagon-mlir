@@ -112,6 +112,15 @@ inline constexpr StringLiteral kHmxResidentImmutableGlobal =
 /// resident kind; its stable identity is recorded separately in the sidecar.
 inline constexpr uint64_t kHmxWorkspaceResidentKeyTag = uint64_t(1) << 63;
 
+/// Hash domain of the workspace compatibility key (function symbol name plus
+/// the allocation's index within that function).  It deliberately does not take
+/// the module principal: the key must be the same for the same kernel
+/// regardless of which module name the compile observed.  Keeping its own
+/// schema keeps it out of `residentSiteIdentity`'s domain, where adding the
+/// function name alone would be a different (much shorter) message.
+inline constexpr StringLiteral kHmxWorkspaceResidentKeySchema =
+    "hmx.workspace-key/fnv1a64/v1";
+
 /// Keep producer descriptors within the VTCM allocator's supported alignment
 /// range (nonzero powers of two up to the 2048-byte quantum).
 inline bool isSupportedResidentAlignment(int64_t alignment) {

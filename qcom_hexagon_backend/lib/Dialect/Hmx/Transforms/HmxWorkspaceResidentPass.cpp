@@ -347,7 +347,20 @@ struct HmxWorkspaceResidentPass
     // diagnostic that changed the key distribution would measure a different
     // kernel than production.  The stronger principal/function/site identity
     // is published in the provenance record (site_id/function_id) instead.
-    uint64_t hash = llvm::hash_value(func.getSymName());
+    //
+    // Hash the symbol *bytes*, and hash them with the contract's FNV-1a helper
+    // (not `llvm::hash_value`): `llvm::hash_value` seeds every hash with
+    // `get_execution_seed()`, which in a build with
+    // LLVM_ENABLE_ABI_BREAKING_CHECKS (ours) is the address of a libLLVMSupport
+    // function, so the same name hashes differently in every process.  Measured
+    // 2026-10-10: five host compiles of the same kernel produced five different
+    // key values, while the key has to name the same buffer in each of them.
+    // (This line used to be read as hashing a StringAttr's impl pointer;
+    // `FuncOp::getSymName()` returns a StringRef already, so the value hashed
+    // was always the name -- the seed was the defect.)
+    uint64_t hash = kHmxResidentHashOffset;
+    hashResidentPart(hash, kHmxWorkspaceResidentKeySchema);
+    hashResidentPart(hash, func.getSymName());
 
     MLIRContext *context = func.getContext();
     auto i64 = IntegerType::get(context, 64);
