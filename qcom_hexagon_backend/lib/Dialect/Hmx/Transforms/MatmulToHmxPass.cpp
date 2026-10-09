@@ -62,6 +62,7 @@
 #include "HmxVtcmLedger.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -1272,6 +1273,173 @@ Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
   return generic.getResult(0);
 }
 
+/// One link of the pure conversion chain that can carry a contraction result
+/// to the kernel boundary. Both recognised forms forward the value without
+/// touching memory and without recomputing any of it:
+///
+///  * a `linalg.generic` whose body is a single float cast, with identity
+///    indexing maps, all-parallel iterators, one input and one init -- the
+///    narrowing an f32 accumulator pays before an f16 store (the widening
+///    mirror of the shape `FoldCastsIntoMatmul` recognises on the way in);
+///  * a `tensor.extract_slice` -- the sub-region a masked store addresses. The
+///    tile's logical shape is what this rewrite preserves, so the slice still
+///    describes the same elements once its source is the read-out tile.
+///
+/// Anything else -- an elementwise compute, a transpose, a reduction, a
+/// broadcast, a `tensor.insert_slice` -- is not a link: what it produces is no
+/// longer the engine's fp16 image of the accumulator, so the chain is refused.
+static bool isPureConversionLink(Operation *op) {
+  if (isa<tensor::ExtractSliceOp>(op))
+    return true;
+  auto generic = dyn_cast<linalg::GenericOp>(op);
+  if (!generic || !generic.hasPureTensorSemantics())
+    return false;
+  if (generic.getNumDpsInputs() != 1 || generic.getNumDpsInits() != 1)
+    return false;
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }))
+    return false;
+  if (!llvm::all_of(generic.getIteratorTypesArray(),
+                    [](utils::IteratorType it) {
+                      return it == utils::IteratorType::parallel;
+                    }))
+    return false;
+  Block &body = generic.getRegion().front();
+  if (body.getOperations().size() != 2) // the cast and the yield
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(body.back());
+  if (!yield || yield->getNumOperands() != 1)
+    return false;
+  Operation *cast = yield->getOperand(0).getDefiningOp();
+  return cast && isa<arith::ExtFOp, arith::TruncFOp>(cast) &&
+         isa<BlockArgument>(cast->getOperand(0));
+}
+
+/// The kernel boundary: the op that hands the value to the outside world. A
+/// `bufferization.materialize_in_destination` is a store (Triton's `tl.store`
+/// lowers to it, never to a `func.return`), a `func.return` the kernel result
+/// itself.
+static bool isKernelBoundary(Operation *op) {
+  return isa<bufferization::MaterializeInDestinationOp, func::ReturnOp>(op);
+}
+
+/// The element type the kernel boundary reads from `v`, or a null Type when the
+/// path from `v` to the boundary is not a pure conversion chain (see
+/// `isPureConversionLink`) or when the paths disagree: a value the boundary
+/// reads both directly and through a chain is read at two different widths, and
+/// one epilogue cannot serve both. With no user at all there is no boundary to
+/// serve. Otherwise the answer is what the last link in the chain produces --
+/// the fp16 image when the boundary stores one, the accumulator's own width
+/// when it does not.
+static Type boundaryElementType(Value v, int depth = 0) {
+  if (depth > 8)
+    return {};
+  auto type = dyn_cast<RankedTensorType>(v.getType());
+  if (!type)
+    return {};
+  Type elem;
+  for (Operation *user : v.getUsers()) {
+    if (isKernelBoundary(user)) {
+      if (elem && elem != type.getElementType())
+        return {};
+      elem = type.getElementType();
+      continue;
+    }
+    if (!isPureConversionLink(user))
+      return {};
+    for (Value result : user->getResults()) {
+      Type downstream = boundaryElementType(result, depth + 1);
+      if (!downstream || (elem && elem != downstream))
+        return {};
+      elem = downstream;
+    }
+  }
+  return elem;
+}
+
+/// True when the kernel boundary reads the engine's fp16 read-out and nothing
+/// in between computes on a wider value: the epilogue may then hand the tile it
+/// already produced straight to the store, and the widen it would otherwise run
+/// -- plus the narrowing cast that widen feeds -- is an identity round trip.
+/// A residual keeps the wide form: the C term has to be added after the
+/// read-out, and adding it to the fp16 tile instead of the widened image
+/// changes the rounding.
+static bool boundaryReadsFp16Image(Operation *op, RankedTensorType outType,
+                                   Value residual) {
+  if (!dtype::isF32(outType.getElementType()) || residual)
+    return false;
+  Type elem = boundaryElementType(op->getResult(0));
+  return elem && dtype::isCroutonElement(elem);
+}
+
+/// Hands `tile` -- the engine's fp16 read-out -- straight to the kernel
+/// boundary by rewriting the pure conversion chain that carried the
+/// contraction result there, and erases the chain's links: with the boundary
+/// reading the fp16 image, the narrowing cast that produced that image from a
+/// widened copy is an identity, and so is the widening the copy needed.
+///
+/// The substitution point is the chain value whose type the tile already has
+/// (walking back from the boundary until the types agree), so the op the
+/// rewrite touches keeps the operand types it had. Returns false, with the IR
+/// untouched, when the chain is not pure or holds no such value.
+static bool foldChainToTile(RewriterBase &b, Operation *op, Value tile) {
+  Value result = op->getResult(0);
+  if (!llvm::all_of(result.getUsers(), [](Operation *user) {
+        return isKernelBoundary(user) || isPureConversionLink(user);
+      }))
+    return false;
+
+  // Walk the chain, recording its values, its links in source order (erasing
+  // them in reverse is then a topological erase) and its boundaries.
+  SmallVector<Value> chain{result};
+  SmallVector<Operation *> links;
+  SmallVector<Operation *> boundaries;
+  SmallVector<Value> frontier{result};
+  while (!frontier.empty()) {
+    Value v = frontier.pop_back_val();
+    for (Operation *user : v.getUsers()) {
+      if (isKernelBoundary(user)) {
+        boundaries.push_back(user);
+        continue;
+      }
+      links.push_back(user);
+      for (Value linked : user->getResults()) {
+        chain.push_back(linked);
+        frontier.push_back(linked);
+      }
+    }
+  }
+  // A chain that reaches no boundary has nothing to fold into.
+  if (boundaries.empty())
+    return false;
+
+  // The tile replaces the chain value whose type it already has; every use of
+  // that value becomes a use of the tile, which is what makes the links
+  // downstream of it dead. A cast narrows the element type and a slice
+  // narrows the shape, so walking back from the boundary until the types agree
+  // always names such a value -- or refuses when none exists.
+  SmallVector<Value> targets;
+  for (Operation *boundary : boundaries)
+    for (OpOperand &operand : boundary->getOpOperands())
+      if (llvm::is_contained(chain, operand.get())) {
+        Value v = operand.get();
+        while (v.getType() != tile.getType()) {
+          Operation *def = v.getDefiningOp();
+          if (!def || !llvm::is_contained(links, def))
+            return false; // no chain value has the tile's type: cannot rewire
+          v = def->getOpOperand(0).get();
+        }
+        targets.push_back(v);
+      }
+
+  for (Value v : targets)
+    b.replaceAllUsesWith(v, tile);
+  for (Operation *link : llvm::reverse(links))
+    if (link->use_empty())
+      b.eraseOp(link);
+  return true;
+}
+
 /// The epilogue shared by the whole and the M-blocked forms: turn the engine's
 /// fp16 read-out `ar` (a crouton array over `outType`'s logical shape) back
 /// into a row-major tensor, widening and adding `residual` (the original
@@ -1280,22 +1448,39 @@ Value addInto(OpBuilder &b, Location loc, Value lhs, Value rhs) {
 /// result that escapes unconsumed, so this keeps that narrow by construction.
 /// A `residual` that is not a dense internal buffer keeps the descriptor-based
 /// `addInto` (see `isDenseInternal`).
-static Value emitEpilogue(RewriterBase &b, Location loc, Value ar,
-                          RankedTensorType outType, Value residual,
-                          bool canFuseTail, int64_t decisionId) {
+///
+/// The result is the value the contraction's users should see. When the kernel
+/// boundary reads the engine's fp16 image (see `boundaryReadsFp16Image`) that
+/// is the fp16 tile itself and `boundaryFolded` says the boundary was rewired
+/// to consume it -- in which case the contraction op is left with no user and
+/// its caller must erase it rather than replace it.
+struct EpilogueResult {
+  Value value;
+  bool boundaryFolded = false;
+};
+
+static EpilogueResult emitEpilogue(RewriterBase &b, Location loc,
+                                   Operation *op, Value ar,
+                                   RankedTensorType outType, Value residual,
+                                   bool canFuseTail, int64_t decisionId) {
   if (dtype::isF32(outType.getElementType()) && fusedTailLegal(outType) &&
       canFuseTail && (!residual || isDenseInternal(residual)))
-    return unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
-                            residual);
+    return {unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
+                             residual),
+            false};
 
   auto f16Out = RankedTensorType::get(outType.getShape(), b.getF16Type());
   Value result =
       unpackWithLeaves(b, loc, ar, f16Out, /*fused=*/false, decisionId);
-  if (dtype::isF32(outType.getElementType()))
+  if (dtype::isF32(outType.getElementType())) {
+    if (boundaryReadsFp16Image(op, outType, residual) &&
+        foldChainToTile(b, op, result))
+      return {result, true};
     result = widenToF32(b, loc, result);
+  }
   if (residual)
     result = addInto(b, loc, result, residual);
-  return result;
+  return {result, false};
 }
 
 /// The transposed weight view behind `rhs`, or `rhs` itself. The weight
@@ -1454,9 +1639,15 @@ static LogicalResult emitDiagnosticTailMatmul(Operation *op,
   // The normal epilogue bridge is deliberately left in the canonical loop form;
   // hmx-partition's marked diagnostic path owns the full/edge rewrite and is
   // the first consumer that gives its valid M/N extents to the unpack leaf.
-  Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
-                              empty ? Value{} : init, escapes, decision.id);
-  rewriter.replaceOp(op, result);
+  EpilogueResult epilogue =
+      emitEpilogue(rewriter, loc, op, matmul->getResult(0), outType,
+                   empty ? Value{} : init, escapes, decision.id);
+  if (epilogue.boundaryFolded)
+    // The boundary was rewritten to consume the epilogue directly, so the
+    // contraction's own result has no user left.
+    rewriter.eraseOp(op);
+  else
+    rewriter.replaceOp(op, epilogue.value);
   return success();
 }
 
@@ -1610,9 +1801,13 @@ struct MatmulToHmx : public RewritePattern {
       // when the result is f32 and the leaf contract holds by construction (see
       // `fusedTailLegal`); the residual is threaded only when it is dense by
       // construction, anything else keeps the old epilogue.
-      Value result = emitEpilogue(rewriter, loc, matmul->getResult(0), outType,
-                                  empty ? Value{} : init, escapes, decision.id);
-      rewriter.replaceOp(op, result);
+      EpilogueResult epilogue =
+          emitEpilogue(rewriter, loc, op, matmul->getResult(0), outType,
+                       empty ? Value{} : init, escapes, decision.id);
+      if (epilogue.boundaryFolded)
+        rewriter.eraseOp(op);
+      else
+        rewriter.replaceOp(op, epilogue.value);
       // The transpose's only user was this matmul; with the bridge reading its
       // input directly the view is dead, and one-shot bufferization does not
       // DCE -- leaving it would keep the very copy this rewrite removes.
@@ -1694,9 +1889,16 @@ struct MatmulToHmx : public RewritePattern {
                                           packedLhs, packedRhs, outEmpty,
                                           /*tail_plan=*/{});
       setDecisionId(matmul.getOperation(), decision.id);
-      Value blockResult =
-          emitEpilogue(rewriter, loc, matmul->getResult(0), blockOutType,
+      // The M-blocked form carries each block's read-out through the block
+      // loop, so the contraction's users are `tensor.insert_slice`s and the
+      // boundary fold -- which rewrites a pure conversion chain to a store --
+      // cannot apply: `isPureConversionLink` refuses a slice that inserts.
+      EpilogueResult epilogue =
+          emitEpilogue(rewriter, loc, op, matmul->getResult(0), blockOutType,
                        residual, escapes, decision.id);
+      assert(!epilogue.boundaryFolded &&
+             "blocked contraction cannot fold its boundary chain");
+      Value blockResult = epilogue.value;
 
       Value inserted =
           tensor::InsertSliceOp::create(rewriter, loc, blockResult, carried,
