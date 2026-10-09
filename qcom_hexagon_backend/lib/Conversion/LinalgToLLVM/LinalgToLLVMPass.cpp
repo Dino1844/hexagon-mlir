@@ -176,16 +176,6 @@ public:
       return passOption;
     };
 
-    auto setAllowReturnAllocs = [&](auto passOption) {
-      passOption.allowReturnAllocsFromLoops = true;
-      return passOption;
-    };
-
-    auto setBufferizeFunctionBoundaries = [&](auto passOption) {
-      passOption.bufferizeFunctionBoundaries = true;
-      return passOption;
-    };
-
     auto setLWP = [&](auto passOption) {
       passOption.disableLWPLoop = disableLWPLoop;
       passOption.LWPloopDepth = LWPloopDepth;

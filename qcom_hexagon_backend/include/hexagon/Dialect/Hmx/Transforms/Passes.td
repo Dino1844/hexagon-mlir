@@ -315,13 +315,14 @@ def HmxVectorReadout : InterfacePass<"hmx-vector-readout",
     the vector thread never reads freed VTCM and the caller never observes the
     destination before it is written.
 
-    KNOWN INCOMPLETE: the three runtime entry points are called, but the
-    `configure` call that hands the executor its function pointer is NOT emitted
-    -- a function's address is not expressible before `convert-func-to-llvm`
-    (`llvm.mlir.addressof` rejects a `func.func` symbol). The pass is therefore
-    off by default and the kernel is not runnable until that call is emitted from
-    a pass that runs after the func-to-llvm conversion. See the comments on
-    `kReadoutFnPrefix` in the implementation.
+    The `configure` call that hands the executor its function pointer cannot
+    be emitted by this pass -- a function's address is not expressible before
+    `convert-func-to-llvm` (`llvm.mlir.addressof` rejects a `func.func` symbol)
+    -- so it is emitted by `HmxToLLVMPass::wireVectorReadout` (through
+    `wireConfigureCalls`), which runs after the func-to-llvm conversion. That
+    was the only thing that once kept the pass off by default; it is on by
+    default since 2026-10-04 (the `enable-hmx-vector-readout` option of
+    `LinalgToLLVMPass`).
   }];
 
   let options = [
