@@ -24,6 +24,7 @@
 
 #include <cassert>
 #include <functional>
+#include <mutex>
 
 namespace hexagon {
 namespace userdma {
@@ -43,6 +44,25 @@ private:
 
   uint32_t tail = 0; // next allocation index
   uint32_t head = 0; // next free index
+
+  // Guards head/tail. The only mutation point is alloc(), which therefore
+  // takes this lock for its whole body (reservation of `tail` + the free-scan
+  // that advances `head`); size()/isFull() read head/tail and are only ever
+  // called from inside that critical section (no external callers today).
+  // Same primitive as the rest of the runtime (VTCMPool/BufferManager/
+  // HexagonThreadPool): plain std::mutex + std::lock_guard; no new dependency.
+  //
+  // Lock granularity & deadlock argument: the lock covers *all* of alloc(),
+  // including the busy-wait over inFlight() when the ring is full — head must
+  // not be scanned by two threads at once, and a partially-updated head/tail
+  // is exactly what lets two callers reserve the same token or spin forever in
+  // isFull(). While held, alloc() calls only the inFlight callback, and that
+  // callback polls DMA registers (dmpoll()) — it takes no lock and never
+  // re-enters the ring. So this mutex is a leaf: a holder waits on hardware,
+  // never on another software lock, and callers may hold their own outer lock
+  // (UserDMA::enqueueMutex_) on entry — the order outer -> ring is the only
+  // direction that exists, hence no cycle and no deadlock.
+  std::mutex ringMutex_;
 
 public:
   /*! Creates a ring buffer for storage items of type T
@@ -78,7 +98,10 @@ public:
 
   //! allocates an entry in ring buffer and returns the entry
   //! token identifier for the allocated entry
+  //! Thread-safe: the whole body (isFull/free-scan/`tail` reservation) runs
+  //! under ringMutex_; see that member for granularity and deadlock reasoning.
   T *alloc(uint32_t &token) {
+    std::lock_guard<std::mutex> lock(ringMutex_);
     while (isFull()) { // Loop as long as the queue is full
       uint32_t numFreed = 0;
       uint32_t sampledSize = size();

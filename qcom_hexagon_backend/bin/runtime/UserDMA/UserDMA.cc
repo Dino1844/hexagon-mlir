@@ -49,6 +49,9 @@ unsigned int UserDMA::init() { return dmpause() & DM0_STATUS_MASK; }
 uint32_t UserDMA::copy(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
                        uint32_t numBytes, bool bypassCacheSrc,
                        bool bypassCacheDst, DMAStatus *status) {
+  // Enqueue critical section: alloc + descriptor fill + dmstart/dmlink run as
+  // one unit (see enqueueMutex_ for scope and lock order).
+  std::lock_guard<std::mutex> lock(enqueueMutex_);
   // length limited to 24 bits
   if (numBytes > DESC_LENGTH_MASK) {
     *status = DMAFailure;
@@ -122,6 +125,11 @@ uint32_t UserDMA::copy2D(void *src, AddrSpace srcAS, void *dst, AddrSpace dstAS,
                          uint32_t dstStride, bool bypassCacheSrc,
                          bool bypassCacheDst, bool isOrdered,
                          uint32_t cacheAllocationPolicy, DMAStatus *status) {
+
+  // Enqueue critical section: alloc + descriptor fill + dmstart/dmlink (and
+  // the rejected-descriptor path) run as one unit (see enqueueMutex_ for
+  // scope and lock order).
+  std::lock_guard<std::mutex> lock(enqueueMutex_);
 
   *status = DMAFailure;
 

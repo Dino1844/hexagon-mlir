@@ -30,6 +30,7 @@
 #include "UserDMAInstructions.h"
 #include "UserDMARegisters.h"
 #include <cassert>
+#include <mutex>
 
 namespace hexagon {
 namespace userdma {
@@ -99,6 +100,21 @@ private:
   void *tailDMADesc = nullptr; // Tracks the tail DMA descriptor
 
   RingBuffer<DMADesc2D> *dmaQueue = nullptr; // Storage for all DMA descriptors
+
+  //! Serializes the whole enqueue path of copy()/copy2D(): ring alloc() +
+  //! descriptor population + the dmstart/dmlink link-list update
+  //! (isFirstDMA/tailDMADesc). Locking alloc() alone is not sufficient: the
+  //! slot it hands back is not yet marked in-flight, so a concurrent
+  //! alloc() free-scan could reclaim it mid-population (two writers on one
+  //! descriptor => one lost transfer), and two threads could both take the
+  //! isFirstDMA branch or dmlink against a stale tailDMADesc.
+  //! Lock order: enqueueMutex_ -> RingBuffer::ringMutex_ (only direction that
+  //! exists; the ring never takes this lock, its inFlight callback only polls
+  //! DMA registers), so the nesting cannot deadlock. wait() deliberately takes
+  //! no lock: it polls hardware until its own transfer completes and must not
+  //! be blocked behind unrelated enqueues (or behind an alloc() spinning on a
+  //! full ring).
+  std::mutex enqueueMutex_;
 };
 
 } // namespace userdma
