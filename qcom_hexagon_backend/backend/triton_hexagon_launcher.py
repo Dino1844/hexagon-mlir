@@ -26,6 +26,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
 )
 from triton.backends.qcom_hexagon_backend.utils import (
     enforce_hmx_launch_contract,
+    hmx_grid_notice,
     parse_triton_llvm_kernel_signature,
     profile_triton_inputs,
 )
@@ -565,7 +566,8 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         # an executor. In particular, a tail manifest is single-instance by
         # construction; rejecting grid>1 here prevents several closures from
         # sharing the diagnostic/runtime workspace before any device access.
-        enforce_hmx_launch_contract(hmx_manifest, launch_grid)
+        # The returned parsed manifest feeds the grid>1 HMX fact notice below.
+        manifest = enforce_hmx_launch_contract(hmx_manifest, launch_grid)
 
         resident_scope_id = make_resident_scope_id(kernel_obj_as_bytes, func_name)
         # Getting the input metadata for effective wrapper codegen.
@@ -673,6 +675,25 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         # already built; this dict only feeds wrapper codegen / executor knobs),
         # and the grid==1 wrapper is a direct call regardless
         # (multithreading_enabled == prod(grid) > 1), so neither flag is read.
+
+        # grid>1 with HMX on the manifest: state what that combination means
+        # before the wrapper is generated, because "more programs" reads as
+        # "parallel HMX matmuls" and the runtime provides no such thing (the
+        # engine section runs on one resident thread holding the HMX lock for
+        # life; the programs are either fresh threads per launch or a serial
+        # loop, decided by the same options dict the wrapper will read below).
+        # Facts and the one structural recommendation only -- no timing claims,
+        # because no grid-vs-HMX speedup has been measured here. Same shape as
+        # the CopyToDMA warning below: say it, then act is left to the user.
+        grid_notice = hmx_grid_notice(
+            manifest,
+            launch_grid,
+            func_name,
+            threaded_dispatch=bool(options["enableThreadedDispatch"])
+            or bool(options["enableMultiThreading"]),
+        )
+        if grid_notice is not None:
+            warnings.warn(grid_notice, stacklevel=2)
 
         # Temporary safety gate:
         # UserDMA-backed hexagonmem-copy lowering is unstable with Triton SPMD

@@ -539,7 +539,10 @@ static int64_t vtcmBytesCommitted(func::FuncOp func) {
 /// This is a finder, not a validator: the bridge is emitted by `matmul-to-hmx`,
 /// so the one structural fact the tile loop needs is that every producer of the
 /// array shares one source and one enclosing loop. The old body-shape whitelist
-/// is gone with the hand-written pipeline.
+/// is gone with the hand-written pipeline -- with one exception, `loop` below:
+/// claiming a loop to ERASE is not a decline but an ownership claim, and the
+/// only loop this finder may claim is the bridge's own (see
+/// `isBridgePackLoop`).
 struct ActivationBridge {
   Value src;                    // row-major source (the DDR side to stage)
   Value buffer;                 // the crouton buffer the array is built on
@@ -557,6 +560,45 @@ static SmallVector<PackActOp> packWriters(Value array) {
   return packs;
 }
 
+/// Whether `loop` IS the bridge's own pack loop -- whether it exists only to
+/// pack `act`, so retiring the bridge may retire the loop along with it.
+///
+/// This is an identification test, NOT a validator: a loop that fails it is not
+/// declined, it is simply not claimed, and its packs are retired one by one
+/// instead (the `!bridge->loop` arm of `emitStageLoop`'s cleanup). No shape
+/// stops staging because of this.
+///
+/// What it rules out is claiming a loop the bridge merely SITS inside.
+/// `matmul-to-hmx` wraps its pack in a loop over the bridge's outer tiles
+/// (`packCroutonsWithLeaves`), but canonicalization folds the single-tile case
+/// (`Mt == 1`) into a bare `hmx.pack_act`, and what then encloses the pack is
+/// the kernel's own loop -- the m/n/k loop the matmul runs in. The staged
+/// emitter builds its tile loop *inside* wherever the matmul sits and afterwards
+/// erases `bridge->loop` to retire the bridge; claiming the kernel's loop erases
+/// the kernel, the freshly built tile loop and the matmul's result write with
+/// it, and leaves behind a manifest that records a staged plan over an empty
+/// span (no pack, no mma, no output store). That is the silent-decay bug this
+/// test guards: a matmul under an N loop alone, `Mt == 1`.
+///
+/// The rule is `findPackBridge`'s, for the same reason on the serial arm: the
+/// body holds the bridge's packs and the index arithmetic feeding them, and
+/// anything else -- the kernel's fills and copies, a second bridge, the matmul
+/// itself -- makes it somebody else's loop, which is not this finder's to
+/// erase. A pack of another array counts as somebody else's.
+static bool isBridgePackLoop(scf::ForOp loop, Value act) {
+  for (Operation &inner : loop.getBody()->without_terminator()) {
+    if (auto pack = dyn_cast<PackActOp>(&inner)) {
+      if (pack.getDst() != act)
+        return false;
+      continue;
+    }
+    if (inner.getName().getDialectNamespace() == "arith")
+      continue;
+    return false;
+  }
+  return true;
+}
+
 std::optional<ActivationBridge> findActivationBridge(Value act) {
   SmallVector<PackActOp> packs;
   Value buffer = act;
@@ -564,8 +606,16 @@ std::optional<ActivationBridge> findActivationBridge(Value act) {
   if (act.getDefiningOp<memref::AllocOp>()) {
     // Canonicalized form: the packs write the allocation in place.
     packs = packWriters(act);
-    if (!packs.empty())
-      loop = packs.front()->getParentOfType<scf::ForOp>();
+    if (!packs.empty()) {
+      // The packs' nearest enclosing loop is the bridge's own loop only when
+      // the bridge still has one; a pack canonicalization left bare sits
+      // inside the kernel's loop, which is not ours to erase (see
+      // `isBridgePackLoop`). Unclaimed = unlooped bridge: same retirement
+      // path as a pack at the top level, packs erased individually.
+      scf::ForOp enclosing = packs.front()->getParentOfType<scf::ForOp>();
+      if (enclosing && isBridgePackLoop(enclosing, act))
+        loop = enclosing;
+    }
   } else if (auto carried = act.getDefiningOp<scf::ForOp>()) {
     // Carried form: the array is the pack loop's iter_arg, so the buffer is the
     // iter_arg's initial value (the allocation) and the producers write the
@@ -587,10 +637,13 @@ std::optional<ActivationBridge> findActivationBridge(Value act) {
 
   // The bridge is one source packed by every writer; an unrolled body just has
   // more writers of the same source. Writers of different sources into one
-  // array are not the bridge shape.
+  // array are not the bridge shape, and writers sitting in different loops are
+  // not one bridge this finder can retire as a unit -- the nearest enclosing
+  // loop of the first writer is the candidate every writer must share.
   Value src = packs.front().getSrc();
+  scf::ForOp enclosing = packs.front()->getParentOfType<scf::ForOp>();
   for (PackActOp p : packs)
-    if (p.getSrc() != src || p->getParentOfType<scf::ForOp>() != loop)
+    if (p.getSrc() != src || p->getParentOfType<scf::ForOp>() != enclosing)
       return std::nullopt;
   return ActivationBridge{src, buffer, loop, packs};
 }

@@ -1445,6 +1445,259 @@ def hmx_fallback_notice(manifest, kernel_name=None):
 
 
 # ---------------------------------------------------------------------------
+# Launch-time readers
+# ---------------------------------------------------------------------------
+# The compile-time notice above answers "did this kernel silently lose HMX?"
+# at the one point every compilation passes through. It cannot answer the
+# questions a user asks at LAUNCH time, and each of the three below has already
+# produced a wrong conclusion in this repository:
+#
+#   REFUSAL       -- the per-site reasons, at the moment the launch is being
+#                    watched. The compile-time print runs only on a cache miss
+#                    and is buried in compile output
+#                    (docs/evidence/2026-10-01/
+#                    why-hmx-refusals-are-invisible-2026-10-01.md).
+#   PARTIAL       -- a function where some matmuls reached the engine and some
+#                    did not reads as "I got HMX" in every plan-only check
+#                    (the module-level PARTIAL verdict of
+#                    tools/hexmlir/manifest_verdict.py).
+#   CONTRADICTION -- a record claiming plan=full-hmx whose own
+#                    execution.bridge_counts say pack_act/pack_weight/unpack
+#                    are ALL 0. Those counts are recounted from the IR
+#                    (refreshHmxManifestBridgeCounts), so zero bridge sites
+#                    means no bridge op exists in the kernel: hmx-partition
+#                    emitted an empty HMX span while the manifest kept the
+#                    admitted plan -- the false green measured on n-loop-only
+#                    matmul structures (the TILES comment in
+#                    exp/hmx/op_bench/mm_user_shapes.py). The two halves of
+#                    such a record cannot both be true.
+#
+# Both functions below are pure and never raise, on the same terms as the
+# compile-time notice above: the judgment lives here so host tests can drive it
+# with synthetic manifests, and the emission (warnings.warn from the driver's
+# launch path) is the caller's job. The interpreter's default warning filter
+# deduplicates by message text, so repeated launches of a kernel print once --
+# that only holds if these messages carry nothing that varies per launch (no
+# reps, timestamps or addresses), which is why nothing here formats either.
+
+
+def _hmx_warning_name(kernel_name):
+    return f"{kernel_name}: " if isinstance(kernel_name, str) and kernel_name else ""
+
+
+def _hmx_warning_reason(record):
+    """The compiler's own reason for one record, never an invented spelling.
+
+    A missing reason is `reason unavailable` and an unrecognized one is
+    labelled unrecognized (via _hmx_summary_known), matching the
+    compile-time notice's vocabulary: a code this boundary does not know is
+    never quoted back as if the compiler had emitted it.
+    """
+    reason = record.get("reason")
+    if reason is None:
+        return "reason unavailable"
+    return _hmx_summary_known(
+        reason, HMX_PLAN_REASONS.get(record.get("plan"), frozenset())
+    )
+
+
+def _hmx_warning_site(record):
+    """`[#id function shape reason=...]` for one record in a launch warning."""
+    return (
+        f"[#{record.get('id', '?')} {record.get('function', '?')} "
+        f"{_hmx_summary_shape(record)} "
+        f"reason={_hmx_warning_reason(record)}]"
+    )
+
+
+def _hmx_parse_manifest(manifest):
+    """The manifest as a dict, or None.
+
+    The launch path holds the manifest as the JSON string the launcher itself
+    consumes (driver.py); host tests hand in the parsed dict. Either spelling
+    is accepted, and anything unreadable answers None rather than raising --
+    a warning that crashes the launch it is warning about would be worse than
+    no warning.
+    """
+    if isinstance(manifest, str):
+        try:
+            manifest = json.loads(manifest)
+        except (TypeError, ValueError):
+            return None
+    return manifest if isinstance(manifest, dict) else None
+
+
+def _hmx_bridge_sites_all_zero(record):
+    """True only for a readable full record whose three bridge counts are 0.
+
+    A missing execution/bridge_counts/count key is NOT a contradiction: it is
+    an unreadable record, and this check exists to catch a record that reads
+    clearly and disagrees with itself, not to guess at one that reads nothing.
+    """
+    execution = record.get("execution")
+    if not isinstance(execution, dict):
+        return False
+    counts = execution.get("bridge_counts")
+    if not isinstance(counts, dict):
+        return False
+    return all(
+        isinstance(counts.get(field), int) and counts.get(field) == 0
+        for field in ("pack_act_sites", "pack_weight_sites", "unpack_sites")
+    )
+
+
+def hmx_manifest_warnings(manifest, kernel_name=None):
+    """Launch-time warnings for HMX facts the manifest records but no path shows.
+
+    Returns a list of message strings, empty exactly when every contraction
+    site in the manifest reached the HMX engine and the manifest is
+    self-consistent about how. Three conditions, in this order:
+
+    * any site with plan=hvx  -> one REFUSAL message naming the kernel, each
+      refused site's id/function/shape and the compiler's own reason, and
+      saying plainly that those matmuls run on the HVX path instead of HMX;
+    * both hvx and non-hvx sites -> one PARTIAL message stating `k/n matmul(s)
+      on HMX`, so a mixed function cannot read as "HMX is on";
+    * every full-hmx record whose pack_act_sites, pack_weight_sites and
+      unpack_sites are all 0 -> one CONTRADICTION message per record: the
+      partition produced no HMX bridge sites (false green) and the matmul did
+      not execute on HMX.
+
+    Accepts the JSON string form or the parsed dict; an unreadable manifest,
+    no matmuls, or records this boundary cannot classify yield no warning
+    rather than an exception (a reporter that dies on its own input is worse
+    than silence). Records with an unrecognized plan are counted by neither
+    side: an unknown plan is not evidence of HMX use nor of refusal.
+    """
+    manifest = _hmx_parse_manifest(manifest)
+    if manifest is None:
+        return []
+    records = manifest.get("matmuls")
+    if not isinstance(records, list) or not records:
+        return []
+    refused = [
+        record
+        for record in records
+        if isinstance(record, dict)
+        and record.get("plan") in HMX_PLANS - HMX_NON_HVX_PLANS
+    ]
+    on_hmx = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("plan") in HMX_NON_HVX_PLANS
+    ]
+    total = len(records)
+    who = _hmx_warning_name(kernel_name)
+    messages = []
+
+    if refused:
+        sites = " ".join(_hmx_warning_site(record) for record in refused)
+        messages.append(
+            f"hmx: {who}HMX is not used for {len(refused)}/{total} matmul(s); "
+            f"they run on the HVX path, not on the HMX engine: {sites} "
+            f'-- per-site records: kernel.packed_metadata["hmx_manifest"]'
+        )
+    if refused and on_hmx:
+        messages.append(
+            f"hmx: {who}PARTIAL -- {len(on_hmx)}/{total} matmul(s) on HMX, "
+            f"{len(refused)} on HVX; 'this kernel uses HMX' is true only for "
+            f"the {len(on_hmx)} site(s) that reached the engine"
+        )
+    for record in on_hmx:
+        # Scope, not special-casing: the all-zero bridge-count contradiction
+        # has only ever been measured on plan=full-hmx records (the n-loop
+        # empty-span defect). An hmx-tail record's counts are not pinned by
+        # any measurement yet, so this checks exactly the claim that is known
+        # to be falsifiable -- widen it when a tail case is measured.
+        if record.get("plan") != "full-hmx":
+            continue
+        if not _hmx_bridge_sites_all_zero(record):
+            continue
+        messages.append(
+            f"hmx: {who}matmul #{record.get('id', '?')} "
+            f"{record.get('function', '?')} {_hmx_summary_shape(record)} "
+            f"claims plan=full-hmx, but its execution.bridge_counts are "
+            f"pack_act_sites=0, pack_weight_sites=0, unpack_sites=0: "
+            f"hmx-partition produced no HMX bridge sites (false green) -- "
+            f"no HMX work exists in this kernel, so this matmul did not "
+            f"execute on HMX"
+        )
+    return messages
+
+
+def hmx_grid_notice(manifest, launch_grid, kernel_name=None, *, threaded_dispatch=None):
+    """The grid>1-with-HMX facts a Triton programmer otherwise gets wrong.
+
+    Returns None unless BOTH hold: prod(launch_grid) > 1, and the manifest
+    claims at least one HMX site (plan in HMX_NON_HVX_PLANS). Those are the
+    conditions under which "more programs" is believed to mean "parallel HMX
+    matmuls", which the runtime does not provide:
+
+    * the HMX engine section runs on a single resident thread that holds the
+      HMX lock for life (HmxRoleExecutor), so programs never execute their
+      HMX matmuls in parallel, no matter how many there are;
+    * `threaded_dispatch` (the wrapper's tm.exec vs tm.exec_serial choice,
+      enableThreadedDispatch or enableMultiThreading) decides what the other
+      programs do: fresh qurt threads created and joined on every launch
+      (ThreadManager does not keep the thread pool alive), or one serial
+      loop. None means the caller does not know which, so the message states
+      both rather than guessing.
+
+    Facts only: no timing, no speedup, no comparison -- nothing here has been
+    measured as a ratio, so nothing here claims one. The message ends with
+    the one structural recommendation the mechanism supports: for HMX
+    matmuls, grid=1 with the tiling loop inside the kernel.
+    """
+    manifest = _hmx_parse_manifest(manifest)
+    if manifest is None:
+        return None
+    records = manifest.get("matmuls")
+    if not isinstance(records, list):
+        return None
+    on_hmx = [
+        record
+        for record in records
+        if isinstance(record, dict) and record.get("plan") in HMX_NON_HVX_PLANS
+    ]
+    if not on_hmx:
+        return None
+    if (
+        not isinstance(launch_grid, (tuple, list))
+        or len(launch_grid) != 3
+        or any(type(size) is not int or size < 1 for size in launch_grid)
+    ):
+        return None
+    programs = prod(launch_grid)
+    if programs <= 1:
+        return None
+
+    threads = (
+        f"each launch creates and joins {programs} fresh qurt threads "
+        "(ThreadManager does not keep the thread pool alive)"
+    )
+    serial = f"the {programs} instances run one after another in a serial loop"
+    if threaded_dispatch is True:
+        dispatch = threads
+    elif threaded_dispatch is False:
+        dispatch = f"{serial} (tm.exec_serial), not in parallel"
+    else:
+        dispatch = (
+            f"with threaded dispatch {threads}; without it {serial} "
+            f"(tm.exec_serial)"
+        )
+
+    who = _hmx_warning_name(kernel_name)
+    return (
+        f"hmx: {who}launch grid {tuple(launch_grid)} = {programs} program "
+        f"instance(s), but their {len(on_hmx)} HMX matmul site(s) do not run "
+        f"in parallel across programs: the HMX engine section executes on a "
+        f"single resident thread that holds the HMX lock for life "
+        f"(HmxRoleExecutor), and {dispatch}. For HMX matmuls prefer grid=1 "
+        f"with the tiling loop inside the kernel"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Record-only v3 consumer
 # ---------------------------------------------------------------------------
 # Every check below is exact-field and closed-enum.  There is no "fill in a

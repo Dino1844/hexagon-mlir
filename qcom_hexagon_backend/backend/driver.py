@@ -8,6 +8,7 @@
 # ===------------------------------------------------------------------------===
 
 import json
+import warnings
 
 from math import prod
 from triton.backends.driver import DriverBase
@@ -17,6 +18,7 @@ from triton.backends.qcom_hexagon_backend.triton_hexagon_launcher import (
     HexagonUtils,
 )
 from triton.backends.qcom_hexagon_backend.utils import make_profiled_return
+from triton.backends.qcom_hexagon_backend.utils import hmx_manifest_warnings
 from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata_fields
 from triton.backends.qcom_hexagon_backend.utils import summarize_hmx_manifest
 from triton.backends.qcom_hexagon_backend.utils import validate_hmx_record_json
@@ -176,6 +178,22 @@ def getHexagonLauncherClass():
             # Validated for diagnostics, then deliberately not forwarded: the
             # launcher keeps using the v2 execution child alone.
             self.hmx_record = self._load_hmx_record(pack_metadata)
+            # Launch-time visibility for what this kernel's manifest already
+            # records but no default path showed: refused sites with the
+            # compiler's own reasons, partial HMX coverage (`k/n on HMX`), and
+            # the self-contradictory full-hmx record whose bridge_counts are
+            # all zero -- hmx-partition emitted no HMX bridge sites, so the
+            # claimed HMX execution does not exist (false green). The judgment
+            # is the pure reporter in utils.py; this is only the emission.
+            # warnings.warn rather than print: the interpreter's default
+            # filter deduplicates by message text, so repeated launches of the
+            # same kernel warn once and stay quiet for kernels with nothing to
+            # report -- messages must therefore carry no per-launch content
+            # (the reporter keeps them free of reps/timestamps/addresses).
+            for _warning in hmx_manifest_warnings(
+                hmx_manifest, pack_metadata["name"]
+            ):
+                warnings.warn(_warning, stacklevel=2)
             num_fixed_args = 9
             inputs_with_constants = list(args[num_fixed_args:])
             inputs = [
