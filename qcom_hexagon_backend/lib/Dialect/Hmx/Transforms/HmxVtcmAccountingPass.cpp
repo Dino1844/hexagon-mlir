@@ -32,6 +32,12 @@
 #include "hexagon/Dialect/Hmx/Transforms/Passes.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
+// The one VTCM byte ledger. This pass is its strict superset: it reads every
+// population the ledger reads, splits them further, and re-derives the resident
+// declaration from the allocation sites as an independent check. What it shares
+// -- the declaration itself -- it reads through the ledger.
+#include "HmxVtcmLedger.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
@@ -3879,7 +3885,12 @@ struct HmxVtcmAccountingPass
         accounting.complete = false;
       } else {
         accounting.hasDeclaredWeightBytes = true;
-        accounting.declaredWeightResidentBytes = declared.getInt();
+        // The value comes from the shared ledger, so the budget readers and the
+        // census cannot read two different declarations; the shape and sign
+        // checks above stay here, because the census reports a malformed
+        // declaration rather than reading it as a smaller number.
+        accounting.declaredWeightResidentBytes =
+            hmx::vtcm::residentBytes(module);
         if (accounting.declaredWeightResidentBytes !=
             accounting.weightResidentBytes)
           accounting.complete = false;

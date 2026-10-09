@@ -31,6 +31,11 @@
 #include "hexagon/Dialect/Hmx/Transforms/HmxRoleHandoff.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
+
+// The one VTCM byte ledger: this pass's budget read goes through it rather than
+// through a private copy of hmx-partition's walk (see the header for why).
+#include "HmxVtcmLedger.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -1245,30 +1250,6 @@ static std::optional<RoleSplitMatch> matchSplitLoop(func::FuncOp fn) {
   return m;
 }
 
-/// VTCM bytes this function's own allocations already hold. The
-/// post-bufferization image (memref.alloc in the VTCM space, plus the
-/// resident-weight declaration), same as hmx-partition's own version -- the
-/// two passes run at the same pipeline point and must see the same number
-/// or this pass's budget check is fiction.
-static int64_t roleVtcmBytesCommitted(func::FuncOp fn) {
-  int64_t bytes = 0;
-  fn.walk([&](memref::AllocOp alloc) {
-    auto type = dyn_cast<MemRefType>(alloc.getType());
-    if (!type || !type.hasStaticShape() ||
-        type.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE)
-      return;
-    Type elem = type.getElementType();
-    if (!elem.isIntOrFloat())
-      return;
-    bytes += type.getNumElements() * (elem.getIntOrFloatBitWidth() / 8);
-  });
-  if (auto module = fn->getParentOfType<ModuleOp>())
-    if (auto resident =
-            module->getAttrOfType<IntegerAttr>("hmx.weight_resident_bytes"))
-      bytes += resident.getInt();
-  return bytes;
-}
-
 /// Declare (once) and look up a private runtime function. NO mutex: this
 /// pass's runOnOperation holds hmxModuleStateMutex for its whole run (the
 /// manifest write it exists for), so every module mutation below is already
@@ -1483,8 +1464,7 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   int64_t rowBytes =
       scratchType.getNumElements() * (scratchType.getElementTypeBitWidth() / 8);
   int64_t budget = HmxTarget().vtcmBudget;
-  int64_t committed = roleVtcmBytesCommitted(fn);
-  int64_t room = budget - committed + rowBytes;
+  int64_t room = hmx::vtcm::roomBytes(fn, budget, rowBytes);
   int64_t need = m.mt * rowBytes;
   if (need > room) {
     fn.emitRemark("thread-role split not applied: the ")

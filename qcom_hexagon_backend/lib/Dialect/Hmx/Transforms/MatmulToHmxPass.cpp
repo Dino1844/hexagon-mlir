@@ -57,6 +57,10 @@
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
+// The one VTCM byte ledger: this pass's committed-bytes read goes through it
+// rather than through a private tensor-level walk (see the header for why).
+#include "HmxVtcmLedger.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -304,8 +308,6 @@ struct MatmulDecision {
   }
 };
 
-static int64_t vtcmBytesCommitted(Operation *within);
-
 /// Stamp an HMX bridge operation with the function-local decision id. The
 /// bufferization model copies this explicit attribute when it rebuilds the op;
 /// locations are intentionally not used as a metadata channel.
@@ -455,8 +457,10 @@ public:
               capability.tailCandidate();
           if (diagnosticTail) {
             const HmxTarget::ContractionShape &shape = capability.shape;
-            auto paddedPlan = target.planBridge(shape.mp, shape.np, shape.kp,
-                                                vtcmBytesCommitted(op));
+            auto paddedPlan =
+                target.planBridge(shape.mp, shape.np, shape.kp,
+                                  hmx::vtcm::committedBytes(
+                                      op, hmx::vtcm::Population::Tensor));
             if (paddedPlan && !paddedPlan.blocked(shape.mp)) {
               decision.reason = MatmulReason::SelectedTail;
               decision.plan = paddedPlan;
@@ -979,56 +983,6 @@ static Value padMatrix(RewriterBase &b, Location loc, Value value,
 /// carries no memory space, so nothing about the op signatures changes.
 Value vtcmEmpty(RewriterBase &b, Location loc, RankedTensorType type) {
   return AllocCroutonOp::create(b, loc, type);
-}
-
-/// Bytes already committed to VTCM by earlier attributions in this function:
-/// the static `hmx.alloc_crouton` crouton arrays previous rewrites created.
-/// This pass runs before
-/// bufferization, so at this stage those are exactly the crouton arrays
-/// previous rewrites created -- reading them back is what lets the second dot
-/// of an attention pair see the first dot's residency. Without it Gate 3 would
-/// check every dot against an empty budget, which is fiction once two dots
-/// share a kernel. Deliberately a query, not an allocator: placement stays with
-/// the existing space-1 machinery.
-static int64_t vtcmBytesCommitted(Operation *within) {
-  auto func = within->getParentOfType<func::FuncOp>();
-  if (!func)
-    return 0;
-  int64_t bytes = 0;
-  func.walk([&](AllocCroutonOp alloc) {
-    auto type = dyn_cast<RankedTensorType>(alloc.getResult().getType());
-    if (!type || !type.hasStaticShape())
-      return;
-    bytes += type.getNumElements() * (type.getElementTypeBitWidth() / 8);
-  });
-  // This is *this dot's* budget and nothing more: the crouton arrays earlier
-  // attributions in this function committed, plus -- through
-  // `HmxTarget::planBridge`, whose `croutonBytes(m, n, k)` includes the `k * n`
-  // term and whose M-blocking path subtracts `weightBytes` explicitly -- this
-  // contraction's own working set, weight included.
-  //
-  // A weight that will be made resident across the whole kernel is *not*
-  // accounted here, and cannot be: residency is decided by
-  // `WeightResidentPass`, which runs after this pass because it needs the
-  // `hmx.matmul` this pass creates. So the two facts cannot be combined here
-  // even in principle. An earlier version of this function read
-  // `hmx.weight_resident_bytes` and claimed the module declaration was "their
-  // single source of truth, so the budget this pass checks cannot drift from
-  // the one the runtime reserves". That read was dead on the production path --
-  // the attribute is written later, so the term was always zero -- and the claim
-  // was the opposite of what the ordering guarantees. The weight's crouton array
-  // is an `hmx.alloc_crouton` here, so adding the declaration on top of the walk
-  // would also have counted the same weight twice once the attribute did exist.
-  //
-  // The persistent total is checked where it is decided, in
-  // `WeightResidentPass`, before it commits a resident buffer. What a refusal
-  // costs depends on the weight's source and the pass says which: a runtime
-  // argument weight keeps the per-launch device-side pack, and a constant weight
-  // has no such fallback -- after bufferization it is a `memref.get_global` the
-  // engine cannot read, so its VTCM buffer is the only legal form and the
-  // residency pass rejects the module instead. Neither outcome is decided here,
-  // and neither revises the plan this function made.
-  return bytes;
 }
 
 /// The AH/WH permutation applied at compile time. For an activation (a
@@ -1559,7 +1513,8 @@ struct MatmulToHmx : public RewritePattern {
     // Region residency, not a single-op fiction: bytes earlier attributions in
     // this function already committed to VTCM, so the second dot of an
     // attention pair is weighed with the first dot's arrays resident.
-    int64_t vtcmUsed = vtcmBytesCommitted(op);
+    int64_t vtcmUsed =
+        hmx::vtcm::committedBytes(op, hmx::vtcm::Population::Tensor);
 
     if (decision.reason == MatmulReason::SelectedTail) {
       decision.vtcmBefore = vtcmUsed;

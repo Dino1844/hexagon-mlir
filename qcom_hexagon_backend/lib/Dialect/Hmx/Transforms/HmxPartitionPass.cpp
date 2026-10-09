@@ -92,6 +92,10 @@
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
+// The one VTCM byte ledger: this pass's budget reads go through it rather than
+// through a private walk (see the header for why the private walks went).
+#include "HmxVtcmLedger.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
@@ -490,39 +494,6 @@ LogicalResult readTailGrid(MatmulOp op, const TileShape &shape,
                   logical[1],
                   logical[2]};
   return success();
-}
-
-/// Bytes already committed to VTCM in this function. After bufferization the
-/// static space-1 crouton allocations (`hmx.alloc_crouton`, the tensor-level
-/// image of this walk) are `memref.alloc`s, so this is the tile-level image of
-/// `MatmulToHmxPass::vtcmBytesCommitted`: the budget the attribution checked is
-/// the same budget the pipeline checks here.
-static int64_t vtcmBytesCommitted(func::FuncOp func) {
-  int64_t bytes = 0;
-  func.walk([&](memref::AllocOp alloc) {
-    auto type = dyn_cast<MemRefType>(alloc.getType());
-    if (!type || !type.hasStaticShape() ||
-        type.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE)
-      return;
-    Type elem = type.getElementType();
-    if (!elem.isIntOrFloat())
-      return;
-    bytes += type.getNumElements() * (elem.getIntOrFloatBitWidth() / 8);
-  });
-  // Resident constant weights are `hexagonmem.alloc`s (or already lowered),
-  // never `memref.alloc`s, so the resident declaration is the only place their
-  // footprint is visible here. This pass runs after `WeightResidentPass`, which
-  // created them, so the attribute exists. `matmul-to-hmx` cannot read it --
-  // it runs first, and the weight is still an `hmx.alloc_crouton` there -- so
-  // this is the tile-level image of the *partitioning* budget rather than of
-  // `matmul-to-hmx::vtcmBytesCommitted`, which measures a different thing: one
-  // contraction's own working set. Both are needed and they are not the same
-  // number, which is why neither pass can stand in for the other.
-  if (auto module = func->getParentOfType<ModuleOp>())
-    if (auto resident =
-            module->getAttrOfType<IntegerAttr>("hmx.weight_resident_bytes"))
-      bytes += resident.getInt();
-  return bytes;
 }
 
 /// The activation bridge behind an `hmx.matmul`: the pack(s) that fill the
@@ -2008,7 +1979,7 @@ static LogicalResult tryFoldSerialActivationBridge(
   auto actType = cast<MemRefType>(act.getType());
   int64_t actBytes = actType.getNumElements() * 2;
   int64_t scratchBytes = shape.k * layout::kCroutonBytes;
-  int64_t room = vtcmBudget - vtcmBytesCommitted(func) + actBytes;
+  int64_t room = hmx::vtcm::roomBytes(func, vtcmBudget, actBytes);
   if (scratchBytes > room) {
     op.emitRemark("HMX serial pack fold not applied: the crouton-row "
                   "scratch needs ")
@@ -2238,7 +2209,7 @@ static LogicalResult emitStageLoop(IRRewriter &rewriter, Location opLoc,
   //     with its own traceability block.
   int64_t statusBytes = 4;
   int64_t ringBytes = slotBytes + statusBytes;
-  int64_t room = vtcmBudget - vtcmBytesCommitted(func) + actBytes;
+  int64_t room = hmx::vtcm::roomBytes(func, vtcmBudget, actBytes);
 
   // The deepest ring the budget can pay for, `scratch + depth * ring`: 2, or 1
   // when only the serial ring fits. 0 means not even that fits, so the plain

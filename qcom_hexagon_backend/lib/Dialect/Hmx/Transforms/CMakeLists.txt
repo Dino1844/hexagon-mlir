@@ -10,6 +10,7 @@ add_mlir_dialect_library(HmxTransforms
   HmxVectorReadoutPass.cpp
   HmxWorkspaceResidentPass.cpp
   HmxVtcmAccountingPass.cpp
+  HmxVtcmLedger.cpp
 
   DEPENDS
   HmxTransformsPassIncGen

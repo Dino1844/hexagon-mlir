@@ -102,6 +102,10 @@
 #include "hexagon/Dialect/Hmx/Transforms/HmxTarget.h"
 #include "hexagon/Dialect/Hmx/Transforms/Transforms.h"
 
+// The one VTCM byte ledger: this pass's transient read goes through it rather
+// than through a private copy of hmx-partition's walk (see the header for why).
+#include "HmxVtcmLedger.h"
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -460,35 +464,14 @@ static LogicalResult verifyResidentByteAggregate(ModuleOp module) {
   return success();
 }
 
-/// VTCM bytes the function's own static allocations already hold. After
-/// bufferization the space-1 crouton arrays (`hmx.alloc_crouton`'s tile-level
-/// image) are `memref.alloc`s, so this is the same walk, over the same ops, as
-/// the allocation half of `HmxPartitionPass::vtcmBytesCommitted` -- one pool,
-/// one set of allocations, so the three readers of it cannot drift apart. The
-/// tensor-level `hmx.alloc_crouton` walk `matmul-to-hmx` uses is not available
-/// here: this pass runs after bufferization.
-///
-/// Computed fresh at each admission rather than cached, because the answer
-/// moves under the loop: a runtime weight that becomes resident has its pack
-/// array erased, so a cached total would keep charging for a buffer that is gone
-/// and would refuse later weights for a transient that no longer exists.
-static int64_t transientVtcmBytes(func::FuncOp func) {
-  int64_t bytes = 0;
-  func.walk([&](memref::AllocOp alloc) {
-    auto type = dyn_cast<MemRefType>(alloc.getType());
-    if (!type || !type.hasStaticShape() ||
-        type.getMemorySpaceAsInt() != hexagon::VTCM_ADDRESS_SPACE)
-      return;
-    Type elem = type.getElementType();
-    if (!elem.isIntOrFloat())
-      return;
-    bytes += type.getNumElements() * (elem.getIntOrFloatBitWidth() / 8);
-  });
-  return bytes;
-}
-
 /// The answer to the one question this pass has to ask before it commits a
 /// resident buffer: does the persistent footprint still fit the pool?
+///
+/// The transient half comes from the shared VTCM ledger (`hmx::vtcm`), computed
+/// fresh at each admission rather than cached, because the answer moves under
+/// the loop: a runtime weight that becomes resident has its pack array erased,
+/// so a cached total would keep charging for a buffer that is gone and would
+/// refuse later weights for a transient that no longer exists.
 ///
 /// `hexagonmem` VTCM is a single pool of `HmxTarget::defaultVtcmBudget` bytes,
 /// shared by the crouton arrays, the accumulators and every resident weight, and
@@ -540,7 +523,8 @@ admitResidentVtcm(func::FuncOp func, ModuleOp module, int64_t addedBytes,
   ResidentVtcmAdmission admission;
   admission.budget = HmxTarget::defaultVtcmBudget;
   admission.requested = bytes;
-  admission.transient = transientVtcmBytes(func);
+  admission.transient =
+      hmx::vtcm::transientBytes(func, hmx::vtcm::Population::Memref);
   // `hmx.weight_resident_bytes` holds what *earlier* functions committed -- this
   // pass is a per-function pass that writes the attribute only when it ends --
   // so it and `addedBytes` are disjoint and sum to the footprint so far.
