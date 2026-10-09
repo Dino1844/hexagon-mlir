@@ -270,6 +270,8 @@ public:
   void *CreateBufferAlias(void *ptr, size_t nbytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     HexagonBuffer *buffer = FindBuffer<HexagonBuffer>(ptr, bufferMap_);
+    CHECK((buffer != nullptr),
+          "Attempt made to alias unknown or already freed allocation");
     auto bufferAlias =
         std::make_unique<hexagon::HexagonBufferAlias>(*buffer, nbytes);
 

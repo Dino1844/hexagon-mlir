@@ -21,6 +21,12 @@ is on the default path. If the tile edge moved and only the C++ side learned
 about it, the host would pack weights into the wrong shape: no compile error, no
 failed assertion, silently wrong numerics.
 
+A fourth spelling joined on 2026-10-09: `hexagon::F16_CROUTON_SHAPE`
+(`include/hexagon/Common/Common.h`) is the HVX image side of the same crouton,
+the block an (n, h, w, c) pack leaves innermost. It is bound to the engine
+header by the one fact the two spellings share -- the block is exactly one
+crouton's worth of elements -- and *not* dim by dim, for the reason above.
+
 ⚠️ **An equal number is not automatically the same fact.** The header's
 `kCroutonHalf` is 2 ("two halves of a pair") and the element size is 2 ("bytes
 per f16"). Binding those to each other would assert a coincidence, and would
@@ -80,6 +86,16 @@ def cpp_int_const(source: str, name: str) -> int:
     return int(match.group(1))
 
 
+def cpp_uint_vector(source: str, name: str) -> list[int]:
+    """An `inline const SmallVector<unsigned> NAME = {...};` initializer."""
+    match = re.search(
+        rf"inline\s+const\s+SmallVector<unsigned>\s+{name}\s*=\s*\{{([^}}]*)\}}",
+        source,
+    )
+    assert match, f"SmallVector {name} not found (renamed?)"
+    return [int(value) for value in re.findall(r"\d+", match.group(1))]
+
+
 def py_int_const(path: str, name: str) -> int:
     """A module-level `NAME = <int>` in a Python source file."""
     match = re.search(
@@ -93,7 +109,8 @@ def layout_header() -> str:
     return read("include/hexagon/Dialect/Hmx/IR/HmxCroutonLayout.h")
 
 
-def crouton_bytes() -> int:
+def layout_consts() -> dict[str, int]:
+    """Every `k*` constant in the layout header, expressions resolved."""
     source = layout_header()
     raw = dict(re.findall(r"constexpr\s+int64_t\s+(\w+)\s*=\s*([^;]+);", source))
     assert raw, "no layout constants parsed"
@@ -106,7 +123,12 @@ def crouton_bytes() -> int:
                 resolved[name] = int(eval(expr, {"__builtins__": {}}, resolved))  # noqa: S307
             except NameError:
                 pass
-    assert "kCroutonBytes" in resolved, sorted(raw)
+    return resolved
+
+
+def crouton_bytes() -> int:
+    resolved = layout_consts()
+    assert "kCroutonBytes" in resolved, sorted(resolved)
     return resolved["kCroutonBytes"]
 
 
@@ -166,10 +188,44 @@ def main() -> None:
             "the compiler used."
         )
 
-    total = len(sites) + len(edge_sites) + len(elem_sites)
+    # --- the HVX image-side crouton block -----------------------------------
+    # A fourth spelling of the same 2 KiB f16 crouton, from the HVX image side:
+    # the block an (n, h, w, c) pack leaves innermost is 8 x 2 x 32 x 2
+    # (`PackUnpackUtils.cpp` / `SeedLayoutConversions.cpp`). The engine header
+    # calls itself "the one home for the engine's leaf physical constants" but
+    # never mentions this table, so nothing tied the two decompositions of one
+    # crouton together. Only the fact both spellings share is bound: the block
+    # is exactly one crouton's worth of elements. The dim-by-dim correspondence
+    # is deliberately *not* asserted -- the two tables decompose the same 1024
+    # elements differently, which is the "equal number is not the same fact"
+    # case from the module docstring.
+    layout = layout_consts()
+    hvx_block = cpp_uint_vector(
+        read("include/hexagon/Common/Common.h"), "F16_CROUTON_SHAPE"
+    )
+    assert len(hvx_block) == 4, (
+        f"F16_CROUTON_SHAPE is no longer the 4-d image block: {hvx_block}"
+    )
+    block_elements = 1
+    for extent in hvx_block:
+        block_elements *= extent
+    hvx_sites = {
+        "hexagon::F16_CROUTON_SHAPE (one HVX image block)": block_elements,
+    }
+    for name, value in hvx_sites.items():
+        assert value == layout["kCroutonElements"], (
+            f"{name}={value} covers a different number of f16 elements than "
+            f"one crouton (kCroutonElements={layout['kCroutonElements']}, "
+            "HmxCroutonLayout.h). The HVX image block and the engine crouton "
+            "would no longer be the same 2 KiB: no compile error, wrong "
+            "geometry on device."
+        )
+
+    total = len(sites) + len(edge_sites) + len(elem_sites) + len(hvx_sites)
     print(
         f"crouton geometry agreement: PASS ({total} mirrors; "
-        f"crouton={expected} B, tile edge={edge}, elem bytes={elem_bytes})"
+        f"crouton={expected} B, tile edge={edge}, elem bytes={elem_bytes}, "
+        f"hvx block={block_elements} elems)"
     )
 
 
