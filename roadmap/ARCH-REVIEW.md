@@ -22,7 +22,7 @@
 | HMX 子系统（20k 行，最重） | ArchHmx | 根因 1/2/3/5 |
 | 内存 / 数据流（VTCM/DMA/runtime） | ArchMemory | 根因 1/2/3；bug 表 #1/#2/#3 |
 | dialect 边界 / 类型系统（横切） | ArchDialect | 根因 2/3；bug 表 #7/#8 |
-| **★ 专项深挖 · HMX accumulator 建模**（外部四路调研 + 一手 ISA） | GpuResourceModeling / OtherNpuAcc / AcademicDataflow / MlirResourcePatterns | **根因 3 的性能维度最重表现 → §2.5** |
+| **★ 专项深挖 · HMX accumulator 建模**（外部四路调研 + 一手 ISA，**含对早先乐观诊断的修正**） | GpuResourceModeling / OtherNpuAcc / AcademicDataflow / MlirResourcePatterns | 根因 3 的一个侧面 → **§2.5（降级为廉价证伪调查）** |
 
 ---
 
@@ -129,13 +129,17 @@
 
 ---
 
-## 2.5 专项深挖 —— HMX accumulator 资源建模（新发现，一手 ISA 证据，改变根因优先级）
+## 2.5 专项深挖 —— HMX accumulator 资源建模（一手 ISA 证据 + 对早先诊断的修正）
 
-> **这一节的地位**：由多路外部调研 + 直接核对高通官方 ISA 引出的**新发现**。
-> 它把「read-out 占 39.79% 且无法重叠」从「硬件限制」重新定性为「**对 ISA 的欠建模**」——
-> 即：**硬件本来就给了双缓冲能力，编译器没用上**。因此这条应作为**性能类最高杠杆项**，优先于多数纯重构项。
+> **这一节的地位（已修正）**：由多路外部调研 + 直接核对高通官方 ISA 引出。
+> 早先版本把它当成「编译器欠建模、双 accumulator 能解锁 39.79% 性能」的最高杠杆项。
+> **读了运行时源码后这个结论被大幅收窄**：swap 已隐式在跑、39.79% 是 HVX unpack、
+> convert/multiply 同为单发射 HMX 指令难重叠。**本节现定位为「廉价证伪调查项」**——
+> 先花半天证实双 accumulator 有无重叠价值，再决定是否投入；证伪前不改实现。
+> 保留本节是因为：(a) 硬件有 2 个 accumulator 是一手 ISA 事实，值得记录；
+> (b) 它示范了「外部调研 + 核对一手源」如何**纠正**一个看似合理的乐观诊断。
 
-### 2.5.1 决定性一手证据：HMX 硬件有「一对 accumulator + swap」
+### 2.5.1 一手 ISA 证据：HMX 硬件有「一对 accumulator + swap」（事实成立，但价值需证伪）
 
 高通官方 **《Qualcomm Hexagon V81 HMX Programmer's Reference Manual》**（80-N2040-62 Rev AA, 2026-03）原文（本人直接读取核实）：
 
@@ -148,17 +152,29 @@
 
 ⇒ **结论**：HMX accumulator **不是单一的**——硬件自带 **2 个 accumulator set + 一条 clear-and-swap**，正是 TPU 式「复制一份给编译器做双缓冲」的设计。bias 有 4 组，convert state 亦标为多份（Age 0）。
 
-### 2.5.2 现状：对 ISA 的欠建模
+### 2.5.2 现状：模型粗糙，但「swap 隐式已在跑」——修正先前过于乐观的诊断
 
-当前编译器把 `hmx.mma` / `hmx.acc_clear` / `hmx.acc_read` 全部建模为对**同一个** `HmxEngineResource` 的读写效应（`HmxDialect.h:73-87`、`HmxOps.td:480-533`），按资源身份互斥。等价于：
+> **诚实修正（2026-10-09，读运行时源码后）**：本节早先版本断言「编译器不发 swap，导致 WAR 固化成真依赖、读出无法重叠」。**这个因果链被运行时源码推翻**，下面先给核实到的事实，再给真正成立的结论。
 
-- **不表达「有 2 份」**（没有数量概念）；
-- **不表达「哪一份是 primary」**（没有实例编号）；
-- **不发出 swap**（`HmxExternalFnNames.h` 无 swap/primary 选择叶子，`acc_read` 只有 retain 语义）。
+**核实到的运行时事实**（`bin/runtime/hmx/src/HMXAPI.c:36-55`）：
 
-后果：`acc_read(i)`（convert，写 Set k）与 `mma(i+1)`（写 Set k+1）之间**本可用 rename 消除的 WAR 依赖被固化成真依赖**，读出窗口无法与下一轮计算重叠——与「读出占 39.79% kernel 时间」的现象一致。
+```c
+void hmx_acc_store_f16(unsigned dst_addr, unsigned set) {
+  (void)set;                                    // set 被忽略
+  Q6_mxmem_AR_after_hf((void*)dst_addr, 0);     // Rs 写死 0
+}
+```
 
-**为什么 MemoryEffects 表达不了**：MLIR `SideEffectInterfaces.td` 的 `MemRead/MemWrite/MemAlloc/MemFree` 是挂在某个 `Resource` 上的**布尔效应**，**没有实例编号、没有容量、没有时间区间**。用它表达「有 2 份、带 primary 指针、只在读出窗口被占用」的资源，必然过度串行化。这与 ARCH-REVIEW 根因 3（无类型的 ABI/契约）同源，但影响的是**性能上限**而非仅可维护性。
+对照 PRM Figure 11，`Q6_mxmem_AR_after_hf` 第二参数即 Rs，`Rs[0]=0` = **Clear accumulator values and swap primary accumulator**。⇒ **每次读出都 clear+swap，硬件的双 accumulator ping-pong 已经在自动发生**，不依赖编译器建模。
+
+**因此三条早先断言不成立**：
+1. ~~「编译器不发 swap」~~ → swap 隐式在每个读出叶子里，硬件自动轮转。
+2. ~~「双 accumulator 能消除 39.79% 读出」~~ → 39.79% 是 **`hmx.unpack_acc`（HVX 指令：AR crouton→row-major）**（`Passes.td:260-264`），不是 accumulator convert；且 `hmx.vector_readout`/`thread-role-partition` 已在攻这块。
+3. **真正未证实的前提**：`hmx.mma`（multiply）与 `hmx.acc_read`（convert）**都是 HMX 指令、同一单发射 CISC 引擎**。2 个 accumulator 要变成「重叠」，前提是引擎能把 convert 与 multiply **流水化**——**[未证实]**，且对单发射 CISC 引擎**大概率不成立**。TPU v1 能 double-buffer 是因为它的矩阵单元是多级流水，不是同一发射口。
+
+**真正成立的结论（收窄后的价值）**：编译器的 `HmxEngineResource` 布尔互斥模型确实粗糙（无数量/实例/时间），但它**当前并没有因此损失 ping-pong 收益**——因为硬件隐式轮转已覆盖常见路径。粗糙模型的真实代价在于**无法表达少数几种模式**（见 2.5.4 收窄后的清单），而不是「39.79% 被锁死」。
+
+**为什么 MemoryEffects 仍值得批评**（技术判断成立，但不影响当前性能）：MLIR `SideEffectInterfaces.td` 的效应是挂在 `Resource` 上的**布尔值**，无实例编号/容量/时间区间，无法表达「2 份、带 primary、只在读出窗口占用」。这是**可维护性与未来可扩展性**的债，不是当前性能瓶颈。
 
 ### 2.5.3 业界/学术界如何建模同类资源（四路调研交叉验证）
 
@@ -177,34 +193,43 @@
 2. **显式分配 + 绑定 + swap**（alloc/bind/swap，或寄存器分配）；
 3. **时间索引占用 或 token 依赖**（reservation table / dependence token），把 WAR 冲突转成 rename，把「要不要重叠」变成调度器的自由度。
 
-### 2.5.4 推荐设计（三层，由调研直接导出）
+### 2.5.4 收窄后的推荐（先证伪，再决定是否投入）
 
-> 定位：**纯编译器改动，不需要新硬件**——硬件的 2 个 accumulator + swap 已经在了。
+> **定位修正**：由于 swap 已隐式在跑、39.79% 是 HVX unpack、且 convert 与 multiply 同引擎难重叠（见 2.5.2），
+> **「双 accumulator 消除读出串行」不再是一个可直接开工的改造**。这一节从「推荐实现」降级为「**先做廉价证伪实验，再决定**」。
+
+**为什么不能直接照 TPU/TMEM 抄**（诚实的适用性边界）：
+- TPU v1 / Blackwell TMEM 的 accumulator 能重叠，前提是它们的矩阵单元是**多级流水、convert/epilogue 与 multiply 在不同阶段**。HMX 是**单发射 CISC 引擎**（PRM §2.1：`The CISC-based architecture combines memory accesses with operations`），multiply 与 convert 都要抢同一个发射口。
+- 因此 2 个 accumulator 在 HMX 上**未必**能换来 TPU 式的重叠。这是「参考」与「照搬」的分界。
+
+**先做这个廉价证伪实验（强烈建议，任何实现之前）**：
+1. 读 v79/v75 的 HMX PRM（**不是** V81）确认：目标芯片是否同样是一对 accumulator；convert 与 multiply 能否并行/流水（PRM 或 SDK 头 `qurt_hmx.h` 通常会说明发射约束）。
+2. 在设备上 A/B：一条 kernel 固定 `acc_read` 后插 `Q6_..._nop` 延迟 vs 不插，测 multiply 能否在 convert 未完成时发射。**这一步能直接证实/证伪「双 accumulator 有重叠价值」**，成本远低于改 dialect。
+3. 若证实引擎单发射、convert 阻塞 multiply → **双 accumulator 对主流水无价值，本条降级为纯可维护性债**（回到根因 3），不值得为性能投入。
+
+**只有当实验证实存在重叠窗口时**，才走以下三层建模（否则是过度工程）：
 
 | 层 | 做法 | 取代什么 |
 |---|---|---|
-| **值层** | accumulator 作为 SSA value（`hmx.acc<N>` 或 `!hmx.acc` token），一个逻辑累加一个值，冲突只在真正同值处出现 | 取代「所有 op 互碰一个资源」 |
-| **资源层** | 建模为**有数量有容量的池**：`HmxAccPool<2>`（2 set + 4 bias set + convert state），用显式 `alloc`/`bind`/`swap` 表达分配、绑定、翻转 | 取代 `HmxEngineResource` 的布尔读写效应 |
-| **调度层** | 用**时间占用表 + 容量**判冲突（`同槽位 ∧ 时间重叠 ⇒ 冲突`），用 token 依赖替代内存效果同步；允许在「同一 acc 的下轮 mma」与「本轮 convert 读出」之间做 **rename（双缓冲）** 或 **split-K + VTCM fixup** 的成本取舍 | 取代「同资源即冲突」 |
+| 值层 | accumulator 作为 SSA value / `!hmx.acc` token，冲突只在真正同值处出现 | 取代「所有 op 互碰一个资源」 |
+| 资源层 | `HmxAccPool<2>`（2 set + 4 bias set）+ 显式 `alloc`/`bind`/`swap` | 取代 `HmxEngineResource` 布尔效应 |
+| 调度层 | 时间占用表 + 容量判冲突；允许 rename（双缓冲）或 split-K + VTCM fixup 取舍 | 取代「同资源即冲突」 |
 
-**收益机制**（可复现推理）：把 `mma(i+1)` 绑到另一个 accumulator set，`acc_read(i)` 的 convert 读出就与之**完全重叠**，39.79% 的读出从关键路径消失。**[推断]** 实际收益取决于 convert 与 mma 的拍数比和发射约束，需实测标定。
+**收窄后真正可落地的低风险子项**（无论证伪结果如何都成立）：
+- **`bias_set` 已有 4 组**（PRM §2.3.1，硬件现成）——但当前叶子 `(void)set` **丢弃了 set**（`HMXAPI.c:41`，`Q6_mxmem_AR_after_hf` 第二参写死 0）。若要利用 4 组 bias 做读出侧并行，需先让叶子真正传 set。这是**明确、局部、可测**的改动。
 
-**落地最小步**（不改硬件、逐级可验）：
-1. 在 `hmx` dialect 增加 accumulator 的**实例编号**（Set 0/1）与 **swap 语义**叶子（接 `HmxExternalFnNames.h`，对应 PRM 的 clear-and-swap 位）。
-2. `hmx-partition` 生成 tile 循环时做**双 accumulator 轮转**（i 用 Set0、i+1 用 Set1），复用现有 `hmx.vector_readout`/`thread-role-partition` 的线程编排，但从「单 buffer 靠线程掩盖」升级为「双 buffer 真重叠」。
-3. 用 `bias_set` 已有的 4 组（硬件现成）进一步放开读出侧并行。
+**Steelman（为何现状不算「错」）**：单一隐式 accumulator + 隐式 swap 在当前负载下**已经提供了 ping-pong**；`HmxEngineResource` 布尔互斥虽粗糙但**未造成已证实的性能损失**。改它的正确动机是**可维护性 + 未来可表达性**，不是「解锁 39.79%」。
 
-**Steelman（为何现状不算「错」）**：单一隐式 accumulator 是更省面积、更简单的硬件与编译器模型；在「一个 kernel 一个 matmul」的早期负载下不是瓶颈。**但**：(a) 硬件已经给了 2 份+swap，不用是纯浪费；(b) 负载已演进到 attention 双 dot、连续多层 matmul、读出占 39.79%，此时欠建模直接付真金白银的性能税。
+**风险/未验证（关键）**：[未验证-高] 目标芯片（v73/v75/v79）的 accumulator 数量与 convert/multiply 发射关系——**PRM 是 V81 的，且我无法在本机访问设备或 SDK 头核实**。这条未验证直接决定本方案是「有价值」还是「过度工程」，**必须先证伪再投入**。
 
-**风险/未验证**：[未验证] 目标芯片（v73/v75/v79）是否与 V81 一样是「一对 accumulator」——PRM 是 V81 的，前代可能不同，**动手前必须按目标 arch 核对**；[未验证] `libhmxapi.a` 是否已暴露 swap 但编译器没接。这两点是本方案唯一的前置调查项。
+### 2.5.5 与既有根因的关系（降级后）
 
-### 2.5.5 与既有根因的关系
+这条**不是一个新根因，而是根因 3（无类型/欠建模的资源与契约）的一个侧面**，但**不是其性能维度的最重表现**（修正：早先版本误判为「最高优先级，解锁 39.79%」）。
 
-这条**不是一个新根因，而是根因 3（无类型/欠建模的资源与契约）在性能维度上的最重表现**，且与 ARCH-REVIEW 附录 B 的多个发现同源：
-- 附录 B #6「单 HMX kernel 限制」——单一 accumulator 资源是其根因之一；
-- `hmx.vector_readout`、`thread-role-partition`——都是在**单 buffer 硬件假设**下用线程/流水掩盖读出，双 accumulator 让它们从「掩盖」变「真重叠」。
+- 附录 B #6「单 HMX kernel 限制」——模块级单例是其根因，与 accumulator 数量**无直接因果**（那是 manifest topology / 全局变量命名问题，不是 accumulator 不够）。
+- `hmx.vector_readout`、`thread-role-partition`——它们攻的是 **HVX unpack（39.79%）**，已在正确方向上；**双 accumulator 与这块基本无关**。
 
-⇒ **行动建议**：把 2.5 提为性能类**最高优先级**的调查+改造项，先做 2.5.4 的「最小步 1-2」验证双 accumulator 能否在目标芯片上打通，再决定是否做完整的三层建模。
+⇒ **降级后的行动建议**：把 2.5 从「性能改造项」降为**「廉价证伪调查项」**——花半天读 v79/v75 PRM + 一个设备 A/B，证实/证伪「双 accumulator 有重叠价值」。**在证伪之前不投入任何 dialect/实现改动**（否则是基于未证实前提的过度工程）。若证伪为「无重叠价值」，本条并入根因 3 作为纯可维护性债，不单列。
 
 ---
 
@@ -234,20 +259,18 @@
 
 ```mermaid
 flowchart LR
-    A["⓿ 调查+打通双 accumulator<br/>(§2.5 最高优先级)<br/>先验证目标芯片有 2 set+swap"] --> B["① 修正确性 bug<br/>(§3，尤其两个 🔴)<br/>不依赖重构"]
+    A["⓿ 廉价证伪调查<br/>(§2.5 半天)<br/>读 v79/v75 PRM + 设备 A/B<br/>证实双 acc 有无重叠价值"] --> B["① 修正确性 bug<br/>(§3，尤其两个 🔴)<br/>不依赖重构"]
     B --> C["② 死代码清理<br/>(HexKL/crouton/tptr/空dialect)<br/>纯删除、立刻减负"]
     C --> D["③ 抽 HmxVtcmLedger<br/>+ 统一 crouton 表示<br/>消灭重复账本"]
     D --> E["④ ABI 契约类型化<br/>(签名一次声明 + dma_token)"]
-    E --> F["⑤ accumulator 三层建模<br/>(值/资源/调度层, §2.5.4)<br/>真正消除读出串行"]
-    F --> G["⑥ mega-pass 阶段化<br/>+ 配置单一 IDL<br/>(最 invasive，放最后)"]
+    E --> F["⑤ mega-pass 阶段化<br/>+ 配置单一 IDL<br/>(最 invasive，放最后)"]
 ```
 
 **理由**：
-- **⓿ 放最前**：§2.5 是唯一能**抬高性能上限**的项（硬件已给 2 个 accumulator + swap，编译器欠建模）。且它是**调查型**——先花小成本确认目标芯片（v73/v75/v79）是否同为双 accumulator、`libhmxapi.a` 是否已暴露 swap，再决定投入。风险低、潜在收益最大（读出 39.79% 可望移出关键路径）。
+- **⓿ 是调查不是改造**：§2.5 的「双 accumulator」前提未证实（swap 已隐式在跑、convert/multiply 同引擎难重叠、39.79% 是 HVX unpack）。花半天证伪，再决定要不要投入——**在证伪前不改 dialect/实现**。
 - ①② 零风险高收益、立刻缩小后续重构面。
 - ③④ 中等抽取、直击最高频改动热点。
-- ⑤ 放在 ③④ 之后：完整的值/资源/调度三层建模依赖 crouton 统一与 ABI 类型化打底。
-- ⑥ 最 invasive，待前面简化后再做更顺。
+- ⑤ 最 invasive，待前面简化后再做更顺。
 
 ---
 
@@ -341,3 +364,12 @@ flowchart LR
 - MLIR 官方：`SideEffectInterfaces.td`（效果是布尔、无实例/容量/时间）、Bufferization 文档（DPS/「similarities to register allocation」）、async dialect（token 替代效果同步）。
 
 **调研方法**：4 个只读 scout agent（GPU / MLIR / 其他 NPU / 学术）并行调研；accumulator 配对与 swap 这条由本人直接读 V81 PRM 核实。MLIR agent 因 provider 流中断未提交完整报告，其结论从研究轨迹重建（关键发现：Triton 用 alloc + token 建模 TMEM accumulator，非效果互斥）。
+
+**★ 修正的关键一手证据（本机仓库源码，2026-10-09 核实）**：
+- `bin/runtime/hmx/src/HMXAPI.c:36-55`：`hmx_acc_store_f16` 调 `Q6_mxmem_AR_after_hf(dst, 0)`，**Rs 写死 0**（= PRM Fig 11 的 clear+swap）⇒ 硬件 ping-pong 隐式已在每次读出发生；`hmx_acc_clear_f16` = `Q6_mxclracc_hf()`；`hmx_mma_f16` = `Q6_activation_hf_mxmem_RR_deep` + `Q6_weight_hf_mxmem_RR`（两条必须同一 packet）。
+- `bin/runtime/hmx/include/HMXAPI.h`：文件头标注「verified on device (OnePlus 13, Hexagon v79)」——即**运行时在 v79 上验证过**，但**未提及 accumulator 数量**，故 v79 是否双 accumulator 仍未证实。
+- `lib/Conversion/HmxToLLVM/HmxToLLVMPass.cpp:1929-1970`（`LowerAccRead`）：`acc_read` → `hmx_bias_load_f16(bias,set)` + `hmx_acc_store_f16(dst,set)`；但叶子侧 `(void)set` 丢弃 set。
+- `lib/Conversion/LinalgToLLVM/Passes.td:260-264`：39.79% 明确指 **`hmx.unpack_acc`（HVX）**，不是 convert。
+- `HMXAPI.c:41`、`PRM §2.3.1`：bias 有 4 组，但叶子 `(void)set` 丢弃 → 4 组 bias 当前未被利用。
+
+**修正结论**：本节早先的乐观因果链（「不发 swap → WAR 固化 → 双 acc 解锁 39.79%」）被上述运行时源码推翻。真实情况是 swap 已隐式在跑、39.79% 是 HVX unpack、convert 与 multiply 同为单发射 HMX 指令难重叠。**§2.5 已降级为廉价证伪调查项。**
