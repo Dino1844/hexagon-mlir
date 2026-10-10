@@ -189,6 +189,25 @@ struct UnpackAccOpInterface
 struct UnpackAccF32OpInterface
     : public DstBufferizableOpInterfaceExternalModel<UnpackAccF32OpInterface,
                                                      UnpackAccF32Op> {
+  /// The one same-buffer read/write pair this op can have: the residual is the
+  /// accumulator the destination overwrites, and the leaf reads element (i, j)
+  /// of it and writes element (i, j) of the same matrix in the same call. An
+  /// element-wise-aligned read and write of one buffer is not a read-after-write
+  /// conflict -- the analysis would otherwise bufferize the destination out of
+  /// place and insert a full copy of the accumulator per read-out, which is the
+  /// exact cost the K-loop resident form exists to remove. Declared here rather
+  /// than left to the generic rule because the leaf contract (not the interface
+  /// default) is what makes it sound; see `hmx__unpack_f32_tile`.
+  bool isNotConflicting(Operation *op, mlir::OpOperand *read,
+                        mlir::OpOperand *write,
+                        const AnalysisState & /*state*/) const {
+    auto unpack = cast<UnpackAccF32Op>(op);
+    // The residual is the only input; anything else is not the pair.
+    if (read->get() != unpack.getResidual())
+      return false;
+    return read->get() == write->get();
+  }
+
   LogicalResult bufferize(Operation *op, RewriterBase &rewriter,
                           const BufferizationOptions &options,
                           BufferizationState &state) const {

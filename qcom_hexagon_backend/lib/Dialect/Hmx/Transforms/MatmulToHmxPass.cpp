@@ -1178,6 +1178,172 @@ bool isDenseInternal(Value v, int depth = 0) {
   return false;
 }
 
+/// True when `user` is the accumulate a K loop performs on its accumulator, in
+/// the all-parallel identity shape `linalg.generic` spells it: two f32 inputs,
+/// one add, nothing else. This is exactly what `addInto` builds (above), and
+/// exactly what Triton emits when it hoists the `tl.zeros` initialiser above
+/// the loop and adds the engine's read-out into the carried accumulator.
+static bool isAccumulateAdd(Operation *user) {
+  auto generic = dyn_cast<linalg::GenericOp>(user);
+  if (!generic || !generic.hasPureTensorSemantics())
+    return false;
+  if (generic.getNumDpsInputs() != 2 || generic.getNumDpsInits() != 1 ||
+      generic->getNumResults() != 1)
+    return false;
+  if (!llvm::all_of(generic.getIndexingMapsArray(),
+                    [](AffineMap map) { return map.isIdentity(); }))
+    return false;
+  if (!llvm::all_of(generic.getIteratorTypesArray(),
+                    [](utils::IteratorType it) {
+                      return it == utils::IteratorType::parallel;
+                    }))
+    return false;
+  auto type = dyn_cast<RankedTensorType>(generic->getResult(0).getType());
+  if (!type || type.getRank() != 2 || !dtype::isF32(type.getElementType()))
+    return false;
+  Block &body = generic.getRegion().front();
+  if (body.getOperations().size() != 2) // the add and the yield
+    return false;
+  auto yield = dyn_cast<linalg::YieldOp>(body.back());
+  if (!yield || yield->getNumOperands() != 1)
+    return false;
+  auto add = yield->getOperand(0).getDefiningOp<arith::AddFOp>();
+  if (!add || !add->hasOneUse() || !add->getResult(0).hasOneUse())
+    return false;
+  // Both inputs are the body's block arguments; none is a recomputed value.
+  return isa<BlockArgument>(add->getOperand(0)) &&
+         isa<BlockArgument>(add->getOperand(1));
+}
+
+/// The K loop a contraction's f32 accumulator is carried by, when there is
+/// one: the innermost enclosing `scf.for` whose iter arg is an f32 rank-2
+/// matrix of this contraction's own shape. The engine overwrites its hardware
+/// accumulator every segment, so a K-looped contraction keeps the running sum
+/// in a value the loop carries -- flash attention's `dot(p, v, acc)`, a real
+/// FFN's inner loop, and Triton's own accumulator around `tl.dot`. Two
+/// spellings reach this fact and both are the same region:
+///
+///   * the *region form*: the contraction's init is the loop's iter arg
+///     (`outs(carried)`) -- the epilogue's residual is that very value;
+///   * the *accumulate form*: the contraction's init is the loop-invariant
+///     zero-fill (`isEmptyInit`, so the engine may clear) and exactly one user
+///     of the result is the accumulate above, whose init is the carried value
+///     and whose result the loop yields.
+///
+/// `add` names the accumulate to fold, or null in the region form (where the
+/// epilogue builds its own `addInto`). A refusal here is a decline: the
+/// contraction keeps the epilogue it had, and says nothing -- this is a
+/// capability query, not a diagnostic.
+struct KAccumulatorLoop {
+  scf::ForOp loop;
+  Value carried;  ///< the loop's iter arg
+  Value loopInit; ///< the loop's init operand for that iter arg
+  Operation *add; ///< the accumulate generic to fold, or null
+};
+
+static std::optional<KAccumulatorLoop>
+findKAccumulator(Operation *op, Value init, RankedTensorType outType) {
+  // The fused leaf contract is what the K-loop form reuses, so it is the same
+  // admission: f32 out, static rank-2, both extents on the tile grid.
+  if (!dtype::isF32(outType.getElementType()) || !fusedTailLegal(outType))
+    return std::nullopt;
+  auto loop = op->getParentOfType<scf::ForOp>();
+  if (!loop)
+    return std::nullopt;
+  auto isCarried = [&](Value v) {
+    auto arg = dyn_cast<BlockArgument>(v);
+    return arg && arg.getOwner()->getParentOp() == loop &&
+           llvm::is_contained(loop.getRegionIterArgs(), arg) &&
+           arg.getType() == outType;
+  };
+
+  // The region form: the contraction's own init is the carried accumulator.
+  if (isCarried(init)) {
+    for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs()))
+      if (arg == init)
+        return KAccumulatorLoop{loop, init, loop.getInitArgs()[i], nullptr};
+    return std::nullopt;
+  }
+
+  // The accumulate form: one user, the add into the carried accumulator, and
+  // the add's own result is the value the loop carries out. The contraction
+  // must then have an empty init -- otherwise its C term is not the accumulator
+  // this rewrite would initialise, and folding the add would lose it.
+  if (!isEmptyInit(init) || !op->getResult(0).hasOneUse())
+    return std::nullopt;
+  Operation *user = *op->getResult(0).getUsers().begin();
+  if (!isAccumulateAdd(user))
+    return std::nullopt;
+  auto generic = cast<linalg::GenericOp>(user);
+  Value carried = generic.getDpsInitOperand(0)->get();
+  if (!isCarried(carried) || !generic->getResult(0).hasOneUse())
+    return std::nullopt;
+  unsigned index = loop.getTiedLoopResult(cast<BlockArgument>(carried))
+                       .getResultNumber();
+  if (loop.getBody()->getTerminator()->getOperand(index) !=
+      generic->getResult(0))
+    return std::nullopt;
+  for (auto [i, arg] : llvm::enumerate(loop.getRegionIterArgs()))
+    if (arg == carried)
+      return KAccumulatorLoop{loop, carried, loop.getInitArgs()[i], generic};
+  return std::nullopt;
+}
+
+/// The accumulator made resident for one K loop: a VTCM array allocated above
+/// the loop, initialised from the loop's own init value, and handed to the
+/// loop as that iter arg's new init -- so the loop carries the resident buffer
+/// itself and the post-loop consumers read it where it lives.
+///
+/// `bufferization.alloc_tensor` with an explicit memory space is the stock
+/// spelling of "allocate in VTCM"; the dialect's own `hmx.alloc_crouton` is a
+/// crouton array's allocation point and is f16-shaped by construction, while
+/// the accumulator is a row-major f32 matrix. The one-shot bufferize pass maps
+/// the space-1 allocation to a `memref.alloc` in the VTCM space, which the
+/// workspace-resident pass then pins per function (its ordinal key) and the
+/// ledger's memref census counts: the accounting comes from the allocation
+/// site, not from a walk written here.
+static Value emitResidentAccumulator(RewriterBase &b, Location loc,
+                                     scf::ForOp loop, Value carried,
+                                     Value loopInit,
+                                     RankedTensorType outType) {
+  OpBuilder::InsertionGuard guard(b);
+  b.setInsertionPoint(loop);
+  IntegerAttr space = IntegerAttr::get(
+      IntegerType::get(b.getContext(), 64), hexagon::VTCM_ADDRESS_SPACE);
+  Value acc = bufferization::AllocTensorOp::create(
+      b, loc, outType, /*dynamic_sizes=*/ValueRange{}, /*copy=*/Value{},
+      space);
+  Value accInit;
+  if (isEmptyInit(loopInit)) {
+    // The loop starts from nothing: a zero-fill is write-only, where a copy
+    // would also read the matrix it overwrites.
+    Value zero =
+        arith::ConstantOp::create(b, loc, b.getZeroAttr(outType.getElementType()));
+    accInit = linalg::FillOp::create(b, loc, zero, acc).getResult(0);
+  } else {
+    // Any other initial value is the loop's own C term: an element-wise copy
+    // into the resident array, in a `linalg.generic` so bufferization writes
+    // the destination in place rather than through a `memref.copy`.
+    SmallVector<AffineMap> maps(2, b.getMultiDimIdentityMap(outType.getRank()));
+    SmallVector<utils::IteratorType> iterators(
+        outType.getRank(), utils::IteratorType::parallel);
+    accInit = linalg::GenericOp::create(
+                  b, loc, TypeRange{outType}, ValueRange{loopInit},
+                  ValueRange{acc}, maps, iterators,
+                  [&](OpBuilder &bodyBuilder, Location l, ValueRange args) {
+                    linalg::YieldOp::create(bodyBuilder, l, args[0]);
+                  })
+                  .getResult(0);
+  }
+  // Retarget the loop at the resident array. The old init value it replaces
+  // has no other user on this path; the canonicalizers after this pass erase
+  // whatever is left of it.
+  unsigned index = loop.getTiedLoopResult(cast<BlockArgument>(carried))
+                       .getResultNumber();
+  loop.getInitArgsMutable()[index].set(accInit);
+  return accInit;
+}
+
 /// The mirror of the pack: one leaf call per AR crouton row-pair. `fused`
 /// selects the leaf: `hmx.unpack_acc_f32` (the fused tail) widens and adds the
 /// optional `residual` -- the original accumulator's C term -- in the same call
@@ -1193,12 +1359,21 @@ bool isDenseInternal(Value v, int depth = 0) {
 /// pass. Both forms share the loop so bufferization treats the destination the
 /// same way (a fresh internal buffer, copied out to the kernel output
 /// afterwards) -- which is what the allocator-side 128 B guarantee applies to.
+///
+/// `dst` overrides that fresh buffer: the K-loop form hands it the accumulator
+/// the loop carries (a resident VTCM array), so every leaf call reads the
+/// running sum and overwrites it in place -- one buffer across all the loop's
+/// segments instead of a DDR image per segment. The destination the loop
+/// carries IS the residual then: the leaf's residual operand is this
+/// iteration's carried value, the same buffer it writes.
 Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
                        RankedTensorType outType, bool fused, int64_t decisionId,
-                       Value residual = {}) {
+                       Value residual = {}, Value dst = {}) {
   auto arType = cast<RankedTensorType>(ar.getType());
-  Value dst = tensor::EmptyOp::create(b, loc, outType.getShape(),
-                                      outType.getElementType());
+  Value destination =
+      dst ? dst
+          : tensor::EmptyOp::create(b, loc, outType.getShape(),
+                                    outType.getElementType());
   Value zero = arith::ConstantIndexOp::create(b, loc, 0);
   Value one = arith::ConstantIndexOp::create(b, loc, 1);
   // One tile row per call: the crouton grid's first dim is the 32-row tile
@@ -1206,7 +1381,8 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
   Value tiles = arith::ConstantIndexOp::create(b, loc, arType.getDimSize(0));
   IntegerAttr count = b.getI64IntegerAttr(hmx::layout::kCroutonPair);
 
-  auto loop = scf::ForOp::create(b, loc, zero, tiles, one, ValueRange{dst});
+  auto loop = scf::ForOp::create(b, loc, zero, tiles, one,
+                                 ValueRange{destination});
   {
     OpBuilder::InsertionGuard guard(b);
     b.setInsertionPointToStart(loop.getBody());
@@ -1214,8 +1390,12 @@ Value unpackWithLeaves(RewriterBase &b, Location loc, Value ar,
     Value arg = loop.getRegionIterArg(0);
     Value out;
     if (fused) {
+      // The residual is the C term, or -- when the caller carries the
+      // destination itself -- this iteration's carried value: the same buffer
+      // the leaf writes, which is what makes the read-modify-write one pass.
+      Value res = dst ? arg : residual;
       auto unpack = hmx::UnpackAccF32Op::create(
-          b, loc, outType, ar, arg, i, zero, residual, count, IntegerAttr(),
+          b, loc, outType, ar, arg, i, zero, res, count, IntegerAttr(),
           IntegerAttr(), IntegerAttr());
       setDecisionId(unpack.getOperation(), decisionId);
       out = unpack->getResult(0);
@@ -1449,6 +1629,13 @@ static bool foldChainToTile(RewriterBase &b, Operation *op, Value tile) {
 /// A `residual` that is not a dense internal buffer keeps the descriptor-based
 /// `addInto` (see `isDenseInternal`).
 ///
+/// `kAccumulator` is the resident accumulator a K loop carries (see
+/// `findKAccumulator`): the one case where the widening and the add do not run
+/// as separate DDR passes at all. The fused leaf writes the accumulator in
+/// place, with the accumulator itself as residual, so the loop's segments
+/// accumulate inside VTCM and only the final value is read out (by the loop's
+/// own post-loop consumers, which see the loop result as before).
+///
 /// The result is the value the contraction's users should see. When the kernel
 /// boundary reads the engine's fp16 image (see `boundaryReadsFp16Image`) that
 /// is the fp16 tile itself and `boundaryFolded` says the boundary was rewired
@@ -1462,7 +1649,18 @@ struct EpilogueResult {
 static EpilogueResult emitEpilogue(RewriterBase &b, Location loc,
                                    Operation *op, Value ar,
                                    RankedTensorType outType, Value residual,
-                                   bool canFuseTail, int64_t decisionId) {
+                                   bool canFuseTail, int64_t decisionId,
+                                   Value kAccumulator = {}) {
+  // The K-loop accumulator: one leaf call per AR crouton row, resident
+  // accumulator as both destination and residual, no widen pass and no DDR
+  // image per segment. `residual` (the C term) was materialised into the
+  // accumulator when the loop was retargeted, so both forms converge here.
+  if (kAccumulator)
+    return {unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
+                             /*residual=*/{},
+                             /*dst=*/kAccumulator),
+            false};
+
   if (dtype::isF32(outType.getElementType()) && fusedTailLegal(outType) &&
       canFuseTail && (!residual || isDenseInternal(residual)))
     return {unpackWithLeaves(b, loc, ar, outType, /*fused=*/true, decisionId,
@@ -1782,6 +1980,52 @@ struct MatmulToHmx : public RewritePattern {
       bool hoistRhs =
           bInvariant && rhsBytes <= room - (hoistLhs ? lhsBytes : 0) - outBytes;
 
+      // The accumulator this K loop carries, made resident in VTCM
+      // (docs/hmx/kchunk-accumulator-residency-2026-10-10.md). It is the one
+      // form where the engine's widening and the add do not run as separate
+      // DDR passes per segment: the leaf adds the read-out into the resident
+      // array in place, and only the loop's final value is read out. Mechanism,
+      // not a shape rule -- every K-looped contraction whose accumulator is a
+      // static f32 matrix qualifies, and a refusal here is a decline back to
+      // the epilogue above, never a half-built form.
+      std::optional<KAccumulatorLoop> kAcc =
+          findKAccumulator(op, init, outType);
+      if (kAcc) {
+        // The budget it pays on: beside the engine's read-out -- the one bridge
+        // array that stays resident, the operand croutons becoming per-tile
+        // staging slots -- plus whatever this function already holds: the
+        // ledger's tensor census for the crouton arrays, and the accumulators
+        // this pass already made resident, which are `alloc_tensor`s the
+        // tensor-level census does not see (the ledger's *memref* population
+        // counts them, post-bufferization). Both terms are shape functions; no
+        // new constant is introduced and no shape is special-cased.
+        int64_t arBytes = contract.m * contract.n * HmxTarget::croutonElemBytes;
+        int64_t accBytes = contract.m * contract.n *
+                           (outType.getElementTypeBitWidth() / 8);
+        int64_t freeBesideReadout = target.vtcmBudget - vtcmUsed -
+                                    accumulatorBytes - arBytes;
+        if (accBytes > freeBesideReadout) {
+          op->emitRemark() << "K-loop f32 accumulator not made VTCM-resident: "
+                              "it needs "
+                           << accBytes << " bytes and only "
+                           << freeBesideReadout
+                           << " are free beside the engine's read-out"
+                              " (vtcmBudget="
+                           << target.vtcmBudget << " bytes)";
+          kAcc.reset();
+        }
+      }
+      Value kAccumulator;
+      if (kAcc) {
+        kAccumulator = emitResidentAccumulator(rewriter, loc, kAcc->loop,
+                                               kAcc->carried, kAcc->loopInit,
+                                               outType);
+        // The resident bytes this function now holds, for the next
+        // contraction's budget question (the pass is per-function).
+        accumulatorBytes += contract.m * contract.n *
+                            (outType.getElementTypeBitWidth() / 8);
+      }
+
       Value packedLhs =
           emitBridgeAbove(rewriter, loc, lhs, hmx::croutonLayoutType(lhsType),
                           /*isWeight=*/false, op, hoistLhs, decision.id);
@@ -1800,10 +2044,19 @@ struct MatmulToHmx : public RewritePattern {
       // The fused tail replaces the unpack+widen[+add] epilogue with one leaf
       // when the result is f32 and the leaf contract holds by construction (see
       // `fusedTailLegal`); the residual is threaded only when it is dense by
-      // construction, anything else keeps the old epilogue.
+      // construction, anything else keeps the old epilogue. The K-loop
+      // accumulator is the third caller of that leaf (see `emitEpilogue`).
       EpilogueResult epilogue =
           emitEpilogue(rewriter, loc, op, matmul->getResult(0), outType,
-                       empty ? Value{} : init, escapes, decision.id);
+                       empty ? Value{} : init, escapes, decision.id,
+                       kAcc ? kAcc->carried : Value{});
+      if (kAcc && kAcc->add) {
+        // The accumulate the loop carried is the leaf's residual now, so its
+        // own op is the fold: the loop yields the epilogue's value instead.
+        Value accumulated = kAcc->add->getResult(0);
+        accumulated.replaceAllUsesWith(epilogue.value);
+        rewriter.eraseOp(kAcc->add);
+      }
       if (epilogue.boundaryFolded)
         rewriter.eraseOp(op);
       else
@@ -1916,6 +2169,13 @@ struct MatmulToHmx : public RewritePattern {
 private:
   const HmxTarget target;
   AttributionTally *const tally;
+  /// Bytes of f32 accumulator this pass has made VTCM-resident in the function
+  /// so far. The pattern instance is per-function (the pass is nested under
+  /// func.func), so this is the function's own total. The tensor-level ledger
+  /// census cannot see these: they are `bufferization.alloc_tensor`s, visible
+  /// to the *memref* population after bufferization -- so the budget question
+  /// this pass asks carries its own term rather than re-walking.
+  mutable int64_t accumulatorBytes = 0;
 };
 
 /// The read-out array behind a value, looking through the loop an
@@ -2524,9 +2784,13 @@ struct MatmulToHmxPass
   void getDependentDialects(DialectRegistry &registry) const override {
     // The pass emits only hmx/arith/linalg/scf/tensor ops: the crouton arrays
     // go through the dialect's own `hmx.alloc_crouton`, not through the
-    // bufferization dialect.
+    // bufferization dialect. The one exception is the K-loop accumulator's
+    // allocation, which is a row-major f32 matrix rather than a crouton array
+    // -- the stock `bufferization.alloc_tensor` with an explicit memory space
+    // is exactly that (see `emitResidentAccumulator`).
     registry.insert<hmx::HmxDialect, arith::ArithDialect, linalg::LinalgDialect,
-                    scf::SCFDialect, tensor::TensorDialect>();
+                    scf::SCFDialect, tensor::TensorDialect,
+                    bufferization::BufferizationDialect>();
   }
 
   void runOnOperation() override {
