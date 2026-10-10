@@ -245,18 +245,21 @@ struct HmxTarget {
   // ---------------------------------------------------------------------
   // The planning facts as queries.
   //
-  // Phase 1 of the query facade (operator-parity ticket 15). Each method
-  // below is an expression a consuming pass already evaluates on its own,
-  // named here so the next op class asks instead of re-deriving: they read
-  // the constants above and the existing arithmetic, and introduce no number
-  // of their own. Until Phase 2 migrates the consumers, the passes keep
-  // their own spellings by design, and an equality pin holds the two at the
-  // same value:
+  // Phase 1 of the query facade (operator-parity ticket 15) named each fact a
+  // consuming pass evaluates on its own, so the next op class asks instead of
+  // re-deriving: they read the constants above and the existing arithmetic,
+  // and introduce no number of their own. Phase 2 then migrated every
+  // consumer onto these queries and deleted its local spelling, so the
+  // methods below are the only place each is written.
+  //
+  // What holds that claim is the inverse direction of the usual pin: not
+  // "two spellings agree" but "no second spelling exists".
   //   * test/Dialect/Hmx/Transforms/hmx-target-query-equality.mlir -- the
   //     reads that reach IR (the manifest's budget and bridge-peak bytes, the
   //     pack loop's tile counts, the refusal remarks), on the real pass;
   //   * test/test_hmx_target_query_facade.py -- every query against every
-  //     consuming pass's spelling, evaluated side by side.
+  //     consuming pass's *call site*, so a pass that re-derives a fact the
+  //     facade answers turns one of the two red.
   // ---------------------------------------------------------------------
 
   /// The VTCM budget a `vtcm-budget` pass option resolves to. 0 means "not
@@ -337,7 +340,7 @@ struct HmxTarget {
   /// binding term at the other end and is blocked the same way when it does.
   BridgePlan planBridge(int64_t m, int64_t n, int64_t k,
                         int64_t vtcmUsed) const {
-    int64_t room = vtcmBudget - vtcmUsed;
+    int64_t room = roomBeside(vtcmUsed);
     // The whole contraction wins when it fits. The strict `<` is the same
     // boundary the pass's budget remark is written against (`footprint >= room`
     // refuses).

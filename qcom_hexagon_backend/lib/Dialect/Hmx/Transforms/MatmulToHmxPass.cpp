@@ -1084,8 +1084,8 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
   auto srcType = cast<RankedTensorType>(src.getType());
   int64_t rows = srcType.getDimSize(0);
   int64_t cols = srcType.getDimSize(1);
-  int64_t tileCols = cols / HmxTarget::tileEdge;
-  int64_t rowTiles = rows / HmxTarget::tileEdge;
+  int64_t tileCols = HmxTarget::tilesIn(cols);
+  int64_t rowTiles = HmxTarget::tilesIn(rows);
 
   // Outer tile count and K-run length in source-block coordinates. A weight's K
   // runs down the source rows, an activation's along its columns. A transposed
@@ -1143,8 +1143,8 @@ Value packCroutonsWithLeaves(RewriterBase &b, Location loc, Value src,
 bool fusedTailLegal(RankedTensorType outType) {
   if (outType.getRank() != 2 || !outType.hasStaticShape())
     return false;
-  return outType.getDimSize(0) % HmxTarget::tileEdge == 0 &&
-         outType.getDimSize(1) % HmxTarget::tileEdge == 0;
+  return HmxTarget::isTileAligned(outType.getDimSize(0)) &&
+         HmxTarget::isTileAligned(outType.getDimSize(1));
 }
 
 /// True when the matmul result escapes the kernel unconsumed (every user is a
@@ -1950,12 +1950,10 @@ struct MatmulToHmx : public RewritePattern {
 
     // The bridge stages crouton arrays, which are the engine's fp16 whatever
     // the sources' element type is, so every byte figure here is a crouton
-    // byte.
-    // NOT-A-DECISION: a local alias of HmxTarget::croutonElemBytes, named for
-    // the unit it expresses. It decides nothing on its own.
-    constexpr int64_t inBytes = HmxTarget::croutonElemBytes;
-    int64_t room = target.vtcmBudget - vtcmUsed;
-    int64_t rhsBytes = contract.k * contract.n * inBytes;
+    // byte -- and one of the three terms `HmxTarget` names: the activation,
+    // the weight and the engine's fp16 read-out.
+    int64_t room = target.roomBeside(vtcmUsed);
+    int64_t rhsBytes = HmxTarget::weightBytes(contract.k, contract.n);
     bool aInvariant = isLoopInvariant(lhs, op);
     // Invariance is a property of the bytes the bridge reads: the transpose
     // input once resolved, not the view on top of it.
@@ -1974,8 +1972,8 @@ struct MatmulToHmx : public RewritePattern {
       // hoisted (packed once, kept resident) only if its buffer fits what is
       // left after prior residency and the rest of this attribution; otherwise
       // it is emitted at the consumer and re-packed once per block iteration.
-      int64_t lhsBytes = contract.m * contract.k * inBytes;
-      int64_t outBytes = contract.m * contract.n * 2;
+      int64_t lhsBytes = HmxTarget::activationBytes(contract.m, contract.k);
+      int64_t outBytes = HmxTarget::readoutBytes(contract.m, contract.n);
       bool hoistLhs = aInvariant && lhsBytes <= room - rhsBytes - outBytes;
       bool hoistRhs =
           bInvariant && rhsBytes <= room - (hoistLhs ? lhsBytes : 0) - outBytes;
@@ -2011,7 +2009,7 @@ struct MatmulToHmx : public RewritePattern {
         // request refused at load.
         // Every term is a shape function of this contraction; no new constant
         // is introduced and no shape is special-cased.
-        int64_t arBytes = contract.m * contract.n * HmxTarget::croutonElemBytes;
+        int64_t arBytes = HmxTarget::readoutBytes(contract.m, contract.n);
         int64_t accBytes = contract.m * contract.n *
                            (outType.getElementTypeBitWidth() / 8);
         int64_t residentBeside = vtcmUsed + accumulatorBytes + lhsBytes +
@@ -2104,8 +2102,8 @@ struct MatmulToHmx : public RewritePattern {
     // The block's arrays are the activation block and the read-out block; the
     // weight is whole. This is exactly `plan.bytes`, and the same budget the
     // plan was chosen against.
-    int64_t blockActBytes = blockM * contract.k * inBytes;
-    int64_t blockArBytes = blockM * contract.n * 2;
+    int64_t blockActBytes = HmxTarget::activationBytes(blockM, contract.k);
+    int64_t blockArBytes = HmxTarget::readoutBytes(blockM, contract.n);
     bool hoistRhs =
         bInvariant && rhsBytes <= room - blockActBytes - blockArBytes;
 
@@ -2822,8 +2820,7 @@ struct MatmulToHmxPass
     // budget (0 meaning the device default, see HmxTarget) and whether this
     // pipeline provides the VTCM allocator the crouton arrays need.
     HmxTarget target;
-    if (vtcmBudgetBytes > 0)
-      target.vtcmBudget = vtcmBudgetBytes;
+    target.vtcmBudget = HmxTarget::resolveVtcmBudget(vtcmBudgetBytes);
     // Record-only is a metadata pass, not a partial HMX lowering. It must not
     // claim that VTCM is usable when no HMX allocation will be emitted.
     target.vtcmAllocator = recordOnly ? false : vtcmAllocator;

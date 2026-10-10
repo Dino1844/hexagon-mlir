@@ -978,7 +978,7 @@ LogicalResult validateRecord(ModuleOp module, DictionaryAttr record,
       return emitManifestError(
           module, report, "HMX plans require all-static logical dimensions");
     if (logical.staticShape &&
-        (*logical.staticShape)[0] <= HmxTarget::minRows)
+        !HmxTarget::hasEnoughRows((*logical.staticShape)[0]))
       return emitManifestError(module, report,
                                "HMX plans require logical M > " +
                                    llvm::Twine(HmxTarget::minRows));

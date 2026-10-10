@@ -521,7 +521,7 @@ admitResidentVtcm(func::FuncOp func, ModuleOp module, int64_t addedBytes,
   if (bytes < 0)
     return module.emitError("resident weight byte count is negative");
   ResidentVtcmAdmission admission;
-  admission.budget = HmxTarget::defaultVtcmBudget;
+  admission.budget = HmxTarget::resolveVtcmBudget(0);
   admission.requested = bytes;
   admission.transient =
       hmx::vtcm::transientBytes(func, hmx::vtcm::Population::Memref);

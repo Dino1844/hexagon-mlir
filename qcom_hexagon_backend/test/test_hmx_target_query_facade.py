@@ -4,15 +4,17 @@
 Phase 1 of the HmxTarget query facade (operator-parity ticket 15) moved the
 planning facts the passes each read on their own -- the vtcm-budget
 resolution, the crouton tile counts, the crouton byte terms, the row floor --
-into named query methods on `HmxTarget.h`. It migrated no consumer: the
-passes still spell the same arithmetic in place. That leaves two spellings
-of each fact, and this file is what holds them at the same value until
-Phase 2 retires one of them.
+into named query methods on `HmxTarget.h`. Phase 2 then migrated the consumers
+to those methods, which is why the spellings compared here are the call sites
+themselves: a consumer that reverts to re-deriving a fact the facade answers
+fails one of the pins below.
 
 Three things are pinned, per query:
 
   * the query's own body, extracted from `HmxTarget.h` and evaluated;
-  * the consuming pass's spelling, extracted from its source and evaluated;
+  * the consuming pass's call site, extracted from its source and evaluated
+    under the query's own body (so the site names the query and not a second
+    spelling of its arithmetic);
   * the frozen values the IR side observes -- the CHECK literals of
     `test/Dialect/Hmx/Transforms/hmx-target-query-equality.mlir` and
     `hmx-target-query-refusals.mlir`, which run the real pass on this
@@ -20,19 +22,15 @@ Three things are pinned, per query:
     a third copy of the same number is the disease this work set out to
     cure, and a test file is not exempt.
 
-Why evaluate instead of comparing text: the two spellings are deliberately
-different text (`contract.m * contract.k * inBytes` and
-`activationBytes(rows, k)` name the same product), so an equality of
-*values* over a table of inputs is the only thing that can actually fail.
-
-One spelling deserves its own note. `MatmulToHmxPass` writes the read-out
-bytes as `contract.m * contract.n * 2` with a bare `2`, where the facade
-says `croutonElemBytes`. They are equal today because the engine's read-out
-is fp16, which is exactly what `readoutBytes` documents. Pinning them binds
-that coincidence to its reason: if the crouton element ever stopped being
-2 bytes, this test fails and the site must be fixed rather than the number
-adjusted. (The same treatment `test_crouton_size_agreement.py` gives the
-layout header's bare literals.)
+Why evaluate instead of comparing text: the two sides are deliberately
+different text (`HmxTarget::readoutBytes(contract.m, contract.n)` and
+`readoutBytes(m, n)` name the same product), so an equality of *values* over a
+table of inputs is the only thing that can actually fail. The one spelling that
+used to deserve its own note -- `MatmulToHmxPass` writing the read-out bytes
+as `contract.m * contract.n * 2` with a bare `2` -- is gone with Phase 2: the
+site now names `readoutBytes`, which is what documents the coincidence. The
+same treatment `test_crouton_size_agreement.py` gives the layout header's bare
+literals remains for the header's own constants below.
 """
 
 from __future__ import annotations
@@ -233,7 +231,7 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         )
         self.assertSite(
             self.matmul,
-            "if (vtcmBudgetBytes > 0) target.vtcmBudget = vtcmBudgetBytes;",
+            "target.vtcmBudget = HmxTarget::resolveVtcmBudget(vtcmBudgetBytes);",
             "matmul-to-hmx no longer resolves its vtcm-budget option here "
             "(the reading moved, or this pin is stale)",
         )
@@ -247,8 +245,8 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         )
         self.assertSite(
             self.partition,
-            "const int64_t vtcmBudget = this->vtcmBudgetBytes > 0 "
-            "? this->vtcmBudgetBytes : HmxTarget::defaultVtcmBudget;",
+            "const int64_t vtcmBudget = "
+            "HmxTarget::resolveVtcmBudget(this->vtcmBudgetBytes);",
             "hmx-partition no longer resolves its vtcm-budget option here "
             "(the reading moved, or this pin is stale)",
         )
@@ -265,12 +263,12 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
             )
         self.assertSite(
             self.weight,
-            "admission.budget = HmxTarget::defaultVtcmBudget;",
+            "admission.budget = HmxTarget::resolveVtcmBudget(0);",
             "weight-resident no longer reads the device default here",
         )
         self.assertSite(
             self.thread,
-            "int64_t budget = HmxTarget().vtcmBudget;",
+            "int64_t budget = HmxTarget::resolveVtcmBudget(0);",
             "thread-role-partition no longer reads the default budget here",
         )
 
@@ -278,8 +276,8 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         self.assertSameValue("roomBeside(vtcmUsed)", "vtcmBudget - vtcmUsed")
         self.assertSite(
             self.matmul,
-            "int64_t room = target.vtcmBudget - vtcmUsed;",
-            "matmul-to-hmx no longer computes the room beside the "
+            "int64_t room = target.roomBeside(vtcmUsed);",
+            "matmul-to-hmx no longer asks the target for the room beside the "
             "committed bytes here",
         )
 
@@ -288,18 +286,18 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         self.assertSameValue("tilesIn(extent)", "extent / tileEdge")
         self.assertSite(
             self.matmul,
-            "int64_t tileCols = cols / HmxTarget::tileEdge; "
-            "int64_t rowTiles = rows / HmxTarget::tileEdge;",
-            "the pack bridge no longer divides its extents by the tile "
-            "edge here",
+            "int64_t tileCols = HmxTarget::tilesIn(cols); "
+            "int64_t rowTiles = HmxTarget::tilesIn(rows);",
+            "the pack bridge no longer asks the target for its tile counts "
+            "here",
         )
 
     def test_is_tile_aligned_matches_fused_tail_legality(self):
         self.assertSameValue("isTileAligned(extent)", "extent % tileEdge == 0")
         self.assertSite(
             self.matmul,
-            "return outType.getDimSize(0) % HmxTarget::tileEdge == 0 "
-            "&& outType.getDimSize(1) % HmxTarget::tileEdge == 0;",
+            "return HmxTarget::isTileAligned(outType.getDimSize(0)) && "
+            "HmxTarget::isTileAligned(outType.getDimSize(1));",
             "fusedTailLegal no longer checks the tile grid in place",
         )
 
@@ -310,7 +308,7 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         )
         self.assertSite(
             self.manifest,
-            "(*logical.staticShape)[0] <= HmxTarget::minRows)",
+            "!HmxTarget::hasEnoughRows((*logical.staticShape)[0])",
             "the manifest no longer refuses on the row floor here",
         )
 
@@ -322,23 +320,22 @@ class HmxTargetQueryFacadeTest(unittest.TestCase):
         self.assertSameValue("readoutBytes(m, n)", "m * n * croutonElemBytes")
         self.assertSite(
             self.matmul,
-            "int64_t lhsBytes = contract.m * contract.k * inBytes;",
+            "int64_t lhsBytes = HmxTarget::activationBytes(contract.m, contract.k);",
             "the activation term is no longer spelled in place",
         )
         self.assertSite(
             self.matmul,
-            "int64_t rhsBytes = contract.k * contract.n * inBytes;",
+            "int64_t rhsBytes = HmxTarget::weightBytes(contract.k, contract.n);",
             "the weight term is no longer spelled in place",
         )
         self.assertSite(
             self.matmul,
-            "int64_t outBytes = contract.m * contract.n * 2;",
-            "the read-out term is no longer spelled in place (its bare 2 "
-            "is what this pin anchors to croutonElemBytes)",
+            "int64_t outBytes = HmxTarget::readoutBytes(contract.m, contract.n);",
+            "the read-out term is no longer spelled in place",
         )
         self.assertSite(
             self.matmul,
-            "int64_t arBytes = contract.m * contract.n * HmxTarget::croutonElemBytes;",
+            "int64_t arBytes = HmxTarget::readoutBytes(contract.m, contract.n);",
             "the read-out term is no longer spelled in place on the "
             "accumulator path",
         )

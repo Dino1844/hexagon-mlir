@@ -2747,9 +2747,7 @@ struct HmxPartitionPass
 
     // The engine's budget, with the one field a caller may narrow: 0 means the
     // device default (see HmxTarget).
-    const int64_t vtcmBudget = this->vtcmBudgetBytes > 0
-                                   ? this->vtcmBudgetBytes
-                                   : HmxTarget::defaultVtcmBudget;
+    const int64_t vtcmBudget = HmxTarget::resolveVtcmBudget(this->vtcmBudgetBytes);
 
     // The K batch per `hmx.mma`, resolved the same way: 0 is the hardware
     // maximum, so "not passed", "passed 0" and "passed 32" are one request.

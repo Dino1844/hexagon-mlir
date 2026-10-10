@@ -1512,7 +1512,7 @@ static LogicalResult emitRoleSplit(func::FuncOp fn, RoleSplitMatch &m) {
   // ---- budget: the rotating rows against the room the scratch retires ----
   int64_t rowBytes =
       scratchType.getNumElements() * (scratchType.getElementTypeBitWidth() / 8);
-  int64_t budget = HmxTarget().vtcmBudget;
+  int64_t budget = HmxTarget::resolveVtcmBudget(0);
   int64_t room = hmx::vtcm::roomBytes(fn, budget, rowBytes);
   int64_t need = m.mt * rowBytes;
   if (need > room) {
