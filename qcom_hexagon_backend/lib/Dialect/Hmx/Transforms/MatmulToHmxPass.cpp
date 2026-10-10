@@ -1991,27 +1991,44 @@ struct MatmulToHmx : public RewritePattern {
       std::optional<KAccumulatorLoop> kAcc =
           findKAccumulator(op, init, outType);
       if (kAcc) {
-        // The budget it pays on: beside the engine's read-out -- the one bridge
-        // array that stays resident, the operand croutons becoming per-tile
-        // staging slots -- plus whatever this function already holds: the
-        // ledger's tensor census for the crouton arrays, and the accumulators
-        // this pass already made resident, which are `alloc_tensor`s the
-        // tensor-level census does not see (the ledger's *memref* population
-        // counts them, post-bufferization). Both terms are shape functions; no
-        // new constant is introduced and no shape is special-cased.
+        // The budget it pays on: the whole footprint this function would hold
+        // with the accumulator resident, priced against the same pool the
+        // bridge itself was planned against. Beside the library's
+        // committed bytes -- the ledger's tensor census for the crouton
+        // arrays -- and the accumulators this pass already made resident
+        // (`alloc_tensor`s the tensor-level census cannot see; the ledger's
+        // *memref* population counts them, post-bufferization), the residency
+        // is this attribution's own arrays: the activation croutons, the
+        // weight croutons and the engine's read-out, all live beside the
+        // accumulator at once. Those three are the very terms `planBridge`
+        // reserved for this contraction, so the plan and the accumulator now
+        // share one number instead of the plan pricing two arrays and the
+        // accumulator pretending the rest of the pool is empty. They are
+        // counted whole, never as per-tile slots: when activation staging
+        // never happens -- the degraded, unstaged state a host check must
+        // price -- the bridge arrays are whole arrays resident for the whole
+        // loop, which is the state that exhausts the pool and gets the
+        // request refused at load.
+        // Every term is a shape function of this contraction; no new constant
+        // is introduced and no shape is special-cased.
         int64_t arBytes = contract.m * contract.n * HmxTarget::croutonElemBytes;
         int64_t accBytes = contract.m * contract.n *
                            (outType.getElementTypeBitWidth() / 8);
-        int64_t freeBesideReadout = target.vtcmBudget - vtcmUsed -
-                                    accumulatorBytes - arBytes;
-        if (accBytes > freeBesideReadout) {
-          op->emitRemark() << "K-loop f32 accumulator not made VTCM-resident: "
-                              "it needs "
-                           << accBytes << " bytes and only "
-                           << freeBesideReadout
-                           << " are free beside the engine's read-out"
-                              " (vtcmBudget="
-                           << target.vtcmBudget << " bytes)";
+        int64_t residentBeside = vtcmUsed + accumulatorBytes + lhsBytes +
+                                 rhsBytes + arBytes;
+        int64_t residentTotal = residentBeside + accBytes;
+        if (residentTotal >= target.vtcmBudget) {
+          // The strict `<` is the boundary `planBridge` refuses at, so the
+          // accumulator is admitted exactly when the whole footprint fits.
+          op->emitRemark()
+              << "K-loop f32 accumulator not made VTCM-resident: the function "
+                 "would hold "
+              << residentTotal << " bytes of VTCM against the "
+              << target.vtcmBudget << "-byte budget (committed " << vtcmUsed
+              << ", resident accumulators " << accumulatorBytes
+              << ", activation croutons " << lhsBytes
+              << ", weight croutons " << rhsBytes << ", read-out " << arBytes
+              << ", this accumulator " << accBytes << ")";
           kAcc.reset();
         }
       }
