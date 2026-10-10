@@ -43,7 +43,6 @@ std::mutex &mlir::hmx::hmxModuleStateMutex() {
 
 namespace {
 
-constexpr StringLiteral kManifestAttr = "hmx.kernel_manifest";
 // This is the only versioned name in this file.  It is a wire protocol
 // identity, not a C++ API name.
 constexpr StringLiteral kManifestSchema = "hex.hmx.kernel_manifest/v2";
@@ -1296,7 +1295,7 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
                                        bool createIfMissing,
                                        bool requireFinal = false,
                                        bool checkFingerprints = true) {
-  Attribute raw = module->getAttr(kManifestAttr);
+  Attribute raw = module->getAttr(kHmxManifestAttr);
   if (!raw) {
     if (!createIfMissing)
       return emitManifestError(module, reportErrors,
@@ -1311,8 +1310,8 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
     fields.append(kKeyPackWeightSites, IntegerAttr::get(i64, 0));
     fields.append(kKeyUnpackSites, IntegerAttr::get(i64, 0));
     fields.append(kKeyCountSemantics, StringAttr::get(ctx, kCountSemantics));
-    module->setAttr(kManifestAttr, fields.getDictionary(ctx));
-    raw = module->getAttr(kManifestAttr);
+    module->setAttr(kHmxManifestAttr, fields.getDictionary(ctx));
+    raw = module->getAttr(kHmxManifestAttr);
   }
 
   auto manifest = dyn_cast<DictionaryAttr>(raw);
@@ -1549,14 +1548,14 @@ FailureOr<DictionaryAttr> readManifest(ModuleOp module, bool reportErrors,
 
 LogicalResult writeManifest(ModuleOp module, NamedAttrList &fields) {
   MLIRContext *ctx = module.getContext();
-  Attribute previous = module->getAttr(kManifestAttr);
-  module->setAttr(kManifestAttr, fields.getDictionary(ctx));
+  Attribute previous = module->getAttr(kHmxManifestAttr);
+  module->setAttr(kHmxManifestAttr, fields.getDictionary(ctx));
   if (failed(readManifest(module, /*reportErrors=*/true,
                           /*createIfMissing=*/true))) {
     if (previous)
-      module->setAttr(kManifestAttr, previous);
+      module->setAttr(kHmxManifestAttr, previous);
     else
-      module->removeAttr(kManifestAttr);
+      module->removeAttr(kHmxManifestAttr);
     return failure();
   }
   return success();
@@ -2381,7 +2380,7 @@ LogicalResult mlir::hmx::refreshHmxManifestBridgeCounts(ModuleOp module) {
 }
 
 LogicalResult mlir::hmx::finalizeHmxManifest(ModuleOp module) {
-  Attribute previous = module->getAttr(kManifestAttr);
+  Attribute previous = module->getAttr(kHmxManifestAttr);
   FailureOr<DictionaryAttr> current =
       readManifest(module, /*reportErrors=*/true, /*createIfMissing=*/true,
                    /*requireFinal=*/true, /*checkFingerprints=*/false);
@@ -2405,14 +2404,14 @@ LogicalResult mlir::hmx::finalizeHmxManifest(ModuleOp module) {
 
   NamedAttrList fields(*current);
   fields.set(kKeyMatmuls, ArrayAttr::get(ctx, entries));
-  module->setAttr(kManifestAttr, fields.getDictionary(ctx));
+  module->setAttr(kHmxManifestAttr, fields.getDictionary(ctx));
   if (failed(readManifest(module, /*reportErrors=*/true,
                           /*createIfMissing=*/false,
                           /*requireFinal=*/true, /*checkFingerprints=*/true))) {
     if (previous)
-      module->setAttr(kManifestAttr, previous);
+      module->setAttr(kHmxManifestAttr, previous);
     else
-      module->removeAttr(kManifestAttr);
+      module->removeAttr(kHmxManifestAttr);
     return failure();
   }
   return success();
@@ -2421,7 +2420,7 @@ LogicalResult mlir::hmx::finalizeHmxManifest(ModuleOp module) {
 std::string mlir::hmx::serializeHmxManifestJson(ModuleOp module) {
   // Serialization is a publication boundary.  Do not expose an intermediate
   // module attribute merely because its attribution records are already valid.
-  if (!module->getAttr(kManifestAttr))
+  if (!module->getAttr(kHmxManifestAttr))
     return "{}";
 
   if (failed(finalizeHmxManifest(module)))

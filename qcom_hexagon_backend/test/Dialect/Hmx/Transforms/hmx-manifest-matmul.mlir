@@ -42,7 +42,12 @@ module {
 // -----
 
 // A legal contraction is selected, its generated hmx.matmul carries the stable
-// decision id, and the manifest reports the actual bridge footprint.
+// decision id, and the manifest reports the actual bridge footprint. The
+// execution block (block_m / blocking) is what the launch-time tile notice
+// reads: a whole-block contraction publishes block_m == M, and that equality is
+// what keeps the notice silent (hmx_tile_notice in backend/utils.py).
+// CHECK-DAG: block_m = 64 : i64
+// CHECK-DAG: blocking = "whole"
 // SELECTED: function = "selected"
 // SELECTED: id = 0 : i64
 // SELECTED: logical = {{.*}}
@@ -82,6 +87,7 @@ module {
 // BLOCKED: reason = "selected-aligned"
 // BLOCKED: vtcm_before_bytes = 0 : i64
 // BLOCKED: vtcm_bridge_peak_bytes = 4784128 : i64
+// BLOCKED: vtcm_budget_bytes = 8388608 : i64
 // BLOCKED: hmx.matmul
 // BLOCKED: hmx.decision_id = 0 : i64
 module {

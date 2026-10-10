@@ -235,12 +235,6 @@ def LowerLibdevice :
 	let constructor = "hexagon::createLowerLibdevicePass()";
 }
 
-def LowerTPtr :
-    InterfacePass<"lower-tptr", "mlir::FunctionOpInterface"> {
-  let summary = "Lower tptr ops to mlir dialect ops";
-  let constructor = "hexagon::createLowerTPtrPass()";
-}
-
 def LowerTTX :
     InterfacePass<"lower-ttx", "mlir::FunctionOpInterface"> {
   let summary = "Lower ttx ops to mlir dialect ops";
@@ -251,51 +245,6 @@ def MatmulToConv : Pass<"matmul-to-conv", "func::FuncOp"> {
   let summary = "Convert linalg.matmul to linalg.conv2d ops";
 
   let constructor = "hexagon::createMatmulToConvPass()";
-}
-
-def MatmulToHexKL : InterfacePass<"matmul-to-hexkl", "mlir::FunctionOpInterface"> {
-  let summary = "Convert linalg.matmul to hexkl.matmul";
-
-  let description = [{
-    Converts linalg.matmul operations with FP16 inputs to hexkl.matmul.
-
-    Modes:
-    - macro: High-level API with stricter requirements
-      * Outputs f16 only (must upcast to f32 later if needed)
-      * Strict dimension limits (M≤1600, N≤5120, K≤76030)
-      * Memory allocation handled by macro API
-      * Optimized DMA transfers and tiling strategy
-
-    - micro(default): Low-level API with more flexibility
-      * Can output f16 or f32 directly
-      * Fine grained control over tiling and memory allocation
-  }];
-
-  let constructor = "mlir::hexagon::createMatmulToHexKLPass()";
-
-  let options = [
-    Option<"mode", "mode", "std::string",
-           /*default=*/"\"micro\"",
-           "HexKL API mode: 'micro' (default) or 'macro'">
-  ];
-}
-
-def DecomposeHexKLMatmul :
-    InterfacePass<"decompose-hexkl-matmul", "mlir::FunctionOpInterface"> {
-  let summary = "Decompose hexkl.matmul into hexkl micro HMX operations";
-  let description = [{
-    Decomposes hexkl::MatmulOp into a sequence of hexkl micro HMX operations
-    that perform tiled matrix multiplication. This pass implements the same
-    tiling strategy as hexkl_matmul_f16f16_f32 in the runtime library.
-
-    The decomposition includes:
-    - VTCM allocation for tile buffers
-    - Triple-nested loops for row/column/inner tiling
-    - Activation and weight tile loading and layout conversion
-    - HMX matrix multiplication with accumulation
-    - Result readback and format conversion (f16 to f32)
-  }];
-  let constructor = "hexagon::createDecomposeHexKLMatmulPass()";
 }
 
 def ConvTiling : Pass<"conv-tiling", "func::FuncOp"> {
@@ -523,27 +472,6 @@ def SeedLayoutConversions :
   let constructor =
        "hexagon::createSeedLayoutConversionsPass()";
 
-}
-
-def LowerHexKLMatmulToMacro : InterfacePass<"lower-hexkl-matmul-to-macro", "mlir::FunctionOpInterface"> {
-  let summary = "Lower hexkl.matmul to optimized hexkl_macro_mm_f16 call";
-  let description = [{
-    This pass lowers hexkl::MatmulOp to a single call to the optimized
-    hexkl_macro_mm_f16 library function, handling layout transformations
-    for activations (RM→AH) and output (AH→RM). Assumes weights are
-    already in WH layout (pre-transformed by PreprocessWeightsForHMX pass).
-  }];
-  let constructor = "mlir::hexagon::createLowerHexKLMatmulToMacroPass()";
-}
-
-def PreprocessWeightsForHMX :   InterfacePass<"preprocess-weights-hmx", "mlir::FunctionOpInterface"> {
-  let summary = "Transform constant weights to HMX WH layout at compile time";
-  let description = [{
-    This pass identifies constant weight tensors used as RHS in matmul operations
-    and transforms them from row-major to WH (HMX weight) layout by calling
-    hexkl_macro_rm_to_wh_f16_inplace at compile time.
-  }];
-  let constructor = "mlir::hexagon::createPreprocessWeightsForHMXPass()";
 }
 
 def ForceHVXCrouton :

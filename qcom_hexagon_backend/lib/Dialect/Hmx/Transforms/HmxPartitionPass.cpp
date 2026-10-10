@@ -378,7 +378,7 @@ LogicalResult recordPipelineDecision(MatmulOp op,
       op.emitError("hmx.matmul is not inside a function and module");
       return failure();
     }
-    if (!module->hasAttr("hmx.kernel_manifest")) {
+    if (!module->hasAttr(kHmxManifestAttr)) {
       op.emitError("hmx.matmul has a decision id but no module manifest");
       return failure();
     }
@@ -2516,7 +2516,7 @@ struct HmxPartitionPass
     // IR that has not gone through matmul-to-hmx.  Such IR has no attribution
     // record to update; production/full-pipeline IR always carries the module
     // manifest created by matmul-to-hmx.
-    const bool hasManifest = module->hasAttr("hmx.kernel_manifest");
+    const bool hasManifest = module->hasAttr(kHmxManifestAttr);
     if (hasManifest && (failed(ensureHmxManifest(module)) ||
                         failed(restoreHmxManifestDecisionIds(module, func)) ||
                         failed(refreshHmxManifestBridgeCounts(module))))

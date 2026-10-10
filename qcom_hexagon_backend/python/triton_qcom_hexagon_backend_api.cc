@@ -9,17 +9,13 @@
 
 #include "triton_qcom_hexagon_backend_api.h"
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
-#include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxRecordV3.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxResidentContract.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
-#include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
-#include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Dialect/TmTensor/IR/TmTensorDialect.h"
 #include "hexagon/Target/HEX_LLVMIR/LLVMIRTranslation.h"
@@ -373,17 +369,13 @@ void loadDialects(mlir::MLIRContext &context) {
   mlir::registerAllDialects(registry);   // TODO: restrict
   mlir::registerAllExtensions(registry); // TODO: restrict
 
-  registry.insert<mlir::crouton::CroutonDialect>();
   registry.insert<mlir::hexagonmem::HexagonMemDialect>();
-  registry.insert<mlir::hexkl::HexKLDialect>();
   registry.insert<mlir::hmx::HmxDialect>();
   registry.insert<mlir::hvx::HvxDialect>();
   registry.insert<mlir::tm_tensor::TmTensorDialect>();
   registry.insert<mlir::ttx::TTXDialect>();
-  registry.insert<mlir::tptr::HexagonTPtrDialect>();
 
   // Register all external models.
-  mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::hmx::registerBufferizableOpInterfaceExternalModels(registry);
 
   context.appendDialectRegistry(registry);

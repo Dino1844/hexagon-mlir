@@ -15,7 +15,7 @@
 // metadata; the kernel lowering is byte-for-byte the kernel the unmarked module
 // would have produced, which is the whole point of a record-only schema.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // The two schemas describe the same compile, so the plan they name for the same

@@ -9,7 +9,7 @@
 // The real LinalgToLLVM pipeline must not publish an accounting attribute
 // without the explicit internal module marker.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-workspace-resident})' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK-LABEL: module

@@ -23,7 +23,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
@@ -520,16 +519,6 @@ static SizeResult getMemRefSize(BaseMemRefType type,
   return {true, true, elements * elementBytes, constantBoundedExtent};
 }
 
-static SizeResult getCroutonSize(crouton::CroutonType type) {
-  if (!type.getVtcm().getValue())
-    return {};
-  int64_t elements = type.getNumElements();
-  if (elements <= 0 ||
-      elements > std::numeric_limits<int64_t>::max() / layout::kCroutonBytes)
-    return {true, false, 0};
-  return {true, true, elements * layout::kCroutonBytes};
-}
-
 static SizeResult getAllocationSize(Operation *operation) {
   if (auto alloc = dyn_cast<bufferization::AllocTensorOp>(operation)) {
     Attribute memorySpace = alloc.getMemorySpaceAttr();
@@ -571,8 +560,6 @@ static SizeResult getAllocationSize(Operation *operation) {
     if (auto memrefType = dyn_cast<BaseMemRefType>(type))
       result =
           getMemRefSize(memrefType, alloc.getDynamicSizes(), extraOperandIsAddress);
-    else if (auto croutonType = dyn_cast<crouton::CroutonType>(type))
-      result = getCroutonSize(croutonType);
     else
       return {true, false, 0};
     if (!result.isVtcm)
@@ -1358,8 +1345,6 @@ static bool isVtcmType(Type type) {
       return true;
     return memorySpace == hexagon::VTCM_ADDRESS_SPACE;
   }
-  if (auto croutonType = dyn_cast<crouton::CroutonType>(type))
-    return croutonType.getVtcm().getValue();
   return false;
 }
 
@@ -3735,7 +3720,7 @@ struct HmxVtcmAccountingPass
   void getDependentDialects(DialectRegistry &registry) const override {
     registry
         .insert<HmxDialect, hexagonmem::HexagonMemDialect,
-                crouton::CroutonDialect, memref::MemRefDialect,
+                memref::MemRefDialect,
                 bufferization::BufferizationDialect, cf::ControlFlowDialect>();
   }
 

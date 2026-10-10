@@ -77,24 +77,6 @@ void setLinalgToLLVMOptions(
       !arch_kwargs.at("enableConvertToHexagonmem").compare(TRUE);
   options.enableHexagonmemCopyToDMA =
       !arch_kwargs.at("enableHexagonmemCopyToDMA").compare(TRUE);
-  options.enableHexKL = !arch_kwargs.at("enableHexKL").compare(TRUE);
-  // hexKLMode: the Python field is GONE as of 2026-09-30, so there is nothing
-  // to read here any more. Left `std::string` unset so the declared default
-  // ("micro", Passes.td) applies -- deliberately NOT an `at()` read, because
-  // `at()` throws on a missing key and 16 tests build partial option maps.
-  //
-  // Why deleting the field is behaviour-preserving, verified rather than argued:
-  //  * every `hexKLMode == "macro"` branch sits behind `enableHexKL`, and
-  //    LinalgToLLVMPass rejects that combination outright --
-  //    "enableHexKL is incompatible with the HMX manifest contract" -- so those
-  //    branches were unreachable before this change and are still unreachable;
-  //  * the only caller that ever set the field is
-  //    test/python/torch-mlir/test_hexkl_macro_matmul.py, and it already fails
-  //    on exactly that error, and is not part of the host gate;
-  //  * the direct-drive lit path (test/Conversion/LinalgToLLVM/
-  //    matmul_to_hexkl.mlir) passes `(matmul-to-hexkl)` its own options and
-  //    never goes through this function, so the pass option stays in Passes.td.
-  // See docs/codegen/knob-fork-classification-2026-09-30.md §1.3.1-5.
   options.enableCollapseAddressSpace =
       !arch_kwargs.at("enableCollapseAddressSpace").compare(TRUE);
   options.tileSizes = arch_kwargs.at("tileSizes");

@@ -1710,6 +1710,184 @@ def hmx_grid_notice(manifest, launch_grid, kernel_name=None, *, threaded_dispatc
     )
 
 
+# The HmxTarget.h constants the tile recommendation is computed from, mirrored
+# so a recommendation can be built from a manifest alone.  These are *copies of
+# a decided contract*, not a second budget model: the values are chosen in C++
+# (tileEdge is aliased from the crouton layout contract, defaultVtcmBudget is
+# the device's VTCM pool, croutonElemBytes is the fp16 crouton), and each copy
+# is pinned against the compiler's own output -- the tile edge and the row
+# floor by the manifest's padded/full/tail arithmetic and HMX_MINIMUM_ROWS
+# above, the budget by the records' published `vtcm_budget_bytes` -- so a
+# one-sided change fails a host test instead of quietly diverging.
+HMX_CROUTON_ELEM_BYTES = 2
+HMX_VTCM_BUDGET_BYTES = 8 * 1024 * 1024
+
+
+def _hmx_crouton_bytes(rows, n, k):
+    """`HmxTarget::croutonBytes`: the VTCM bytes one `rows`-row span holds.
+
+    One crouton is a 32x32 fp16 block, so a span's three arrays -- its
+    activation rows, the whole weight and its fp16 read-out -- cost
+    `(rows*k + k*n + rows*n) * 2`. The read-out is fp16 whatever the
+    contraction's element type (a wider result is widened after the unpack),
+    which is why no element width enters here.
+    """
+    return (rows * k + k * n + rows * n) * HMX_CROUTON_ELEM_BYTES
+
+
+def _hmx_single_span_limit(rows, fixed, room):
+    """The largest second extent that still lets `rows` rows fit ONE span.
+
+    Solving `croutonBytes(rows, other, fixed) < room` for `other` -- the
+    activation and read-out terms scale with the extent being solved for, the
+    `rows * fixed` term does not:
+
+        (rows*fixed + other*(rows + fixed)) * 2 < room
+      ⟺ other * (rows + fixed) * 2 < room - rows*fixed*2
+
+    Pass the extent that stays put as `fixed`; the answer is the largest tile
+    value of the one that varies. 0 means nothing fits: not even a single span
+    of `rows` rows is inside the room, so the only lever left is `rows`.
+    """
+    numerator = room - rows * fixed * HMX_CROUTON_ELEM_BYTES - 1
+    denominator = (rows + fixed) * HMX_CROUTON_ELEM_BYTES
+    if numerator < 0 or denominator <= 0:
+        return 0
+    return numerator // denominator
+
+
+def _hmx_static_logical_shape(record):
+    """`(m, n, k)` for a record whose logical shape is fully static, else None.
+
+    A dynamic extent has no tile to recommend: the bridge decision for it is
+    made per launch, and a recommendation computed from a symbol would be a
+    guess wearing a number.
+    """
+    logical = record.get("logical")
+    if not isinstance(logical, dict):
+        return None
+    values = []
+    for axis in ("m", "n", "k"):
+        dimension = logical.get(axis)
+        if not isinstance(dimension, dict):
+            return None
+        value = dimension.get("value")
+        if type(value) is not int or value < 1:
+            return None
+        values.append(value)
+    return tuple(values)
+
+
+def hmx_tile_notice(manifest, kernel_name=None):
+    """The tile choice behind an HMX matmul, when it costs more than one span.
+
+    The engine takes one contraction at a time and its crouton arrays must sit
+    in the shared VTCM pool, so `matmul-to-hmx` decides how many rows of M one
+    span walks (`HmxTarget::planBridge`, exported per record as
+    `execution.block_m`). This reports that decision wherever it is not one
+    span, together with the two numbers that decide it: the bytes one span
+    needs and the room the pool leaves. A single-span site says nothing --
+    which is what keeps this off the default path.
+
+    Span count is the objective function, for a measured reason: every extra
+    K span pays a full read-out plus the residual add-back, measured at
+    80.9-100.3 us per block on 256x256x4096
+    (docs/hmx/tiled-k-matmul-support-2026-09-30.md, sections 4.0 and 4.5b,
+    iters=300). That number is K spans only; no M-span figure has been
+    measured, so this notice states counts and never a time it cannot source.
+
+    What this cannot see, stated so nobody reads more into it: the manifest
+    describes ONE contraction -- one `tl.dot`, at the extents the kernel's
+    `BLOCK_*` gave it. How many dots the kernel executes (a K loop, an M or N
+    loop) is the other half of the span count and is not published anywhere,
+    so the recommendation is phrased as the single-span limits at the site's
+    own M rather than as a total.
+
+    Facts and one structural recommendation only, the same contract as the
+    grid notice above: no ratio is claimed, nothing is measured here,
+    and unreadable input answers no message rather than an exception.
+    """
+    manifest = _hmx_parse_manifest(manifest)
+    if manifest is None:
+        return []
+    records = manifest.get("matmuls")
+    if not isinstance(records, list):
+        return []
+    who = _hmx_warning_name(kernel_name)
+    messages = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        # A refused site is the refusal reporter's answer (the launch-time
+        # warnings above and the compile-time sibling) and publishes no bridge
+        # plan, so recommending a block for one would rest on a number this
+        # record does not carry.
+        if record.get("plan") not in HMX_NON_HVX_PLANS:
+            continue
+        shape = _hmx_static_logical_shape(record)
+        if shape is None:
+            continue
+        m, n, k = shape
+        execution = record.get("execution")
+        if not isinstance(execution, dict):
+            continue
+        block_m = execution.get("block_m")
+        # `block_m` is the compiler's own planBridge answer, so it is read, not
+        # recomputed: a second copy of the blocking search in Python would be a
+        # second place for the decision to drift.
+        if type(block_m) is not int or block_m < 1 or m % block_m:
+            continue
+        spans = m // block_m
+        if spans <= 1:
+            continue
+        budget = record.get("vtcm_budget_bytes")
+        if type(budget) is not int or budget < 1:
+            budget = HMX_VTCM_BUDGET_BYTES
+        before = record.get("vtcm_before_bytes")
+        # Committed bytes are load-bearing (they are the room), and a record
+        # that does not publish them is not a basis for a recommendation.
+        if type(before) is not int or before < 0:
+            continue
+        room = budget - before
+        k_limit = _hmx_single_span_limit(m, n, room)
+        n_limit = _hmx_single_span_limit(m, k, room)
+        # An extent off the tile grid is not a whole contraction (it lands in
+        # hmx-tail at best), so the limits are reported on the grid.
+        k_limit -= k_limit % HMX_TILE_EDGE
+        n_limit -= n_limit % HMX_TILE_EDGE
+        # A zero limit is a real answer ("nothing fits"), so it is said rather
+        # than rounded into a misleading small block.
+        if k_limit:
+            k_part = f"K fits one span up to {k_limit} at this N"
+        else:
+            k_part = f"no K fits one span at N={n}"
+        if n_limit:
+            n_part = f"N fits one span up to {n_limit} at this K"
+        else:
+            n_part = f"no N fits one span at K={k}"
+        messages.append(
+            f"hmx: {who}matmul #{record.get('id', '?')} "
+            f"{record.get('function', '?')} {m}x{n}x{k} is walked in "
+            f"{spans} HMX span(s) of {block_m} rows: one span holds "
+            f"{_hmx_crouton_bytes(block_m, n, k)} bytes of VTCM and all {m} "
+            f"rows at once would need {_hmx_crouton_bytes(m, n, k)}, over the "
+            f"{room} bytes the VTCM pool leaves after {before} of its {budget} "
+            f"bytes are already committed -- the "
+            f"{k * n * HMX_CROUTON_ELEM_BYTES}-byte weight is the term "
+            f"blocking M does not shrink. With M={m} fixed, {k_part}, and "
+            f"{n_part} (rounded down to the {HMX_TILE_EDGE}-element tile "
+            f"grid), so pick the largest BLOCK_K/BLOCK_N that still fits one "
+            f"span: a smaller block fits but multiplies the number of dots "
+            f"over the full matrix. An extra K span costs a measured "
+            f"80.9-100.3 us on a 256x256x4096 contraction "
+            f"(docs/hmx/tiled-k-matmul-support-2026-09-30.md sections "
+            f"4.0/4.5b, iters=300); no M-span figure has been measured, so "
+            f"this notice states counts, not times. Per-site record: "
+            f'kernel.packed_metadata["hmx_manifest"]'
+        )
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # Record-only v3 consumer
 # ---------------------------------------------------------------------------

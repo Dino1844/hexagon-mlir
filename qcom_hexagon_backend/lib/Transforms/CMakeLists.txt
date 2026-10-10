@@ -14,9 +14,7 @@ add_mlir_library(Transforms
   VectorLoweringPass.cpp
   DecomposeTensorConcatPass.cpp
   MatmulToConvPass.cpp
-  MatmulToHexKLPass.cpp
   CopyCanonicalizationPass.cpp
-  DecomposeHexKLMatmulPass.cpp
   ConvTilingPass.cpp
   ConvertLayoutPass.cpp
   ExpandMathOpsPass.cpp
@@ -28,7 +26,6 @@ add_mlir_library(Transforms
   MaxnumLegalizePass.cpp
   ConvertZeroSizeMemrefPass.cpp
   ConvertToHexagonmem.cpp
-  LowerTPtr.cpp
   SeedLayoutConversions.cpp
   ForceHVXCrouton.cpp
   SmallExponentToMultiplyPass.cpp
@@ -45,8 +42,6 @@ add_mlir_library(Transforms
   HoistScalarOps.cpp
   FoldMulFByZeroPass.cpp
   FoldResourceTransposePass.cpp
-  LowerHexKLMatmulToMacroPass.cpp
-  PreprocessWeightsForHMXPass.cpp
   FoldPackUnpackConstantsPass.cpp
   EliminateRedundantUnpackPackPass.cpp
   DivToMulOptimizationPass.cpp

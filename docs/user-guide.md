@@ -19,7 +19,6 @@
             - [Triton and Triton_Shared](#Triton-and-Triton_Shared)
             - [Hexagon SDK](#hexagon-sdk)
             - [Hexagon Tools](#hexagon-tools)
-            - [Hexagon Kernel Library (HexKL)](#hexagon-kernel-library-hexkl)
             - [Download the clang toolchain](#download-the-clang-toolchain)
         - [Building LLVM for Triton](#building-llvm-for-triton)
         - [Creating a Python Environment](#creating-a-python-environment)
@@ -43,8 +42,6 @@ This user guide provides instructions for setting up and installing Qualcomm Hex
 - **Python Version**: Python 3.11 (recommended)
 - **Hardware**: Qualcomm Hexagon NPU (tested architectures - v73, v75, v79, v81)
 - **Device Access**: Access to Qualcomm Hexagon NPU enabled device
-
-Note: HexKL option is not valid currently for v81.
 
 ### Required Permissions
 - Root/sudo access for system package installation
@@ -104,7 +101,7 @@ export HEXAGON_MLIR_ROOT=$PWD
 We provide a script `HEXAGON_MLIR_ROOT/scripts/build_hexagon_mlir.sh` that automates much of the setup process of building a complete `Hexagon-MLIR + Triton + Torch-MLIR` environment locally, including: 
 
 * Submodule setup for `triton` and `triton_shared`.
-* Downloading and extracting Hexagon SDK, Hexagon Tools, and Hexagon Kernel Library (HexKL).
+* Downloading and extracting Hexagon SDK and Hexagon Tools.
 * Downloading and building the required LLVM version for Triton.
 * Creating a Python virtual environment and installing required Python packages.
 * Building Triton with Hexagon backend support and running tests.
@@ -128,7 +125,6 @@ Local development requires downloading several components:
 
 * [Hexagon SDK 6.4.0.2](https://softwarecenter.qualcomm.com/catalog/item/Hexagon_SDK)
 * [Hexagon Tools 19.0.02](https://softwarecenter.qualcomm.com/catalog/item/Hexagon_open_access)
-* [Hexagon Kernel Library (HexKL 1.0.0)](https://softwarecenter.qualcomm.com/catalog/item/Hexagon_KL)
 * LLVM (Triton-compatible)
 * Python Virtual Environment
 * [triton](https://github.com/triton-lang/triton)
@@ -141,7 +137,6 @@ Export the following environment variables
 ```bash
 export HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK/6.4.0.2
 export HEXAGON_TOOLS=/path/to/Tools
-export HEXKL_ROOT=/path/to/hexkl_addon
 export LLVM_PROJECT_BUILD_dir=/path/to/llvm/build
 export CONDA_ENV=/path/to/your/python/env
 ```
@@ -168,20 +163,6 @@ export HEXAGON_SDK_ROOT=/path/to/Hexagon_SDK/6.4.0.2
 wget https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_open_access/Linux/Debian/19.0.02/Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 tar -xzf Hexagon_open_access.Core.19.0.02.Linux-Any.tar.gz
 export HEXAGON_TOOLS=/path/to/Tools
-```
-
-##### Hexagon Kernel Library (HexKL)
-
-* Download the HexKL package.
-* Extract the outer zip.
-* Extract the inner zip (e.g., hexkl-1.0.0-beta1-6.4.0.0.zip).
-* Locate the `hexkl_addon` directory. 
-
-```bash
-wget https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_KL/Linux/1.0.0/Hexagon_KL.Core.1.0.0.Linux-Any.zip
-unzip Hexagon_KL.Core.1.0.0.Linux-Any.zip 
-unzip hexkl-1.0.0-beta1-6.4.0.0.zip
-export HEXKL_ROOT=/path/to/hexkl_addon
 ```
 
 ##### Download the clang toolchain
@@ -247,7 +228,7 @@ Then set:
 
 #### Building Triton Locally
 
-Now, your variables might be already set for `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS`, `HEXKL_ROOT`, `LLVM_PROJECT_BUILD_DIR`, and `CONDA_ENV`.
+Now, your variables might be already set for `HEXAGON_SDK_ROOT`, `HEXAGON_TOOLS`, `LLVM_PROJECT_BUILD_DIR`, and `CONDA_ENV`.
 There are some `triton` specific variables that need to be set in order to build Triton with Hexagon backend support:
 
 ```bash

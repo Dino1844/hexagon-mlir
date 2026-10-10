@@ -156,9 +156,6 @@ The compilation follows these stages:
 5. **Linking**: Create shared library with runtime wrapper
 6. **Execution**: Load and run on device
 
-### What is Hexagon Kernel Library (HexKL)?
-HexKL is Qualcomm's Hexagon Kernel Library (currently available on request) providing providing both host CPU-side and NPU-side kernels optimized for AI/ML workloads such as matrix multiplication in various configurations. Details on setup are available in the [user-guide](user-guide.md) and please refer to [matmul-hexkl-tutorial](tutorials/triton/matmul_hexkl.md) for a tutorial demonstrating it's usage within hexagon-mlir.
-
 ### How do I profile kernel performance?
 
 Use the built-in profiling:

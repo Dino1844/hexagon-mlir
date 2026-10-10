@@ -34,6 +34,12 @@ namespace hmx {
 /// hand-off never depends on location metadata.
 inline constexpr StringLiteral kHmxDecisionIdAttr = "hmx.decision_id";
 
+/// The module attribute carrying the structured HMX attribution manifest.
+/// The manifest writer (HmxManifest.cpp) and every reader that gates on the
+/// manifest's presence (partition, resident passes) name it through this one
+/// constant, so the spelling cannot drift between producer and consumers.
+inline constexpr StringLiteral kHmxManifestAttr = "hmx.kernel_manifest";
+
 /// Internal, test-only IR marker. It is deliberately not a backend option:
 /// the normal attribution path never sets it, so production tail selection
 /// remains closed while diagnostic producer/consumer tests can exercise the

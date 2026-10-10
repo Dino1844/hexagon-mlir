@@ -12,22 +12,20 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Conversion/DMAToLLVM/Passes.h"
-#include "hexagon/Conversion/HexKLToLLVM/Passes.h"
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/HmxToLLVM/HmxToLLVM.h"
 #include "hexagon/Conversion/HvxToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Common.h"
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
-#include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
-#include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/Passes.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Transforms/Passes.h"
+
+#include <algorithm>
 
 #include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
 #include "mlir/Conversion/Passes.h"
@@ -50,7 +48,9 @@
 #include "mlir/Dialect/Quant/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/IR/MLIRContext.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/TargetParser/Triple.h"
@@ -98,21 +98,13 @@ public:
                     scf::SCFDialect, async::AsyncDialect, tensor::TensorDialect,
                     cf::ControlFlowDialect, bufferization::BufferizationDialect,
                     vector::VectorDialect, memref::MemRefDialect,
-                    LLVM::LLVMDialect, crouton::CroutonDialect, ttx::TTXDialect,
-                    tptr::HexagonTPtrDialect, hexagonmem::HexagonMemDialect,
-                    hexkl::HexKLDialect, hmx::HmxDialect, hvx::HvxDialect,
-                    quant::QuantDialect>();
+                    LLVM::LLVMDialect, ttx::TTXDialect,
+                    hexagonmem::HexagonMemDialect, hmx::HmxDialect,
+                    hvx::HvxDialect, quant::QuantDialect>();
   }
 
   void runOnOperation() override {
     auto moduleOp = getOperation();
-    if (enableHexKL) {
-      moduleOp.emitError(
-          "enableHexKL is incompatible with the HMX manifest contract: "
-          "HexKL consumes linalg.matmul before HMX attribution can record it");
-      signalPassFailure();
-      return;
-    }
 
     // The record-only path is intentionally available to hand-written memref
     // IR, but it cannot translate the tensor ABI produced by Triton: the HVX
@@ -127,6 +119,57 @@ public:
       return;
     }
 
+    // SCF threading rewrites the loop nest into scf.parallel to be picked up by
+    // virtual threads; multi-threading, VTCM tiling and the external scratch
+    // buffer each expect to be the sole owner of that nest / of the per-instance
+    // VTCM budget. Combining them is an undefined pipeline, so reject it loudly
+    // here instead of asserting: an assert is compiled out of Release/NDEBUG
+    // builds and would silently emit the broken pipeline.
+    if (enableSCFThreading &&
+        (enableMultiThreading || enableVTCMTiling || scratch > 0)) {
+      moduleOp.emitError(
+          "enableSCFThreading is incompatible with enableMultiThreading, "
+          "enableVTCMTiling and scratch>0; scf-threading can be enabled only "
+          "if linalg multi-threading, vtcm tiling and the external scratch "
+          "buffer are all off");
+      signalPassFailure();
+      return;
+    }
+
+    PassManager pm(&getContext(), moduleOp.getOperationName());
+    addProductionPasses(pm, moduleOp);
+
+    if (failed(runPipeline(pm, getOperation())))
+      signalPassFailure();
+  }
+
+  /// Set by the diagnostic entry point through
+  /// `runLinalgToLLVMPipeline`. Empty on the production pass, which has no such
+  /// stage. A `std::function` rather than a `function_ref` because the pass may
+  /// be cloned (and run) after the caller's lambda has gone out of scope.
+  std::function<void(PassManager &)> diagnosticStage;
+
+  /// Append the whole production sequence to `pm`.
+  ///
+  /// The pass owns the guards and the run; the diagnostic entry point
+  /// (`hmx-diagnostic-record`, in the HmxDiagnostics library) calls this and
+  /// then appends the two diagnostic passes at the stage they belong. Keeping
+  /// the sequence here is what lets the diagnostics live outside this file and
+  /// outside `libtriton.so`: there is exactly one copy of the production order,
+  /// and it does not reference the diagnostic passes at all.
+  ///
+  /// `moduleOp` is the module the passes will run on; it is used for the target
+  /// triple and data layout, which the caller's IR already depends on.
+  void addProductionPasses(PassManager &pm, ModuleOp moduleOp,
+                            llvm::function_ref<void(PassManager &)>
+                                atDiagnosticStage = {});
+};
+
+} // namespace
+
+void LinalgToLLVMPass::addProductionPasses(
+    PassManager &pm, ModuleOp moduleOp,
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage) {
     MLIRContext *context = moduleOp.getContext();
 
     setTargetTriple(moduleOp);
@@ -193,12 +236,6 @@ public:
       return passOption;
     };
 
-    auto setHexKLMode = [&](auto passOption) {
-      passOption.mode = hexKLMode;
-      return passOption;
-    };
-
-    PassManager pm(&getContext(), moduleOp.getOperationName());
 
     // RequestCWrappersPass adds an attribute to a function if it has a return
     // value which would generate a c-wrapper function during the
@@ -237,7 +274,6 @@ public:
 
     pm.addNestedPass<func::FuncOp>(createLowerTTXPass());
     pm.addPass(createLowerLibdevicePass());
-    pm.addNestedPass<func::FuncOp>(createLowerTPtrPass());
     pm.addNestedPass<func::FuncOp>(createHexagonLowerTmTensorPass());
     pm.addNestedPass<func::FuncOp>(createReduceContractionRankPass());
     pm.addPass(createLinalgFoldUnitExtentDimsPass());
@@ -265,20 +301,6 @@ public:
     pm.addPass(createConvertElementwiseToLinalgPass());
     // Remove quant.scast ops
     pm.addPass(createCSEPass());
-    if (enableHexKL) {
-      pm.addNestedPass<func::FuncOp>(
-          mlir::hexagon::createFoldResourceTransposePass());
-      pm.addNestedPass<func::FuncOp>(
-          mlir::hexagon::createFoldCastsIntoMatmulPass());
-      pm.addNestedPass<func::FuncOp>(
-          createMatmulToHexKLPass(setHexKLMode(MatmulToHexKLOptions{})));
-      if (hexKLMode == "macro") {
-        pm.addNestedPass<func::FuncOp>(
-            hexagon::createPreprocessWeightsForHMXPass());
-      }
-      pm.addPass(createCanonicalizerPass());
-    }
-
     // HMX engine attribution is always scheduled so the module manifest
     // describes every linalg.matmul, including runs that intentionally keep
     // manual buffer management. The normal path rewrites eligible matmuls;
@@ -323,9 +345,6 @@ public:
     pm.addPass(createCSEPass());
 
     if (enableSCFThreading) {
-      assert(!enableMultiThreading && !enableVTCMTiling && scratch == 0 &&
-             "currently scf-threading can be enabled only if"
-             " linalg multi-threading and vtcm tiling are off");
       pm.addNestedPass<func::FuncOp>(createFormSCFThreadsPass());
     }
 
@@ -634,29 +653,29 @@ public:
       pm.addNestedPass<func::FuncOp>(createMemoryOffsetsPass());
     }
 
-    // Analyze the allocation structure that survives every optional placement
-    // rewrite. In particular, scratch mode replaces VTCM allocations with views
-    // of an external argument; running first would publish a census for IR that
-    // no longer exists. The pass remains marker-gated and never changes v2 or
-    // launcher policy.
-    if (enableBufferization)
-      pm.addPass(mlir::hmx::createHmxVtcmAccountingPass());
+    // The one place a stage exists for the HMX diagnostics. The production
+    // pipeline passes nothing here, so nothing diagnostic is scheduled, no
+    // diagnostic pass is linked into the backend library, and the diagnostics
+    // still run at the stage they need: after every placement rewrite, before
+    // the memref lowerings that erase the VTCM allocations the census inspects
+    // and the facts the record folds in.
+    // Two sources, not one: the caller may hand a stage in (the diagnostic
+    // entry point does) or the pass may have been given one before it runs
+    // (same entry point, installed through runLinalgToLLVMPipeline). A
+    // function_ref built from an *empty* std::function is non-null, so the
+    // emptiness has to be tested on the std::function itself.
+    if (atDiagnosticStage)
+      atDiagnosticStage(pm);
+    else if (diagnosticStage)
+      diagnosticStage(pm);
 
     // Finalize the record-only v3 document from the compile-time facts
-    // attribution published and the sidecars just produced.  Inert without the
-    // internal `hmx.diagnostic_v3_record` marker, so this changes nothing on the
-    // v2 path: the pass returns immediately when the marker is absent.
+    // attribution published and the census sidecars just produced.  Inert
+    // without the internal `hmx.diagnostic_v3_record` marker, so this changes
+    // nothing on the v2 path: the pass returns immediately when the marker is
+    // absent.  It sits after the stage above on purpose -- the census runs there
+    // in a diagnostic run, and the record folds in the facts it proves.
     pm.addPass(mlir::hmx::createHmxRecordV3Pass());
-
-    if (enableHexKL) {
-      if (hexKLMode == "macro") {
-        // Lower to HexKL macro API
-        pm.addNestedPass<func::FuncOp>(createLowerHexKLMatmulToMacroPass());
-      } else {
-        // Decompose hexkl.matmul to micro ops
-        pm.addNestedPass<func::FuncOp>(createDecomposeHexKLMatmulPass());
-      }
-    }
 
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());
@@ -712,7 +731,6 @@ public:
     pm.addPass(hexagon::createDMAToLLVMPass());
     pm.addPass(hexagonmem::createHexagonMemToLLVMPass(
         setDeviceType(hexagonmem::HexagonMemToLLVMOptions{})));
-    pm.addPass(hexkl::createHexKLToLLVMPass());
     pm.addPass(mlir::hmx::createHmxToLLVMPass());
     pm.addPass(mlir::hvx::createHvxToLLVMPass());
 
@@ -731,16 +749,57 @@ public:
 
     if (enableHexagonRoutines)
       pm.addPass(createHexagonLLVMEnableHexagonRoutinesPass());
+}
 
-    if (failed(runPipeline(pm, getOperation()))) {
-      signalPassFailure();
-    }
-  }
-};
-
-} // namespace
+void hexagon::addLinalgToLLVMDependentDialects(DialectRegistry &registry) {
+  // The production pass owns the list; construct one just to read it.
+  LinalgToLLVMPass producer(LinalgToLLVMOptions{});
+  producer.getDependentDialects(registry);
+}
 
 std::unique_ptr<OperationPass<ModuleOp>>
 hexagon::createLinalgToLLVMPass(const LinalgToLLVMOptions &options) {
   return std::make_unique<LinalgToLLVMPass>(options);
+}
+
+LogicalResult hexagon::runLinalgToLLVMPipeline(
+    MLIRContext &context, ModuleOp module, StringRef options,
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage) {
+  // The pipeline parser resolves pass names through the global registry, so the
+  // registration must have happened. `hexagon/Conversion/LinalgToLLVM/Passes.h`
+  // (already included above) declares it; re-registering is idempotent.
+  registerLinalgToLLVMPass();
+
+  // `linalg-to-llvm` parses its own options, so build the pipeline from the
+  // forwarded text and take the pass the parser produced. Parsing them here
+  // would create a second option surface that can drift from the .td.
+  //
+  // The pipeline parser breaks a pass's options on whitespace, so a forwarded
+  // value cannot contain a space; the comma is the separator and is translated
+  // back into what that parser expects. No current option value contains a
+  // comma, and if one ever does this is where to fix it -- not by handing the
+  // diagnostic entry a second option surface.
+  std::string forwarded(options.str());
+  std::replace(forwarded.begin(), forwarded.end(), ',', ' ');
+  std::string pipeline = "linalg-to-llvm";
+  if (!forwarded.empty())
+    pipeline += "{" + forwarded + "}";
+
+  PassManager pm(&context, module.getOperationName());
+  if (failed(parsePassPipeline(pipeline, pm)))
+    return failure();
+
+  // Instal the stage on the pass the parser built, not on a copy of it: the
+  // generated copy constructor does not carry the option values, so a copy
+  // would silently fall back to the production defaults.
+  for (Pass &pass : pm.getPasses())
+    if (auto *linalgToLLVM = dyn_cast_if_present<LinalgToLLVMPass>(&pass))
+      linalgToLLVM->diagnosticStage = atDiagnosticStage;
+
+  // `PassManager::run` loads the dependent dialects of the passes it runs, so
+  // the production sequence and the diagnostics alike get the dialects they
+  // declare.
+  if (failed(pm.run(module)))
+    return failure();
+  return success();
 }

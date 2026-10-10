@@ -15,8 +15,7 @@
 // `func.func` would grow an `_mlir_ciface_*` wrapper around the symbol).
 //
 // The assembly of the pass -- LLVMConversionTarget, DataLayoutAnalysis, memref
-// descriptors -- follows HexKLToLLVM, which is the local precedent for lowering
-// to this runtime.
+// descriptors -- is the standard shape for lowering to this runtime.
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"
@@ -58,7 +57,7 @@
 using namespace mlir;
 using namespace mlir::hmx;
 
-// At global scope, like HexKLToLLVM: the generated pass base lands in ::impl.
+// At global scope: the generated pass base lands in ::impl.
 #define GEN_PASS_DEF_HMXTOLLVM
 #include "hexagon/Conversion/HmxToLLVM/Passes.h.inc"
 

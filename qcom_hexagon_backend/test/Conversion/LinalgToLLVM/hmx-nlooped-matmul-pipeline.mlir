@@ -48,7 +48,7 @@
 // from it, then the accumulator is cleared, the mma issued and the accumulator
 // read back.
 // CHECK: llvm.call @hmx_pack_weight_f16_bulk
-// CHECK: llvm.call @hexagon_runtime_dma_start
+// CHECK: llvm.call @hexagon_runtime_dma2d_start
 // CHECK: llvm.call @hexagon_runtime_dma_wait
 // CHECK: llvm.call @hmx_pack_act_f16_bulk
 // CHECK: llvm.call @hmx_acc_clear_f16

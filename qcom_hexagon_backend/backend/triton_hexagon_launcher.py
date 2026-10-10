@@ -27,6 +27,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
 from triton.backends.qcom_hexagon_backend.utils import (
     enforce_hmx_launch_contract,
     hmx_grid_notice,
+    hmx_tile_notice,
     parse_triton_llvm_kernel_signature,
     profile_triton_inputs,
 )
@@ -695,6 +696,15 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         if grid_notice is not None:
             warnings.warn(grid_notice, stacklevel=2)
 
+        # The tile choice behind this kernel's HMX matmuls, when the compiler
+        # had to walk a contraction in more than one span. Same shape as the
+        # grid notice above -- facts plus the single-span limits the manifest's
+        # own numbers imply, no measured ratio, no new option -- and equally
+        # silent for a single-span kernel, which is every whole-block kernel
+        # this tree compiles today.
+        for tile_notice in hmx_tile_notice(manifest, func_name):
+            warnings.warn(tile_notice, stacklevel=2)
+
         # Temporary safety gate:
         # UserDMA-backed hexagonmem-copy lowering is unstable with Triton SPMD
         # multithreaded wrappers at higher grid sizes (observed DSP abort in
@@ -712,7 +722,6 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         hexec = HexagonExecutor(
             kernel_run_id=kernel_run_id,
             enable_lwp=options["enableLWP"],
-            enable_hexkl=options["enableHexKL"],
             cleanup_device_post_exec=options["deviceCleanup"],
         )
 

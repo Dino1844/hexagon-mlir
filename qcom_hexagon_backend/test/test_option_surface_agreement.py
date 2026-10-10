@@ -157,19 +157,6 @@ PINNED_DEFAULTS = {
     "LWPloopDepth": ("1", "upstream LWP loop depth. The Python surface exposes enableLWP and "
                            "disableLWPLoop but not the depth, which is an inconsistency rather than "
                            "a decision -- recorded as such so it is not mistaken for one."),
-    "hexKLMode": (r'\"micro\"', "Became an orphan on 2026-09-30, the same shape as "
-                              "enableSeedLayoutConversions above: the Python field was removed as a "
-                              "proven no-op. Every `hexKLMode == \"macro\"` branch sits behind "
-                              "enableHexKL, and LinalgToLLVMPass rejects that combination outright "
-                              "(\"enableHexKL is incompatible with the HMX manifest contract\"), so "
-                              "the branches were unreachable. Verified rather than argued: the only "
-                              "caller that ever set the field, "
-                              "test/python/torch-mlir/test_hexkl_macro_matmul.py, already fails on "
-                              "exactly that error and is not in the host gate; and deleting the "
-                              "field left the production FA kernel byte-identical (1131 "
-                              "instructions, kernel md5 unchanged). The upstream pass option and the "
-                              "direct -matmul-to-hexkl lit path are untouched. This entry pins the "
-                              "value the pipeline now takes."),
 }
 
 # --------------------------------------------------------------------------

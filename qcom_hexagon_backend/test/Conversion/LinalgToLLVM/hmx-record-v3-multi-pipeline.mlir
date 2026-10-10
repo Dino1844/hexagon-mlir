@@ -17,9 +17,9 @@
 // FileCheck prefix: a shared scan would let one directive's match position
 // decide whether the next one still finds its own.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s --check-prefix=V2
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s --check-prefix=RECS
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s --check-prefix=DIGESTS
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=V2
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=RECS
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=DIGESTS
 //===----------------------------------------------------------------------===//
 
 // The v2 execution manifest is unaffected and stays the execution authority.

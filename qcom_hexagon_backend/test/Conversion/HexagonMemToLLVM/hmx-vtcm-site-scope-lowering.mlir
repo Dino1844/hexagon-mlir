@@ -28,7 +28,7 @@
 //    bracket anywhere, fails in hmx-to-llvm: the table and the kernel would
 //    otherwise disagree about whether the attribution was ever requested.
 //
-// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // -----

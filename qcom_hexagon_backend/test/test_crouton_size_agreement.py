@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Source contract: the crouton geometry is a few numbers, not many spellings.
 
-The crouton byte size is named once in `HmxCroutonLayout.h`, but three other
+The crouton byte size is named once in `HmxCroutonLayout.h`, but other
 translation units re-spell the same quantum for their own reasons
-(`HexagonMemOps` as an allocation alignment, `HexagonMemToLLVMPass` as the
-default crouton size, the VTCM pool as its max alignment). They agree today;
-nothing tied them. This binds them, without forcing HexagonMem to depend on the
-Hmx dialect header.
+(`HexagonMemOps` as an allocation alignment, the VTCM pool as its max
+alignment). They agree today; nothing tied them. This binds them, without
+forcing HexagonMem to depend on the Hmx dialect header.
+
+A third mirror lived in `HexagonMemToLLVMPass` as `DEFAULT_CROUTON_SIZE`, for
+the block size of a crouton allocation. The `hexagonmem` crouton conversion ops
+that used it were deleted along with the crouton dialect, and with them the only
+reason that constant existed, so it is gone rather than bound.
 
 Two more geometries had the same disease, and worse: they are spelled on the
 **Python host** side, where a divergence cannot fail to compile -- it just
@@ -140,10 +144,6 @@ def main() -> None:
         "HexagonMemOps::kMaxAllocationAlignment": cpp_int_const(
             read("lib/Dialect/HexagonMem/IR/HexagonMemOps.cpp"),
             "kMaxAllocationAlignment",
-        ),
-        "HexagonMemToLLVM::DEFAULT_CROUTON_SIZE": cpp_int_const(
-            read("lib/Conversion/HexagonMemToLLVM/HexagonMemToLLVMPass.cpp"),
-            "DEFAULT_CROUTON_SIZE",
         ),
         "VTCMPool::kMaxAlignment": cpp_int_const(
             read("bin/runtime/src/VTCMPool.cpp"), "kMaxAlignment"

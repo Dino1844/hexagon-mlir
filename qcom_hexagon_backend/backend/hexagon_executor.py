@@ -61,7 +61,6 @@ class HexagonExecutor:
         enable_lwp=False,
         enable_etm=False,
         compile_only=False,
-        enable_hexkl=False,
         cleanup_device_post_exec=True,
         perf_path=None,
     ):
@@ -92,7 +91,6 @@ class HexagonExecutor:
         self.config = self.get_config()
         self.enable_lwp = enable_lwp
         self.enable_etm = enable_etm  # When set to True, etm traces will be collected and processed with pyetm.
-        self.enable_hexkl = enable_hexkl
         self.final_result = "Pass"
         self.cleanup_device_post_exec = cleanup_device_post_exec
 
@@ -121,7 +119,6 @@ class HexagonExecutor:
             "HEXAGON_MLIR_ROOT": "HEXAGON_MLIR_ROOT",
             "HEXAGON_SDK_ROOT": "HEXAGON_SDK_ROOT",
             "Q6_VERSION": "HEXAGON_ARCH_VERSION",
-            "HEXKL_ROOT": "HEXKL_ROOT",
         }
         if self.exec_mode == "device":
             env_vars.update(
@@ -304,21 +301,6 @@ class HexagonExecutor:
             runtime_libs.append("qhmath")
         else:
             print(f"Warning: QHMATH library not found at {QHMATH_DIR}")
-
-        hexkl_dir = """{HEXKL_ROOT}/lib/hexagon_toolv19_v{Q6_VERSION}""".format(
-            HEXKL_ROOT=self.config.env_vars["HEXKL_ROOT"],
-            Q6_VERSION=self.config.Q6_VERSION,
-        )
-        if (
-            self.enable_hexkl
-            and os.path.exists(hexkl_dir)
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_micro.a"))
-            and os.path.exists(os.path.join(hexkl_dir, "libhexkl_macro.a"))
-        ):
-            hexkl_micro_a = os.path.join(hexkl_dir, "libhexkl_micro.a")
-            hexkl_macro_a = os.path.join(hexkl_dir, "libhexkl_macro.a")
-            runtime_libs.append(hexkl_micro_a)
-            runtime_libs.append(hexkl_macro_a)
 
         # HMX leaf primitives: a prebuilt static library (SDK-clang compiled, so
         # the HMX intrinsics are already lowered). Linked only if it was built.

@@ -50,10 +50,6 @@ template <typename CopyOpTy> static bool isValidCandidate(CopyOpTy op) {
   auto sourceType = op.getSource().getType();
   auto targetType = op.getTarget().getType();
 
-  if (isa<crouton::CroutonType>(sourceType) ||
-      isa<crouton::CroutonType>(targetType))
-    return false;
-
   auto sourceMemRefType = dyn_cast<MemRefType>(sourceType);
   auto targetMemRefType = dyn_cast<MemRefType>(targetType);
 

@@ -12,6 +12,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
+#include "mlir/IR/DialectRegistry.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir {
@@ -45,6 +47,37 @@ std::unique_ptr<InterfacePass<FunctionOpInterface>> createHexmemCpyToDMAPass();
 std::unique_ptr<OperationPass<ModuleOp>> createLinalgToLLVMPass(
     const LinalgToLLVMOptions &options = LinalgToLLVMOptions());
 
+/// The whole diagnostic entry point in one call: build the production pipeline
+/// from `options` (written in `linalg-to-llvm`'s own key=value spelling, comma
+/// separated, empty text = the production defaults) and run it, invoking
+/// `atDiagnosticStage` at the one place where the production sequence used to
+/// mount the two HMX diagnostic passes.
+///
+/// The stage is the load-bearing part. The census inspects VTCM allocations and
+/// the record folds in facts the census sidecars prove, so both must run while
+/// those still exist -- after every placement rewrite, before the memref
+/// lowerings that erase them. Injecting them from inside the production pass is
+/// what puts them there; appending them to a pipeline string would put them
+/// after lowering, where they see nothing.
+///
+/// The options are parsed by `linalg-to-llvm`'s own parser, because the pass is
+/// built by that parser rather than copied: the generated pass copy constructor
+/// does not carry the option values, so a copy would silently fall back to the
+/// defaults. Building the pass in place keeps the forwarding honest.
+/// The dialects the production sequence needs.
+///
+/// A pass that runs the sequence in a nested pass manager has to declare them
+/// itself: the dialects are loaded from a `PassManager`, and a context refuses
+/// to load one once it is marked multi-threaded, which it is by the time a
+/// nested pipeline runs. Declaring them on the host pass makes the *outer*
+/// manager load them before anything runs. Taking them from here keeps the list
+/// in one place.
+void addLinalgToLLVMDependentDialects(DialectRegistry &registry);
+
+LogicalResult runLinalgToLLVMPipeline(
+    MLIRContext &context, ModuleOp module, StringRef options,
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage);
+
 std::unique_ptr<OperationPass<ModuleOp>> createLowerConstantsSeparatelyPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createLowerPackPass();
@@ -52,6 +85,7 @@ std::unique_ptr<OperationPass<func::FuncOp>> createLowerPackPass();
 std::unique_ptr<OperationPass<func::FuncOp>> createSplitReduceGenericPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createVectorRowReducePass();
+
 
 // Row reduction whose horizontal fold stays in the vector domain: the butterfly
 // result is placed into lane j of a group register and written once per group.

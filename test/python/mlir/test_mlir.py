@@ -34,8 +34,6 @@ def get_options(kernel_name: str, args) -> dict[str, str]:
         options["enableHexagonmemCopyToDMA"] = args.enable_hexagonmem_copy_to_dma
     if args.enable_bufferization is not None:
         options["enableBufferization"] = args.enable_bufferization
-    if args.enable_hexkl is not None:
-        options["enableHexKL"] = args.enable_hexkl
     if args.enable_lwp is not None:
         options["enableLWP"] = args.enable_lwp
 
@@ -165,13 +163,6 @@ Examples:
         action="store_true",
         default=None,
         help="Enable bufferization passes (default: True)",
-    )
-    options_group.add_argument(
-        "--enable-hexkl",
-        dest="enable_hexkl",
-        action="store_true",
-        default=None,
-        help="Enable HexKL to lower matmul and convolutions to HMX ops (default: False)",
     )
     options_group.add_argument(
         "--enable-lwp",

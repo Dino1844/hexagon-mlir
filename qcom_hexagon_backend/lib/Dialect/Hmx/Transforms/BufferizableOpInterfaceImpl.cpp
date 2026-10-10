@@ -27,7 +27,6 @@
 // `#hmx.crouton` -> `#hmx.crouton_memref_layout` mapping the stock
 // `alloc_tensor` never could (hmx-interface-gaps.md section 2.2).
 //
-// The shape follows HexKL's implementation of the same interface.
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"

@@ -11,7 +11,7 @@
 // rewriting; the resulting internal attribute must survive later lowering as
 // metadata.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-workspace-resident})' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK-DAG: schema = "hex.hmx.kernel_manifest/v2"

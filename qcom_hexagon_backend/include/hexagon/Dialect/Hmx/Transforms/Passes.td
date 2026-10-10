@@ -474,9 +474,36 @@ def HmxVtcmAccounting : Pass<"hmx-vtcm-accounting"> {
   let constructor = "mlir::hmx::createHmxVtcmAccountingPass()";
 }
 
+def HmxDiagnosticRecord : Pass<"hmx-diagnostic-record", "mlir::ModuleOp"> {
+  let summary = "Independent entry point for the two HMX diagnostic passes";
+
+  let description = [{
+    Runs the production pipeline with the VTCM allocation census
+    (`hmx-vtcm-accounting`) injected at the stage where it belongs: after every
+    placement rewrite, while the VTCM allocations and the sidecars they produce
+    are still explicit. The record-only v3 document (`hmx-v3-record`) is mounted
+    by the production sequence itself, immediately after that stage, so a
+    diagnostic run gets the census sidecars first and a production run still
+    finalises the document when the internal marker asks for it.
+
+    The production pipeline no longer mounts the two diagnostic passes, so the
+    backend library (and therefore the device) carries no diagnostic pass code.
+    The pass that replaces the mount lives in the HmxDiagnostics library, which
+    is linked only into `linalg-hexagon-opt`; that is why this entry point is
+    available from the opt tool and nowhere else.
+
+    `production` forwards options to the production sequence in
+    `linalg-to-llvm`'s own key=value spelling, so a diagnostic run is a
+    production run plus the two passes and no option exists twice:
+
+        builtin.module(hmx-diagnostic-record{production=scratch=1048576})
+  }];
+
+  let constructor = "mlir::hmx::createHmxDiagnosticRecordPass()";
+}
+
 def HmxRecordV3 : Pass<"hmx-v3-record"> {
   let summary = "Finalize the record-only HMX v3 record document";
-
   let description = [{
     Finalizes the record-only `hex.hmx.kernel_manifest/v3` document that
     attribution published from compile-time facts. It runs at module scope right

@@ -56,7 +56,7 @@
 // residency on) is hmx-vtcm-liveness-pipeline.mlir.
 //
 //===----------------------------------------------------------------------===//
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-workspace-resident=false})' -split-input-file | FileCheck %s
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident=false})' -split-input-file | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // -----

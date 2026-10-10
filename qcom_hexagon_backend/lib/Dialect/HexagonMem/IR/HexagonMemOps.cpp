@@ -25,7 +25,6 @@
 
 using namespace mlir;
 using namespace mlir::hexagonmem;
-using namespace mlir::crouton;
 
 namespace {
 constexpr uint64_t kMaxAllocationAlignment = 2048;
@@ -53,15 +52,7 @@ void HexagonMemDialect::registerOperations() {
 
 LogicalResult AllocOp::verify() {
   auto type = getBuffer().getType();
-  if (auto croutonType = mlir::dyn_cast<CroutonType>(type)) {
-    if (getAlignment() != 2048)
-      return emitOpError(
-          "Crouton allocations are expected to have an alignment of 2048");
-    if (static_cast<int64_t>(getDynamicSizes().size()) != 0)
-      return emitOpError(
-          "Dynamic shapes are not supported for crouton allocations");
-
-  } else if (auto memRefType = mlir::dyn_cast<MemRefType>(type)) {
+  if (auto memRefType = mlir::dyn_cast<MemRefType>(type)) {
     if (!isSupportedAllocationAlignment(getAlignment()))
       return emitOpError(
           "alignment must be a power of two in [1, 2048]");
@@ -82,67 +73,6 @@ LogicalResult AllocOp::verify() {
   return success();
 }
 
-LogicalResult verifyTypeCompatibility(Operation *op, MemRefType memrefType,
-                                      CroutonType croutonType) {
-  if (!memrefType.hasRank())
-    return op->emitOpError("Unsupported: unranked memrefs");
-
-  if (!memrefType.hasStaticShape())
-    return op->emitOpError("Unsupported: dynamic shaped memrefs");
-
-  auto memrefElementType = memrefType.getElementType();
-  auto croutonElementType = croutonType.getElementType();
-
-  if (memrefElementType != croutonElementType) {
-    return op->emitOpError("Element types don't match");
-  }
-
-  auto elementSize = memrefElementType.getIntOrFloatBitWidth() / 8;
-
-  auto memrefShape = memrefType.getShape();
-  auto croutonTableShape = croutonType.getShape();
-
-  if (memrefShape.back() * elementSize != 2048) {
-    return op->emitOpError("The product of the last dimension of memrefType is "
-                           "expected to be equal to 2048 bytes");
-  }
-
-  if (memrefType.getRank() - 1 != croutonType.getRank()) {
-    return op->emitOpError()
-           << "Memref rank " << memrefType.getRank() - 1
-           << " does not match crouton table rank " << croutonType.getRank()
-           << " for the first n-1 dimensions";
-  }
-
-  for (size_t i = 0; i < croutonTableShape.size(); ++i) {
-    if (memrefShape[i] != croutonTableShape[i]) {
-      return op->emitOpError()
-             << "Memref shape does not match crouton shape for dimension " << i;
-    }
-  }
-
-  if (hexagon::isInVTCMAddressSpace(memrefType) !=
-      croutonType.getVtcm().getValue()) {
-    return op->emitOpError(
-        "Memref and crouton type address spaces don't match");
-  }
-
-  return success();
-}
-
-LogicalResult MemrefToCroutonOp::verify() {
-  auto memrefType = llvm::cast<MemRefType>(getSource().getType());
-  auto croutonType = llvm::cast<CroutonType>(getResult().getType());
-
-  return verifyTypeCompatibility(getOperation(), memrefType, croutonType);
-}
-
-LogicalResult CroutonToMemrefOp::verify() {
-  auto croutonType = llvm::cast<CroutonType>(getSource().getType());
-  auto memrefType = llvm::cast<MemRefType>(getResult().getType());
-
-  return verifyTypeCompatibility(getOperation(), memrefType, croutonType);
-}
 
 //===----------------------------------------------------------------------===//
 // ODS-Generated Declarations

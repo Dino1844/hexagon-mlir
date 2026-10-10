@@ -14,8 +14,11 @@
 // three different things, and each has one name here.
 //
 // The ODS constraints the ops already carry (`F16`, `F16, F32`) express the same
-// contract: the C++ checks here and the generated verifiers are two hand-written
-// copies, so keep them in step (nothing binds the two mechanically).
+// contract, but they are no longer two copies kept in step by hand:
+// test_hmx_dtype_admitted_set_contract.py binds the ODS element lists to
+// `dtype::isAdmittedFloat` below (and to the lowering's leaf-family tables and
+// the host prepack's dtype map), so a one-sided rename is a red test rather
+// than a silent drift.
 //
 // Why not MLIR's type system alone: MLIR represents a float as `mlir::FloatType`
 // (the base of every f16/f32/bf16/f8) and offers `Type::isFloat()`,

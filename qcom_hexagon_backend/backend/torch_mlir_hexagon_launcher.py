@@ -317,7 +317,6 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
             kernel_run_id=kernel_run_id,
             enable_lwp=options["enableLWP"],
             enable_etm=enable_etm,
-            enable_hexkl=options["enableHexKL"],
             cleanup_device_post_exec=cleanup_device_post_exec,
         )
 

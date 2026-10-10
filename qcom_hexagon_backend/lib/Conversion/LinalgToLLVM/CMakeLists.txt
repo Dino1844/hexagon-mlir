@@ -48,7 +48,6 @@ add_mlir_conversion_library(LinalgToLLVM
   HmxTransforms
   HexagonMemToLLVM
   HmxToLLVM
-  HexKLToLLVM
   DMAToLLVM
   # the vector-row-reduce pass emits hvx.vror; the pipeline lowers it via
   # HvxToLLVM

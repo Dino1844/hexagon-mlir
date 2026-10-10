@@ -232,7 +232,6 @@ def test_flash_attention():
         enableHVXInlining=True,
         enableSCFLoopUnroll=True,
         enableMultiThreading=True,
-        enableHexKL=False,
         enableVTCMTiling=False,
         enableConvertToHexagonmem=True,  # was False: this is the only gate on the HMX path (vtcm-allocator), and leaving it off made this test measure a kernel with zero HMX leaves
         enableHexagonmemCopyToDMA=False,

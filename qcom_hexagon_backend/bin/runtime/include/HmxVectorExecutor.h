@@ -93,7 +93,11 @@ extern "C" {
 /// `HmxReadoutBatch slots[16]` and so inherits sizeof, while the compiler emits
 /// exactly six i32 words. If a field is ever added, BOTH change together -- a
 /// mismatch here is not a compile error, it is the executor reading garbage
-/// pointers out of the middle of a tile descriptor.
+/// pointers out of the middle of a tile descriptor. The static_assert below
+/// makes the runtime half of that pair a loud build break (this header is
+/// compiled only for the 32-bit device target, so 24 bytes is the pinned
+/// size); the compiler half is pinned by kHmxReadoutBatchWords in
+/// HmxReadoutHandoff.h.
 typedef struct {
   uint32_t rowStart;   ///< first m-row in `ar`
   uint32_t rowCount;   ///< how many rows, i.e. the batch size G
@@ -102,6 +106,11 @@ typedef struct {
   void    *ar;         ///< accumulator array in VTCM (all rows live, any subset)
   void    *dst;        ///< row-major destination, already offset to rowStart
 } HmxReadoutBatch;
+static_assert(sizeof(HmxReadoutBatch) == 24,
+              "the read-out descriptor ABI changed size on the device target; "
+              "every side agrees on the layout through this header, so this "
+              "break is loud by construction -- the compiler emission must "
+              "carry the new field count via kHmxReadoutBatchWords too");
 
 /// Type of the read-out the executor runs on the vector thread. The compiler
 /// emits one of these per kernel; it is the function that used to be inline.

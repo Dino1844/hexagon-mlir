@@ -24,20 +24,15 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "hexagon/Conversion/DMAToLLVM/Passes.h"
-#include "hexagon/Conversion/HexKLToLLVM/Passes.h"
 #include "hexagon/Conversion/HmxToLLVM/Passes.h"
 #include "hexagon/Conversion/HvxToLLVM/Passes.h"
 #include "hexagon/Conversion/HexagonMemToLLVM/Passes.h"
 #include "hexagon/Conversion/LinalgToLLVM/Passes.h"
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
-#include "hexagon/Dialect/HexKL/IR/HexKLDialect.h"
-#include "hexagon/Dialect/HexKL/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/Hvx/IR/HvxDialect.h"
 #include "mlir/Dialect/Arith/Transforms/BufferizableOpInterfaceImpl.h"
 #include "hexagon/Dialect/HexagonMem/IR/HexagonMemDialect.h"
-#include "hexagon/Dialect/HexagonTPtr/IR/HexagonTPtrDialect.h"
 #include "hexagon/Dialect/TTX/IR/TTXDialect.h"
 #include "hexagon/Dialect/TmTensor/IR/TmTensorDialect.h"
 #include "hexagon/Transforms/Passes.h"
@@ -53,12 +48,9 @@ int main(int argc, char **argv) {
   mlir::registerAllPasses();             // TODO: restrict
   mlir::registerAllExtensions(registry); // TODO: restrict
 
-  registry.insert<mlir::crouton::CroutonDialect>();
   registry.insert<mlir::ttx::TTXDialect>();
   registry.insert<mlir::tm_tensor::TmTensorDialect>();
-  registry.insert<mlir::tptr::HexagonTPtrDialect>();
   registry.insert<mlir::hexagonmem::HexagonMemDialect>();
-  registry.insert<mlir::hexkl::HexKLDialect>();
   registry.insert<mlir::hmx::HmxDialect>();
   registry.insert<mlir::hvx::HvxDialect>();
 
@@ -88,7 +80,6 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerHexagonRVOPass();
   mlir::hexagon::registerDecomposeTensorConcatPass();
   mlir::hexagon::registerMatmulToConvPass();
-  mlir::hexagon::registerMatmulToHexKLPass();
   mlir::hmx::registerMatmulToHmxPass();
   mlir::hmx::registerHmxPartitionPass();
   mlir::hmx::registerThreadRolePartitionPass();
@@ -97,14 +88,15 @@ int main(int argc, char **argv) {
   mlir::hmx::registerHmxVectorReadoutPass();
   mlir::hmx::registerHmxVtcmAccountingPass();
   mlir::hmx::registerHmxRecordV3Pass();
-  mlir::hexagon::registerDecomposeHexKLMatmulPass();
+  // Independent entry point for the two diagnostic passes above. The production
+  // pipeline mounts neither, so this registration is what makes them reachable.
+  mlir::hmx::registerHmxDiagnosticRecordPass();
   mlir::hexagon::registerConvTilingPass();
   mlir::hexagon::registerDMAToLLVMPass();
   mlir::hexagon::registerExpandMathOpsPass();
   mlir::hexagon::registerRemoveMLProgramPass();
   mlir::hexagon::registerHexagonLLVMEnableHexagonRoutines();
   mlir::hexagonmem::registerHexagonMemToLLVMPass();
-  mlir::hexkl::registerHexKLToLLVMPass();
   mlir::hmx::registerHmxToLLVMPass();
   mlir::hexagon::registerExpandBoolVecPass();
   mlir::hexagon::registerLowerConstantsSeparatelyPass();
@@ -132,10 +124,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerHexagonLWPPass();
   mlir::hexagon::registerHexagonLowerTmTensorPass();
   mlir::hexagon::registerLowerTTXPass();
-  mlir::hexagon::registerLowerTPtrPass();
-  mlir::hexagon::registerLowerHexKLMatmulToMacroPass();
   mlir::hexagon::registerFoldCastsIntoMatmulPass();
-  mlir::hexagon::registerPreprocessWeightsForHMXPass();
   mlir::hexagon::registerFoldMulFByZeroPass();
   mlir::hexagon::registerFoldResourceTransposePass();
   mlir::hexagon::registerFoldPackUnpackConstantsPass();
@@ -147,11 +136,9 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerHexagonL2PrefetchPass();
 
   // Register all external models.
-  mlir::hexkl::registerBufferizableOpInterfaceExternalModels(registry);
   mlir::hmx::registerBufferizableOpInterfaceExternalModels(registry);
   // hmx.matmul's f32 result is the fp16 read-out widened at the tensor level,
-  // so the arith tensor ops have to be bufferizable here (the HexKL macro path
-  // does the same thing, but it is off by default and never exercised).
+  // so the arith tensor ops have to be bufferizable here.
   mlir::arith::registerBufferizableOpInterfaceExternalModels(registry);
 
   return mlir::asMainReturnCode(mlir::MlirOptMain(

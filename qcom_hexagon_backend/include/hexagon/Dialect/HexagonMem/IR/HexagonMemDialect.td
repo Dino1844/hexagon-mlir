@@ -25,9 +25,7 @@ def HexagonMem_Dialect : Dialect {
     and copy ops.
   }];
 
-  let dependentDialects = [
-    "mlir::crouton::CroutonDialect"
-  ];
+  let dependentDialects = [];
 
   let extraClassDeclaration = [{
     void registerTypes();

@@ -37,7 +37,7 @@
 // Nothing here is a backend option, an admission decision, a grid authority, or
 // a v2/v3 manifest field, and no device is involved.
 //
-// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s
+// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s
 // The checker is told which module symbols to check, and that list is required:
 // it cannot use position.  With `-split-input-file` the async-runtime pass
 // prepends a bare module holding its private runtime declarations, so the first
@@ -46,7 +46,7 @@
 // sidecar appearing in an unnamed module fails -- while the declaration-only
 // preamble is simply not a target.
 //
-// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(linalg-to-llvm)' | python3 "$(dirname %s)/hmx-vtcm-event-join-pipeline.py" --expect n2_event_join_pipeline --expect n2_two_site_pipeline
+// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(hmx-diagnostic-record)' | python3 "$(dirname %s)/hmx-vtcm-event-join-pipeline.py" --expect n2_event_join_pipeline --expect n2_two_site_pipeline
 // The checker's own attribute reader is the one piece that is not a direct
 // equality check, so it has its own tests: the whitespace-after-`=` shape, the
 // multi-group token that broke integer parsing, and the rejections that must

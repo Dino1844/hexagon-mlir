@@ -19,7 +19,6 @@ message(STATUS "LLVM BIN DIR is ${LLVM_BIN_DIR}")
 ###############################################################################
 
 set(HEXAGON_SDK_ROOT $ENV{HEXAGON_SDK_ROOT})
-set(HEXKL_ROOT $ENV{HEXKL_ROOT})
 set(Q6_VERSION $ENV{HEXAGON_ARCH_VERSION})
 
 
@@ -50,7 +49,6 @@ set(HEXAGON_INCLUDES
     -I${HEXAGON_SDK_ROOT}/incs/stddef
     -I${HEXAGON_SDK_ROOT}/libs/qhl_hvx/inc
     -I${HEXAGON_SDK_ROOT}/libs/qhl_hvx/inc/internal
-    -I${HEXKL_ROOT}/include
     -I${HEXAGON_SDK_ROOT}/rtos/qurt/computev${Q6_VERSION}/include/posix
     -I${HEXAGON_SDK_ROOT}/rtos/qurt/computev${Q6_VERSION}/include/qurt
     -I${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -120,7 +118,6 @@ set(HEXAGON_RUNTIME_SRC
     src/HexagonBufferAlias.cpp
     src/HexagonAPI.cpp
     src/HexagonCAPI.cpp
-    src/HexKLAPI.cpp
 )
 
 add_library(hexagon_runtime STATIC)
@@ -176,7 +173,7 @@ endforeach()
 # Qualcomm's clang lowers. Linking that bitcode into the kernel module (which the
 # project's own LLVM compiles) would leave undefined `llvm.hexagon.M8.*` calls and
 # the final .so would fail to load. A prebuilt .a is resolved at .so link time by
-# the SDK clang++, exactly like qhmath / hexkl_micro.
+# the SDK clang++, exactly like qhmath.
 #
 # Sources live under hmx/ (their own module dir); the archive keeps landing in
 # this directory's binary dir, which is where the executor looks for it.

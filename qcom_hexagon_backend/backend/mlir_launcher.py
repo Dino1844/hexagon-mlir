@@ -69,10 +69,9 @@ class MLIRHexagonLauncher:
         hexec = HexagonExecutor(
             kernel_run_id=kernel_run_id,
             # options values are strings (required by translate_linalg_to_obj), so
-            # parse explicitly — str("False") is truthy and would incorrectly enable LWP/HexKL.
+            # parse explicitly — str("False") is truthy and would incorrectly enable LWP.
             enable_lwp=options["enableLWP"].lower() == "true",
             enable_etm=enable_etm,
-            enable_hexkl=options["enableHexKL"].lower() == "true",
             cleanup_device_post_exec=cleanup_device_post_exec,
             perf_path="/data/local/tmp/perf.txt",
         )

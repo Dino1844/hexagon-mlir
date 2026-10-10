@@ -43,7 +43,10 @@ def Hmx_Dialect : Dialect {
     community SDK does not ship.
 
     The dialect is deliberately NOT named `hexkl` and does not reuse its op
-    names, so the zero-investment `hexkl` path stays inert and untouched.
+    names. The `hexkl` path it replaced has since been retired (the dialect,
+    its conversion and its runtime call were dead: unreachable behind the HMX
+    manifest rejection, and dependent on a library the community SDK does not
+    ship), so nothing in this tree produces or lowers `hexkl.*` any more.
   }];
 
   let dependentDialects = [

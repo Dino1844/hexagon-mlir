@@ -77,17 +77,9 @@ createLinalgGeneralizePass();
 
 std::unique_ptr<OperationPass<ModuleOp>> createLowerLibdevicePass();
 
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>> createLowerTPtrPass();
-
 std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>> createLowerTTXPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createMatmulToConvPass();
-
-std::unique_ptr<InterfacePass<FunctionOpInterface>> createMatmulToHexKLPass(
-    const MatmulToHexKLOptions &options = MatmulToHexKLOptions());
-
-std::unique_ptr<InterfacePass<FunctionOpInterface>>
-createDecomposeHexKLMatmulPass();
 
 std::unique_ptr<OperationPass<func::FuncOp>> createInsertScratchArgPass(
     const InsertScratchArgOptions &options = InsertScratchArgOptions());
@@ -119,12 +111,6 @@ std::unique_ptr<Pass> createHoistScalarOpsPass();
 std::unique_ptr<Pass> createFoldMulFByZeroPass();
 
 std::unique_ptr<Pass> createFoldResourceTransposePass();
-
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createLowerHexKLMatmulToMacroPass();
-
-std::unique_ptr<InterfacePass<mlir::FunctionOpInterface>>
-createPreprocessWeightsForHMXPass();
 
 std::unique_ptr<Pass> createFoldPackUnpackConstantsPass();
 

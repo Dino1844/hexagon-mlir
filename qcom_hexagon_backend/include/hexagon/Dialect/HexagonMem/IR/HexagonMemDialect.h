@@ -20,7 +20,6 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/DestinationStyleOpInterface.h"
 
-#include "hexagon/Dialect/Crouton/IR/CroutonDialect.h"
 
 //===----------------------------------------------------------------------===//
 // HexagonMem Dialect

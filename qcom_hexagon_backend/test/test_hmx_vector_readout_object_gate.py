@@ -410,7 +410,7 @@ def _fa_compile_obj(**options):
     fa_opts = dict(
         enableVectorization=True, enableSplitReduceGeneric=True,
         enableHVXInlining=True, enableSCFLoopUnroll=True,
-        enableMultiThreading=True, enableHexKL=False,
+        enableMultiThreading=True,
         enableVTCMTiling=False, enableConvertToHexagonmem=True,
         enableHexagonmemCopyToDMA=False,
         N_CTX=n_ctx, BLOCK_M=n_ctx, BLOCK_DMODEL=d_head, BLOCK_N=64,

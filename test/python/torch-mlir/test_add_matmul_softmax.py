@@ -43,7 +43,7 @@ def test_add_matmul_softmax_torch(enablelwp):
     # cannot gate anything: no tolerance proves anything about it, in either
     # direction. Seed first, then choose a tolerance -- widening rtol before the
     # input is fixed just hides the instability.
-    # Value 42 matches test_hexkl_macro_matmul.py:35 in this directory.
+    # Value 42 matches the seed used by the other torch-mlir tests in this directory.
     torch.manual_seed(42)
     x = torch.randn(shape)
     y = torch.randn(shape)

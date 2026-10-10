@@ -18,8 +18,8 @@
 // there are still two enters, two leaves, each still wrapped around its own
 // allocation, and the two token/site operand pairs are still different.
 //
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s --check-prefixes=RAW
-// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | linalg-hexagon-opt -pass-pipeline='builtin.module(cse,canonicalize)' | FileCheck %s --check-prefixes=CSE
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefixes=RAW
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | linalg-hexagon-opt -pass-pipeline='builtin.module(cse,canonicalize)' | FileCheck %s --check-prefixes=CSE
 //===----------------------------------------------------------------------===//
 
 module @n2_cse_stable attributes {

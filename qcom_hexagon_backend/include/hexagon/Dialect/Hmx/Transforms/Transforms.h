@@ -41,6 +41,8 @@ std::unique_ptr<Pass> createHmxVtcmAccountingPass();
 
 std::unique_ptr<Pass> createHmxRecordV3Pass();
 
+std::unique_ptr<Pass> createHmxDiagnosticRecordPass();
+
 } // namespace hmx
 } // namespace mlir
 

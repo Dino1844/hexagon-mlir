@@ -433,7 +433,7 @@ struct HmxWorkspaceResidentPass
     // complete manifest transaction because sibling function passes may run
     // concurrently; do not nest a lock inside the setter.
     std::lock_guard<std::mutex> manifestGuard(hmxModuleStateMutex());
-    if (module->hasAttr("hmx.kernel_manifest") &&
+    if (module->hasAttr(kHmxManifestAttr) &&
         failed(setHmxManifestWorkspaceClass(module, func.getSymName(),
                                             kHmxWorkspaceResident)))
       return signalPassFailure();

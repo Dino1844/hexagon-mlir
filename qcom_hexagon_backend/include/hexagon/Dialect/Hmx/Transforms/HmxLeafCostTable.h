@@ -272,7 +272,7 @@ enum class Leaf {
   AccClear,         // hmx_acc_clear_f16 (Q6_mxclracc_hf)
   AccRead,          // hmx_acc_store_f16 (fused convert+clear read-out)
   MmaF16,           // hmx_mma_f16
-  // the staging channel (hmx.stage / hmx.await -> hexagon_runtime_dma_start
+  // the staging channel (hmx.stage / hmx.await -> hexagon_runtime_dma2d_start
   // / dma_wait, the 24-bit 2D UserDMA descriptors)
   DmaStage,
   DmaAwait,

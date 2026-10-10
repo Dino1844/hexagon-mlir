@@ -62,16 +62,6 @@ class HexagonOptions:
     convTileSizes: str = ""
     enableConvertToHexagonmem: bool = True  # rewrites memref.alloc/copy to hexagonmem.*
     enableHexagonmemCopyToDMA: bool = False  # rewrites hexmem.copy to memref.dma_*
-    enableHexKL: bool = False  # use HexKL to lower matmul and convolutions
-    # hexKLMode (str, "micro"/"macro") was REMOVED here on 2026-09-30. Every
-    # branch that tested it sat behind enableHexKL, which LinalgToLLVMPass
-    # rejects outright ("enableHexKL is incompatible with the HMX manifest
-    # contract"), so the field was unreachable; the declared pass default is
-    # "micro" (Passes.td), i.e. what this field always supplied. Verified in
-    # docs/codegen/knob-fork-classification-2026-09-30.md §1.3.1-5. Re-adding a
-    # Python field for a pass option that no reachable path reads is the
-    # "adding a knob that cannot change anything" pattern; register a real
-    # owner in ROADMAP §2.1 first if one is ever needed.
     enableMultiThreading: bool = (
         False  # linalg-generic based multi-threading (FormVirtualThreadsPass)
     )

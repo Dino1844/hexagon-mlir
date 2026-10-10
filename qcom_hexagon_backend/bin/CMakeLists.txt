@@ -80,6 +80,11 @@ target_link_libraries(linalg-hexagon-opt PRIVATE
     MLIRRegisterAllDialects
     MLIRRegisterAllPasses
     MLIRRegisterAllExtensions
+
+    # The HMX diagnostic passes and their entry point. Deliberately here and
+    # not in the backend library: the production pipeline carries no diagnostic
+    # pass, so nothing diagnostic is linked into what ships to the device.
+    HmxDiagnostics
 )
 
 mlir_check_all_link_libraries(linalg-hexagon-opt)

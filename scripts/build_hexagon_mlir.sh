@@ -104,26 +104,6 @@ fi
 HEXAGON_TOOLS=${BASE_DIR}/HEXAGON_TOOLS/Tools
 export HEXAGON_TOOLS=${HEXAGON_TOOLS}
 
-# Get Hexagon_KL
-echo "extracting Hexagon_KL..."
-cd ${BASE_DIR}
-mkdir -p HEXKL_DIR
-cd HEXKL_DIR
-
-if [[ ! -f Hexagon_KL.Core.1.0.0.Linux-Any.zip ]]; then
-  echo "Downloading Hexagon_KL..."
-  wget https://softwarecenter.qualcomm.com/api/download/software/tools/Hexagon_KL/Linux/1.0.0/Hexagon_KL.Core.1.0.0.Linux-Any.zip
-fi
-
-if [[ ! -d hexkl_addon ]]; then
-  echo "Extracting Hexagon_KL..."
-  unzip -q Hexagon_KL.Core.1.0.0.Linux-Any.zip
-  unzip -q hexkl-1.0.0-beta1-6.4.0.0.zip
-else
-  echo "Hexagon_KL already extracted. Skipping."
-fi
-export HEXKL_ROOT=${BASE_DIR}/HEXKL_DIR/hexkl_addon
-
 # check BASE_DIR is pre-defined in the environment
 : "${BASE_DIR:?Please set BASE_DIR before running this script}"
 

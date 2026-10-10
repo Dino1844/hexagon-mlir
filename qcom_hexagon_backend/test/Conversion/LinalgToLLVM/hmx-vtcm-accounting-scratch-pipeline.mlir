@@ -18,7 +18,7 @@
 // pipeline.mlir); the default flipped to on 2026-10-04, so the flag is what
 // keeps this fixture on the path it was written for.
 //
-// RUN: not linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{scratch=1048576 enable-workspace-resident=false})' 2>&1 | FileCheck %s
+// RUN: not linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=scratch=1048576,enable-workspace-resident=false})' 2>&1 | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK: HMX VTCM accounting is incomplete: static allocation bytes or resident-byte provenance could not be proven

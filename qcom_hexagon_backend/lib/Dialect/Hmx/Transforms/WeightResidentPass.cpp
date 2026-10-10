@@ -2183,7 +2183,7 @@ struct WeightResidentPass
           return signalPassFailure();
         }
         int64_t slot = *tensorSlot;
-        if (module->hasAttr("hmx.kernel_manifest")) {
+        if (module->hasAttr(kHmxManifestAttr)) {
           auto decisionId = op->getAttrOfType<IntegerAttr>(kHmxDecisionIdAttr);
           if (!decisionId ||
               failed(bindHmxManifestWeightSlot(
@@ -2536,7 +2536,7 @@ struct WeightResidentPass
         (addedBytes || module->hasAttr(kResidentBytesAttr)) &&
         failed(verifyResidentByteAggregate(module)))
       return signalPassFailure();
-    if (module->hasAttr("hmx.kernel_manifest") &&
+    if (module->hasAttr(kHmxManifestAttr) &&
         failed(reconcileHmxManifestWeightPolicies(module, prepackRuntimeWeights)))
       return signalPassFailure();
   }

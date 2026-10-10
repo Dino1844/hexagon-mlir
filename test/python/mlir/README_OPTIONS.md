@@ -111,7 +111,6 @@ All options from `HexagonOptions` class can be set. Here are the most commonly u
 - `enableHexagonmemCopyToDMA`: Convert hexagonmem copy to DMA ops
 - `enableBufferization`: Enable bufferization passes
 - `enableCollapseAddressSpace`: Collapse address spaces
-- `enableHexKL`: Use HexKL for matmul/convolutions
 - `enableSeedLayoutConversions`: Seed layout conversions around conv2d
 - `enableLWP`: Enable lightweight profiling
 - `fusion`: Enable linalg generic op fusion
