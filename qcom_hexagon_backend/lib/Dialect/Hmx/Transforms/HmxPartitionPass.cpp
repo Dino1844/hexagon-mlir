@@ -86,6 +86,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Common/Common.h"
+#include "hexagon/Conversion/LinalgToLLVM/Common.h" // printCensusRemarkToStderr
 #include "hexagon/Dialect/Hmx/IR/HmxDialect.h"
 #include "hexagon/Dialect/Hmx/IR/HmxDType.h"
 #include "hexagon/Dialect/Hmx/Transforms/HmxManifest.h"
@@ -109,6 +110,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <cassert>
@@ -249,6 +251,46 @@ constexpr int64_t kSerialPipelineDepth = 3;
 // See docs/results/t-hmx-staging-gate-dead-2026-10-02.md and
 // docs/results/b3-voided-baselines-2026-10-02.md.
 constexpr int64_t kStageMinKTiles = 32;
+
+// TRACEABILITY: kReadoutRingCostUs kReadoutUnpackUsPerMiB
+//   mechanism: The read-out channel's price compares two per-execution
+//     times: R, the staged ring's fixed cost (the pipeliner's peeled
+//     prologue and epilogue, the parity selects its yield constraint
+//     forces, the ring slots and their status words), and g-hat, the
+//     accumulator read-out time the engine can hide behind its mma work.
+//     `open <=> g-hat > R` is a per-execution inequality, so the outer
+//     trip count T multiplies both sides and cancels; T only scales the
+//     launch-level difference the remark reports. "T x cost vs benefit" is
+//     the same inequality written at launch granularity, and as a DECISION
+//     it is wrong: it kills shapes whose per-execution margin is positive
+//     (g-hat 9, R 8, T 100 is +100 us, not 800 > 9).
+//   measurement: R: one build, flash attention grid 1, iters=1000,
+//     2026-10-04 -- staged ring + read-out 5466 us vs unstaged serial 5230
+//     us = +236 us over 16 chunks x 2 rings = 7.4 us per ring
+//     (docs/hmx/readout-channel-pricing-design-2026-10-10.md section 1.3).
+//     Two further builds of the same design put a ring at 9-12 us (depth 2,
+//     no read-out) and 18 us (depth 1), so the cross-build band is 7-18 us
+//     per ring; 7.4 is the same-build value and the one in use.
+//     g-hat price: S1's attribution (1024x512x64) spends ~37 us per launch
+//     end to end with the accumulator unpack of 1 MiB at ~35% of it, i.e.
+//     12.95 us per MiB; exp/hmx/leaf_bw_probe/RESULTS.md (2026-09-21, on
+//     device, 2.11 GHz pinned) corroborates the order of magnitude at
+//     cols=512 (79 GB/s rd+wr). The LOW end of the band is taken: it
+//     understates g-hat, which biases toward CLOSE -- the same side as the
+//     flash-attention lesson (+5% for opening a loop-re-executed shape).
+//     The leaf's small-call price (59.2 pcyc per 2 rows x 64 cols = 256 B,
+//     ~115 us per MiB) is deliberately NOT used: it would price flash
+//     attention's 128 KiB read-out as open, against its measured -236 us.
+//   shape set: S1 1024x512x64 (Mt=32, Nt=16, Kt=2) and flash attention's
+//     per-chunk Q@K/P@V (Mt=32, Nt=2, Kt=2, 16 executions per launch) --
+//     the two shapes the design's section 2.3 self-check uses.
+//   workload representativeness: NOT ESTABLISHED. S1 is the project's own
+//     anchor shape and flash attention is one real kernel; nothing between
+//     them is measured. That is why Phase A prices WITHOUT deciding (the
+//     remark's verdict cannot move the gate) and Phase B is gated on the
+//     design's section 4 criteria plus a fresh ROADMAP 2.1 entry.
+constexpr double kReadoutRingCostUs = 7.4;
+constexpr double kReadoutUnpackUsPerMiB = 12.95;
 
 struct PipelineDecision {
   int64_t requestedDepth = 0;
@@ -915,6 +957,158 @@ static std::optional<int64_t> constantIndexValue(Value value) {
   if (!integer)
     return std::nullopt;
   return integer.getInt();
+}
+
+/// `auto` staging's read-out channel, with its Phase-A price tag
+/// (`docs/hmx/readout-channel-pricing-design-2026-10-10.md` section 4).
+///
+/// THE DECISION IS UNCHANGED. The verdict is the binary check it has always
+/// been: a matmul an outer `scf.for`/`scf.forall` re-executes keeps the
+/// channel closed, because the staged ring's fixed cost is paid per
+/// EXECUTION of the tile loop and an outer loop re-executes the matmul per
+/// iteration. Measured both ways on shallow-K shapes (Kt=2, iters=1000,
+/// this build, 2026-10-04): a once-per-launch matmul is the channel's win
+/// (S1 61 -> 38 us) while flash attention's per-chunk Q@K and P@V -- the
+/// same shape executed 16 times -- lose (staged ring + read-out 5466 us vs
+/// unstaged serial 5230 us; the read-out itself is neutral there, 5466 vs
+/// 5555 with the ring held fixed). Removing the check without a
+/// replacement cost flash attention +5%.
+///
+/// THE PRICE TAG rides alongside the verdict and never moves it: the pass
+/// computes `open <=> g-hat(geometry) > R` -- per execution, T cancels --
+/// and remarks ONLY when the price and the binary verdict DISAGREE.
+/// Agreement is silent on purpose. A remark that always fires is a remark
+/// nobody reads, and the default configuration must stay quiet: under the
+/// stock wiring the standard operators price as the gate already decides
+/// (S1 opens and wins, flash attention closes and loses, the chunked
+/// linear-attention shape closes), so nothing is added to their stderr.
+/// The remark reports an estimate, never a measured saving, and names the
+/// geometry, T, both verdicts and their difference -- the observation
+/// record Phase B's gate reads before the price may take over. It is
+/// formatted once and reported twice (RowReduceGroupStorePass's pattern):
+/// `emitRemark` for `linalg-hexagon-opt`, and `printCensusRemarkToStderr`
+/// because a Triton compile never shows a remark -- the DiagnosticEngine
+/// drops it below the Error threshold before any handler (Common.h). The
+/// mirror is off unless HEXMLIR_DIAG_REMARKS is set.
+///
+/// g-hat is a volume estimate over the constants above (the design's G1
+/// estimator): one read-out moves Mt * Nt accumulator tiles of 32 x 32 f16
+/// (2 KiB each), priced at kReadoutUnpackUsPerMiB. G1's second term -- the
+/// cap at the engine time per execution -- never binds where this channel
+/// lives (Kt < kStageMinKTiles): the unpack costs Mt*Nt*0.025 us against
+/// Mt*Nt*Kt*0.13 us of engine time (8.7k pcyc per mma batch at the ~2.1 GHz
+/// steady clock), a ratio of 0.196/Kt < 1 for every Kt >= 1, so `min`
+/// reduces to the volume term. The design's G2 anchor ratio is deliberately
+/// absent: it is the self-chosen-anchor mistake kStageMinKTiles was named
+/// for, and it may not steer a decision.
+///
+/// Unknown loop bounds are not guessed (design section 2.4): T then reads
+/// "dynamic" and only the per-execution term is reported. Unreadable
+/// geometry never reaches here -- the caller fails the compilation closed
+/// before the channel is consulted -- so there is no silent-unpriced path.
+int64_t readoutChannelDecision(MatmulOp op, int64_t stagedReadoutMTiles,
+                               int64_t requestedDepth) {
+  // One walk answers both questions: does an outer loop re-execute this
+  // matmul (the verdict), and how many times per launch does the tile loop
+  // run (the launch-level context of the remark).
+  bool gatedByOuterLoop = false;
+  bool staticTripCounts = true;
+  int64_t tripCount = 1;
+  for (Operation *ancestor = op->getParentOp(); ancestor != nullptr;
+       ancestor = ancestor->getParentOp()) {
+    if (isa<scf::ForallOp>(ancestor)) {
+      // Closes the channel like a `scf.for`; its iteration space is not
+      // read for the trip count (see the unknown-bounds rule above).
+      gatedByOuterLoop = true;
+      staticTripCounts = false;
+      break;
+    }
+    auto loop = dyn_cast<scf::ForOp>(ancestor);
+    if (!loop)
+      continue;
+    gatedByOuterLoop = true;
+    std::optional<int64_t> lb = constantIndexValue(loop.getLowerBound());
+    std::optional<int64_t> ub = constantIndexValue(loop.getUpperBound());
+    std::optional<int64_t> st = constantIndexValue(loop.getStep());
+    if (!lb || !ub || !st || *st <= 0 || *ub < *lb) {
+      staticTripCounts = false;
+      break;
+    }
+    int64_t trips = (*ub - *lb + *st - 1) / *st;
+    // A product that large is a representability hazard, not a number
+    // anyone wants in a remark; "unknown" is the honest answer.
+    if (trips < 1 || tripCount > (int64_t{1} << 40) / trips) {
+      staticTripCounts = false;
+      break;
+    }
+    tripCount *= trips;
+  }
+
+  // The regime where the channel's value is even read: the read-out split
+  // enabled, `auto` depth (an explicit `pipeline-depth` is an A/B arm that
+  // bypasses both floors), and a K extent below the transfer floor (at or
+  // above it the ShallowK conjunction is false and the value is not
+  // consulted). Outside it the price has nothing to say, so it stays
+  // silent -- that is what keeps the default configuration quiet.
+  std::optional<TileShape> shape = getTileShape(op);
+  if (stagedReadoutMTiles <= 0 || requestedDepth > 0 || !shape ||
+      shape->k >= kStageMinKTiles)
+    return gatedByOuterLoop ? 0 : stagedReadoutMTiles;
+
+  double readoutMib = static_cast<double>(shape->m) * shape->n *
+                      layout::kTileEdge * layout::kTileEdge * 2.0 /
+                      (1024.0 * 1024.0);
+  double gHatUs = readoutMib * kReadoutUnpackUsPerMiB;
+  bool pricedOpen = gHatUs > kReadoutRingCostUs;
+
+  // Agreement is the silent case (Phase A's zero-noise discipline).
+  if (pricedOpen == !gatedByOuterLoop)
+    return gatedByOuterLoop ? 0 : stagedReadoutMTiles;
+
+  double differenceUs = gHatUs - kReadoutRingCostUs;
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << "HMX readout channel pricing (Phase A, observation only; the "
+        "decision is unchanged): Mt="
+     << shape->m << " Nt=" << shape->n << " Kt=" << shape->k
+     << ", the tile loop executes ";
+  if (staticTripCounts)
+    os << tripCount << (tripCount == 1 ? " time per launch"
+                                       : " times per launch");
+  else
+    os << "an unknown number of times per launch (dynamic loop bounds)";
+  os << "; the read-out moves " << llvm::format("%.3f", readoutMib)
+     << " MiB per execution, an estimated " << llvm::format("%.2f", gHatUs)
+     << " us hideable at " << llvm::format("%.4g", kReadoutUnpackUsPerMiB)
+     << " us per MiB, against the staged ring's "
+     << llvm::format("%.1f", kReadoutRingCostUs)
+     << " us per execution (same-build measurement; 7-18 us per ring across "
+        "builds); pricing suggests "
+     << (pricedOpen ? "OPEN" : "CLOSED") << ", the binary gate says "
+     << (gatedByOuterLoop ? "CLOSED" : "OPEN") << ", difference "
+     << llvm::format("%+.2f", differenceUs) << " us per execution";
+  if (staticTripCounts)
+    os << " (" << llvm::format("%+.2f", differenceUs * (double)tripCount)
+       << " us per launch)";
+  else
+    os << "; T is dynamic, so only the per-execution term is reported";
+  // The m-tile floor of the same conjunction declines on its own: name it,
+  // or the remark could be read as "the channel would stage this shape".
+  if (!gatedByOuterLoop && shape->m < stagedReadoutMTiles)
+    os << "; note Mt=" << shape->m << " is below the read-out batch floor of "
+       << stagedReadoutMTiles
+       << ", which declines staging regardless of the channel";
+  os << ".";
+  op.emitRemark() << StringRef(text);
+  // Formatted once, used twice on purpose (RowReduceGroupStorePass does the
+  // same): the remark is what `linalg-hexagon-opt` shows, and this stderr
+  // mirror is what a Triton compile shows -- this MLIR's DiagnosticEngine
+  // drops a remark below its Error print threshold before any handler sees
+  // it, and exposes no setter to lower it (Common.h). Without the mirror the
+  // phase's observation record could not be taken from a real compile at all.
+  // Off unless HEXMLIR_DIAG_REMARKS is set, so the default stays quiet.
+  hexagon::printCensusRemarkToStderr(text);
+  return gatedByOuterLoop ? 0 : stagedReadoutMTiles;
 }
 
 static LogicalResult verifyPackCoverage(Operation *anchor,
@@ -2541,14 +2735,14 @@ struct HmxPartitionPass
     // matmul that no outer loop re-executes; the single-matmul gate this
     // replaces was a proxy for exactly this condition, and removing it
     // without a replacement cost flash attention +5%.
+    //
+    // Phase A of docs/hmx/readout-channel-pricing-design-2026-10-10.md
+    // section 4 prices the same channel (`open <=> g-hat > R`, per
+    // execution) and remarks when the price disagrees with the verdict
+    // above; the verdict itself is untouched. See readoutChannelDecision.
     auto readoutChannelFor = [&](MatmulOp op) -> int64_t {
-      if (this->stagedReadoutMTiles <= 0)
-        return 0;
-      for (Operation *ancestor = op->getParentOp(); ancestor != nullptr;
-           ancestor = ancestor->getParentOp())
-        if (isa<scf::ForOp, scf::ForallOp>(ancestor))
-          return 0;
-      return this->stagedReadoutMTiles;
+      return readoutChannelDecision(op, this->stagedReadoutMTiles,
+                                    this->pipelineDepth);
     };
 
     // The engine's budget, with the one field a caller may narrow: 0 means the
