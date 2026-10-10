@@ -600,8 +600,11 @@ def create_timestamped_folder(
     # device directory -- and every file pushed into it -- keeps its name across
     # launches, which is what lets the adb shim's md5 push-skip (gated by the
     # same env var) recognise unchanged files instead of re-pushing 3+ MB every
-    # launch (~20 s measured, for kernels that run in ~50 us). Opt-in: only the
-    # sweep in exp/hmx/t3_overlap_ab sets it. Safe against collisions because
+    # launch (~20 s measured, for kernels that run in ~50 us). Default ON since
+    # 2026-10-10 (tools/hexmlir/env.sh; ticket
+    # .scratch/measurement/issues/04-fast-launch-and-pull-cost.md) -- the tunnel
+    # is priced per byte and the push used to dwarf the kernel. Opt out with
+    # HEXAGON_FAST_LAUNCH=0 and a reason. Safe against collisions because
     # device work is serialised by tools/run_tests.sh lock; a stale file from a
     # previous launch is either overwritten (same name) or never loaded
     # (run_main_on_hexagon loads libs by name from this run's push set).
@@ -727,9 +730,15 @@ class HexagonLauncherBase:
         filename_without_ext: str,
         paths_to_shared_libs_generated: list[str],
         wrapper_generator: HexagonWrapperGenerator,
+        pull_outputs: bool = True,
     ) -> list[Tensor]:
         """
         Generates the input and output paths and runs the kernel
+
+        pull_outputs is the caller's declaration that nobody reads this
+        launch's output tensors (see qcom_hexagon_backend/backend/launch_intent.py);
+        it skips the pull only, never the device-side dump, and defaults to True
+        so a caller that declares nothing keeps the round-trip.
         """
         # Generate input/output paths
         input_tensor_paths, output_tensor_paths = self.generate_input_output_paths(
@@ -741,5 +750,6 @@ class HexagonLauncherBase:
             input_tensor_paths,
             output_tensor_paths,
             generatePerf=True,
+            pull_outputs=pull_outputs,
         )
         return results

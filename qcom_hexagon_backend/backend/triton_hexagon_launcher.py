@@ -24,6 +24,7 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     create_timestamped_folder,
     make_resident_scope_id,
 )
+from triton.backends.qcom_hexagon_backend.launch_intent import pull_outputs_enabled
 from triton.backends.qcom_hexagon_backend.utils import (
     enforce_hmx_launch_contract,
     hmx_grid_notice,
@@ -766,9 +767,25 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         print("==> Shared object generated: ", so_path)
 
         # 4 - Running the shared object located at `so_path`
+        # pull_outputs is the launch intent: a caller that only wants the Perf
+        # line (a steady-state benchmark, say) declares `pull_outputs(False)` and
+        # pays nothing for the output bytes.  Everything that consumes them --
+        # the `rel` checks, the value tests -- stays outside that block, so the
+        # default (True) is what every correctness path uses.
+        pull_outputs = pull_outputs_enabled()
         results = super().execute_kernel(
-            hexec, local_dir_path, func_name, [so_path], wrapper_generator
+            hexec,
+            local_dir_path,
+            func_name,
+            [so_path],
+            wrapper_generator,
+            pull_outputs=pull_outputs,
         )
+        if not pull_outputs:
+            # Nothing came back, so there is nothing to copy into the caller's
+            # tensors, and the count check below would otherwise fail on a
+            # launch that is behaving exactly as declared.
+            return results
 
         # In Triton the inputs arguments to a kernel function, can also contain output pointers
         # and essentially each input can be an output as well, so we

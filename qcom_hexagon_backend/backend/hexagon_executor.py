@@ -160,7 +160,11 @@ class HexagonExecutor:
             input_tensor_paths (list<str>): Paths to the input tensors in the local directory.
             output_paths (list<str>): Paths to the local directory where output tensors files need to be generated.
             generatePerf (bool): Boolean to specify whether performance report should be generated while running on device.
-        """
+            pull_outputs (bool): Whether to pull the output tensors back over the tunnel.
+                The tensors are only ever *needed* by a caller that computes on them;
+                a Perf-only launch pays ~4 s/MB for bytes nobody reads (see
+                qcom_hexagon_backend/backend/launch_intent.py). Skipping the pull
+                does not skip the device-side dump, so a later pull is never stale.
     '''
 
     def run(
@@ -169,6 +173,7 @@ class HexagonExecutor:
         input_tensor_paths: list[str],
         output_paths: list[str],
         generatePerf: bool = False,
+        pull_outputs: bool = True,
     ) -> list[Tensor]:
         if self.exec_mode == "simulator":
             self.run_kernel_on_simulator(paths_to_shared_libs_local)
@@ -178,7 +183,15 @@ class HexagonExecutor:
                 input_tensor_paths,
                 output_paths,
                 generatePerf,
+                pull_outputs,
             )
+
+        if not pull_outputs:
+            # Nothing was pulled, so there is nothing to hand back.  An empty
+            # list (rather than a partial or stale one) is what makes a caller
+            # that forgot its own declaration notice it.
+            print("==> Ran successfully (output pull skipped by launch intent)")
+            return []
 
         print(f"==> Ran successfully, collecting results")
         results = []
@@ -411,6 +424,7 @@ class HexagonExecutor:
         input_tensor_paths: list[str],
         output_paths: list[str],
         generatePerf: bool = False,
+        pull_outputs: bool = True,
     ):
         """Push files to device, and run on DSP"""
         print("==> Running the kernel on device ...")
@@ -641,6 +655,12 @@ class HexagonExecutor:
                 True,
             ),
             # Pull all the output tensors from device
+            # pull_outputs=False (qcom_hexagon_backend/backend/launch_intent.py)
+            # is the caller declaring that nobody reads them: the tunnel is the
+            # most expensive part of a launch per byte.  The device-side dump
+            # still happens -- the wrapper writes the files, so this run's
+            # product is what a later launch overwrites and what a later pull
+            # returns.
             (
                 "adb {} -s {} pull {} {}".format(
                     self.config.env_vars["ANDROID_HOST"],
@@ -650,7 +670,7 @@ class HexagonExecutor:
                     # Append a random entry to make sure the list in not empty.
                     os.path.dirname((output_paths + ["/invalid/dir"])[0]),
                 ),
-                bool(output_paths),
+                bool(output_paths) and pull_outputs,
             ),
             # Pull the perf report from device
             (
@@ -687,12 +707,24 @@ class HexagonExecutor:
                 ),
                 # HEXAGON_FAST_LAUNCH=1 keeps the device directory alive so the
                 # md5 push-skip has something to compare against on the next
-                # launch; the stable-name half of the same opt-in is in
-                # create_timestamped_folder().
+                # launch; the stable-name half of the same protocol (default
+                # since 2026-10-10) is in create_timestamped_folder().
                 self.cleanup_device_post_exec
                 and os.getenv("HEXAGON_FAST_LAUNCH") != "1",
             ),
         ]
+
+        if not pull_outputs:
+            # Announced rather than silently dropped: the executor's own
+            # per-command lines are the measurement instrument (the launch
+            # phase profiler reads "Command took X seconds" out of this
+            # stream), and a launch that simply cost less with no reason
+            # printed is how a protocol claim goes unverifiable.
+            print(
+                "==> output pull skipped (launch intent: pull_outputs=False); "
+                "perf.txt is still pulled",
+                flush=True,
+            )
 
         try:
             if self.enable_etm:

@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""The output-pull launch intent, as bare-assert pytest tests.
+
+What is being pinned
+--------------------
+A launch pays for its output bytes twice as much as for anything else: the
+tunnel runs at roughly 0.2-0.6 MB/s in *both* directions, and a steady-state
+benchmark reads only the ``Perf`` line.  ``launch_intent.pull_outputs(False)``
+lets such a caller skip the pull.
+
+The number this file protects is not the saving, it is the **boundary**: the
+skip must reach the pull command and nothing else.  Three properties, each
+checked against the real code:
+
+1. The default is "pull".  A caller that declares nothing must get today's
+   behaviour, because every ``rel`` check and every value test in the tree
+   depends on it.
+2. The skip is total for the output pull and invisible to everything else:
+   ``perf.txt`` is still pulled, the device-side dump still happens (the
+   wrapper writes the files), the pre-run ``rm -rf`` still clears them.
+3. The skipped pull is observable, not silent.  A launch that simply cost less
+   with no reason printed is how a protocol claim goes unverifiable.
+
+``main()`` below exists so that running this file as a script is a real gate
+rather than a silent no-op; its siblings carry the same guard.
+
+No device, no network, no SDK: the toolchain paths the executor checks are
+synthesised in a temporary directory.
+"""
+
+import collections
+import contextlib
+import io
+import json
+import os
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
+import torch
+
+from triton.backends.qcom_hexagon_backend.hexagon_executor import (
+    HexagonExecutor,
+)
+from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
+    HexagonLauncherBase,
+)
+from triton.backends.qcom_hexagon_backend.launch_intent import (
+    pull_outputs,
+    pull_outputs_enabled,
+)
+
+#: The manifest/weight fixtures the launch path validates against.  Reused
+#: rather than re-declared so this file cannot drift from the contract the
+#: driver already enforces.
+from test_hmx_manifest_metadata import _MANIFEST, _WEIGHT
+
+
+# --------------------------------------------------------------------------- #
+# Doubles
+# --------------------------------------------------------------------------- #
+
+
+class _SubprocessRecorder:
+    """Stands in for the ``subprocess`` module inside the executor.
+
+    Every command the executor would have handed to a shell is recorded
+    verbatim and answered with an empty success, which is enough: the executor
+    parses nothing from a pull (the bytes land as files) and parses nothing
+    from ``ls`` when there are no dumps.
+    """
+
+    def __init__(self):
+        self.commands = []
+
+    def check_output(self, command, **kwargs):
+        self.commands.append(command)
+        return b""
+
+    def run(self, command, **kwargs):
+        self.commands.append(command)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def pulls(self):
+        return [c for c in self.commands if " pull " in c]
+
+    def CalledProcessError(self):  # pragma: no cover - never raised here
+        raise AssertionError("unreachable")
+
+
+class _ExecutorStub:
+    """The half of ``HexagonExecutor`` the launcher touches."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+    def get_Executable_Path(self):
+        return ""
+
+    def generate_shared_object(self, *_args, **_kwargs):
+        return "/tmp/pull-policy-stub.so"
+
+
+class _GeneratorStub:
+    def __init__(self, input_profs, iterations, func_name, output_profs, grid, options, scope):
+        self.input_profs = input_profs
+        self.output_profs = output_profs
+
+    def generate_cpp_wrapper(self, _file_name, _exec_dir):
+        return "// stub wrapper"
+
+
+class _WrapperStub:
+    """The generator-side facts ``generate_input_output_paths`` reads."""
+
+    input_profs = []
+    output_profs = []
+    weight_prepack = None
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+
+
+def _fake_toolchain(root: Path) -> tuple[str, str]:
+    """Create the two libraries ``run_kernel_on_device`` insists exist."""
+    tools = root / "HEXAGON_Tools"
+    libdir = tools / "target/hexagon/lib/v79/G0/pic"
+    libdir.mkdir(parents=True)
+    (libdir / "libc++.so.1").write_bytes(b"")
+    (libdir / "libc++abi.so.1").write_bytes(b"")
+    return str(tools), "79"
+
+
+def _executor(root: Path):
+    """A real ``HexagonExecutor`` with every external path synthesised."""
+    tools, q6 = _fake_toolchain(root)
+    executor = object.__new__(HexagonExecutor)
+    executor.exec_mode = "device"
+    executor.device_path = str(root / "device")
+    executor.lib_path = str(root / "device/lib")
+    executor.alt_perf_path = None
+    executor.enable_lwp = False
+    executor.enable_etm = False
+    executor.final_result = "Pass"
+    executor.cleanup_device_post_exec = True
+    config = collections.namedtuple("config", ("env_vars", "HEX_TOOLS", "Q6_VERSION"))
+    executor.config = config(
+        env_vars={
+            "ANDROID_HOST": "",
+            "ANDROID_SERIAL": "pull-policy-serial",
+            "HEXAGON_MLIR_ROOT": str(root),
+            "HEXAGON_SDK_ROOT": str(root / "Hexagon_SDK"),
+            "HEXAGON_TOOLS": tools,
+        },
+        HEX_TOOLS={},
+        Q6_VERSION=q6,
+    )
+    return executor
+
+
+def _launcher_module():
+    import triton.backends.qcom_hexagon_backend.triton_hexagon_launcher as module
+
+    return module
+
+
+def _launch(launcher, pull=True):
+    """One ``_exec_kernel`` call with the surrounding pieces stubbed out.
+
+    ``HexagonLauncherBase.execute_kernel`` and the executor classes are replaced
+    by recorders, so what is observed is the *plumbing*: whether the intent
+    reached the call and whether the result came back.
+    """
+    module = _launcher_module()
+    original_executor = module.HexagonExecutor
+    original_generator = module.TritonHexagonWrapperGenerator
+    original_execute = HexagonLauncherBase.execute_kernel
+    seen = {}
+
+    def execute(self, hexec, local_dir, filename, libs, wrapper_generator, pull_outputs=True):
+        seen["pull_outputs"] = pull_outputs
+        return [] if not pull_outputs else [torch.zeros(4)]
+
+    module.HexagonExecutor = _ExecutorStub
+    module.TritonHexagonWrapperGenerator = _GeneratorStub
+    HexagonLauncherBase.execute_kernel = execute
+    launcher.generate_and_dump_wrapper = lambda *_a, **_k: "/tmp/pull-policy-wrapper.cpp"
+    # Artifacts (the .o the launcher writes) land in a scratch dir that is
+    # removed with the test, not in /tmp.
+    with tempfile.TemporaryDirectory() as scratch:
+        previous_dump_dir = os.environ.get("HEXAGON_MLIR_DUMP_DIR")
+        os.environ["HEXAGON_MLIR_DUMP_DIR"] = scratch
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                results = launcher._exec_kernel(
+                    b"kernel-object-bytes",
+                    1,
+                    "pull_policy_probe",
+                    [torch.zeros(4)],
+                    [],
+                    (1, 1, 1),
+                    weight_prepack=json.dumps(_WEIGHT),
+                    hmx_manifest=json.dumps(_MANIFEST),
+                )
+        finally:
+            if previous_dump_dir is None:
+                os.environ.pop("HEXAGON_MLIR_DUMP_DIR", None)
+            else:
+                os.environ["HEXAGON_MLIR_DUMP_DIR"] = previous_dump_dir
+            module.HexagonExecutor = original_executor
+            module.TritonHexagonWrapperGenerator = original_generator
+            HexagonLauncherBase.execute_kernel = original_execute
+
+    # The caller's tensor is the evidence for the copy-back half: it is written
+    # only when results came back.
+    return seen, results
+
+
+# --------------------------------------------------------------------------- #
+# Tests
+# --------------------------------------------------------------------------- #
+
+
+def test_the_intent_is_scoped_and_restored():
+    assert pull_outputs_enabled() is True, "a caller that declares nothing must pull"
+    with pull_outputs(False):
+        assert pull_outputs_enabled() is False
+    assert pull_outputs_enabled() is True, "the scope must close"
+    # An exception must not leak the declaration: a failing benchmark is still
+    # a benchmark, and the next launch in the same session is somebody's rel
+    # check.
+    try:
+        with pull_outputs(False):
+            raise RuntimeError("benchmark exploded")
+    except RuntimeError:
+        pass
+    assert pull_outputs_enabled() is True, "an exception must not leave the intent set"
+
+
+def test_the_executor_skips_the_output_pull_and_nothing_else():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        executor = _executor(root)
+        so_path = root / "kernel.so"
+        so_path.write_bytes(b"")
+        outputs = [str(root / f"kernel_o{i}.raw") for i in range(2)]
+        inputs = [str(root / "kernel_t0.raw")]
+        for p in inputs + outputs:
+            Path(p).write_bytes(b"")
+
+        import triton.backends.qcom_hexagon_backend.hexagon_executor as hexec_mod
+
+        def launch(pull_outputs):
+            """One launch with every shell command recorded and stdout kept."""
+            recorder = _SubprocessRecorder()
+            spoken = io.StringIO()
+            original = hexec_mod.subprocess
+            hexec_mod.subprocess = recorder
+            try:
+                with contextlib.redirect_stdout(spoken):
+                    hexec_mod.HexagonExecutor.run_kernel_on_device(
+                        executor,
+                        [str(so_path)],
+                        inputs,
+                        outputs,
+                        generatePerf=True,
+                        pull_outputs=pull_outputs,
+                    )
+            finally:
+                hexec_mod.subprocess = original
+            return recorder.commands, spoken.getvalue()
+
+        commands, spoken = launch(True)
+        pulls = [c for c in commands if " pull " in c]
+        assert [c for c in pulls if "kernel_o0.raw" in c], pulls
+        assert [c for c in pulls if "kernel_o1.raw" in c], "every output, not just the first"
+        assert any("perf.txt" in c for c in pulls), "perf is not part of the skip"
+        assert "output pull skipped" not in spoken
+        # The staleness guard: each launch still clears the previous run's
+        # outputs before running, so a later pull can never return them.
+        assert [c for c in commands if "rm -rf" in c and "kernel_o0.raw" in c]
+
+        commands, spoken = launch(False)
+        pulls = [c for c in commands if " pull " in c]
+        assert not [c for c in pulls if "kernel_o0.raw" in c], pulls
+        assert not [c for c in pulls if "kernel_o1.raw" in c], pulls
+        assert any("perf.txt" in c for c in pulls), "the timing must survive"
+        assert [c for c in commands if "rm -rf" in c and "kernel_o0.raw" in c], (
+            "the staleness guard must survive the skip"
+        )
+        assert any("kernel.so" in c for c in commands), "the library handling is untouched"
+        assert "output pull skipped" in spoken, "the skip must be visible, not silent"
+
+
+def test_a_skipped_pull_returns_nothing_rather_than_stale_bytes():
+    """``run()`` must not read files it was told not to pull.
+
+    The output paths here deliberately do not exist: the collecting half raises
+    on them when it runs, and returns an empty list when it does not.  That
+    asymmetry is the assertion -- a partial or stale tensor instead of an error
+    is the failure this ordering prevents.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        executor = _executor(root)
+        so_path = root / "kernel.so"
+        so_path.write_bytes(b"")
+        missing = [str(root / "kernel_o0.raw")]
+        calls = []
+
+        def fake_device(self, paths, inputs, outputs, generatePerf=False, pull_outputs=True):
+            calls.append(pull_outputs)
+            return []
+
+        original = HexagonExecutor.run_kernel_on_device
+        HexagonExecutor.run_kernel_on_device = fake_device
+        try:
+            try:
+                executor.run([str(so_path)], [], missing, generatePerf=True)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError(
+                    "the default still collects the outputs -- and these do not exist"
+                )
+            assert (
+                executor.run(
+                    [str(so_path)], [], missing, generatePerf=True, pull_outputs=False
+                )
+                == []
+            )
+        finally:
+            HexagonExecutor.run_kernel_on_device = original
+        assert calls == [True, False]
+
+
+def test_execute_kernel_forwards_the_declaration():
+    import triton.backends.qcom_hexagon_backend.triton_hexagon_launcher as module
+
+    class _Executor:
+        def __init__(self):
+            self.seen = None
+
+        def run(self, paths, inputs, outputs, generatePerf=False, pull_outputs=True):
+            self.seen = pull_outputs
+            return [] if not pull_outputs else [torch.zeros(1)]
+
+    launcher = object.__new__(module.TritonHexagonLauncher)
+    with tempfile.TemporaryDirectory() as tmp:
+        for declared, expected in ((None, True), (False, False), (True, True)):
+            executor = _Executor()
+            kwargs = {} if declared is None else {"pull_outputs": declared}
+            launcher.execute_kernel(
+                executor, tmp, "kernel", ["/tmp/k.so"], _WrapperStub(), **kwargs
+            )
+            assert executor.seen is expected, declared
+
+
+def test_the_launcher_reads_the_intent_and_skips_the_copy_back():
+    import triton.backends.qcom_hexagon_backend.triton_hexagon_launcher as module
+
+    launcher = object.__new__(module.TritonHexagonLauncher)
+
+    seen, results = _launch(launcher)
+    assert seen["pull_outputs"] is True
+    assert len(results) == 1, "the default round-trips the tensors"
+
+    seen, results = _launch(launcher)
+    assert seen["pull_outputs"] is True, "the previous scope must not leak"
+
+    with pull_outputs(False):
+        seen, results = _launch(launcher)
+        assert seen["pull_outputs"] is False, "the declaration must reach the call"
+        assert results == [], "no tensors, so nothing to copy back"
+
+def main() -> None:
+    tests = (
+        test_the_intent_is_scoped_and_restored,
+        test_the_executor_skips_the_output_pull_and_nothing_else,
+        test_a_skipped_pull_returns_nothing_rather_than_stale_bytes,
+        test_execute_kernel_forwards_the_declaration,
+        test_the_launcher_reads_the_intent_and_skips_the_copy_back,
+    )
+    for test in tests:
+        test()
+        print(f"ok  {test.__name__}")
+    print(f"output-pull launch intent: {len(tests)} passed")
+
+
+if __name__ == "__main__":
+    main()
