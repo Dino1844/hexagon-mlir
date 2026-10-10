@@ -40,12 +40,24 @@ that make the explicit ``do_bench=`` path work instead:
 * :func:`predict_tile_pcyc` / :func:`cost_prune` / :func:`rank_tile_candidates`
   -- the leaf cost table's C0 consumer (design:
   ``docs/hmx/cost-table-revival-for-search-2026-10-10.md``).  C0 ORDERS
-  candidates by modeled pcyc and prunes NOTHING: the pruning predicate is
-  written and pinned here but has no call site until C1, and the runner
-  switch that enables even the ordering defaults to OFF.  What C0 does
-  produce every run is the calibration cross table ("constants vs this
-  run's measurements", version-stamped by ``table_rev``) -- a report, never
-  a table edit.
+  candidates by modeled LOWER bound and prunes NOTHING: the pruning
+  predicate is written and pinned here but has no call site until C1, and
+  the runner switch that enables even the ordering defaults to OFF.  The
+  ordering sorts by ``lb``, not by the interval midpoint, so it is monotone
+  in the interval -- if every cell of A is cheaper than every cell of B,
+  A sorts first -- which is the property the midpoint cannot promise under
+  overlapping intervals.  What C0 does produce every run is the calibration
+  cross table ("constants vs this run's measurements", version-stamped by
+  ``table_rev``) -- a report, never a table edit.
+* :func:`judge_champion_round` / :func:`canary_verdict` -- the verdict the
+  search's runner promised in its own docstring and never implemented: a
+  challenger takes the crown only by beating the incumbent by more than
+  this project's gate ``max(3xCV, 15%)``, and a known-healthy canary config
+  re-measured every round decides whether the round's numbers may be read
+  at all -- "the device is not well" is a different fact from "every
+  config was slow", and without the sentinel the two are the same number.
+  Both land in the runner's result JSON as the changeover log, the
+  per-config CVs and the canary status.
 
 What is deliberately NOT here
 -----------------------------
@@ -65,7 +77,7 @@ Run:  ::
     from triton.backends.qcom_hexagon_backend.hmx_search import (
         hexagon_bench, enumerate_tile_configs, tuning_key_int,
         predict_tile_pcyc, cost_prune, rank_tile_candidates,
-        build_cost_calibration,
+        build_cost_calibration, judge_champion_round, canary_verdict,
     )
 """
 
@@ -128,6 +140,22 @@ __all__ = [
     "ABSTAIN_MANIFEST",
     "ABSTAIN_NO_CELL",
     "ABSTAIN_TABLE_MISSING",
+    "CHAMPION_CV_FACTOR",
+    "CHAMPION_MARGIN_FLOOR",
+    "champion_gate",
+    "quantile_spread_cv",
+    "CANARY_MISSING",
+    "CANARY_UNMEASURED",
+    "CANARY_DRIFT",
+    "CANARY_REFERENCE",
+    "CANARY_OK",
+    "ROUND_VALID",
+    "ROUND_INVALID_CANARY",
+    "CANARY_TILES",
+    "CANARY_SHAPE",
+    "canary_config",
+    "canary_verdict",
+    "judge_champion_round",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -198,7 +226,7 @@ def span_count(m: int, n: int, k: int, tiles: tuple[int, int, int]) -> int:
     span and a BK=64 32-span config differ 32x in spans while potentially
     differing by one "once per K segment" tax in cycles -- which is exactly
     the blind spot :func:`predict_tile_pcyc` was added to price (C0 orders by
-    modeled pcyc with this as the tiebreak).
+    the modeled lower bound, with this as the tiebreak).
     """
     bm, bn, bk = tiles
     return ((m + bm - 1) // bm) * ((n + bn - 1) // bn) * ((k + bk - 1) // bk)
@@ -723,8 +751,17 @@ class TilePrediction(NamedTuple):
     the most expensive one, so the family spread (engine 22.0 vs 26.4,
     ~20% and unexplained; unpack 86.0 vs 191.9 across families) is absorbed
     by construction rather than argued about.  ``p50`` is the interval
-    midpoint -- C0 has no basis for a better point estimate, and an ordering
-    that is monotone in the interval is all the design asks of it.
+    midpoint -- C0 has no basis for a better point estimate -- and it is
+    what the calibration report compares against a measurement.  The
+    ORDERING does not use it: :func:`rank_tile_candidates` sorts by ``lb``,
+    because the midpoint is not monotone in the interval when intervals
+    overlap (A = [100, 300] has midpoint 200 and loses to B = [150, 160]
+    with midpoint 155, although A could still be the cheaper config), while
+    the lower bound is: if every cell of A is cheaper than every cell of B
+    (``ub(A) < lb(B)``), A sorts first, guaranteed.  Sorting by ``lb`` also
+    puts the candidate that COULD be cheapest at the front of the bounded
+    selection's dispatch budget, which is the right experiment to run
+    first.
     """
 
     tiles: tuple[int, int, int]
@@ -992,7 +1029,7 @@ def cost_prune(candidates, shape, *, control_tile=None,
 
 def rank_tile_candidates(shape, legal, *, fingerprints=None,
                          cell_index=None):
-    """C0's ordering: modeled cost first, span count as the tiebreak.
+    """C0's ordering: modeled lower bound first, span count as the tiebreak.
 
     This is the only way C0 touches the search, and it is safe by
     construction: the function returns a PERMUTATION of its input.  No
@@ -1001,6 +1038,14 @@ def rank_tile_candidates(shape, legal, *, fingerprints=None,
     instead of the fewest-span ones.  span_count only counts blocks, so it
     is blind to block bytes and to source heat -- BK=2048 in one span and
     BK=64 in thirty-two spans is the blind spot this ordering repairs.
+
+    The key is ``lb``, not the interval midpoint, and that is what makes the
+    ordering's promise true: it is monotone in the interval (``ub(A) <
+    lb(B)`` implies A first), which the midpoint cannot promise when
+    intervals overlap -- see :class:`TilePrediction`.  ``lb`` is also the
+    conservative choice for a bounded budget: the candidate whose
+    OPTIMISTIC bound is lowest is the one that could be fastest, so it is
+    the one worth measuring before the dispatch budget runs out.
 
     An abstaining candidate keeps its span order but sorts after every
     priced one: an abstain is the model saying "unknown", and unknown is
@@ -1017,7 +1062,7 @@ def rank_tile_candidates(shape, legal, *, fingerprints=None,
         spans = span_count(m, n, k, cfg.tiles)
         if pred.abstain is not None:
             return (1, 0.0, spans, cfg.tiles)
-        return (0, pred.p50, spans, cfg.tiles)
+        return (0, pred.lb, spans, cfg.tiles)
 
     return sorted(legal, key=key)
 
@@ -1124,6 +1169,406 @@ def calibration_iters(perf_us: float, target_us: float = 2_000_000.0,
     """
     per_iter = max(float(perf_us), 1.0)
     return max(lo, min(hi, int(target_us / per_iter)))
+
+
+# --------------------------------------------------------------------------- #
+# The champion criterion and the per-round canary
+# --------------------------------------------------------------------------- #
+
+#: The project's verdict gate, ``max(3 x CV, 15%)`` (``AGENTS.md`` section 4),
+#: written as its two factors.  Both numbers are inherited, not chosen here:
+#: the multiplier is the project's own, and the floor is the same 15% that
+#: :data:`PRUNE_MARGIN` names for the pruning predicate ("below it a gain is
+#: not a gain").  A second pair of constants for the same gate is how two
+#: copies of one rule start to disagree.
+CHAMPION_CV_FACTOR = 3.0
+CHAMPION_MARGIN_FLOOR = 0.15
+
+#: The canary's statuses.  A canary is a known-healthy minimal config measured
+#: once per round; its whole job is to separate "this config is slow" from
+#: "the device is not well" -- two facts that produce the same per-config
+#: numbers and need opposite responses.
+CANARY_MISSING = "missing"
+CANARY_UNMEASURED = "unmeasured"
+CANARY_DRIFT = "drift"
+CANARY_REFERENCE = "reference-established"
+CANARY_OK = "ok"
+
+#: What a round as a whole may say.  ``valid``: the canary was healthy, so the
+#: configs' verdicts below it may be read.  ``invalid-canary``: they may NOT
+#: -- the round is void, which is a different statement from "every config
+#: was slow", and the one a reader could not otherwise make.
+ROUND_VALID = "valid"
+ROUND_INVALID_CANARY = "invalid-canary"
+
+#: The canary config: the smallest tile the engine takes exactly, on the
+#: contraction that exercises exactly it.  Legal by the enumerator
+#: (``tile_verdict(32, 32, 32)`` is :data:`REASON_OK`), so a canary failure
+#: is never a legality question, and one span of every loop, so it is the
+#: cheapest honest probe there is.  The shape is a CUBE on purpose: the
+#: predictions in this module take (M, N, K) while the runner's tuples are
+#: (M, K, N), and a symmetric shape makes that spelling difference unable to
+#: alter the canary's geometry -- the one place where a K/N mix-up would be
+#: undetectable in the numbers.
+CANARY_TILES = (32, 32, 32)
+CANARY_SHAPE = (32, 32, 32)
+
+
+def canary_config() -> dict:
+    """The sentinel config as data: its tiles, its shape, and its label.
+
+    Returned rather than written at each call site so the runner, the
+    contract test and the report all name the SAME sentinel -- a canary
+    whose shape quietly differed between rounds would compare this round's
+    device against nobody.
+    """
+    return {"cfg": "canary-32x32x32", "tiles": list(CANARY_TILES),
+            "shape_mnk": list(CANARY_SHAPE)}
+
+
+def _is_finite(value) -> bool:
+    """JSON-and-device-safe finiteness: present, not NaN, not infinite."""
+    if value is None:
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number not in (float("inf"), float("-inf"))
+
+
+def _record_q50(record) -> Optional[float]:
+    """A measurement's median pcyc, or None when it has none.
+
+    Accepts both a measurement dict and a bare number, so a previous
+    round's canary record and a hand-written constant both work as a
+    reference.
+    """
+    if isinstance(record, Mapping):
+        value = record.get("q50_pcyc")
+    else:
+        value = record
+    return float(value) if _is_finite(value) else None
+
+
+def quantile_spread_cv(q20, q50, q80) -> float:
+    """The CV a ``[q20, q50, q80]`` triple carries: ``(q80 - q20) / q50``.
+
+    A spread proxy, not the sample stdev/mean: what one launch keeps is the
+    quantile triple :func:`hexagon_bench` returns, not the per-rep samples
+    (the autotuner's ``do_bench`` is called with exactly ``quantiles`` and
+    nothing else, so the samples have nowhere to ride).  The proxy is
+    deliberately on the conservative side -- for a normal sample the
+    interquantile range is ``2 * 0.8416 * sigma``, so this overstates sigma
+    by about 1.68x, and an overstated CV can only WIDEN the gate, never
+    crown a config that is not there.  The paired-difference CV the
+    criterion analysis prefers (``docs/analysis/
+    criterion-paired-se-v2-2026-10-07.md``) needs the per-rep samples and a
+    paired protocol, neither of which the search keeps; a per-arm spread
+    overstates it for the same reason, which is the safe direction to be
+    wrong in.  A missing or unreadable spread yields 0.0, which puts the
+    gate on its 15% floor rather than inventing precision.
+    """
+    if not all(_is_finite(v) for v in (q20, q50, q80)):
+        return 0.0
+    median = float(q50)
+    if median <= 0.0:
+        return 0.0
+    return max(0.0, (float(q80) - float(q20)) / median)
+
+
+def champion_gate(cv) -> float:
+    """``max(3 x CV, 15%)`` as a fraction: the margin a challenger must clear.
+
+    The comparison is strict, so exactly-equal goes to the incumbent: the
+    crown changes hands only when the challenger is faster by MORE than
+    this.  An unreadable CV is treated as 0, which leaves the 15% floor
+    standing rather than opening the gate.
+    """
+    value = float(cv) if _is_finite(cv) else 0.0
+    return max(CHAMPION_CV_FACTOR * abs(value), CHAMPION_MARGIN_FLOOR)
+
+
+def canary_verdict(metrics, reference=None) -> dict:
+    """The per-round sentinel's verdict, as data.
+
+    ``metrics`` is the canary config's own measurement this round -- the
+    same ``{q50_pcyc, q20_pcyc, q80_pcyc}`` shape every config's is -- and
+    ``reference`` is the previous round's canary record (or its median).
+    Three ways it fails, and one way it cannot judge yet:
+
+    * **missing** -- no canary rode with this round.  The round cannot tell
+      "the device is broken" from "the configs are slow", so it may not
+      publish a verdict at all.
+    * **unmeasured** -- the canary failed or printed no cycles.  A
+      known-healthy config that cannot run is the device, not the config.
+    * **drift** -- the canary moved by more than the gate from its
+      reference.  Same config, same build, same iteration count: a move
+      that large is the clock/power state (C15:14 gates while the qtimer
+      does not, and this project has measured that ratio move), and every
+      other number in the round was taken under whatever state that was.
+    * **reference-established** -- no healthy reference existed, so this
+      run becomes the one.  The round is valid; the next round can judge.
+
+    Only ``ok`` and ``reference-established`` are healthy.  The returned
+    record carries enough state (its own median) to serve as the next
+    round's ``reference``.
+    """
+    record = dict(status=CANARY_OK, healthy=True, q50_pcyc=None, cv=0.0,
+                  reference_q50_pcyc=None, delta_pct=None, gate_pct=None,
+                  reason="")
+    if metrics is None:
+        record.update(
+            status=CANARY_MISSING, healthy=False,
+            reason=("no canary measurement rode with this round: without "
+                    "its sentinel the round cannot tell a broken device "
+                    "from slow configs, so it publishes no verdict"))
+        return record
+
+    q50 = _record_q50(metrics)
+    cv = quantile_spread_cv(metrics.get("q20_pcyc"), metrics.get("q50_pcyc"),
+                            metrics.get("q80_pcyc")) if isinstance(
+                                metrics, Mapping) else 0.0
+    record["cv"] = cv
+    record["q50_pcyc"] = _finite_or_none(q50)
+    if q50 is None:
+        record.update(
+            status=CANARY_UNMEASURED, healthy=False,
+            reason=("the canary config failed or printed no cycles: a "
+                    "known-healthy config that cannot run indicts the "
+                    "device or the launch path, not the config"))
+        return record
+
+    reference_q50 = _record_q50(reference)
+    record["reference_q50_pcyc"] = _finite_or_none(reference_q50)
+    if reference_q50 is None or reference_q50 <= 0.0:
+        record.update(
+            status=CANARY_REFERENCE,
+            reason=("no healthy reference existed, so this run establishes "
+                    "it; the round is valid and the next round can judge "
+                    "against this median"))
+        return record
+
+    gate = champion_gate(cv)
+    delta = (q50 - reference_q50) / reference_q50
+    record["delta_pct"] = _finite_or_none(100.0 * delta)
+    record["gate_pct"] = _finite_or_none(100.0 * gate)
+    if abs(delta) > gate:
+        record.update(
+            status=CANARY_DRIFT, healthy=False,
+            reason=(f"the canary moved {100.0 * delta:+.1f}% from its "
+                    f"reference, more than the {100.0 * gate:.1f}% gate: "
+                    "same config, same build, same iteration count, so the "
+                    "device state moved and every other number in this "
+                    "round was taken under it"))
+        return record
+    record["reason"] = (f"the canary stayed within {100.0 * abs(delta):.1f}% "
+                        f"of its reference (gate {100.0 * gate:.1f}%)")
+    return record
+
+
+def judge_champion_round(measurements, *, control=None, canary=None,
+                         canary_reference=None, iters=None) -> dict:
+    """The search's verdict: who won, by how much, and whether to read it.
+
+    ``measurements`` is one record per measured config -- the ``timings``
+    mapping the sweep already produces (``cfg``, ``tiles``, ``q50_pcyc``,
+    ``q20_pcyc``, ``q80_pcyc``; a missing or infinite median means that
+    config was never measured).  ``control`` is the manual default tile the
+    winner is judged against (the design's own control arm), given as a cfg
+    label or a tiles tuple.  ``canary`` is the sentinel's measurement and
+    ``canary_reference`` the previous round's canary record.
+
+    The crown is DEFENDED, not merely argmin'd.  Candidates are visited in
+    a deterministic order (tiles, then label -- never the measurement
+    itself, so noise cannot pick its own bracket) starting from the control
+    arm, and a challenger takes the crown only by beating the INCUMBENT by
+    more than ``max(3 x CV, 15%)`` with the bar set by the noisier of the
+    two arms.  A challenger inside the gate keeps the incumbent, so a 2%
+    "improvement" cannot take the crown on its own noise.  With no control
+    arm the incumbent starts at the first enumerated candidate: the walk is
+    still deterministic, but the starting point is nominal, which is why the
+    significance flag is then False no matter who survives.
+
+    The per-config failures and the round-level failure stay separate.  A
+    config that scored inf is recorded under ``unmeasured`` -- that config
+    is bad, and the round can say so.  A canary that failed is recorded as
+    ``invalid-canary`` -- the DEVICE is suspect, every config in the round
+    is equally suspect, and the report's champion is still named (it is the
+    walk's survivor) but marked not significant, because a round that
+    cannot vouch for itself does not get to publish a winner.  That is the
+    whole point of the sentinel: "all configs are slow" and "the device is
+    broken" used to be the same JSON.
+
+    ``iters`` rides along because a percentage without its
+    ``iters_per_launch`` is not a citation (``AGENTS.md`` section 4).
+    """
+    canary_record = canary_verdict(canary, canary_reference)
+    round_valid = bool(canary_record["healthy"])
+
+    rows = []
+    for entry in measurements:
+        row = dict(entry)
+        row["tiles_tuple"] = tuple(row.get("tiles") or ())
+        rows.append(row)
+
+    def q50_of(row):
+        return _record_q50(row)
+
+    measured = [r for r in rows if q50_of(r) is not None]
+    unmeasured = [str(r.get("cfg", "")) for r in rows if q50_of(r) is None]
+
+    def cv_of(row):
+        return quantile_spread_cv(row.get("q20_pcyc"), row.get("q50_pcyc"),
+                                  row.get("q80_pcyc"))
+
+    def label_of(row):
+        return str(row.get("cfg", ""))
+
+    def as_control(row):
+        """Match the control arm by label or by tiles."""
+        if control is None:
+            return False
+        if str(control) == label_of(row):
+            return True
+        tiles = tuple(control) if not isinstance(control, str) else None
+        return tiles is not None and tiles == row["tiles_tuple"]
+
+    control_rows = [r for r in measured if as_control(r)]
+    control_row = control_rows[0] if control_rows else None
+    control_any = [r for r in rows if as_control(r)]
+    ordered = sorted(measured,
+                     key=lambda r: (r["tiles_tuple"], label_of(r)))
+
+    comparisons: list[dict] = []
+    changes: list[dict] = []
+
+    def compare(challenger, incumbent, step):
+        challenger_q50 = q50_of(challenger)
+        incumbent_q50 = q50_of(incumbent)
+        cv = max(cv_of(challenger), cv_of(incumbent))
+        gate = champion_gate(cv)
+        delta = (incumbent_q50 - challenger_q50) / incumbent_q50
+        record = dict(
+            step=step, challenger=label_of(challenger),
+            incumbent=label_of(incumbent),
+            challenger_q50_pcyc=_finite_or_none(challenger_q50),
+            incumbent_q50_pcyc=_finite_or_none(incumbent_q50),
+            delta_pct=_finite_or_none(100.0 * delta),
+            cv=_finite_or_none(cv), gate_pct=_finite_or_none(100.0 * gate),
+            gate_form="max(3xCV, 15%)",
+            outcome="kept",
+        )
+        if delta > gate:
+            record["outcome"] = "takeover"
+            changes.append(dict(record))
+        comparisons.append(record)
+        return record["outcome"] == "takeover"
+
+    incumbent = None
+    walk_note = ""
+    if control_row is not None:
+        incumbent = control_row
+        walk_note = ("the incumbent starts at the manual control tile: the "
+                     "winner is judged against it, so it defends the crown "
+                     "first")
+    elif control_any:
+        walk_note = ("the manual control tile was nominated but never "
+                     "measured (it scored inf), so there is no arm to judge "
+                     "a win against")
+    elif control is not None:
+        walk_note = ("the nominated control arm is not among this round's "
+                     "measurements, so there is no arm to judge a win "
+                     "against")
+    elif ordered:
+        incumbent = ordered[0]
+        walk_note = ("no control arm was nominated: the incumbent starts at "
+                     "the first enumerated candidate, so the walk is "
+                     "deterministic but the starting point is nominal")
+
+    if incumbent is not None:
+        for step, challenger in enumerate(
+                [r for r in ordered if r is not incumbent]):
+            if compare(challenger, incumbent, step):
+                incumbent = challenger
+
+    champion_row = incumbent
+    champion = label_of(champion_row) if champion_row is not None else None
+    champion_tiles = (list(champion_row["tiles_tuple"])
+                      if champion_row is not None else None)
+
+    beats_control = None
+    if control_row is not None and champion_row is not None:
+        control_q50 = q50_of(control_row)
+        champion_q50 = q50_of(champion_row)
+        cv = max(cv_of(control_row), cv_of(champion_row))
+        gate = champion_gate(cv)
+        if champion_row is control_row:
+            beats_control = dict(
+                delta_pct=0.0, cv=_finite_or_none(cv),
+                gate_pct=_finite_or_none(100.0 * gate),
+                gate_form="max(3xCV, 15%)", significant=False,
+                note=("the manual control tile kept the crown: no "
+                      "candidate beat it by the gate"))
+        else:
+            delta = (control_q50 - champion_q50) / control_q50
+            significant = bool(round_valid and delta > gate)
+            beats_control = dict(
+                delta_pct=_finite_or_none(100.0 * delta),
+                cv=_finite_or_none(cv),
+                gate_pct=_finite_or_none(100.0 * gate),
+                gate_form="max(3xCV, 15%)", significant=significant,
+                note=("the champion beat the manual control tile by "
+                      f"{100.0 * delta:.1f}%, "
+                      + ("more than" if delta > gate else "not more than")
+                      + f" the {100.0 * gate:.1f}% gate"))
+
+    significant = bool(round_valid and beats_control is not None
+                       and beats_control["significant"])
+    if not round_valid:
+        significance_note = (
+            "the round is void (" + canary_record["status"] + "): "
+            + canary_record["reason"] + ". The champion below is the walk's "
+            "survivor, not a verdict.")
+    elif beats_control is None:
+        significance_note = (
+            "no control arm produced a measurement, so there is nothing to "
+            "prove a win against: the champion is the walk's survivor "
+            "(NOT-PROVEN, which is not the same as 'no effect')")
+    elif beats_control["significant"]:
+        significance_note = (
+            f"the champion beat the manual control tile by more than the "
+            f"gate at iters={iters}")
+    else:
+        significance_note = (
+            f"the champion did not beat the manual control tile by more "
+            f"than the gate at iters={iters}: NOT-PROVEN, which is not the "
+            "same as 'no effect'")
+
+    return dict(
+        kind="hmx-search-champion",
+        round_verdict=ROUND_VALID if round_valid else ROUND_INVALID_CANARY,
+        iters=iters,
+        gate=dict(form="max(3xCV, 15%)", cv_factor=CHAMPION_CV_FACTOR,
+                  margin_floor=CHAMPION_MARGIN_FLOOR),
+        canary=canary_record,
+        walk_note=walk_note,
+        measured_configs=len(measured),
+        champion=champion,
+        champion_tiles=champion_tiles,
+        champion_q50_pcyc=(_finite_or_none(q50_of(champion_row))
+                           if champion_row is not None else None),
+        control=(label_of(control_row) if control_row is not None else None),
+        control_tiles=(list(control_row["tiles_tuple"])
+                       if control_row is not None else None),
+        beats_control=beats_control,
+        champion_significant=significant,
+        significance_note=significance_note,
+        changes=changes,
+        comparisons=comparisons,
+        unmeasured=unmeasured,
+        cvs={label_of(r): _finite_or_none(cv_of(r)) for r in rows},
+    )
 
 
 # --------------------------------------------------------------------------- #
