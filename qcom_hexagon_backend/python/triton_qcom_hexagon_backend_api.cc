@@ -414,7 +414,19 @@ static void validatePrepackAttributes(mlir::ModuleOp module) {
     if (!string || string.getValue().empty())
       fail("malformed HMX prepack attribute: " + name.str());
     auto parsed = llvm::json::parse(string.getValue());
-    if (!parsed || (array ? !parsed->getAsArray() : !parsed->getAsObject()))
+    if (!parsed) {
+      // Take the Error before refusing.  An `Expected` that dies still holding
+      // an Error aborts the process (this build has
+      // LLVM_ENABLE_ABI_BREAKING_CHECKS on) and leaks it silently without it,
+      // so refusing without taking it turns "fail loudly" into "die unclearly":
+      // measured 2026-10-10, a module with `hmx.weight_prepack = "not json"`
+      // made the translation entry SIGABRT instead of raising, which is the
+      // same defect class as the `assert` the write-set invariant used to have
+      // -- a refusal that depends on build flags rather than on the code.
+      llvm::consumeError(parsed.takeError());
+      fail("malformed HMX prepack JSON: " + name.str());
+    }
+    if (array ? !parsed->getAsArray() : !parsed->getAsObject())
       fail("malformed HMX prepack JSON: " + name.str());
   };
   validate(mlir::hmx::kHmxWeightPrepackAttr, /*array=*/true);
@@ -452,6 +464,25 @@ static void validatePrepackAttributes(mlir::ModuleOp module) {
 // WeightResidentPass.cpp), which is the same key `weight_prepack` publishes
 // and `input_profs.idx` reads.  Scalars never enter it -- an argument that is
 // not a tensor is counted past, not assigned a slot.
+//
+// The one seam this does not close: time.  The set is a snapshot of the module
+// as it arrived at the translation entry, but it drives a protocol that runs
+// after the pipeline has rewritten that module (which slots the device dumps,
+// the host pulls, and the launcher copies back).  A pass that, after this
+// point, makes the kernel write an argument it did not write before would
+// leave the snapshot stale in the dangerous direction: the slot is missing
+// from the set, so nothing is dumped or pulled for it and nothing is copied
+// back -- a `rel` check that reads as a pass on a result that never arrived.
+// The decline arm above covers what the extractor cannot *model*; it cannot
+// cover a write that did not exist yet.
+//
+// This is acceptable only as a registered open defect, not as a settled
+// property: whether any pass after this point changes which arguments a kernel
+// writes is not machine-checked [未验证], and the 2026-10-10 defect scan
+// (`docs/analysis/defect-scan-2026-10-10.md` N2) records three same-day passes
+// that do rewrite the shape of writes into argument views.  Fix: re-run this
+// extraction on the lowered module and refuse (or downgrade to `null`) when the
+// two disagree.  Tracked in `.scratch/operator-parity/issues/20-argwrites-assert-hardening.md`.
 
 namespace {
 
@@ -637,11 +668,20 @@ std::optional<std::string> argWritesJson(mlir::ModuleOp module) {
             WrittenMemory::Argument)
           continue;
         auto ordinal = tensorOrdinal.find(writtenArgument);
-        // A memref argument always got an ordinal above, so this cannot miss;
-        // it is asserted rather than defaulted so a type that reaches here
-        // without a slot fails the compile instead of publishing a guess.
-        assert(ordinal != tensorOrdinal.end() &&
-               "a written memref argument has no tensor ordinal");
+        // A memref argument always got an ordinal above (the map is built from
+        // this same kernel's argument list, with the same type test), so this
+        // is a closed-world invariant and not a runtime possibility.  It still
+        // gets a real check, because the alternative is worse than the check:
+        // `assert` is a build-flag invariant -- with -DNDEBUG it disappears and
+        // `ordinal->second` dereferences `end()`, publishing a garbage tensor
+        // ordinal.  The host then dumps, pulls and copies back nothing for the
+        // slot the kernel really writes, so a `rel` check reads as a pass on a
+        // result that never arrived.  Nothing in this tree declares that
+        // assertions stay on, so this file refuses that possibility the same
+        // way it refuses every other invariant violation: `fail(...)`, which
+        // throws out of both translation entries.
+        if (ordinal == tensorOrdinal.end())
+          fail("a written memref argument has no tensor ordinal");
         written.push_back(ordinal->second);
       }
       return mlir::WalkResult::advance();
@@ -680,11 +720,15 @@ std::optional<std::string> argWritesJson(mlir::ModuleOp module) {
 } // namespace
 
 /// The `arg_writes` envelope child for `module`, already as JSON text.
+/// The extraction reads `module` as it was handed to the translation entry
+/// point, because both entries lower `linalg_module` in place: by the time an
+/// LLVM-dialect module exists, the bufferization ops this reads are gone.  That
+/// is also the TOCTOU seam -- a snapshot taken before the pipeline drives a
+/// protocol that runs after it -- whose boundary and status are written in the
+/// block comment that opens the extractor section ("The kernel's
+/// tensor-argument write set").
 ///
-/// The extraction runs on the module as it was handed to the translation
-/// entry point, because both entries lower `linalg_module` in place: by the
-/// time an LLVM-dialect module exists, the bufferization ops this reads are
-/// gone.  The one spelling of "no answer" is `"null"`; see the block comment
+/// The one spelling of "no answer" is `"null"`; see the block comment
 /// above for why a decline is never downgraded to an empty list (an empty
 /// list is the positive claim that nothing is written, which is a different
 /// fact and one the host would act on).
@@ -759,7 +803,8 @@ std::vector<std::vector<char>> translateLinalgToObj(
   std::vector<std::vector<char>> mods_object_codes_as_bytes;
   validatePrepackAttributes(linalg_module);
   // Both translation entries lower `linalg_module` in place, so the write set
-  // is read from it here, first.
+  // is read from it here, first: this is the snapshot side of the TOCTOU seam
+  // described above the extractor.
   std::string argWrites = argWritesJsonFor(linalg_module);
 
   // Needed to know if we should lower the constants separately or not
@@ -1313,6 +1358,8 @@ std::string translateLinalgToLLVMIR(
     const std::unordered_map<std::string, std::string> &options_map,
     std::string *outMetadata) {
   validatePrepackAttributes(linalg_module);
+  // Snapshot of the write set, taken before the pipeline rewrites the module
+  // in place (see the TOCTOU note above the extractor).
   std::string argWrites = argWritesJsonFor(linalg_module);
   auto mod =
       ::mlir::hexagon::translateLinalgToLLVMMLIR(linalg_module, options_map);

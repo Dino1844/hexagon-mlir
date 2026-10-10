@@ -28,6 +28,14 @@ This file pins three things about that fact, in order of consequence:
    comes back, which is today's behaviour; a list means only its slots are
    dumped, pulled and copied back; and the `res_idx` walk stays aligned,
    including next to a pre-packed weight slot.
+4. **How the extractor's one load-bearing invariant fails.**  A missing tensor
+   ordinal used to be an `assert`, i.e. a build-flag invariant: with
+   `-DNDEBUG` it vanishes and the guard becomes an `end()` dereference that
+   publishes a garbage slot, which reads as a pass on a result that never
+   arrived.  It now throws, like the other 23 `fail(...)` sites in that file,
+   and nothing in the build removes that.  The throw itself is pinned here
+   through a neighbouring invariant, because the ordinal one is closed-world
+   and cannot be reached from a compile.
 
 The direction of failure is why the decline arm exists.  Excluding a tensor
 the kernel *does* write would silently lose a result -- no dump, no pull, no
@@ -52,6 +60,8 @@ _HERE = Path(__file__).resolve()
 _BACKEND = _HERE.parents[1]
 _FIXTURES = _HERE.parent / "Conversion" / "LinalgToLLVM"
 _UTILS_PATH = _BACKEND / "backend" / "utils.py"
+#: The C++ file the producer lives in, read as text by the invariant test below.
+_SOURCE = _BACKEND / "python" / "triton_qcom_hexagon_backend_api.cc"
 _SPEC = importlib.util.spec_from_file_location(
     "hexagon_backend_utils_argwrites", _UTILS_PATH
 )
@@ -70,12 +80,15 @@ def _compile(fixture_name):
     One compile per fixture text, cached on the path: the boundary under test
     is C++ -> JSON -> Python, and only a real compile exercises the C++ half.
     """
+    return _compile_text((_FIXTURES / fixture_name).read_text())
+
+
+def _compile_text(source):
+    """Run the real producer over MLIR text and return its envelope."""
     options = _options()
     context = ir.context()
     qcom_hexagon_backend.load_dialects(context)
-    module = qcom_hexagon_backend.parse_mlir_module_from_str(
-        (_FIXTURES / fixture_name).read_text(), context
-    )
+    module = qcom_hexagon_backend.parse_mlir_module_from_str(source, context)
     _, metadata_json = qcom_hexagon_backend.translate_linalg_to_obj(
         module, options, True
     )
@@ -208,6 +221,57 @@ def _manifest():
     return json.loads(json.dumps(_MANIFEST))
 
 
+#: A module whose prepack contract is malformed.  `validatePrepackAttributes`
+#: refuses it with the file's `fail(...)` convention before anything else runs,
+#: which makes it the reachable stand-in for the write set's own invariant
+#: break: both are "this file refuses instead of answering".
+_MALFORMED_PREPACK_MODULE = """
+module attributes {hmx.weight_prepack = "not json at all"} {
+  func.func @broken() {
+    return
+  }
+}
+"""
+
+
+class WriteSetInvariantFailureTest(unittest.TestCase):
+    """How the extractor's one load-bearing invariant fails."""
+
+    def test_the_invariant_is_not_guarded_by_a_bare_assert(self):
+        # The invariant is "a written memref argument always has a tensor
+        # ordinal".  It was an `assert`, which is a build-flag invariant: with
+        # -DNDEBUG the check disappears and `ordinal->second` dereferences
+        # `end()`, publishing a garbage tensor ordinal -- a slot the host then
+        # never dumps, pulls or copies back, so a `rel` check reads as a pass on
+        # a result that never arrived.  Nothing in this tree declares that
+        # assertions stay on, so the extractor now refuses with `fail(...)`,
+        # the convention the other 23 sites in that file already use.  This is
+        # the machine-readable half of the decision: the section must not grow
+        # a bare `assert` back.
+        source = _SOURCE.read_text()
+        start = source.index("std::optional<std::string> argWritesJson(")
+        end = source.index("std::string argWritesJsonFor(")
+        extractor = source[start:end]
+        self.assertNotIn("assert(", extractor)
+        self.assertIn(
+            'fail("a written memref argument has no tensor ordinal")', extractor
+        )
+
+    def test_a_refused_invariant_aborts_the_compile_instead_of_answering(self):
+        # The ordinal invariant itself is closed-world and cannot be reached
+        # from a compile, so what is pinned here is the mechanism it now shares
+        # with every other refusal in that file: the compile raises instead of
+        # publishing an envelope.  A throw swallowed -- or turned into a
+        # SIGABRT -- anywhere between the C++ and here would turn "refuse" into
+        # "die unclearly", which is the failure mode the decline arm exists to
+        # prevent.  This arm is the one that was broken: a malformed *JSON*
+        # prepack contract aborted the process (an `Expected` died still holding
+        # its Error), so the refusal was a build-flag property rather than the
+        # code's.  The non-JSON arm is pinned in test_hmx_manifest_metadata.py.
+        with self.assertRaisesRegex(RuntimeError, "malformed HMX prepack"):
+            _compile_text(_MALFORMED_PREPACK_MODULE)
+
+
 def main() -> None:
     tests = (
         ProducerWriteSetTest(
@@ -234,6 +298,12 @@ def main() -> None:
         ),
         WriteSetBoundaryTest(
             "test_the_field_is_published_by_the_backend_packer"
+        ),
+        WriteSetInvariantFailureTest(
+            "test_the_invariant_is_not_guarded_by_a_bare_assert"
+        ),
+        WriteSetInvariantFailureTest(
+            "test_a_refused_invariant_aborts_the_compile_instead_of_answering"
         ),
     )
     for test in tests:
