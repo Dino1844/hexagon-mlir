@@ -198,7 +198,7 @@ struct HmxTarget {
     if (!isContractionOperand(lhsElem) || !isContractionOperand(rhsElem) ||
         (!dtype::isAdmittedFloat(outElem)))
       return {ContractionRefusal::UnsupportedDType, ContractionPlan::HVX, {}};
-    if (m <= minRows)
+    if (!hasEnoughRows(m))
       return {ContractionRefusal::MinRows, ContractionPlan::HVX, {}};
 
     ContractionShape shape;
@@ -242,12 +242,80 @@ struct HmxTarget {
   // the format, not a choice.
   static constexpr int64_t croutonElemBytes = 2;
 
+  // ---------------------------------------------------------------------
+  // The planning facts as queries.
+  //
+  // Phase 1 of the query facade (operator-parity ticket 15). Each method
+  // below is an expression a consuming pass already evaluates on its own,
+  // named here so the next op class asks instead of re-deriving: they read
+  // the constants above and the existing arithmetic, and introduce no number
+  // of their own. Until Phase 2 migrates the consumers, the passes keep
+  // their own spellings by design, and an equality pin holds the two at the
+  // same value:
+  //   * test/Dialect/Hmx/Transforms/hmx-target-query-equality.mlir -- the
+  //     reads that reach IR (the manifest's budget and bridge-peak bytes, the
+  //     pack loop's tile counts, the refusal remarks), on the real pass;
+  //   * test/test_hmx_target_query_facade.py -- every query against every
+  //     consuming pass's spelling, evaluated side by side.
+  // ---------------------------------------------------------------------
+
+  /// The VTCM budget a `vtcm-budget` pass option resolves to. 0 means "not
+  /// passed", which is the device default: the resolution `matmul-to-hmx` and
+  /// `hmx-partition` each perform on the way to a budget, and what the passes
+  /// with no such option (`weight-resident`, `thread-role-partition`) read
+  /// directly.
+  static int64_t resolveVtcmBudget(int64_t optionBytes) {
+    return optionBytes > 0 ? optionBytes : defaultVtcmBudget;
+  }
+
+  /// The pool left beside what the function already holds. Negative once the
+  /// committed bytes exceed it, which every caller reads as "nothing fits".
+  int64_t roomBeside(int64_t vtcmUsed) const {
+    return vtcmBudget - vtcmUsed;
+  }
+
+  /// The crouton tiles an extent holds: the division every grid computation
+  /// performs (`cols / tileEdge`), named because the pack bridge walks it in
+  /// both operands and the grid in all three extents.
+  static int64_t tilesIn(int64_t extent) { return extent / tileEdge; }
+
+  /// Whether an extent sits on the tile grid, so no tail split applies.
+  static bool isTileAligned(int64_t extent) {
+    return extent % tileEdge == 0;
+  }
+
+  /// Whether a contraction clears the engine's row floor: the boundary
+  /// `queryContraction` checks first and the manifest reads last.
+  static bool hasEnoughRows(int64_t m) { return m > minRows; }
+
+  /// The activation croutons of an M x K block, in bytes.
+  static int64_t activationBytes(int64_t m, int64_t k) {
+    return m * k * croutonElemBytes;
+  }
+
+  /// The weight croutons of a K x N block, in bytes: the one term that does
+  /// not shrink when M is blocked.
+  static int64_t weightBytes(int64_t k, int64_t n) {
+    return k * n * croutonElemBytes;
+  }
+
+  /// The engine's fp16 read-out of an M x N block, in bytes, whatever the
+  /// result's element type.
+  static int64_t readoutBytes(int64_t m, int64_t n) {
+    return m * n * croutonElemBytes;
+  }
+
   /// The crouton footprint of a contraction operated on `rows` rows: both
   /// operands and the engine's fp16 read-out, in bytes. The read-out is fp16
   /// whatever the result's element type (a wider result is widened after the
   /// unpack, outside VTCM).
+  ///
+  /// The three terms are named queries rather than one inlined expression: a
+  /// consumer reads them individually -- an invariant operand is hoisted on
+  /// its own bytes, the read-out is weighed on its own -- so each term needs
+  /// exactly one spelling.
   static int64_t croutonBytes(int64_t rows, int64_t n, int64_t k) {
-    return (rows * k + k * n + rows * n) * croutonElemBytes;
+    return activationBytes(rows, k) + weightBytes(k, n) + readoutBytes(rows, n);
   }
 
   /// The engine's second question, next to `queryContraction`: legality
@@ -281,10 +349,10 @@ struct HmxTarget {
     //   F(b) = b * (k + n) * croutonElemBytes + k * n * croutonElemBytes.
     // F is increasing in b, so the largest fitting b is one division away.
     int64_t perRow = (k + n) * croutonElemBytes;
-    int64_t weightBytes = k * n * croutonElemBytes;
+    int64_t weight = weightBytes(k, n);
     if (perRow <= 0)
       return BridgePlan{};
-    int64_t maxRows = (room - weightBytes - 1) / perRow;
+    int64_t maxRows = (room - weight - 1) / perRow;
     int64_t maxBlock = (maxRows / tileEdge) * tileEdge;
     if (maxBlock < tileEdge)
       return BridgePlan{};
