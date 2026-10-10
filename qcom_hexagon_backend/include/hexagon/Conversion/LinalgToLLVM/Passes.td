@@ -421,6 +421,27 @@ def EraseVectorToTensorWriteback : Pass<"erase-vector-to-tensor-writeback", "fun
   let constructor = "hexagon::createEraseVectorToTensorWritebackPass()";
 }
 
+def InlineSideEffectOnlyGeneric :
+    Pass<"inline-side-effect-only-generic", "func::FuncOp"> {
+  let summary = "Inline a zero-operand linalg.generic into its parent block";
+  let description = [{
+    Matches a `linalg.generic` with no operands, no results and no loop
+    dimensions -- the shell a store generic becomes after elementwise fusion
+    folds its `linalg.fill`s into the region and erases the operands the
+    fold made unused. No lowering accepts that form (`ConvertLinalgToLoops`'
+    rewrite pattern requires at least one memref operand), so it would
+    survive into LLVM translation and fail there with "missing
+    LLVMTranslationDialectInterface".
+
+    Moves each op of the region into the parent block just above the generic
+    and erases the generic. The form has no operands, no results and no
+    iterators, so the region runs exactly once at the generic's position and
+    no value crosses the region boundary: the move preserves dominance, order
+    and semantics for any body. No-op once nothing produces the shell.
+  }];
+  let constructor = "hexagon::createInlineSideEffectOnlyGenericPass()";
+}
+
 def HexagonSlicing :
     Pass<"hexagon-slicing", "mlir::ModuleOp"> {
   let summary = "Pass to slice ops into K parts, "

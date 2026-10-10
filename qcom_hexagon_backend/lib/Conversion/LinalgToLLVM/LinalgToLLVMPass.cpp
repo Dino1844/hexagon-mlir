@@ -698,6 +698,13 @@ void LinalgToLLVMPass::addProductionPasses(
     // fixup ops it emits are never stamped with the nnan assertion.
     if (enableMaxnumLegalize)
       pm.addNestedPass<func::FuncOp>(createHvxMaxnumLegalizePass());
+    // A store generic whose pointer has no range-derived axis (keepdim
+    // reduce storing a [1] result at a scalar offset) becomes a
+    // zero-operand, zero-result generic once fusion has folded its fills
+    // into the region and erased its operands. Nothing lowers that form --
+    // ConvertLinalgToLoops' rewrite pattern requires at least one memref
+    // operand -- so inline the region away before asking it to.
+    pm.addNestedPass<func::FuncOp>(createInlineSideEffectOnlyGenericPass());
     pm.addPass(createConvertLinalgToLoopsPass());
 
     pm.addNestedPass<func::FuncOp>(createFormAsyncThreadsPass());

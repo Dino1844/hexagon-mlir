@@ -111,6 +111,7 @@ int main(int argc, char **argv) {
   mlir::hexagon::registerLowerPack();
   mlir::hexagon::registerSplitReduceGenericPass();
   mlir::hexagon::registerEraseVectorToTensorWritebackPass();
+  mlir::hexagon::registerInlineSideEffectOnlyGenericPass();
   mlir::hexagon::registerSeedLayoutConversions();
   mlir::hexagon::registerForceHVXCroutonPass();
   mlir::hexagon::registerSmallExponentToMultiplyPass();

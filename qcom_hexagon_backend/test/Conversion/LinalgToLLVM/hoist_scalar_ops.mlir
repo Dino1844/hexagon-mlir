@@ -190,3 +190,64 @@ func.func @hoist_integer_ops(%scalar: tensor<i32>, %vector: tensor<128xi32>, %ou
 
   return %result : tensor<128xi32>
 }
+
+// -----
+
+// Test 8: A block argument of an OUTER block (here the function's arg #0,
+// whose argument number happens to be below the input count) is NOT this
+// generic's input. The pass must take the "defined outside, needs no
+// mapping" path and hoist the index_cast as-is. Reading arg#0 as input#0
+// would extract from the rank-0 f32 input and hand the clone an f32 operand.
+// CHECK-LABEL: func.func @hoist_outer_block_arg
+func.func @hoist_outer_block_arg(%n: index, %p: memref<?xf32>, %v: tensor<f32>, %idx: tensor<4xi32>) {
+  // CHECK: %[[I:.*]] = arith.index_cast %arg0 : index to i32
+  // CHECK: %[[T:.*]] = tensor.from_elements %[[I]] : tensor<i32>
+  // CHECK: linalg.generic
+  // CHECK-SAME: ins(%{{.*}}, %{{.*}}, %[[T]] : tensor<f32>, tensor<4xi32>, tensor<i32>)
+  // CHECK: %[[J:.*]] = arith.index_cast %{{.*}} : i32 to index
+  // CHECK: memref.store %{{.*}}, %{{.*}}[%[[J]]]
+  // CHECK-NOT: tensor.extract
+  linalg.generic {
+    indexing_maps = [affine_map<(d0) -> ()>,
+                     affine_map<(d0) -> (d0)>],
+    iterator_types = ["parallel"]
+  } ins(%v, %idx : tensor<f32>, tensor<4xi32>) {
+  ^bb0(%in: f32, %in_1: i32):
+    %i = arith.index_cast %n : index to i32
+    %j = arith.index_cast %i : i32 to index
+    memref.store %in, %p[%j] : memref<?xf32>
+    linalg.yield
+  }
+  return
+}
+
+// -----
+
+// Test 9: the control for the same shape -- the invariant value comes from
+// an op above the generic instead of a block argument. Hoisted as-is, with
+// no extract; the guard routes the block-argument form to exactly this
+// behavior.
+// CHECK-LABEL: func.func @hoist_outside_value
+func.func @hoist_outside_value(%p: memref<?xf32>, %v: tensor<4xf32>, %idx: tensor<4xi32>, %q: i32) {
+  // CHECK: %[[N:.*]] = arith.index_cast %arg3 : i32 to index
+  // CHECK: %[[I:.*]] = arith.index_cast %[[N]] : index to i32
+  // CHECK: %[[T:.*]] = tensor.from_elements %[[I]] : tensor<i32>
+  // CHECK: linalg.generic
+  // CHECK-SAME: ins(%{{.*}}, %{{.*}}, %[[T]] : tensor<4xf32>, tensor<4xi32>, tensor<i32>)
+  // CHECK: %[[J:.*]] = arith.index_cast %{{.*}} : i32 to index
+  // CHECK: memref.store %{{.*}}, %{{.*}}[%[[J]]]
+  // CHECK-NOT: tensor.extract
+  %n = arith.index_cast %q : i32 to index
+  linalg.generic {
+    indexing_maps = [affine_map<(d0) -> (d0)>,
+                     affine_map<(d0) -> (d0)>],
+    iterator_types = ["parallel"]
+  } ins(%v, %idx : tensor<4xf32>, tensor<4xi32>) {
+  ^bb0(%in: f32, %in_1: i32):
+    %i = arith.index_cast %n : index to i32
+    %j = arith.index_cast %i : i32 to index
+    memref.store %in, %p[%j] : memref<?xf32>
+    linalg.yield
+  }
+  return
+}

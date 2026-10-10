@@ -191,8 +191,13 @@ void HoistScalarOpsPass::findHoistableOps(
         return true;
 
       // Case 3: Operand is a block argument from a rank-0 tensor input
+      // The owner check is load-bearing: a block argument of an OUTER block
+      // (function entry, enclosing scf.for) can carry an argument number
+      // below the input count and is not one of this generic's inputs. Such
+      // a value is already handled by case 1 (defined outside the region).
       if (auto barg = dyn_cast<BlockArgument>(v)) {
-        if (barg.getArgNumber() < oldNumInputs) {
+        if (barg.getOwner() == &regionBlock &&
+            barg.getArgNumber() < oldNumInputs) {
           auto tensorType = dyn_cast<RankedTensorType>(
               gop.getDpsInputOperand(barg.getArgNumber())->get().getType());
           return tensorType && tensorType.getRank() == 0;
@@ -231,9 +236,19 @@ void HoistScalarOpsPass::hoistOperations(
       }
 
       // If operand is a block argument from a rank-0 tensor input,
-      // extract the scalar value from the tensor
+      // extract the scalar value from the tensor.
+      // The owner check is load-bearing: a block argument of an OUTER block
+      // (the function's entry block, an enclosing loop's) can carry an
+      // argument number below the input count without being one of this
+      // generic's inputs. Reading it as one extracts from the wrong input --
+      // typically a rank-0 tensor of an unrelated element type -- so the
+      // cloned scalar op gets a wrong-typed operand and the verifier kills
+      // the module. With the check, such a value falls through to the
+      // "defined outside, needs no mapping" path below: the clone keeps the
+      // outer block argument, which is visible above the generic.
       if (auto barg = dyn_cast<BlockArgument>(operand)) {
-        if (barg.getArgNumber() < oldNumInputs) {
+        if (barg.getOwner() == &gop.getRegion().front() &&
+            barg.getArgNumber() < oldNumInputs) {
           Value inputTensor =
               gop.getDpsInputOperand(barg.getArgNumber())->get();
           Value extracted =

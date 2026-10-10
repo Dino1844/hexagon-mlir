@@ -98,6 +98,11 @@ createRowReduceGroupStorePass();
 std::unique_ptr<OperationPass<func::FuncOp>>
 createEraseVectorToTensorWritebackPass();
 
+// Zero-operand linalg.generic shells (what elementwise fusion leaves of a
+// store generic) have no lowering; inline them before ConvertLinalgToLoops.
+std::unique_ptr<OperationPass<func::FuncOp>>
+createInlineSideEffectOnlyGenericPass();
+
 std::unique_ptr<OperationPass<ModuleOp>> createRewriteUBPoisonToZeroPass();
 
 std::unique_ptr<InterfacePass<FunctionOpInterface>>
