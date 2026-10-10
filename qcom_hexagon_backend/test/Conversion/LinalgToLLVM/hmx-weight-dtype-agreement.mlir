@@ -30,6 +30,21 @@
 // vocabulary, not a sample of it.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm{enable-weight-resident=true})' -split-input-file | FileCheck %s --check-prefixes=F16,F32
+//
+// LAYERED arm. The two fields this test is about -- the record's `dtypes.rhs`
+// and the contract's `dtype` -- are both written by passes inside the
+// placement layer (`weight-resident` and `matmul-to-hmx`, with `hmx-partition`
+// finalising the site counts). The full run above therefore pays for the whole
+// lowering to assert two module attributes, and a failure says only "the
+// attributes disagree" without saying which pass moved them. This arm stops
+// the same production sequence right after the placement layer
+// (`hmx-diagnostic-record`'s `stop-after-diagnostic-stage`), so the identical
+// CHECK lines assert the same facts one layer earlier: if one of the two
+// fields stopped being written where the other one is, this arm goes red while
+// the run above may still pass, which is the drift this test exists to catch.
+// The stop is available only from the opt tool's diagnostic entry -- no stop
+// flag exists on `linalg-to-llvm` itself.
+// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-weight-resident=true stop-after-diagnostic-stage})' | FileCheck %s --check-prefixes=F16,F32
 //===----------------------------------------------------------------------===//
 
 // Per dtype, the two serializations are checked together with the reason the

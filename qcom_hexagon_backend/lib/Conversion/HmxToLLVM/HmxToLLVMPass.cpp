@@ -683,14 +683,21 @@ static constexpr int32_t kHmxExecPublishedBatches = 1;
 /// entry point has to hand it exactly that.
 ///
 /// `address` is the aligned pointer word from the descriptor, which is the base
-/// the leaf addressing arithmetic uses (`asAddress`, below). The producer
-/// publishes `memref.extract_aligned_pointer_as_index` of the two buffers, so the
-/// word is the ALIGNED pointer and the static offset is part of the type --
-/// re-deriving `allocated` from it keeps both words consistent instead of leaving
-/// one of them describing a buffer nobody allocated. The read-out reads only
-/// `aligned` and `offset`; `allocated`, sizes and strides are what the calling
-/// convention requires to be present, and passing the real values (rather than
-/// zeros) means a future reader of them is not reading poison.
+/// the leaf addressing arithmetic uses (`asAddress`, below). The word is an
+/// ABSOLUTE address: the producer publishes aligned pointer plus descriptor
+/// offset, element-scaled (HmxVectorReadoutPass::buildDescriptor, the frozen
+/// ABI's `void *dst` / `void *ar`), because a batch words struct has no room for
+/// a view offset. So the reconstructed descriptor's own offset is ZERO -- the
+/// word already covers it -- and writing the TYPE's offset here would subtract
+/// it twice for a static-offset view and, for a dynamically-offset one, write
+/// `kDynamic` (`getStridesAndOffset` reports it as such and still fills the
+/// strides) into a field every consumer reads as a byte count.
+/// Re-deriving `allocated` from the static part of the type keeps both words
+/// consistent instead of leaving one of them describing a buffer nobody
+/// allocated. The read-out reads only `aligned` and `offset`; `allocated`, sizes
+/// and strides are what the calling convention requires to be present, and
+/// passing the real values (rather than zeros or poison) means a future reader
+/// of them is not reading garbage.
 static int64_t memrefAddressSpace(MemRefType type, int64_t fallback);
 
 static void appendMemrefArgs(OpBuilder &rewriter, Location loc,
@@ -712,24 +719,35 @@ static void appendMemrefArgs(OpBuilder &rewriter, Location loc,
   };
 
   // The descriptor word is an i32 ADDRESS, not a pointer: `asAddress` in this file
-  // and `memref.extract_aligned_pointer_as_index` in the producer both speak i32,
-  // because that is how every address crosses into the runtime on this target. So
-  // the word is turned back into a pointer here, in the callee's own address space.
+  // and `extract_aligned_pointer_as_index` + descriptor offset in the producer
+  // both speak i32, because that is how every address crosses into the runtime on
+  // this target. So the word is turned back into a pointer here, in the callee's
+  // own address space.
   Value address = LLVM::IntToPtrOp::create(rewriter, loc, ptrTy, addressWord);
 
   SmallVector<int64_t, 8> strides;
   int64_t offset = 0;
   int64_t rank = type.getRank();
+  // `getStridesAndOffset` reports a dynamic offset as kDynamic, which is
+  // negative, so "static" is exactly "non-negative"; a dynamic offset is also
+  // the one case where the query fails, and it fails while still filling
+  // `strides` -- so the two facts are queried separately. `offset` here is the
+  // TYPE's offset and is deliberately NOT what the descriptor gets: see the doc
+  // comment. The word the descriptor is built from is absolute, so a dynamic
+  // offset in the type is not a loss.
+  bool layoutKnown = succeeded(type.getStridesAndOffset(strides, offset));
+  int64_t staticOffset = layoutKnown && offset >= 0 ? offset : 0;
   bool stridesKnown =
-      succeeded(type.getStridesAndOffset(strides, offset)) && offset >= 0 &&
-      llvm::all_of(strides,
-                   [](int64_t stride) { return !ShapedType::isDynamic(stride); });
+      layoutKnown && llvm::all_of(strides, [](int64_t stride) {
+        return !ShapedType::isDynamic(stride);
+      });
+  bool sizesKnown = type.hasStaticShape();
 
   // The allocated pointer is the aligned pointer minus the type's static offset,
   // which is what a `memref.reinterpret_cast` of a larger buffer would have
   // produced. A buffer the producer never offset needs no arithmetic at all.
   Value allocated = address;
-  if (stridesKnown && offset != 0) {
+  if (stridesKnown && staticOffset != 0) {
     // Computed in the width the word arrived in, which is the runtime's own
     // address ABI (i32 on this target). Widening to i64 to hold the byte count
     // would need a trunc back, and a byte offset that does not fit the word is
@@ -737,7 +755,7 @@ static void appendMemrefArgs(OpBuilder &rewriter, Location loc,
     // wrapped, which would be a pointer to the wrong row.
     Type addrTy = addressWord.getType();
     int64_t elementBytes = type.getElementTypeBitWidth() / 8;
-    int64_t byteOffset = offset * elementBytes;
+    int64_t byteOffset = staticOffset * elementBytes;
     unsigned width = addrTy.getIntOrFloatBitWidth();
     int64_t addrMax = width >= 64
                           ? std::numeric_limits<int64_t>::max()
@@ -755,11 +773,11 @@ static void appendMemrefArgs(OpBuilder &rewriter, Location loc,
 
   out.push_back(allocated);
   out.push_back(address);
-  out.push_back(constant(offset));
+  out.push_back(constant(staticOffset));
   for (int64_t dim = 0; dim < rank; ++dim)
-    out.push_back(stridesKnown ? constant(type.getDimSize(dim))
-                               : LLVM::UndefOp::create(rewriter, loc, i64Ty)
-                                     .getResult());
+    out.push_back(sizesKnown ? constant(type.getDimSize(dim))
+                             : LLVM::UndefOp::create(rewriter, loc, i64Ty)
+                                   .getResult());
   for (int64_t dim = 0; dim < rank; ++dim)
     out.push_back(stridesKnown ? constant(strides[dim])
                                : LLVM::UndefOp::create(rewriter, loc, i64Ty)

@@ -64,6 +64,12 @@ std::unique_ptr<OperationPass<ModuleOp>> createLinalgToLLVMPass(
 /// built by that parser rather than copied: the generated pass copy constructor
 /// does not carry the option values, so a copy would silently fall back to the
 /// defaults. Building the pass in place keeps the forwarding honest.
+///
+/// `stopAfterDiagnosticStage` ends the production sequence right after the
+/// stage above (the census plus the marker-gated record document that follows
+/// it), so the run stops at the placement layer instead of lowering through
+/// translation. This is the layered-lit entry: one copy of the production
+/// order, one extra pass to run. The production pass never sets it.
 /// The dialects the production sequence needs.
 ///
 /// A pass that runs the sequence in a nested pass manager has to declare them
@@ -76,7 +82,8 @@ void addLinalgToLLVMDependentDialects(DialectRegistry &registry);
 
 LogicalResult runLinalgToLLVMPipeline(
     MLIRContext &context, ModuleOp module, StringRef options,
-    llvm::function_ref<void(PassManager &)> atDiagnosticStage);
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage,
+    bool stopAfterDiagnosticStage = false);
 
 std::unique_ptr<OperationPass<ModuleOp>> createLowerConstantsSeparatelyPass();
 

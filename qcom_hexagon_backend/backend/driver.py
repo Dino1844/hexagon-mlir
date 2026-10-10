@@ -21,6 +21,7 @@ from triton.backends.qcom_hexagon_backend.utils import make_profiled_return
 from triton.backends.qcom_hexagon_backend.utils import hmx_manifest_warnings
 from triton.backends.qcom_hexagon_backend.utils import require_pack_metadata_fields
 from triton.backends.qcom_hexagon_backend.utils import summarize_hmx_manifest
+from triton.backends.qcom_hexagon_backend.utils import validate_arg_writes
 from triton.backends.qcom_hexagon_backend.utils import validate_hmx_record_json
 
 
@@ -172,6 +173,14 @@ def getHexagonLauncherClass():
             compiled_enable_lwp = pack_metadata["enableLWP"]
             weight_prepack = pack_metadata["weight_prepack"]
             hmx_manifest = pack_metadata["hmx_manifest"]
+            # The kernel's tensor-argument write set: the ordinals the kernel
+            # writes through, or None when the compiler could not prove one.
+            # The launcher reads it to decide which input tensors are returned
+            # by this launch; None means "every ranked input", which is the
+            # behaviour that predates the field.  Like the other launch
+            # contract children it is validated once, here, and only the value
+            # travels.
+            arg_writes = validate_arg_writes(pack_metadata["arg_writes"])
             # Retained for hmx_manifest_contract() above. Same value the
             # launcher already receives, so this cannot disagree with what ran.
             self.hmx_manifest = hmx_manifest
@@ -223,6 +232,7 @@ def getHexagonLauncherClass():
                 compiled_enable_lwp=compiled_enable_lwp,
                 weight_prepack=weight_prepack,
                 hmx_manifest=hmx_manifest,
+                arg_writes=arg_writes,
                 runtime_options=kwargs,
             )
             # TODO: There seems to be no way to propogate the call returns upward, because

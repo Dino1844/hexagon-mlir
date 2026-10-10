@@ -57,6 +57,18 @@
 //
 //===----------------------------------------------------------------------===//
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident=false})' -split-input-file | FileCheck %s
+//
+// LAYERED arm: the same 102 directives against the same entry stopped right
+// after the placement-stage census. Everything these four modules pin is
+// produced inside that layer -- `matmul-to-hmx` writes the manifest,
+// `weight-resident` decides the policy, the census and the liveness analysis
+// write their sidecars, and `hmx-v3-record` finalises the document from them
+// on the other side of the stage hook. So the identical CHECK lines hold on
+// the stage output alone, and the arm doubles as the packet-census -> record
+// join's own layer test: if the join ever started depending on something only
+// the lowering produces (or only the pre-placement IR has), this run goes red
+// while the one above stays green.
+// RUN: linalg-hexagon-opt %s -split-input-file -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident=false stop-after-diagnostic-stage})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // -----

@@ -23,6 +23,8 @@ from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     WrapperGeneratorStrings,
     create_timestamped_folder,
     make_resident_scope_id,
+    output_tensor_slots,
+    written_argument_slots,
 )
 from triton.backends.qcom_hexagon_backend.launch_intent import pull_outputs_enabled
 from triton.backends.qcom_hexagon_backend.utils import (
@@ -558,6 +560,7 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         compiled_enable_lwp: bool | str | None = None,
         weight_prepack: str | None = None,
         hmx_manifest: str | None = None,
+        arg_writes: list[int] | None = None,
         runtime_options: dict | None = None,
     ) -> list[Tensor]:
         if hmx_manifest is None:
@@ -748,6 +751,12 @@ class TritonHexagonLauncher(HexagonLauncherBase):
                 "compiled kernel metadata is missing the required weight_prepack contract"
             )
         wrapper_generator.weight_prepack = WeightPrepack.from_metadata(weight_prepack)
+        # The compiler's write set for the tensor arguments, or None when it
+        # published none.  Attached to the generator like the pre-pack contract
+        # so the shared dump/pull paths read it, with the same fail-closed
+        # default: no write set means every ranked input is returned, exactly as
+        # before the field existed.
+        wrapper_generator.arg_writes = arg_writes
         print("==> Wrapper generator correctly instantiated")
 
         # The directory path used for execution is given by the executor, and if it's the empty string (meaning running on device),
@@ -792,13 +801,23 @@ class TritonHexagonLauncher(HexagonLauncherBase):
         # overwrite each tensor inputs with the execution results.
         # TODO: This isn't a valid assumption to make when a kernel both returns values
         #       and writes back to the input ptrs. Need to refactor to support both simultaneously.
-        output_tensor_count = self.get_output_tensor_path_count(wrapper_generator)
-        assert len(results), output_tensor_count
         profs = (
             wrapper_generator.output_profs
             if (len(wrapper_generator.output_profs) > 0)
             else wrapper_generator.input_profs
         )
+        # One result per returned slot, in slot order: the executor collects
+        # exactly the paths this launcher asked it to pull, and `res_idx` walks
+        # that same order.  A mismatch here is the alignment failure in its
+        # cheapest form, before it can write one tensor's bytes into another.
+        slots = output_tensor_slots(wrapper_generator)
+        assert len(results) == len(slots), (len(results), len(slots))
+        # The write set lives in the tensor-argument ordinal space, so it only
+        # applies to the input-fallback branch: a return value's `idx` is its
+        # position among the returns and shares that space with nothing.
+        written = None
+        if len(wrapper_generator.output_profs) == 0:
+            written = written_argument_slots(wrapper_generator)
         res_idx = 0
         # A pre-packed weight slot is not the kernel's view of that argument:
         # the host wrote crouton-ordered bytes, the kernel only read them, and
@@ -816,23 +835,28 @@ class TritonHexagonLauncher(HexagonLauncherBase):
             else None
         )
         for out in profs:
-            if out.rank:
-                if prepack is not None and prepack.has_slot(out.idx):
-                    res_idx += 1
-                    continue
-                inputs[out.input_id].copy_(results[res_idx])
+            if not out.rank:
+                continue
+            # A tensor the compiler proved is never written through produced no
+            # dump and no pull, so there is no result for it and `res_idx` must
+            # not advance over it, or the next tensor receives this one's
+            # bytes.  That is the one difference from the pre-packed path
+            # below, which *does* advance: that slot is dumped and pulled, only
+            # its copy-back is skipped.
+            if written is not None and out.idx not in written:
+                continue
+            if prepack is not None and prepack.has_slot(out.idx):
                 res_idx += 1
+                continue
+            inputs[out.input_id].copy_(results[res_idx])
+            res_idx += 1
         return results
 
     # TODO: Replace generate_input_output_paths() with a method that allows triton kernels
     #       to both write back ptrs and return values directly from the kernel
     @staticmethod
     def get_output_tensor_path_count(wrapper_generator):
-        if len(wrapper_generator.output_profs) > 0:
-            profs = wrapper_generator.output_profs
-        else:
-            profs = wrapper_generator.input_profs
-        return sum([1 for out in profs if out.rank])
+        return len(output_tensor_slots(wrapper_generator))
 
 
 # TODO: Specifically related to Triton driver workflow. Currenlty unused and retained

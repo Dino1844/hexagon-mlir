@@ -10,6 +10,14 @@
 // without the explicit internal module marker.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident})' | FileCheck %s
+//
+// LAYERED arm: the absence is a property of the placement layer (the census
+// only runs when the marker asks, and this module carries none), so the same
+// CHECK-NOT lines are the whole assertion one layer earlier. A marker that
+// started reaching the census through some later rewrite would still show up
+// in the full run above and stay invisible here -- which is the point of
+// checking it at both depths.
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident stop-after-diagnostic-stage})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK-LABEL: module

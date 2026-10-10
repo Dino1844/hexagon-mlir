@@ -13,6 +13,15 @@
 // inside the runtime on the first launch.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(linalg-to-llvm)' | FileCheck %s
+//
+// No layered arm here, deliberately: every check from line 21 on names a
+// post-lowering form (`llvm.func @hexagon_runtime_weight_resident_v2_dsp`, the
+// `llvm.mlir.addressof` of the constant, the `llvm.call`), and a run stopped at
+// the placement stage has none of them. The stage-level half of the same claim
+// -- the weight reached the engine as a resident VTCM buffer -- is layered in
+// hmx-weight-dtype-agreement.mlir, whose assertions are all module metadata
+// written inside the placement layer. That file is the layered form of this
+// one's mechanism; this one stays the end-to-end form of it.
 //===----------------------------------------------------------------------===//
 
 // The runtime gets the address of the prepacked constant, which by now is an

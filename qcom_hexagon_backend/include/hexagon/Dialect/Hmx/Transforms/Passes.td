@@ -497,6 +497,15 @@ def HmxDiagnosticRecord : Pass<"hmx-diagnostic-record", "mlir::ModuleOp"> {
     production run plus the two passes and no option exists twice:
 
         builtin.module(hmx-diagnostic-record{production=scratch=1048576})
+
+    `stop-after-diagnostic-stage` ends the production sequence right after the
+    stage instead of lowering through translation, which is the layered-lit
+    entry: the run stops at the placement layer with its VTCM allocations, hmx
+    ops and manifest facts still explicit. The option exists only on this
+    opt-tool-bound entry point, so no stop flag reaches the backend library or
+    the device:
+
+        builtin.module(hmx-diagnostic-record{stop-after-diagnostic-stage})
   }];
 
   let constructor = "mlir::hmx::createHmxDiagnosticRecordPass()";

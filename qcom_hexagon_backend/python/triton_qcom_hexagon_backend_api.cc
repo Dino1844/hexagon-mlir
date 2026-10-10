@@ -25,7 +25,11 @@
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/Dialect/Vector/IR/VectorOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 
@@ -417,7 +421,280 @@ static void validatePrepackAttributes(mlir::ModuleOp module) {
   validate(mlir::hmx::kHmxWeightPrepackLayoutAttr, /*array=*/false);
 }
 
-static std::string buildTranslationMetadata(mlir::ModuleOp module) {
+// ---------------------------------------------------------------------------
+// The kernel's tensor-argument write set (envelope field `arg_writes`)
+// ---------------------------------------------------------------------------
+// What this is for.  The Triton launcher's no-return path treats every ranked
+// input tensor as a possible output pointer, so each launch writes them all to
+// the device, dumps them all back, pulls every file across the tunnel and
+// copies them into the caller's tensors -- a round trip for a tensor the
+// kernel only ever read, on every kernel in the tree (measured: 65% of the
+// pulled bytes in a nine-shape survey are inputs nothing wrote).  Avoiding
+// that needs one fact: which tensor arguments the kernel writes through.
+//
+// That fact is already in the module; this reads it, it does not compute it.
+// Triton's lowering writes every output pointer through a
+// `bufferization.materialize_in_destination` (or a `memref.copy`, or a
+// destination-style op with a memory output), and the destination chain leads
+// back through view ops to the argument that owns the memory.  The chain is
+// followed here and the tensor ordinals it proves are written are published.
+//
+// The direction of failure is the whole design.  Excluding a tensor that IS
+// written would silently lose a result: nothing would be dumped or pulled for
+// it and the host would copy nothing back, so a `rel` check would read as a
+// pass.  So every structure this file does not model declines the extraction,
+// the envelope publishes `null`, and the host keeps today's behaviour of
+// dumping and pulling everything.  Claiming too much is the safe direction:
+// it only forgoes the saving.
+//
+// The slot space is the one the launcher already speaks: the ordinal of an
+// argument among the function's tensor arguments (`tensorArgumentSlot` in
+// WeightResidentPass.cpp), which is the same key `weight_prepack` publishes
+// and `input_profs.idx` reads.  Scalars never enter it -- an argument that is
+// not a tensor is counted past, not assigned a slot.
+
+namespace {
+
+/// The value whose memory `op`'s result views, or a null Value when `op` is
+/// not a view this extractor models.
+///
+/// Only the memory operand is returned.  A view's offsets, sizes and strides
+/// are values rather than memory, and following them would end at an operand
+/// this extractor does not model -- which is a decline, not "not an argument",
+/// so a view that carried extra memory operands would cost the whole
+/// extraction rather than mis-answer it.
+mlir::Value viewedMemorySource(mlir::Operation *op) {
+  if (auto cast = mlir::dyn_cast<mlir::memref::ReinterpretCastOp>(op))
+    return cast.getSource();
+  if (auto subview = mlir::dyn_cast<mlir::memref::SubViewOp>(op))
+    return subview.getSource();
+  if (auto cast = mlir::dyn_cast<mlir::memref::CastOp>(op))
+    return cast.getSource();
+  if (auto expand = mlir::dyn_cast<mlir::memref::ExpandShapeOp>(op))
+    return expand.getSrc();
+  if (auto collapse = mlir::dyn_cast<mlir::memref::CollapseShapeOp>(op))
+    return collapse.getSrc();
+  if (auto view = mlir::dyn_cast<mlir::memref::ViewOp>(op))
+    return view.getSource();
+  if (auto transpose = mlir::dyn_cast<mlir::memref::TransposeOp>(op))
+    return transpose.getIn();
+  if (auto toTensor = mlir::dyn_cast<mlir::bufferization::ToTensorOp>(op))
+    return toTensor.getBuffer();
+  if (auto toBuffer = mlir::dyn_cast<mlir::bufferization::ToBufferOp>(op))
+    return toBuffer.getTensor();
+  if (auto cast = mlir::dyn_cast<mlir::UnrealizedConversionCastOp>(op))
+    return cast->getNumOperands() == 1 ? cast->getOperand(0) : mlir::Value();
+  return mlir::Value();
+}
+
+/// True for the ops that create fresh memory.  A write to one of these cannot
+/// touch an argument, so a chain ending here resolves to "no argument".
+bool createsFreshMemory(mlir::Operation *op) {
+  return mlir::isa<mlir::memref::AllocOp, mlir::memref::AllocaOp,
+                   mlir::tensor::EmptyOp, mlir::bufferization::AllocTensorOp>(
+      op);
+}
+
+/// Append every value `op` writes through, and return true when `op` is a
+/// write site this extractor models.
+bool collectWriteDestinations(mlir::Operation *op,
+                              llvm::SmallVectorImpl<mlir::Value> &out) {
+  if (auto store = mlir::dyn_cast<mlir::memref::StoreOp>(op)) {
+    out.push_back(store.getMemRef());
+    return true;
+  }
+  if (auto store = mlir::dyn_cast<mlir::affine::AffineStoreOp>(op)) {
+    out.push_back(store.getMemRef());
+    return true;
+  }
+  if (auto store = mlir::dyn_cast<mlir::vector::StoreOp>(op)) {
+    out.push_back(store.getBase());
+    return true;
+  }
+  if (auto store = mlir::dyn_cast<mlir::vector::MaskedStoreOp>(op)) {
+    out.push_back(store.getBase());
+    return true;
+  }
+  if (auto copy = mlir::dyn_cast<mlir::memref::CopyOp>(op)) {
+    out.push_back(copy.getTarget());
+    return true;
+  }
+  if (auto materialize =
+          mlir::dyn_cast<mlir::bufferization::MaterializeInDestinationOp>(op)) {
+    out.push_back(materialize.getDest());
+    return true;
+  }
+  // Every destination-style op writes its outputs: the structured linalg
+  // family, tensor.insert_slice, vector.transfer_write, and anything else that
+  // declares the same contract.  Their outputs may be tensors rather than
+  // memrefs; a chain through bufferization.to_tensor resolves those back to
+  // the memory they view, which is what makes a write into a view of an
+  // argument visible at all.
+  if (auto destinationStyle =
+          mlir::dyn_cast<mlir::DestinationStyleOpInterface>(op)) {
+    for (mlir::Value output : destinationStyle.getDpsInits())
+      out.push_back(output);
+    return true;
+  }
+  return false;
+}
+
+/// True when `op` must be declined: it writes memory in a way none of the
+/// recognizers above model, or it declares no effects at all -- which MLIR
+/// treats as "may write anything", so an unrecognized op with no declared
+/// effects is declined rather than assumed pure.
+bool isUnmodelledWriter(mlir::Operation *op) {
+  auto interface = mlir::dyn_cast<mlir::MemoryEffectOpInterface>(op);
+  if (!interface)
+    return true;
+  llvm::SmallVector<mlir::MemoryEffects::EffectInstance, 4> effects;
+  interface.getEffects(effects);
+  return llvm::any_of(
+      effects, [](const mlir::MemoryEffects::EffectInstance &effect) {
+        return mlir::isa<mlir::MemoryEffects::Write>(effect.getEffect());
+      });
+}
+
+/// Where a written value's memory comes from.
+enum class WrittenMemory { Argument, FreshMemory, Unmodelled };
+
+/// Follow one written value back to the memory it views, and report which of
+/// the function's tensor arguments that memory belongs to in `argumentOut`.
+///
+/// A chain that reaches a `memref.alloc`/`tensor.empty` is FreshMemory: no
+/// argument is involved.  A chain that reaches an argument fills `argumentOut`.
+/// Anything else -- an op this extractor does not model, or a block argument
+/// that is not the function's own -- is Unmodelled, and the caller declines
+/// the whole extraction.
+WrittenMemory resolveWrittenMemory(mlir::Value value, mlir::func::FuncOp func,
+                                   mlir::BlockArgument &argumentOut) {
+  // The chains here are linear (each modeled view has exactly one memory
+  // source); the worklist is the bookkeeping for that, and `visited` is what
+  // keeps a future many-source view from looping forever.
+  llvm::SmallVector<mlir::Value> worklist{value};
+  llvm::SmallPtrSet<mlir::Value, 8> visited;
+  while (!worklist.empty()) {
+    mlir::Value current = worklist.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+    if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(current)) {
+      // Only the function's own arguments live in the slot space.  A memref
+      // carried into a loop body would have to be traced to the region's
+      // caller, which is inter-region reasoning this extractor does not do,
+      // so it declines instead of guessing.
+      if (argument.getOwner() != &func.getBody().front() ||
+          !mlir::isa<mlir::BaseMemRefType>(argument.getType()))
+        return WrittenMemory::Unmodelled;
+      argumentOut = argument;
+      return WrittenMemory::Argument;
+    }
+    mlir::Operation *def = current.getDefiningOp();
+    if (!def)
+      return WrittenMemory::Unmodelled;
+    if (createsFreshMemory(def))
+      continue;
+    mlir::Value source = viewedMemorySource(def);
+    if (!source)
+      return WrittenMemory::Unmodelled;
+    worklist.push_back(source);
+  }
+  return WrittenMemory::FreshMemory;
+}
+
+/// The tensor ordinals the module's one kernel writes, as a JSON array, or
+/// `nullopt` when this extractor declines to have an answer.
+std::optional<std::string> argWritesJson(mlir::ModuleOp module) {
+  // The envelope describes one principal kernel.  A module with several
+  // function definitions would leave "which write set is this?" unanswered,
+  // so it declines.
+  mlir::func::FuncOp kernel;
+  for (auto func : module.getOps<mlir::func::FuncOp>()) {
+    if (func.isExternal())
+      continue;
+    if (kernel)
+      return std::nullopt;
+    kernel = func;
+  }
+  if (!kernel)
+    return std::nullopt;
+
+  llvm::DenseMap<mlir::Value, int64_t> tensorOrdinal;
+  for (mlir::BlockArgument argument : kernel.getArguments())
+    if (mlir::isa<mlir::RankedTensorType, mlir::BaseMemRefType>(
+            argument.getType()))
+      tensorOrdinal[argument] = tensorOrdinal.size();
+
+  llvm::SmallVector<int64_t> written;
+  auto walk = kernel.walk([&](mlir::Operation *op) -> mlir::WalkResult {
+    if (op == kernel.getOperation())
+      return mlir::WalkResult::advance();
+
+    llvm::SmallVector<mlir::Value> destinations;
+    if (collectWriteDestinations(op, destinations)) {
+      for (mlir::Value destination : destinations) {
+        mlir::BlockArgument writtenArgument;
+        if (resolveWrittenMemory(destination, kernel, writtenArgument) !=
+            WrittenMemory::Argument)
+          continue;
+        auto ordinal = tensorOrdinal.find(writtenArgument);
+        // A memref argument always got an ordinal above, so this cannot miss;
+        // it is asserted rather than defaulted so a type that reaches here
+        // without a slot fails the compile instead of publishing a guess.
+        assert(ordinal != tensorOrdinal.end() &&
+               "a written memref argument has no tensor ordinal");
+        written.push_back(ordinal->second);
+      }
+      return mlir::WalkResult::advance();
+    }
+
+    // Not a write site.  Views and fresh allocations write nothing
+    // themselves, and an op that derives its effects from nested ops writes
+    // nothing itself either: those effects belong to the nested ops, which
+    // this walk reaches on its own.  Counting them here would decline every
+    // kernel that loops.
+    if (viewedMemorySource(op))
+      return mlir::WalkResult::advance();
+    if (createsFreshMemory(op))
+      return mlir::WalkResult::advance();
+    if (op->hasTrait<mlir::OpTrait::HasRecursiveMemoryEffects>())
+      return mlir::WalkResult::advance();
+    if (isUnmodelledWriter(op))
+      return mlir::WalkResult::interrupt();
+    return mlir::WalkResult::advance();
+  });
+  if (walk.wasInterrupted())
+    return std::nullopt;
+
+  if (written.empty())
+    return std::string("[]");
+  llvm::sort(written);
+  written.erase(llvm::unique(written), written.end());
+  std::string json = "[";
+  llvm::raw_string_ostream stream(json);
+  llvm::interleave(written, stream, ",");
+  stream.flush();
+  json += "]";
+  return json;
+}
+
+} // namespace
+
+/// The `arg_writes` envelope child for `module`, already as JSON text.
+///
+/// The extraction runs on the module as it was handed to the translation
+/// entry point, because both entries lower `linalg_module` in place: by the
+/// time an LLVM-dialect module exists, the bufferization ops this reads are
+/// gone.  The one spelling of "no answer" is `"null"`; see the block comment
+/// above for why a decline is never downgraded to an empty list (an empty
+/// list is the positive claim that nothing is written, which is a different
+/// fact and one the host would act on).
+std::string argWritesJsonFor(mlir::ModuleOp linalgModule) {
+  std::optional<std::string> writes = argWritesJson(linalgModule);
+  return writes ? *writes : std::string("null");
+}
+
+static std::string buildTranslationMetadata(mlir::ModuleOp module,
+                                            const std::string &argWrites) {
   validatePrepackAttributes(module);
   auto weightAttr = module->getAttrOfType<mlir::StringAttr>(
       mlir::hmx::kHmxWeightPrepackAttr);
@@ -458,6 +735,11 @@ static std::string buildTranslationMetadata(mlir::ModuleOp module) {
     fail("HMX manifest is missing or malformed for the translated module");
   json += "},\"hmx_manifest\":";
   json += manifest;
+  // The launcher's write set: which tensor arguments the kernel writes
+  // through, in the tensor-ordinal space.  Computed from the module the
+  // caller handed us, before the pipeline rewrites it.
+  json += ",\"arg_writes\":";
+  json += argWrites;
   if (recordV3) {
     // The v3 child is a separate object with a fixed field name.  It is never
     // merged into, derived from, or substituted for the v2 child.
@@ -476,6 +758,9 @@ std::vector<std::vector<char>> translateLinalgToObj(
   // bytes/char) that will be produced
   std::vector<std::vector<char>> mods_object_codes_as_bytes;
   validatePrepackAttributes(linalg_module);
+  // Both translation entries lower `linalg_module` in place, so the write set
+  // is read from it here, first.
+  std::string argWrites = argWritesJsonFor(linalg_module);
 
   // Needed to know if we should lower the constants separately or not
   mlir::hexagon::LinalgToLLVMOptions optionsLinalgToLLVM;
@@ -532,7 +817,7 @@ std::vector<std::vector<char>> translateLinalgToObj(
     if (mods.empty())
       fail("Cannot construct translation metadata: no translated module was "
            "produced.");
-    *outMetadata = buildTranslationMetadata(mods[0]);
+    *outMetadata = buildTranslationMetadata(mods[0], argWrites);
   }
 
   // Iterating through each LLVM/MLIR module that has been produced
@@ -1028,13 +1313,14 @@ std::string translateLinalgToLLVMIR(
     const std::unordered_map<std::string, std::string> &options_map,
     std::string *outMetadata) {
   validatePrepackAttributes(linalg_module);
+  std::string argWrites = argWritesJsonFor(linalg_module);
   auto mod =
       ::mlir::hexagon::translateLinalgToLLVMMLIR(linalg_module, options_map);
   if (!mod)
     fail("Failed to convert Triton Linalg to LLVM MLIR.");
 
   if (outMetadata) {
-    *outMetadata = buildTranslationMetadata(mod);
+    *outMetadata = buildTranslationMetadata(mod, argWrites);
   } else {
     validatePrepackAttributes(mod);
     if (mlir::hmx::serializeHmxManifestJson(mod) == "{}")

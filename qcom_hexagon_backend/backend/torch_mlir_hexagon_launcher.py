@@ -186,19 +186,22 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
         # because the wrapper consumes the same contract before writing inputs.
         obj_modules, translation_metadata = self.mlir_to_obj(mlir_mod, options)
         # parse_translation_metadata returns (weight_prepack, hmx_manifest,
-        # hmx_record) -- utils.py:1686 and the backend's own tests all unpack
-        # three. This call site was left at two when the v3 `hmx_record` child
-        # was added, so it raised `ValueError: too many values to unpack` for
-        # EVERY kernel on the torch-mlir path -- found 2026-10-01 by noticing
+        # hmx_record, arg_writes) -- utils.py and the backend's own tests all
+        # unpack four. This call site was left at two when the v3 `hmx_record`
+        # child was added, and at three when the `arg_writes` child was, so it
+        # raised `ValueError: too many values to unpack` for EVERY kernel on
+        # the torch-mlir path -- found 2026-10-01 by noticing
         # that hexagon-mlir/test/python/torch-mlir/ is 8-for-8 red and lives
         # outside every gate (run_host_tests.py globs only
         # qcom_hexagon_backend/test and qcom_hexagon_backend/bin/runtime/test).
         #
-        # Only the weight contract is consumed here; the manifest and the record
-        # are host-side children this launcher has never read. So they are
-        # discarded by name, not by counting -- that way the next arity change
-        # is a loud error here rather than a silent mis-index.
-        weight_metadata, _, _ = parse_translation_metadata(translation_metadata)
+        # Only the weight contract is consumed here; the manifest, the record
+        # and the write set are children this launcher has never read. So they
+        # are discarded by name, not by counting -- that way the next arity
+        # change is a loud error here rather than a silent mis-index.
+        weight_metadata, _, _, _ = parse_translation_metadata(
+            translation_metadata
+        )
         from triton.backends.qcom_hexagon_backend.hmx_weight_prepack import WeightPrepack
 
         weight_prepack = WeightPrepack.from_metadata(weight_metadata)
@@ -357,3 +360,16 @@ class TorchMLIRHexagonLauncher(HexagonLauncherBase):
     def get_output_tensor_path_count(wrapper_generator: HexagonWrapperGenerator):
         """Returns number of output paths by checking rank (dim)"""
         return sum([1 for out in wrapper_generator.output_profs if out.rank])
+
+    @staticmethod
+    def get_output_tensor_slots(wrapper_generator: HexagonWrapperGenerator):
+        """Return-value slots only, with no input fallback.
+
+        The torch-mlir contract, kept as it was: a model function's results come
+        back through its return values, and its output paths have never included
+        its inputs.  The write set is a Triton-launcher fact -- torch-mlir
+        compiles through `TorchMlirHexagonWrapperGenerator`, which carries no
+        `arg_writes` attribute -- so this override exists to keep that
+        launcher's behaviour identical, not to opt it into the new rule.
+        """
+        return [out.idx for out in wrapper_generator.output_profs if out.rank]

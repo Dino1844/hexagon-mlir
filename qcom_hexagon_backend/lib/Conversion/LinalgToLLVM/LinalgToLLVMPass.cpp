@@ -137,7 +137,16 @@ public:
     }
 
     PassManager pm(&getContext(), moduleOp.getOperationName());
-    addProductionPasses(pm, moduleOp);
+    // The stage hook and the layered stop are installed on the pass itself (by
+    // the diagnostic entry point, through `runLinalgToLLVMPipeline`) and reach
+    // the sequence through these arguments. A function_ref built from an EMPTY
+    // std::function is non-null, so the emptiness has to be tested on the
+    // std::function before one is made: passing it directly calls an empty
+    // target and aborts.
+    if (diagnosticStage)
+      addProductionPasses(pm, moduleOp, diagnosticStage, stopAfterDiagnosticStage);
+    else
+      addProductionPasses(pm, moduleOp, {}, stopAfterDiagnosticStage);
 
     if (failed(runPipeline(pm, getOperation())))
       signalPassFailure();
@@ -148,6 +157,15 @@ public:
   /// stage. A `std::function` rather than a `function_ref` because the pass may
   /// be cloned (and run) after the caller's lambda has gone out of scope.
   std::function<void(PassManager &)> diagnosticStage;
+
+  /// Set by an entry point through `runLinalgToLLVMPipeline`. When true,
+  /// `addProductionPasses` returns right after the diagnostic stage (the census
+  /// callback above plus the marker-gated record document that follows it), so
+  /// the run ends at the placement layer with its VTCM allocations, hmx ops
+  /// and manifest facts still explicit instead of going through lowering.
+  /// False on the production pass and on the plain diagnostic entry, so both
+  /// sequences are unchanged.
+  bool stopAfterDiagnosticStage = false;
 
   /// Append the whole production sequence to `pm`.
   ///
@@ -160,16 +178,23 @@ public:
   ///
   /// `moduleOp` is the module the passes will run on; it is used for the target
   /// triple and data layout, which the caller's IR already depends on.
+  ///
+  /// `stopAfterDiagnosticStage` ends the sequence right after the stage above
+  /// (census plus the marker-gated record document that follows it), leaving
+  /// the placement layer instead of lowering it. The production pass leaves it
+  /// false, so the production sequence is the same code either way.
   void addProductionPasses(PassManager &pm, ModuleOp moduleOp,
                             llvm::function_ref<void(PassManager &)>
-                                atDiagnosticStage = {});
+                                atDiagnosticStage = {},
+                            bool stopAfterDiagnosticStage = false);
 };
 
 } // namespace
 
 void LinalgToLLVMPass::addProductionPasses(
     PassManager &pm, ModuleOp moduleOp,
-    llvm::function_ref<void(PassManager &)> atDiagnosticStage) {
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage,
+    bool stopAfterDiagnosticStage) {
     MLIRContext *context = moduleOp.getContext();
 
     setTargetTriple(moduleOp);
@@ -677,6 +702,17 @@ void LinalgToLLVMPass::addProductionPasses(
     // in a diagnostic run, and the record folds in the facts it proves.
     pm.addPass(mlir::hmx::createHmxRecordV3Pass());
 
+    // The layer boundary for a layered entry. Everything above this line is the
+    // placement layer: the VTCM allocations, the hmx ops, the manifest and the
+    // diagnostic facts are all still explicit. Everything below is lowering,
+    // which erases them. A test about a mid-pipeline mechanism (weight
+    // residency, the partition's ring, the census) therefore stops here instead
+    // of paying for the rest of the sequence and then asserting facts that
+    // survived it. The production pass and the plain diagnostic entry leave the
+    // flag false, so neither of them reaches this return.
+    if (stopAfterDiagnosticStage)
+      return;
+
     // Lower linalg ops with library_call attribute set to custom fns.
     pm.addPass(createHexagonReplaceWithLibraryCallsPass());
     if (enableHexagonmemCopyToDMA)
@@ -771,7 +807,8 @@ hexagon::createLinalgToLLVMPass(const LinalgToLLVMOptions &options) {
 
 LogicalResult hexagon::runLinalgToLLVMPipeline(
     MLIRContext &context, ModuleOp module, StringRef options,
-    llvm::function_ref<void(PassManager &)> atDiagnosticStage) {
+    llvm::function_ref<void(PassManager &)> atDiagnosticStage,
+    bool stopAfterDiagnosticStage) {
   // The pipeline parser resolves pass names through the global registry, so the
   // registration must have happened. `hexagon/Conversion/LinalgToLLVM/Passes.h`
   // (already included above) declares it; re-registering is idempotent.
@@ -798,10 +835,13 @@ LogicalResult hexagon::runLinalgToLLVMPipeline(
 
   // Instal the stage on the pass the parser built, not on a copy of it: the
   // generated copy constructor does not carry the option values, so a copy
-  // would silently fall back to the production defaults.
+  // would silently fall back to the production defaults. The layered-entry flag
+  // travels with it, for the same reason.
   for (Pass &pass : pm.getPasses())
-    if (auto *linalgToLLVM = dyn_cast_if_present<LinalgToLLVMPass>(&pass))
+    if (auto *linalgToLLVM = dyn_cast_if_present<LinalgToLLVMPass>(&pass)) {
       linalgToLLVM->diagnosticStage = atDiagnosticStage;
+      linalgToLLVM->stopAfterDiagnosticStage = stopAfterDiagnosticStage;
+    }
 
   // `PassManager::run` loads the dependent dialects of the passes it runs, so
   // the production sequence and the diagnostics alike get the dialects they

@@ -213,12 +213,15 @@ _VALID_WEIGHT = {
 }
 
 
-def _envelope(*, manifest=None, weight=None):
+def _envelope(*, manifest=None, weight=None, arg_writes=None):
     return json.dumps(
         {
             "schema": _UTILS.TRANSLATION_METADATA_SCHEMA,
             "weight_prepack": copy.deepcopy(_WEIGHT if weight is None else weight),
             "hmx_manifest": copy.deepcopy(_MANIFEST if manifest is None else manifest),
+            # The write-set child, `null` here as it is for a kernel whose
+            # write set the producer declined to prove.
+            "arg_writes": arg_writes,
         }
     )
 
@@ -241,6 +244,9 @@ def _packed_metadata(**overrides):
         # A v1 envelope publishes no record child; the empty string is that one
         # spelling, and it is the only way to get an absent record.
         "hmx_record": "",
+        # The launch contract's write set: None = the producer could not prove
+        # one, which the launcher reads as "return every ranked input".
+        "arg_writes": None,
     }
     values.update(overrides)
     return values
@@ -522,6 +528,24 @@ class TranslationMetadataTest(unittest.TestCase):
         self.assertEqual(json.loads(metadata["hmx_manifest"]), _MANIFEST)
         # A v1 envelope publishes no record, and never a default one.
         self.assertEqual(metadata["hmx_record"], "")
+        # The write set passes through decoded: this fixture's envelope carries
+        # `null`, so the published value is None -- the fail-closed spelling.
+        self.assertIsNone(metadata["arg_writes"])
+
+    def test_the_write_set_passes_through_unchanged(self):
+        # One producer decision the launcher must not second-guess: a proved
+        # list is published as that list, in order, and a declined one as None.
+        # The launcher decides what None costs; this boundary decides nothing.
+        # (`validate_pack_metadata` is not in play here: apply_translation_metadata
+        # publishes the envelope children only, not the other eleven
+        # packed-metadata fields -- the pack boundary is covered separately.)
+        for value in (None, [], [0], [1, 3]):
+            with self.subTest(arg_writes=value):
+                metadata = {}
+                _UTILS.apply_translation_metadata(
+                    metadata, _envelope(arg_writes=value)
+                )
+                self.assertEqual(metadata["arg_writes"], value)
 
     def test_strict_weight_contract_accepts_a_valid_nonempty_entry(self):
         _UTILS.validate_weight_prepack(_VALID_WEIGHT)
@@ -530,7 +554,7 @@ class TranslationMetadataTest(unittest.TestCase):
         policy["reason"] = "eligible-aligned-f16"
         record = _hmx_record(weight_kind="argument-slot", policy=policy)
         manifest = _manifest([record], [policy])
-        weight_json, _, record_json = _UTILS.parse_translation_metadata(
+        weight_json, _, record_json, _ = _UTILS.parse_translation_metadata(
             _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)
@@ -651,6 +675,20 @@ class TranslationMetadataTest(unittest.TestCase):
                 object(), _metadata(hmx_manifest=json.dumps(stale_manifest))
             )
 
+        # The write set is a required child like the others: a cached artifact
+        # written before it existed is a stale artifact, not a kernel with the
+        # feature off.
+        stale = _metadata()
+        del stale.arg_writes
+        with self.assertRaisesRegex(RuntimeError, "arg_writes"):
+            HexagonBackend.pack_metadata(object(), stale)
+        for value in ("[", "[1,1]", '[1,0]', "[-1]", '"0"', "1"):
+            with self.subTest(arg_writes=value):
+                with self.assertRaisesRegex(RuntimeError, "arg_writes"):
+                    HexagonBackend.pack_metadata(
+                        object(), _metadata(arg_writes=value)
+                    )
+
     def test_translation_weight_policy_and_prepack_are_cross_checked(self):
         policy = copy.deepcopy(_POLICY)
         policy["policy"] = "resident-prepack"
@@ -660,7 +698,7 @@ class TranslationMetadataTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching weight_prepack"):
             _UTILS.parse_translation_metadata(_envelope(manifest=manifest))
 
-        weight_json, _, record_json = _UTILS.parse_translation_metadata(
+        weight_json, _, record_json, _ = _UTILS.parse_translation_metadata(
             _envelope(manifest=manifest, weight=_VALID_WEIGHT)
         )
         self.assertEqual(json.loads(weight_json), _VALID_WEIGHT)

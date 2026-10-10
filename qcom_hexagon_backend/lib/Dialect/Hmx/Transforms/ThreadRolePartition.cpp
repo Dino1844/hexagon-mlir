@@ -534,6 +534,51 @@ static bool nestEquivalent(Operation *a, Operation *b, Value rowA, Value rowB,
   return true;
 }
 
+/// The descriptor buffer a published batch address is built from, or a null
+/// Value for a form this pass does not know.
+///
+/// The read-out split publishes an i32 ADDRESS (the runtime ABI's
+/// `void *ar, *dst`), so `buildDescriptor` emits the aligned pointer PLUS the
+/// buffer's own descriptor offset, element-scaled -- the same rule `asAddress`
+/// applies on the LLVM side, and the reason a view into the middle of another
+/// buffer (a grid-tiled matmul's span) is published pre-offset rather than as
+/// the bare aligned pointer every span shares. The address therefore reads
+/// the descriptor through its two metadata queries, and the emission needs
+/// the BUFFER those name. So the query is: pure arithmetic and casts, the two
+/// metadata queries, and nothing else -- the queries name the buffer (and
+/// must agree on it), the arithmetic is walked, and an impure op, a region,
+/// or a second buffer is a form this pass did not make. The bare
+/// `index_cast(extract)` spelling this pass matched before walks the same
+/// way, so both spellings are accepted.
+static Value readoutDescriptorBuffer(Value published) {
+  Value buffer;
+  SmallVector<Value> worklist{published};
+  while (!worklist.empty()) {
+    Value value = worklist.pop_back_val();
+    Operation *def = value.getDefiningOp();
+    if (!def)
+      continue; // a function argument or a result of something uninteresting
+    if (isa<memref::ExtractAlignedPointerAsIndexOp,
+            memref::ExtractStridedMetadataOp>(def)) {
+      Value named = def->getOperand(0);
+      // Two names in one expression: the address depends on two buffers, so
+      // which one the descriptor is would be a guess.
+      if (buffer && buffer != named)
+        return {};
+      buffer = named;
+      continue;
+    }
+    // `mlir::isPure` does not look inside regions, so a region-bearing
+    // "pure" op can still have effects; the region check is why that
+    // distinction matters here.
+    if (!mlir::isPure(def) || def->getNumRegions() != 0)
+      return {};
+    for (Value operand : def->getOperands())
+      worklist.push_back(operand);
+  }
+  return buffer;
+}
+
 /// The read-out coexistence state of a matched tile loop (R2).
 ///
 /// The production pipeline runs `hmx-vector-readout` BEFORE this pass, so by
@@ -715,22 +760,26 @@ static LogicalResult collectReadoutState(func::FuncOp fn, RoleSplitMatch &m) {
                       "read-out split emits one per boundary)");
         return failure();
       }
-      // The descriptor address: index_cast(extract_aligned_pointer_as_index(
-      // buffer)) -- the read-out split's own spelling (emitPublish), so the
-      // buffer it names is recovered by walking it rather than guessed.
-      auto addrCast =
-          publish.getOperand(0).getDefiningOp<arith::IndexCastOp>();
-      auto extract =
-          addrCast ? addrCast.getIn().getDefiningOp<
-                         memref::ExtractAlignedPointerAsIndexOp>()
-                   : nullptr;
-      if (!addrCast || !extract) {
+      // The descriptor address: the read-out split's own spelling
+      // (buildDescriptor), which reached across in emitPublish as a bare
+      // `index_cast(extract_aligned_pointer_as_index(buffer))`. It now carries
+      // the buffer's descriptor offset inside -- a batch word is an i32
+      // ADDRESS, so a view into the middle of another buffer is published
+      // pre-offset (HmxVectorReadoutPass.cpp: the 2048^3-B multi-span fix),
+      // and the expression is `index_cast(addi(extract(buf),
+      // muli(strided_metadata(buf) offset, bytes)))`. What the emission needs
+      // is the BUFFER, so the arithmetic is walked rather than spelled out:
+      // pure ops only, and the one `extract_aligned_pointer_as_index` in the
+      // expression names it. Two extracts, an impure op, or none at all is an
+      // unknown form -- the same decline, for the same reason (a surprise here
+      // would silently point the lagged publish at the wrong descriptor).
+      Value readoutBuf = readoutDescriptorBuffer(publish.getOperand(0));
+      if (!readoutBuf) {
         fn.emitRemark("thread-role split not applied: a publish call's "
                       "descriptor address is not the read-out split's "
                       "extract-and-cast form");
         return failure();
       }
-      Value readoutBuf = extract.getOperand();
       for (Value v : {readoutBuf, publish.getOperand(0)}) {
         Operation *def = v.getDefiningOp();
         if (def && m.mLoop->isAncestor(def)) {

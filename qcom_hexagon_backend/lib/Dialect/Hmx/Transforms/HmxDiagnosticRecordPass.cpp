@@ -35,6 +35,13 @@
 // so a diagnostic run is the production run plus the two passes, and no option
 // is duplicated as a second surface.
 //
+// `stop-after-diagnostic-stage` ends the production sequence right after the
+// stage (census plus the marker-gated record document that follows it), so the
+// run stops at the placement layer. That is the layered-lit entry: the same
+// production order, one layer of it, with the allocations and hmx ops still
+// explicit -- and it is reachable only from here, which is why no stop flag
+// exists on `linalg-to-llvm` and none reaches the backend library.
+//
 //===----------------------------------------------------------------------===//
 
 #include "hexagon/Conversion/LinalgToLLVM/LinalgToLLVM.h"
@@ -67,6 +74,7 @@ struct HmxDiagnosticRecordPass
   HmxDiagnosticRecordPass(const HmxDiagnosticRecordPass &other)
       : PassWrapper(other) {
     production = other.production;
+    stopAfterDiagnosticStage = other.stopAfterDiagnosticStage;
   }
 
   StringRef getArgument() const final { return "hmx-diagnostic-record"; }
@@ -93,7 +101,7 @@ struct HmxDiagnosticRecordPass
     LogicalResult run = hexagon::runLinalgToLLVMPipeline(
         getContext(), module, this->production, [](PassManager &pm) {
           pm.addPass(mlir::hmx::createHmxVtcmAccountingPass());
-        });
+        }, this->stopAfterDiagnosticStage);
 
     if (failed(run)) {
       module.emitError("hmx-diagnostic-record: cannot run the production "
@@ -111,6 +119,24 @@ struct HmxDiagnosticRecordPass
           "options forwarded to the production linalg-to-llvm pipeline, in "
           "linalg-to-llvm's own key=value spelling (empty = the defaults)"),
       llvm::cl::init("")};
+
+  /// End the production sequence right after the diagnostic stage instead of
+  /// lowering through translation. The stage is the layer boundary: everything
+  /// before it is the placement layer (VTCM allocations, hmx ops, manifest and
+  /// diagnostic facts still explicit), everything after it is lowering that
+  /// erases them. This is what a layered lit wants -- the same production
+  /// order, one layer of it, no second copy of the sequence -- and it is why
+  /// the option lives on this opt-tool-only entry point: no stop flag exists
+  /// on `linalg-to-llvm` itself, so nothing that ships to the device can
+  /// request it.
+  ///
+  ///   linalg-hexagon-opt %s -pass-pipeline='builtin.module(
+  ///     hmx-diagnostic-record{stop-after-diagnostic-stage})'
+  Option<bool> stopAfterDiagnosticStage{
+      *this, "stop-after-diagnostic-stage",
+      llvm::cl::desc("stop the production sequence after the diagnostic "
+                     "stage (the placement layer) instead of lowering"),
+      llvm::cl::init(false)};
 };
 
 } // namespace

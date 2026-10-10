@@ -33,6 +33,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -44,16 +45,27 @@ from triton.backends.qcom_hexagon_backend.hexagon_executor import (
 )
 from triton.backends.qcom_hexagon_backend.hexagon_launcher_base import (
     HexagonLauncherBase,
+    HexagonWrapperGenerator,
+    WrapperGeneratorStrings,
 )
 from triton.backends.qcom_hexagon_backend.launch_intent import (
     pull_outputs,
     pull_outputs_enabled,
 )
+from triton.backends.qcom_hexagon_backend.utils import profile_triton_inputs
 
 #: The manifest/weight fixtures the launch path validates against.  Reused
 #: rather than re-declared so this file cannot drift from the contract the
 #: driver already enforces.
 from test_hmx_manifest_metadata import _MANIFEST, _WEIGHT
+
+#: One value that means "this launch contract has no `arg_writes` field at
+#: all".  It is distinct from ``None``, which is a *published* field whose
+#: value is "unknown": both must produce the same launcher behaviour (return
+#: every ranked input), but a fixture that cannot tell them apart could not
+#: prove that, and a future field default that differs between them would pass
+#: anyway.
+_ABSENT = object()
 
 
 # --------------------------------------------------------------------------- #
@@ -102,9 +114,25 @@ class _ExecutorStub:
 
 
 class _GeneratorStub:
-    def __init__(self, input_profs, iterations, func_name, output_profs, grid, options, scope):
+    def __init__(
+        self,
+        input_profs,
+        iterations,
+        func_name,
+        output_profs,
+        grid,
+        options,
+        scope,
+        arg_writes=_ABSENT,
+    ):
         self.input_profs = input_profs
         self.output_profs = output_profs
+        # Only set when the launch contract published one.  The generator reads
+        # the field with getattr(..., None), so an unset attribute is the
+        # "no write set" arm and must stay observable as such: a fixture that
+        # always defined it would hide the fail-closed default.
+        if arg_writes is not _ABSENT:
+            self.arg_writes = arg_writes
 
     def generate_cpp_wrapper(self, _file_name, _exec_dir):
         return "// stub wrapper"
@@ -166,25 +194,50 @@ def _launcher_module():
     return module
 
 
-def _launch(launcher, pull=True):
+def _launcher_instance():
+    """A real launcher with only ``__init__`` skipped, as the driver builds it."""
+    import triton.backends.qcom_hexagon_backend.triton_hexagon_launcher as module
+
+    return object.__new__(module.TritonHexagonLauncher)
+
+
+def _launch(
+    launcher,
+    pull=True,
+    *,
+    inputs=None,
+    arg_writes=_ABSENT,
+    results=None,
+    weight_prepack=None,
+):
     """One ``_exec_kernel`` call with the surrounding pieces stubbed out.
 
     ``HexagonLauncherBase.execute_kernel`` and the executor classes are replaced
     by recorders, so what is observed is the *plumbing*: whether the intent
     reached the call and whether the result came back.
+
+    ``inputs``/``results`` are the launch's tensors and the bytes the executor
+    hands back; ``arg_writes`` is the launch contract's write set (``_ABSENT``
+    for a metadata object that has no such field).
     """
     module = _launcher_module()
     original_executor = module.HexagonExecutor
     original_generator = module.TritonHexagonWrapperGenerator
     original_execute = HexagonLauncherBase.execute_kernel
     seen = {}
+    inputs = [torch.zeros(4)] if inputs is None else inputs
+    results = [torch.zeros(4) for _ in inputs] if results is None else results
 
     def execute(self, hexec, local_dir, filename, libs, wrapper_generator, pull_outputs=True):
         seen["pull_outputs"] = pull_outputs
-        return [] if not pull_outputs else [torch.zeros(4)]
+        return [] if not pull_outputs else results
 
     module.HexagonExecutor = _ExecutorStub
-    module.TritonHexagonWrapperGenerator = _GeneratorStub
+    module.TritonHexagonWrapperGenerator = (
+        lambda *args, **kwargs: _GeneratorStub(
+            *args, arg_writes=arg_writes, **kwargs
+        )
+    )
     HexagonLauncherBase.execute_kernel = execute
     launcher.generate_and_dump_wrapper = lambda *_a, **_k: "/tmp/pull-policy-wrapper.cpp"
     # Artifacts (the .o the launcher writes) land in a scratch dir that is
@@ -194,15 +247,20 @@ def _launch(launcher, pull=True):
         os.environ["HEXAGON_MLIR_DUMP_DIR"] = scratch
         try:
             with contextlib.redirect_stdout(io.StringIO()):
-                results = launcher._exec_kernel(
+                launch_results = launcher._exec_kernel(
                     b"kernel-object-bytes",
                     1,
                     "pull_policy_probe",
-                    [torch.zeros(4)],
+                    inputs,
                     [],
                     (1, 1, 1),
-                    weight_prepack=json.dumps(_WEIGHT),
+                    weight_prepack=(
+                        json.dumps(_WEIGHT)
+                        if weight_prepack is None
+                        else json.dumps(weight_prepack)
+                    ),
                     hmx_manifest=json.dumps(_MANIFEST),
+                    arg_writes=None if arg_writes is _ABSENT else arg_writes,
                 )
         finally:
             if previous_dump_dir is None:
@@ -213,9 +271,9 @@ def _launch(launcher, pull=True):
             module.TritonHexagonWrapperGenerator = original_generator
             HexagonLauncherBase.execute_kernel = original_execute
 
-    # The caller's tensor is the evidence for the copy-back half: it is written
-    # only when results came back.
-    return seen, results
+    # The caller's tensors are the evidence for the copy-back half: each is
+    # written only when the slot it covers came back.
+    return seen, launch_results
 
 
 # --------------------------------------------------------------------------- #
@@ -375,6 +433,149 @@ def test_the_launcher_reads_the_intent_and_skips_the_copy_back():
         assert seen["pull_outputs"] is False, "the declaration must reach the call"
         assert results == [], "no tensors, so nothing to copy back"
 
+
+# ---------------------------------------------------------------------------
+# The argument write set (`arg_writes`)
+# ---------------------------------------------------------------------------
+
+
+def _wrapper(inputs, *, arg_writes=_ABSENT, weight_prepack=None):
+    """A real generator over real input profiles, with the launch facts set.
+
+    The generator is the one class that reads the write set for the device-side
+    dump list, so a stub there would stub out the thing under test.
+    """
+    wrapper = HexagonWrapperGenerator(
+        profile_triton_inputs(list(inputs)),
+        1,
+        "pull_policy_probe",
+        [],
+        WrapperGeneratorStrings(),
+        {"enableLWP": False},
+    )
+    if arg_writes is not _ABSENT:
+        wrapper.arg_writes = arg_writes
+    wrapper.weight_prepack = weight_prepack
+    return wrapper
+
+
+def _dumped_slots(wrapper):
+    """The `_o{i}.raw` files the generated wrapper writes, in order."""
+    calls = wrapper.generate_tensor_write_to_file_calls("kernel", "/exec")
+    return [int(name) for name in re.findall(r"_o(\d+)\.raw", calls)]
+
+
+def _pull_paths(wrapper):
+    """The host-side paths `generate_input_output_paths` hands the executor."""
+    launcher = HexagonLauncherBase()
+    with tempfile.TemporaryDirectory() as scratch:
+        _, output_paths = launcher.generate_input_output_paths(
+            scratch, "kernel", wrapper
+        )
+    return [os.path.basename(path) for path in output_paths]
+
+
+def test_a_launch_without_a_write_set_returns_every_ranked_input():
+    # Today's behaviour, and the fail-closed default: a metadata object that
+    # has no `arg_writes` at all and one that publishes `null` must behave the
+    # same, because both mean "the producer could not prove a write set".
+    inputs = [torch.zeros(4) for _ in range(3)]
+    for arg_writes in (_ABSENT, None):
+        # Both arms mean "the producer could not prove a write set": the field
+        # is missing, or its value is `null`.  They must behave identically.
+        print(f"  arm arg_writes={arg_writes!r}")
+        wrapper = _wrapper(inputs, arg_writes=arg_writes)
+        assert _dumped_slots(wrapper) == [0, 1, 2], "every ranked input is dumped"
+        assert _pull_paths(wrapper) == [
+            "kernel_o0.raw",
+            "kernel_o1.raw",
+            "kernel_o2.raw",
+        ]
+
+
+def test_a_write_set_prunes_the_dump_the_pull_and_the_copy_back():
+    # One kernel, three tensors, one written through its pointer: the two
+    # unwritten tensors cost a dump, a pull and a copy-back today and nothing
+    # after this.
+    inputs = [torch.zeros(4) for _ in range(3)]
+    wrapper = _wrapper(inputs, arg_writes=[1])
+    assert _dumped_slots(wrapper) == [1], "the device writes only the written tensor"
+    # The slot is kept as the file's own index, not renumbered: the host pulls
+    # `_o1.raw`, and the wrapper reads it back into tensor 1.
+    assert _pull_paths(wrapper) == ["kernel_o1.raw"]
+
+    live = [t.clone() for t in inputs]
+    _launch(
+        _launcher_instance(),
+        inputs=live,
+        arg_writes=[1],
+        results=[torch.full((4,), 7.0)],
+    )
+    # Only the written tensor changed; the other two are exactly what the host
+    # pushed for them, which is the whole point of not pulling them.
+    assert live[0].sum() == 0.0, "an unwritten input is left alone"
+    assert live[1].sum() == 28.0, "the written tensor gets the pulled bytes"
+    assert live[2].sum() == 0.0, "an unwritten input is left alone"
+
+
+def test_a_skipped_slot_does_not_advance_the_result_index():
+    # The alignment trap, in the form that matters: a write set that prunes a
+    # slot must not let the copy-back walk consume that slot's position.  Here
+    # the write set is {1, 2} with three tensors, so the first pulled result
+    # belongs to tensor 1 and the second to tensor 2 -- and never to tensor 0.
+    inputs = [torch.zeros(4) for _ in range(3)]
+    live = [t.clone() for t in inputs]
+    _launch(
+        _launcher_instance(),
+        inputs=live,
+        arg_writes=[1, 2],
+        results=[torch.full((4,), 1.0), torch.full((4,), 2.0)],
+    )
+    assert live[0].sum() == 0.0, "the pruned slot owns no result"
+    assert live[1].sum() == 4.0, "the first pulled result is tensor 1's"
+    assert live[2].sum() == 8.0, "the second pulled result is tensor 2's"
+
+
+def test_a_pre_packed_slot_still_advances_the_result_index():
+    # The two skip rules side by side, because they differ in exactly this one
+    # respect and mixing them up writes one tensor's bytes into another:
+    # a pre-packed slot is dumped and pulled (its crouton bytes come back) but
+    # never copied back, so it DOES advance; a slot the kernel never writes is
+    # neither dumped nor pulled, so it does not.
+    #
+    # Here slot 0 is pre-packed and written, slot 1 is written and ordinary.
+    # One result comes back per pulled slot, in slot order, so the first
+    # belongs to slot 0 -- and is discarded -- and the second to slot 1.
+    weight = {
+        "layout": {
+            "ndims": 5,
+            "results": [[[1, 32], [2, 2], [4, 1]], [[0, 32], [3, 1]]],
+        },
+        "weights": [
+            {
+                "func": "pull_policy_probe",
+                "slot": 0,
+                "shape": [4, 4],
+                "crouton": [1, 1, 16, 32, 2],
+                "dtype": "f16",
+                "location": "vtcm",
+            }
+        ],
+    }
+    inputs = [torch.zeros(4), torch.zeros(4)]
+    live = [t.clone() for t in inputs]
+    _launch(
+        _launcher_instance(),
+        inputs=live,
+        arg_writes=[0, 1],
+        results=[torch.full((4,), 1.0), torch.full((4,), 2.0)],
+        weight_prepack=weight,
+    )
+    # Slot 0's pulled bytes are the crouton image, so the copy-back is skipped
+    # and the caller's row-major tensor survives; slot 1 is copied normally.
+    assert live[0].sum() == 0.0, "a pre-packed slot is never copied back"
+    assert live[1].sum() == 8.0, "the next slot gets the next result"
+
 def main() -> None:
     tests = (
         test_the_intent_is_scoped_and_restored,
@@ -382,6 +583,10 @@ def main() -> None:
         test_a_skipped_pull_returns_nothing_rather_than_stale_bytes,
         test_execute_kernel_forwards_the_declaration,
         test_the_launcher_reads_the_intent_and_skips_the_copy_back,
+        test_a_launch_without_a_write_set_returns_every_ranked_input,
+        test_a_write_set_prunes_the_dump_the_pull_and_the_copy_back,
+        test_a_skipped_slot_does_not_advance_the_result_index,
+        test_a_pre_packed_slot_still_advances_the_result_index,
     )
     for test in tests:
         test()

@@ -19,6 +19,14 @@
 // 4096 less than the whole-array form.
 //===----------------------------------------------------------------------===//
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident})' | FileCheck %s
+//
+// LAYERED arm: the same three sidecar facts (the v2 manifest schema, the
+// resident floor, the transient peak) through the same entry stopped right
+// after the placement layer, where the census and the liveness analysis ran.
+// Every figure this test pins is produced inside that layer, so the identical
+// CHECK lines must hold on the stage output alone; a sidecar that only
+// appeared after lowering -- or only before it -- would split the two arms.
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident stop-after-diagnostic-stage})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // CHECK-DAG: schema = "hex.hmx.kernel_manifest/v2"

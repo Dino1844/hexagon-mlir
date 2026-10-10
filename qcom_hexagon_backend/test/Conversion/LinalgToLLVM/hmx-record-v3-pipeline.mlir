@@ -16,6 +16,14 @@
 // would have produced, which is the whole point of a record-only schema.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s
+//
+// LAYERED arm: the v3 document is finalised by the pass that sits immediately
+// after the placement-stage census, so stopping the same entry right there
+// produces the identical module attributes one layer earlier. The record's
+// `not-proven` bytes are precisely the "nothing was measured" claim of this
+// fixture -- the unmarked run -- so the same CHECK lines prove the claim at
+// the stage rather than after 40 more insertions carried it to translation.
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{stop-after-diagnostic-stage})' | FileCheck %s
 //===----------------------------------------------------------------------===//
 
 // The two schemas describe the same compile, so the plan they name for the same

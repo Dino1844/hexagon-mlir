@@ -209,6 +209,11 @@ class _FakeWrapper:
     def __init__(self, profs, prepack):
         self.input_profs = profs
         self.weight_prepack = prepack
+        # A kernel with no return values: the returned slots are its input
+        # tensors, which is the shape every Triton kernel in the tree has.
+        # No `arg_writes` attribute, so no write set was published and every
+        # ranked input is returned -- the default this fixture has always had.
+        self.output_profs = []
 
 
 class LauncherArgumentImageTest(unittest.TestCase):
@@ -226,7 +231,10 @@ class LauncherArgumentImageTest(unittest.TestCase):
             idx=1, input_id=0, input_type="tensor", value=tensor, rank=2
         )
         launcher = HexagonLauncherBase()
-        launcher.get_output_tensor_path_count = lambda wrapper: 0
+        # The output paths are not what this test reads: it reads the input
+        # image this launcher wrote for the pre-packed slot.  (The count hook
+        # this fixture used to stub is gone -- the launcher now derives the
+        # output slots itself, from the wrapper's profiles.)
         with tempfile.TemporaryDirectory() as directory:
             paths, _ = launcher.generate_input_output_paths(
                 directory, "k", _FakeWrapper([prof], prepack)

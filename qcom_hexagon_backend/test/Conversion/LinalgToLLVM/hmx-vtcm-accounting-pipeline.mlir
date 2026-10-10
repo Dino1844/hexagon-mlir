@@ -12,6 +12,16 @@
 // metadata.
 //
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{production=enable-workspace-resident})' | FileCheck %s
+//
+// No layered arm here, deliberately: the last CHECK (`llvm.func
+// @hexagon_runtime_workspace_resident_v2_dsp`) is a post-lowering form -- the
+// runtime declaration that only `hexagonmem-to-llvm` emits -- so a run stopped
+// at the placement stage cannot satisfy the same assertion set. Everything
+// else this file pins is stage-level and IS covered at that depth by
+// hmx-vtcm-liveness-pipeline.mlir's layered arm. The rule for adding a
+// layered arm is therefore per-assertion, not per-file: layer it when every
+// CHECK line is written inside the placement layer (or survives it as module
+// metadata), and say why here when it is not.
 //===----------------------------------------------------------------------===//
 
 // CHECK-DAG: schema = "hex.hmx.kernel_manifest/v2"

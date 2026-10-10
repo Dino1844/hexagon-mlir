@@ -10,8 +10,16 @@ K-loop form is actually written and where the whole-block form dies
 (`tl.arange` / block dims must be powers of two, `python/triton/_utils.py:68`).
 This file compiles the Triton kernel the users write -- `acc = tl.dot(a, b,
 acc)` inside `for _k in range(0, N_INNER, BLOCK_K)` -- and asserts the HMX
-leaves appear, including the residual add-back that makes the carried
-accumulator correct.
+leaves appear.
+
+What the K-loop accumulate looks like NOW: since the f32 accumulator is made
+VTCM-resident across the loop's segments
+(docs/hmx/kchunk-accumulator-residency-2026-10-10.md), the per-segment
+unpack+widen+add round trip through DDR is gone: one fused leaf
+(`hmx.unpack_acc_f32_bulk`) reads the engine's fp16 read-out INTO the resident
+accumulator, with the accumulator itself as residual. The assertions below pin
+that form -- an f16 unpack leaf, and any fp16-to-fp32 widening arithmetic, are
+exactly what the residency removes.
 
 Placement: `hexagon-mlir/qcom_hexagon_backend/test/test_hmx_klooped_matmul_triton.py`.
 It is host-only (no device, `target_artifact="llir"`) and is picked up by
@@ -90,16 +98,27 @@ def _compile(kernel, rows, inner, cols, **extra):
 
 class KloopedMatmulReachesHmx(unittest.TestCase):
 
-    def test_real_ffn_shape_reaches_hmx_with_residual_add_back(self):
+    def test_real_ffn_shape_reaches_hmx_with_resident_accumulator(self):
         compiled = _compile(klooped_matmul, 256, REAL_FFN_K, 256, BLOCK_K=128)
         asm = compiled.asm["llir"]
         # The engine is reached: the four steps of one contraction.
         self.assertIn("@hmx_pack_act_f16_bulk", asm)
         self.assertIn("@hmx_mma_f16", asm)
-        self.assertIn("@hmx_unpack_acc_f16_bulk", asm)
-        # The carried accumulator is added back after the read-out. Without it
-        # the K loop would silently keep only the last K block's product.
-        self.assertRegex(asm, r"\bfadd\b")
+        # The accumulator is carried inside VTCM by the fused leaf: the read-out
+        # is written straight into the resident f32 accumulator, with the
+        # accumulator itself as residual. Without it the loop would silently
+        # keep only the last K block's product.
+        self.assertIn("@hmx_unpack_acc_f32_bulk", asm)
+        # The resident array is the f32 accumulator: BLOCK_M x BLOCK_N x 4
+        # bytes, pinned by the workspace-resident call the lowering emits (its
+        # byte argument is the size, so a smaller array is not it).
+        self.assertIn("@hexagon_runtime_workspace_resident_v2_dsp", asm)
+        self.assertRegex(asm, r"i32 262144")
+        # What the residency REMOVES, and the reason it exists: the per-segment
+        # fp16 image, its widening, and the add of the carried accumulator --
+        # one DDR round trip per K segment, gone.
+        self.assertNotIn("@hmx_unpack_acc_f16_bulk", asm)
+        self.assertNotRegex(asm, r"\bfpext\b")
         # Attribution agrees it is the per-block contraction that reached HMX.
         manifest = json.loads(compiled.packed_metadata["hmx_manifest"])
         plans = [(rec.get("plan"), rec.get("reason"))

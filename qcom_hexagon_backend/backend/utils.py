@@ -276,6 +276,7 @@ PACK_METADATA_REQUIRED = (
     "weight_prepack",
     "hmx_manifest",
     "hmx_record",
+    "arg_writes",
 )
 
 # The default translation envelope.  It carries the v2 execution manifest only;
@@ -2379,25 +2380,70 @@ def _validate_manifest_weight_prepack(manifest, weight_prepack):
 # must have one, because a v3-capable envelope that structurally omits the child
 # is a malformed artifact rather than a "no record this run" signal.
 TRANSLATION_ENVELOPE_CHILDREN = {
-    HMX_TRANSLATION_V1_SCHEMA: ("schema", "weight_prepack", "hmx_manifest"),
+    HMX_TRANSLATION_V1_SCHEMA: (
+        "schema",
+        "weight_prepack",
+        "hmx_manifest",
+        "arg_writes",
+    ),
     HMX_TRANSLATION_V2_SCHEMA: (
         "schema",
         "weight_prepack",
         "hmx_manifest",
+        "arg_writes",
         "hmx_record",
     ),
 }
 
 
-def parse_translation_metadata(metadata_json):
-    """Unpack the C++ translation envelope into launcher-facing JSON strings.
+def validate_arg_writes(value, field_name="arg_writes"):
+    """Validate the kernel's tensor-argument write set.
 
-    Returns ``(weight_prepack, hmx_manifest, hmx_record)``.  All three stay JSON
-    text because the existing launcher contract consumes the first as a string
-    and the other two are host-side consumers.  ``hmx_record`` is ``None`` for a
-    v1 envelope, which is the only way to get ``None`` here: no default record
-    object is manufactured for a missing child, because a stale or malformed
-    envelope is an actionable compilation error.
+    The value is either a strictly increasing list of tensor ordinals -- the
+    arguments the kernel writes through, in the same ordinal space
+    ``weight_prepack``'s ``slot`` and the launcher's ``input_profs.idx`` use --
+    or ``None``.  ``None`` is not a defect: it is the fail-closed spelling of
+    "the producer could not prove a write set", and the launcher reads it as
+    "keep today's behaviour" (dump, pull and copy back every ranked input).
+    It is a distinct value from ``[]``, which is the positive claim that the
+    kernel writes no tensor argument at all.  Collapsing the two would turn
+    "unknown" into a decision, so they are never merged here or downstream.
+
+    Strictly increasing, rather than merely unique or sorted, so a producer
+    that emits a duplicate or an out-of-order slot is rejected here instead of
+    being silently repaired: a write set that had to be repaired is a write set
+    whose producer this boundary disagrees with.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise ValueError(
+            f"{field_name} must be a list of tensor ordinals or null, got "
+            f"{type(value).__name__}"
+        )
+    previous = -1
+    for index, slot in enumerate(value):
+        _require_strict_int(slot, f"{field_name}[{index}]", minimum=0)
+        if slot <= previous:
+            raise ValueError(
+                f"{field_name} must be strictly increasing, got {value!r}"
+            )
+        previous = slot
+    return value
+
+
+def parse_translation_metadata(metadata_json):
+    """Unpack the C++ translation envelope into its launcher-facing children.
+
+    Returns ``(weight_prepack, hmx_manifest, hmx_record, arg_writes)``.  The
+    first three stay JSON text because the existing launcher contract consumes
+    the first as a string and the other two are host-side consumers.
+    ``hmx_record`` is ``None`` for a v1 envelope, which is the only way to get
+    ``None`` here: no default record object is manufactured for a missing
+    child, because a stale or malformed envelope is an actionable compilation
+    error.  ``arg_writes`` is the odd one out on purpose: it is already the
+    decoded value (a list or ``None``) because it is a flat list rather than a
+    nested document, and the launcher consumes it directly.
 
     The envelope schema is dispatched on its declared value from a closed set.
     Nothing here probes one schema and falls back to another: a v2 envelope
@@ -2419,6 +2465,12 @@ def parse_translation_metadata(metadata_json):
     hmx_manifest = envelope["hmx_manifest"]
     validate_hmx_manifest(hmx_manifest)
     _validate_manifest_weight_prepack(hmx_manifest, weight_prepack)
+    # The write set is validated here, with the rest of the envelope, even
+    # though the torch-mlir caller discards it: a malformed child is a
+    # malformed envelope, and this is the one boundary every compile crosses.
+    arg_writes = validate_arg_writes(
+        envelope["arg_writes"], "translation metadata.arg_writes"
+    )
 
     # The v2 execution manifest is the execution authority in both envelopes and
     # is re-encoded, not reinterpreted.  The v3 child is a sibling record: it is
@@ -2436,15 +2488,19 @@ def parse_translation_metadata(metadata_json):
         _canonical_json(weight_prepack),
         _canonical_json(hmx_manifest),
         hmx_record,
+        arg_writes,
     )
 
 
 def apply_translation_metadata(metadata, metadata_json):
     """Validate an envelope and publish its independent fields."""
     try:
-        weight_prepack, hmx_manifest, hmx_record = parse_translation_metadata(
-            metadata_json
-        )
+        (
+            weight_prepack,
+            hmx_manifest,
+            hmx_record,
+            arg_writes,
+        ) = parse_translation_metadata(metadata_json)
     except ValueError as exc:
         raise RuntimeError(
             "invalid HMX translation metadata returned by the backend: "
@@ -2458,6 +2514,11 @@ def apply_translation_metadata(metadata, metadata_json):
     metadata["hmx_record"] = (
         hmx_record if hmx_record is not None else HMX_RECORD_ABSENT
     )
+    # The kernel's tensor-argument write set, straight from the producer: the
+    # decoded list, or `None` when the producer could not prove one.  It is
+    # published unmodified -- the launcher, not this boundary, decides what a
+    # missing write set costs, and what it costs is today's behaviour.
+    metadata["arg_writes"] = arg_writes
 
 
 def hmx_cache_identity(
@@ -2537,6 +2598,7 @@ def validate_pack_metadata(packed):
         # non-empty one must be a complete, self-consistent v3 document.
         if packed["hmx_record"] != HMX_RECORD_ABSENT:
             validate_hmx_record_json(packed["hmx_record"])
+        validate_arg_writes(packed["arg_writes"])
     except ValueError as exc:
         raise RuntimeError(
             f"invalid compiled kernel metadata: {exc}; clear "

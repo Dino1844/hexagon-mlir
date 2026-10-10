@@ -448,10 +448,43 @@ static Descriptor buildDescriptor(OpBuilder &builder, Location loc,
       builder, loc, MemRefType::get({kHmxReadoutBatchWords}, i32));
   desc.buffer = alloca.getResult();
 
+  // A descriptor word is an i32 ADDRESS (the runtime ABI: `void *ar, *dst`,
+  // HmxVectorExecutor.h), and an address is the memref's aligned pointer PLUS
+  // its descriptor offset, element-scaled. That is the rule `asAddress`
+  // applies on the LLVM side (HmxToLLVMPass.cpp:1476), spelled in the memref
+  // dialect; the offset term is why a pack source that is a `reinterpret_cast`
+  // with a per-iteration offset packs the right block there.
+  //
+  // WHY THIS IS NOT `extract_aligned_pointer_as_index` ALONE. That op returns
+  // the ALIGNED pointer field, and a view into the middle of a buffer keeps
+  // its offset in a SEPARATE field. Every span of a grid-tiled matmul stores
+  // through such a view -- a `reinterpret_cast` of the output whose offset is
+  // `m0*N + n0` -- so the aligned pointer is the SAME value for all of them.
+  // Measured on the device (2048^3-B, 16 spans): all 16 spans wrote the
+  // top-left 512x512 block, the other 15/16 of C kept the caller's zeros, and
+  // rel = 0.96817 ~ sqrt(15/16) -- the exact signature of a span offset that
+  // is missing rather than wrong. `expand-strided-metadata` folds the extract
+  // through the `reinterpret_cast` later on the LLVM path and drops the offset
+  // for good, so there is nothing downstream this pass could lean on.
+  //
+  // The offset is read through `extract_strided_metadata`, the one op that
+  // exposes it as a value (the same idiom HexagonL2PrefetchPass uses to build
+  // a fetch address), rather than by recognising how the view was spelled:
+  // the producer does not know, and a subview, a `reinterpret_cast` and a
+  // cast all end up here with the offset in the same field.
   auto addressOf = [&](Value buffer) {
-    Value pointer =
-        memref::ExtractAlignedPointerAsIndexOp::create(builder, loc, buffer);
-    return arith::IndexCastOp::create(builder, loc, i32, pointer);
+    Value pointer = memref::ExtractAlignedPointerAsIndexOp::create(builder,
+                                                                   loc, buffer);
+    Value offset = memref::ExtractStridedMetadataOp::create(builder, loc,
+                                                           buffer)
+                       .getOffset();
+    int64_t elemBytes =
+        cast<MemRefType>(buffer.getType()).getElementTypeBitWidth() / 8;
+    Value byteOffset = arith::MulIOp::create(
+        builder, loc, offset,
+        arith::ConstantIndexOp::create(builder, loc, elemBytes));
+    Value absolute = arith::AddIOp::create(builder, loc, pointer, byteOffset);
+    return arith::IndexCastOp::create(builder, loc, i32, absolute);
   };
   auto store = [&](int64_t field, Value value) {
     Value index = arith::ConstantIndexOp::create(builder, loc, field);

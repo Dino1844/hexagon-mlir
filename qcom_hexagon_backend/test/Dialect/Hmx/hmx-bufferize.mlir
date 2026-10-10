@@ -99,6 +99,59 @@ func.func @fused_tail_residual_buffers(%a: tensor<2x2x16x32x2xf16>,
 
 // -----
 
+// The residual threading the K-loop accumulator uses: the destination IS the
+// residual -- one VTCM buffer carried across a K loop's segments, read and
+// overwritten in place by every leaf call. The op declares the pair
+// non-conflicting (`hmx__unpack_f32_tile` reads element (i, j) and writes
+// element (i, j) of the same matrix in one call), so bufferization keeps the
+// destination in place: no `memref.copy` of the accumulator appears, which is
+// the whole point of the form (docs/hmx/kchunk-accumulator-residency-2026-10-10.md
+// section 4.1). The post-loop consumer is a store, as it is in every real
+// kernel (a VTCM matrix is never a function result).
+// CHECK-LABEL: func.func @fused_tail_inplace_buffers
+// CHECK-DAG: memref.alloc() {{.*}} : memref<64x64xf32, 1>
+// The K loop carries that one allocation.
+// CHECK-DAG: scf.for %{{.*}} = %{{.*}} to %{{.*}} step %{{.*}} iter_args(%{{[a-z0-9_]+}} = %{{[a-z0-9_]+}}) -> (memref<64x64xf32, 1>)
+// The read-out loop carries the same buffer and the leaf's residual IS its
+// destination: one allocation, read and overwritten in place.
+// CHECK-DAG: hmx.unpack_acc_f32 ins(%{{[a-z0-9_]+}}, %{{[a-z0-9_]+}}, %{{[a-z0-9_]+}}, %[[arg:[a-z0-9_]+]] : memref<2x2x16x32x2xf16, 1>, memref<64x64xf32, 1>) outs(%[[arg]] : memref<64x64xf32, 1>)
+// No copy of the f32 accumulator anywhere: not at the entry, not per leaf
+// call. The one copy this kernel has is the narrowing store to the output,
+// and it is the f16 image's, not the accumulator's.
+// CHECK-NOT: memref.copy %{{[a-z0-9_]+}}, %{{[a-z0-9_]+}} : memref<64x64xf32
+// CHECK-DAG: memref.copy %{{[a-z0-9_]+}}, %arg2 : memref<64x64xf16> to memref<64x64xf16>
+func.func @fused_tail_inplace_buffers(%a: tensor<2x2x16x32x2xf16>,
+                                      %b: tensor<2x2x16x32x2xf16>,
+                                      %dstbuf: memref<64x64xf16>) {
+  %cst = arith.constant 0.000000e+00 : f32
+  %acc = bufferization.alloc_tensor() {memory_space = 1 : i64} : tensor<64x64xf32>
+  %acc0 = linalg.fill ins(%cst : f32) outs(%acc : tensor<64x64xf32>) -> tensor<64x64xf32>
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c2 = arith.constant 2 : index
+  %0 = scf.for %k = %c0 to %c2 step %c1 iter_args(%carried = %acc0) -> (tensor<64x64xf32>) {
+    %crout = bufferization.alloc_tensor() {memory_space = 1 : i64} : tensor<2x2x16x32x2xf16>
+    %mm = hmx.matmul ins(%a, %b : tensor<2x2x16x32x2xf16>, tensor<2x2x16x32x2xf16>)
+                    outs(%crout : tensor<2x2x16x32x2xf16>) -> tensor<2x2x16x32x2xf16>
+    %u = scf.for %i = %c0 to %c2 step %c1 iter_args(%d = %carried) -> (tensor<64x64xf32>) {
+      %x = hmx.unpack_acc_f32 ins(%mm, %i, %c0, %d : tensor<2x2x16x32x2xf16>, tensor<64x64xf32>)
+                              outs(%d : tensor<64x64xf32>) -> tensor<64x64xf32>
+      scf.yield %x : tensor<64x64xf32>
+    }
+    scf.yield %u : tensor<64x64xf32>
+  }
+  %oe = tensor.empty() : tensor<64x64xf16>
+  %g = linalg.generic {indexing_maps = [affine_map<(d0, d1) -> (d0, d1)>, affine_map<(d0, d1) -> (d0, d1)>], iterator_types = ["parallel", "parallel"]} ins(%0 : tensor<64x64xf32>) outs(%oe : tensor<64x64xf16>) {
+  ^bb0(%in: f32, %out: f16):
+    %n = arith.truncf %in : f32 to f16
+    linalg.yield %n : f16
+  } -> tensor<64x64xf16>
+  bufferization.materialize_in_destination %g in writable %dstbuf : (tensor<64x64xf16>, memref<64x64xf16>) -> ()
+  return
+}
+
+// -----
+
 // The bulk `count` is an op attribute, so the interface rebuilds the memref op
 // with it: the ranged range survives bufferization and the lowering can still
 // select the ranged leaf.

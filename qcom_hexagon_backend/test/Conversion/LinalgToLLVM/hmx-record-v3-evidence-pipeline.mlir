@@ -27,6 +27,18 @@
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=V2
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=PROVEN
 // RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record)' | FileCheck %s --check-prefix=UNPROVEN
+//
+// LAYERED arms: the same three prefixes against the same entry stopped right
+// after the placement-stage census. The hand-written sidecars above are module
+// attributes, so they are already there when the census runs, and the record
+// is finalised immediately after it -- every fact the v3 join consumes is
+// written inside that layer. The identical directives therefore prove the join
+// on the stage output alone; a directive that only held after lowering would
+// fail here and leave the run above green, which is exactly the split the batch
+// is meant to detect.
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{stop-after-diagnostic-stage})' | FileCheck %s --check-prefix=V2
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{stop-after-diagnostic-stage})' | FileCheck %s --check-prefix=PROVEN
+// RUN: linalg-hexagon-opt %s -pass-pipeline='builtin.module(hmx-diagnostic-record{stop-after-diagnostic-stage})' | FileCheck %s --check-prefix=UNPROVEN
 //===----------------------------------------------------------------------===//
 
 // The v2 execution manifest is unchanged and remains the execution authority.

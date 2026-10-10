@@ -506,10 +506,16 @@ if (hexagon_runtime_resident_scope_enter_v2_dsp != nullptr &&
             profs = self.input_profs
             prefix = self.common_strings.input_tensor_name
 
+        # The same slot list the host pulls and the copy-back walks (see
+        # `output_tensor_slots`): a tensor the kernel never writes through needs
+        # no dump, no pull and no copy-back, because its bytes are the bytes the
+        # host pushed for it.
+        slots = set(output_tensor_slots(self))
+
         write_to_file_string = ""
         for out in profs:
             # TODO: add scalar/bool support
-            if out.rank:
+            if out.rank and out.idx in slots:
                 write_to_file_string += self.common_strings.dump_to_file_string.format(
                     output_tensor_prefix=prefix,
                     idx=out.idx,
@@ -627,7 +633,63 @@ def create_timestamped_folder(
     return full_path, folder_name
 
 
+def written_argument_slots(wrapper_generator) -> frozenset[int] | None:
+    """The tensor argument ordinals the compiled kernel writes through.
+
+    ``None`` when the launch contract carries no write set -- a cache entry
+    written by an older backend, another frontend, or an extraction the
+    producer declined -- and ``None`` is the fail-closed spelling of "keep
+    today's behaviour": every ranked input is dumped, pulled and copied back.
+    It is deliberately not ``frozenset()``: an empty write set is the positive
+    claim that the kernel writes no tensor argument, which is a different fact
+    and one a caller would act on.
+    """
+    writes = getattr(wrapper_generator, "arg_writes", None)
+    if writes is None:
+        return None
+    return frozenset(writes)
+
+
+def output_tensor_slots(wrapper_generator) -> list[int]:
+    """The tensor ordinals whose bytes this launch returns, in pull order.
+
+    One list drives three consumers that must agree: the device-side dump
+    calls, the host-side pull paths and the copy-back walk.  They cannot
+    disagree, because ``results[res_idx]`` is indexed by that order, so a slot
+    list that changed shape between them would write one tensor's bytes into
+    another.
+
+    When the kernel has return values the slots are those return values: a
+    return is produced whatever the kernel writes through its arguments, so the
+    argument write set cannot prune it.  Otherwise the slots are the tensor
+    arguments -- every one of them when no write set is published, and only
+    the written ones when it is.
+    """
+    if len(wrapper_generator.output_profs) > 0:
+        return [
+            out.idx for out in wrapper_generator.output_profs if out.rank
+        ]
+    writes = written_argument_slots(wrapper_generator)
+    return [
+        out.idx
+        for out in wrapper_generator.input_profs
+        if out.rank and (writes is None or out.idx in writes)
+    ]
+
+
 class HexagonLauncherBase:
+    @staticmethod
+    def get_output_tensor_slots(wrapper_generator) -> list[int]:
+        """The tensor ordinals this launcher returns, in pull order.
+
+        The default is the shared Triton-flavoured rule (see
+        :func:`output_tensor_slots`).  A launcher overrides it only to keep its
+        own contract: torch-mlir's output paths are its return values, with no
+        input fallback at all, so it pins that here rather than inheriting a
+        rule its wrapper never agreed with.
+        """
+        return output_tensor_slots(wrapper_generator)
+
     def generate_input_output_paths(
         self, directory: str, file_name: str, wrapper: HexagonWrapperGenerator
     ) -> tuple[list[str], list[str]]:
@@ -696,9 +758,13 @@ class HexagonLauncherBase:
         # The output path count is provided by the frontend. There are
         # several cases (writing back ptrs, return values, or both)
         # that must be handled accordingly
-        output_tensor_path_count = self.get_output_tensor_path_count(wrapper)
-        for i in range(output_tensor_path_count):
-            output_path = os.path.join(directory, f"{file_name}_o{i}.raw")
+        # The slots, not just their count: the device writes them as
+        # `_o{slot}.raw`, so a write set that prunes an argument in the middle
+        # of the list must not renumber the ones after it.
+        for slot in self.get_output_tensor_slots(wrapper):
+            output_path = os.path.join(
+                directory, f"{file_name}_o{slot}.raw"
+            )
             output_paths.append(output_path)
 
         return input_paths, output_paths

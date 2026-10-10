@@ -474,20 +474,27 @@ class EnvelopeTest(unittest.TestCase):
             "schema": schema,
             "weight_prepack": copy.deepcopy(_WEIGHT),
             "hmx_manifest": copy.deepcopy(_MANIFEST),
+            # The write-set child both envelopes publish.  `None` is the
+            # producer's "could not prove one" spelling, not an absent field:
+            # a truly absent child is the stale-envelope error below.
+            "arg_writes": None,
         }
         envelope.update(copy.deepcopy(overrides))
         return json.dumps(envelope)
 
     def test_v1_envelope_publishes_no_record(self):
-        weight, manifest, record = _UTILS.parse_translation_metadata(
+        weight, manifest, record, writes = _UTILS.parse_translation_metadata(
             self._envelope("hex.hmx.translation/v1")
         )
         self.assertIsNone(record)
         self.assertEqual(json.loads(manifest)["schema"], _UTILS.HMX_MANIFEST_SCHEMA)
         self.assertEqual(json.loads(weight), {"layout": None, "weights": []})
+        # `null` on the wire arrives decoded as None: the fail-closed
+        # "unknown" the launcher reads as "return every ranked input".
+        self.assertIsNone(writes)
 
     def test_v2_envelope_carries_both_children(self):
-        _, manifest, record = _UTILS.parse_translation_metadata(
+        _, manifest, record, _ = _UTILS.parse_translation_metadata(
             self._envelope("hex.hmx.translation/v2", hmx_record=_DOCUMENT)
         )
         self.assertEqual(json.loads(record), _DOCUMENT)
@@ -504,6 +511,18 @@ class EnvelopeTest(unittest.TestCase):
             _UTILS.parse_translation_metadata(
                 self._envelope("hex.hmx.translation/v2")
             )
+
+    def test_an_envelope_must_carry_the_write_set_field(self):
+        # The field is required in both schemas: an envelope without it is an
+        # artifact written before the field existed, which must be an
+        # actionable error rather than a silent "no write set" -- with
+        # `require_pack_metadata_fields` catching the same thing one level up.
+        for schema in ("hex.hmx.translation/v1", "hex.hmx.translation/v2"):
+            with self.subTest(schema=schema):
+                envelope = json.loads(self._envelope(schema))
+                del envelope["arg_writes"]
+                with self.assertRaisesRegex(ValueError, "missing required field"):
+                    _UTILS.parse_translation_metadata(json.dumps(envelope))
 
     def test_unknown_envelope_schema_is_rejected_not_guessed(self):
         for schema in ("hex.hmx.translation/v3", "hex.hmx.kernel_manifest/v3", None):
@@ -640,6 +659,10 @@ class PackedMetadataTest(unittest.TestCase):
             "weight_prepack": json.dumps(_WEIGHT),
             "hmx_manifest": json.dumps(_MANIFEST),
             "hmx_record": "",
+            # `None` is the fail-closed "no proven write set": the launcher
+            # returns every ranked input, which is what a kernel compiled
+            # before the field existed would do.
+            "arg_writes": None,
         }
         values.update(overrides)
         return values
@@ -745,7 +768,14 @@ class CppRoundTripTest(unittest.TestCase):
         envelope = json.loads(self._translate(marked))
         self.assertEqual(envelope["schema"], _UTILS.HMX_TRANSLATION_V2_SCHEMA)
         self.assertEqual(
-            sorted(envelope), ["hmx_manifest", "hmx_record", "schema", "weight_prepack"]
+            sorted(envelope),
+            [
+                "arg_writes",
+                "hmx_manifest",
+                "hmx_record",
+                "schema",
+                "weight_prepack",
+            ],
         )
 
         record = _UTILS.validate_hmx_record_document(envelope["hmx_record"])
@@ -757,12 +787,13 @@ class CppRoundTripTest(unittest.TestCase):
         # The v2 execution manifest is still validated by its own validator.
         _UTILS.validate_hmx_manifest(envelope["hmx_manifest"])
 
-        weight, manifest, published = _UTILS.parse_translation_metadata(
-            json.dumps(envelope)
+        weight, manifest, published, writes = (
+            _UTILS.parse_translation_metadata(json.dumps(envelope))
         )
         self.assertEqual(json.loads(manifest), envelope["hmx_manifest"])
         self.assertEqual(json.loads(published), envelope["hmx_record"])
         self.assertEqual(json.loads(weight), envelope["weight_prepack"])
+        self.assertEqual(writes, envelope["arg_writes"])
 
     def test_the_v2_execution_child_is_identical_in_both_envelopes(self):
         """Marker-on/off A/B over the v2 execution children.
@@ -802,11 +833,18 @@ class CppRoundTripTest(unittest.TestCase):
         v1_envelope = json.loads(self._translate(unmarked))
         v2_envelope = json.loads(self._translate(marked))
         self.assertEqual(
-            sorted(v1_envelope), ["hmx_manifest", "schema", "weight_prepack"]
+            sorted(v1_envelope),
+            ["arg_writes", "hmx_manifest", "schema", "weight_prepack"],
         )
         self.assertEqual(
             sorted(v2_envelope),
-            ["hmx_manifest", "hmx_record", "schema", "weight_prepack"],
+            [
+                "arg_writes",
+                "hmx_manifest",
+                "hmx_record",
+                "schema",
+                "weight_prepack",
+            ],
         )
         # And the closed shape is enforced, not merely documented: one extra key
         # on either arm is refused rather than ignored.
@@ -1246,13 +1284,21 @@ class CacheBoundaryTest(unittest.TestCase):
             weight_prepack=json.dumps(_WEIGHT),
             hmx_manifest=json.dumps(_MANIFEST),
             hmx_record=HMX_RECORD_ABSENT,
+            # The launch contract's write set: None is "the producer could not
+            # prove one", which the launcher reads as "return every ranked
+            # input" -- the behaviour this fixture has always had.
+            arg_writes=None,
         )
         packed = HexagonBackend.pack_metadata(object(), metadata)
         self.assertEqual(packed["hmx_record"], HMX_RECORD_ABSENT)
         self.assertIsNotNone(packed["hmx_record"])
+        self.assertEqual(packed["arg_writes"], None)
         # A stale entry that predates the field is a loud error, not a default.
         del metadata.hmx_record
         with self.assertRaisesRegex(RuntimeError, "hmx_record"):
+            HexagonBackend.pack_metadata(object(), metadata)
+        del metadata.arg_writes
+        with self.assertRaisesRegex(RuntimeError, "arg_writes"):
             HexagonBackend.pack_metadata(object(), metadata)
 
 
@@ -1310,6 +1356,9 @@ class DriverRecordTest(unittest.TestCase):
             "weight_prepack": json.dumps(_WEIGHT),
             "hmx_manifest": json.dumps(_MANIFEST),
             "hmx_record": "",
+            # The launch contract's write set: None = "return every ranked
+            # input", the behaviour that predates the field.
+            "arg_writes": None,
         }
         packed.update(overrides)
         return packed
